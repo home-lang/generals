@@ -1,0 +1,709 @@
+// C&C Generals Zero Hour - Home Port
+// Script Engine (Mission Scripting System)
+//
+// Original: ScriptEngine.cpp/.h, Scripts.cpp/.h (EA Games)
+// Ported to Home with EA's condition-action scripting system
+//
+// EA's scripting architecture:
+// - Scripts = Conditions + Actions
+// - Conditions are checked every frame
+// - When conditions are TRUE, actions execute
+// - Scripts can be: always-active, one-time, subroutines
+//
+// Example script from EA (in map .scb files):
+// ```
+// Script MyScript
+//   OrCondition
+//     Counter 'EnemiesKilled' >= 10
+//   EndOrCondition
+//   ActionsTrue
+//     SetFlag 'ObjectiveComplete' = True
+//     PlayMovie 'VictoryCutscene'
+//     EndGame Victory
+//   EndActionsTrue
+// End
+// ```
+
+import basics/allocator
+import basics/string
+
+const MAX_COUNTERS: u32 = 256
+const MAX_FLAGS: u32 = 256
+const MAX_SCRIPT_GROUPS: u32 = 256
+const MAX_SCRIPTS_PER_GROUP: u32 = 64
+const MAX_ACTIONS_PER_SCRIPT: u32 = 32
+const MAX_CONDITIONS_PER_SCRIPT: u32 = 16
+const MAX_PARAMETERS_PER_ACTION: u32 = 8
+
+// Script constants from EA's Scripts.h
+const THIS_TEAM: string = "<This Team>"
+const THIS_OBJECT: string = "<This Object>"
+const THIS_PLAYER: string = "<This Player>"
+const LOCAL_PLAYER: string = "<Local Player>"
+
+// Counter (integer variable)
+struct ScriptCounter {
+    name: string
+    value: i32
+    is_countdown_timer: bool   // Counts down each frame
+    is_active: bool
+
+    fn init(name: string): ScriptCounter {
+        return ScriptCounter {
+            name: name
+            value: 0
+            is_countdown_timer: false
+            is_active: true
+        }
+    }
+}
+
+// Flag (boolean variable)
+struct ScriptFlag {
+    name: string
+    value: bool
+    is_active: bool
+
+    fn init(name: string): ScriptFlag {
+        return ScriptFlag {
+            name: name
+            value: false
+            is_active: true
+        }
+    }
+}
+
+// Condition comparison operators
+enum ComparisonOp {
+    Equal           // ==
+    NotEqual        // !=
+    LessThan        // <
+    LessThanOrEqual // <=
+    GreaterThan     // >
+    GreaterThanOrEqual // >=
+}
+
+// Condition types (from EA's Condition enum)
+enum ConditionType {
+    // Basic conditions
+    Counter             // Counter comparison (e.g., "Enemies >= 10")
+    Flag                // Flag check (e.g., "ObjectiveStarted == True")
+    Timer               // Timer expired
+    AlwaysTrue          // Always evaluates to true
+
+    // Unit/Object conditions
+    UnitExists          // Check if named unit exists
+    UnitDead            // Check if named unit is dead
+    UnitDamaged         // Check if unit health < threshold
+    UnitNearArea        // Check if unit is near waypoint/area
+    TeamExists          // Check if team exists
+    TeamDead            // Check if team is dead
+
+    // Player conditions
+    PlayerMoney         // Player has $X
+    PlayerPower         // Player has X power
+    PlayerDefeated      // Player defeated
+    PlayerObjectCount   // Player has X of object type
+
+    // Map conditions
+    AreaClear           // Area has no enemy units
+    AreaEntered         // Unit entered trigger area
+    AreaExited          // Unit left trigger area
+
+    // Video/Audio conditions
+    VideoComplete       // Video finished playing
+    SpeechComplete      // Speech finished playing
+
+    // Special conditions
+    DifficultyLevel     // Current difficulty level
+    MissionSeconds      // Mission time elapsed
+}
+
+// Action types (from EA's ScriptAction enum)
+enum ActionType {
+    // Game control
+    EndGame             // End mission (Victory/Defeat)
+    SetDifficulty       // Set difficulty level
+
+    // Counters & Flags
+    SetCounter          // Set counter value
+    AddCounter          // Increment counter
+    SubCounter          // Decrement counter
+    SetFlag             // Set flag value
+    SetTimer            // Set countdown timer
+
+    // Units & Teams
+    SpawnUnit           // Create unit at location
+    DestroyUnit         // Delete unit
+    MoveUnit            // Move unit to location
+    AttackUnit          // Order unit to attack target
+    CreateTeam          // Create team
+    DestroyTeam         // Delete team
+    SetTeamAttackPriority // Set team's attack priorities
+
+    // Player actions
+    GivePlayerMoney     // Add money to player
+    SetPlayerMoney      // Set player money
+    GivePlayerPower     // Add power to player
+    TransferUnits       // Transfer units between players
+
+    // Media
+    PlayMovie           // Play video cutscene
+    PlaySound           // Play sound effect
+    PlaySpeech          // Play voice-over
+    PlayMusic           // Play music track
+    StopMusic           // Stop music
+
+    // Camera
+    MoveCameraTo        // Move camera to waypoint
+    ShakeCamera         // Camera shake effect
+    FadeScreen          // Screen fade (black/white)
+
+    // UI
+    DisplayMessage      // Show text message
+    DisplayObjective    // Show objective text
+    SetRadarEvent       // Show radar ping
+    EnableInput         // Enable/disable player input
+
+    // Scripts
+    EnableScript        // Activate script
+    DisableScript       // Deactivate script
+    CallSubroutine      // Execute another script
+
+    // Map
+    RevealArea          // Reveal fog of war area
+    ShroudArea          // Re-shroud area
+    SetWeather          // Change weather
+    SetTimeOfDay        // Change time of day
+
+    // Debug
+    DebugMessage        // Print debug message
+}
+
+// Script parameter (for actions/conditions)
+struct ScriptParameter {
+    param_type: ParameterType
+    int_value: i32
+    float_value: f32
+    string_value: string
+    bool_value: bool
+
+    fn as_int(self): i32 {
+        return self.int_value
+    }
+
+    fn as_float(self): f32 {
+        return self.float_value
+    }
+
+    fn as_string(self): string {
+        return self.string_value
+    }
+
+    fn as_bool(self): bool {
+        return self.bool_value
+    }
+}
+
+enum ParameterType {
+    Int
+    Float
+    String
+    Bool
+}
+
+// Script condition
+struct ScriptCondition {
+    condition_type: ConditionType
+    comparison_op: ComparisonOp
+    parameters: [MAX_PARAMETERS_PER_ACTION]ScriptParameter
+    param_count: u32
+    is_inverted: bool       // NOT condition
+
+    fn evaluate(self, engine: *ScriptEngine): bool {
+        let result = match self.condition_type {
+            ConditionType.AlwaysTrue => true
+            ConditionType.Counter => self.evaluate_counter(engine)
+            ConditionType.Flag => self.evaluate_flag(engine)
+            ConditionType.Timer => self.evaluate_timer(engine)
+            _ => false  // TODO: Implement other condition types
+        }
+
+        if self.is_inverted {
+            return !result
+        }
+
+        return result
+    }
+
+    fn evaluate_counter(self, engine: *ScriptEngine): bool {
+        if self.param_count < 2 {
+            return false
+        }
+
+        let counter_name = self.parameters[0].as_string()
+        let counter = engine.get_counter(counter_name)
+
+        if !counter {
+            return false
+        }
+
+        let value = counter.?.value
+        let threshold = self.parameters[1].as_int()
+
+        return match self.comparison_op {
+            ComparisonOp.Equal => value == threshold
+            ComparisonOp.NotEqual => value != threshold
+            ComparisonOp.LessThan => value < threshold
+            ComparisonOp.LessThanOrEqual => value <= threshold
+            ComparisonOp.GreaterThan => value > threshold
+            ComparisonOp.GreaterThanOrEqual => value >= threshold
+        }
+    }
+
+    fn evaluate_flag(self, engine: *ScriptEngine): bool {
+        if self.param_count < 2 {
+            return false
+        }
+
+        let flag_name = self.parameters[0].as_string()
+        let flag = engine.get_flag(flag_name)
+
+        if !flag {
+            return false
+        }
+
+        let expected = self.parameters[1].as_bool()
+        return flag.?.value == expected
+    }
+
+    fn evaluate_timer(self, engine: *ScriptEngine): bool {
+        if self.param_count < 1 {
+            return false
+        }
+
+        let timer_name = self.parameters[0].as_string()
+        let counter = engine.get_counter(timer_name)
+
+        if !counter or !counter.?.is_countdown_timer {
+            return false
+        }
+
+        // Timer expired when value <= 0
+        return counter.?.value <= 0
+    }
+}
+
+// Script action
+struct ScriptAction {
+    action_type: ActionType
+    parameters: [MAX_PARAMETERS_PER_ACTION]ScriptParameter
+    param_count: u32
+
+    fn execute(self, engine: *ScriptEngine) {
+        match self.action_type {
+            ActionType.SetCounter => self.execute_set_counter(engine)
+            ActionType.AddCounter => self.execute_add_counter(engine)
+            ActionType.SubCounter => self.execute_sub_counter(engine)
+            ActionType.SetFlag => self.execute_set_flag(engine)
+            ActionType.SetTimer => self.execute_set_timer(engine)
+            ActionType.DisplayMessage => self.execute_display_message(engine)
+            ActionType.DebugMessage => self.execute_debug_message(engine)
+            ActionType.EndGame => self.execute_end_game(engine)
+            _ => {}  // TODO: Implement other action types
+        }
+    }
+
+    fn execute_set_counter(self, engine: *ScriptEngine) {
+        if self.param_count < 2 {
+            return
+        }
+
+        let counter_name = self.parameters[0].as_string()
+        let value = self.parameters[1].as_int()
+
+        engine.set_counter(counter_name, value)
+    }
+
+    fn execute_add_counter(self, engine: *ScriptEngine) {
+        if self.param_count < 2 {
+            return
+        }
+
+        let counter_name = self.parameters[0].as_string()
+        let amount = self.parameters[1].as_int()
+
+        engine.add_counter(counter_name, amount)
+    }
+
+    fn execute_sub_counter(self, engine: *ScriptEngine) {
+        if self.param_count < 2 {
+            return
+        }
+
+        let counter_name = self.parameters[0].as_string()
+        let amount = self.parameters[1].as_int()
+
+        engine.add_counter(counter_name, -amount)
+    }
+
+    fn execute_set_flag(self, engine: *ScriptEngine) {
+        if self.param_count < 2 {
+            return
+        }
+
+        let flag_name = self.parameters[0].as_string()
+        let value = self.parameters[1].as_bool()
+
+        engine.set_flag(flag_name, value)
+    }
+
+    fn execute_set_timer(self, engine: *ScriptEngine) {
+        if self.param_count < 2 {
+            return
+        }
+
+        let timer_name = self.parameters[0].as_string()
+        let seconds = self.parameters[1].as_int()
+
+        engine.set_timer(timer_name, seconds)
+    }
+
+    fn execute_display_message(self, engine: *ScriptEngine) {
+        if self.param_count < 1 {
+            return
+        }
+
+        let message = self.parameters[0].as_string()
+        println("[MESSAGE] {message}")
+        // TODO: Display in UI
+    }
+
+    fn execute_debug_message(self, engine: *ScriptEngine) {
+        if self.param_count < 1 {
+            return
+        }
+
+        let message = self.parameters[0].as_string()
+        println("[DEBUG] {message}")
+    }
+
+    fn execute_end_game(self, engine: *ScriptEngine) {
+        if self.param_count < 1 {
+            return
+        }
+
+        let victory = self.parameters[0].as_bool()
+
+        if victory {
+            println("=== MISSION VICTORY ===")
+            engine.end_game_victory = true
+        } else {
+            println("=== MISSION DEFEAT ===")
+            engine.end_game_defeat = true
+        }
+    }
+}
+
+// Script (conditions + actions)
+struct Script {
+    name: string
+    conditions: []ScriptCondition
+    condition_count: u32
+    actions_true: []ScriptAction
+    action_true_count: u32
+    actions_false: []ScriptAction
+    action_false_count: u32
+
+    is_active: bool
+    is_one_time: bool       // Execute once then deactivate
+    is_subroutine: bool     // Only runs when called
+    has_executed: bool      // Track if one-time script ran
+
+    fn evaluate_and_execute(mut self, engine: *ScriptEngine) {
+        if !self.is_active or (self.is_one_time and self.has_executed) {
+            return
+        }
+
+        // Evaluate all conditions (AND-ed together)
+        let all_true = true
+
+        for i in 0..self.condition_count {
+            if !self.conditions[i].evaluate(engine) {
+                all_true = false
+                break
+            }
+        }
+
+        // Execute appropriate actions
+        if all_true {
+            for i in 0..self.action_true_count {
+                self.actions_true[i].execute(engine)
+            }
+
+            if self.is_one_time {
+                self.has_executed = true
+                self.is_active = false
+            }
+        } else {
+            for i in 0..self.action_false_count {
+                self.actions_false[i].execute(engine)
+            }
+        }
+    }
+}
+
+// Script group (named collection of scripts)
+struct ScriptGroup {
+    name: string
+    scripts: []Script
+    script_count: u32
+    is_active: bool
+    is_subroutine: bool
+}
+
+// Script engine (singleton)
+struct ScriptEngine {
+    counters: [MAX_COUNTERS]ScriptCounter
+    counter_count: u32
+    flags: [MAX_FLAGS]ScriptFlag
+    flag_count: u32
+
+    script_groups: []ScriptGroup
+    group_count: u32
+
+    // Game state
+    end_game_victory: bool
+    end_game_defeat: bool
+    end_game_timer: i32     // Frames until game ends
+    mission_time_seconds: i32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): ScriptEngine {
+        return ScriptEngine {
+            counters: [ScriptCounter.init(""); MAX_COUNTERS]
+            counter_count: 0
+            flags: [ScriptFlag.init(""); MAX_FLAGS]
+            flag_count: 0
+            script_groups: []
+            group_count: 0
+            end_game_victory: false
+            end_game_defeat: false
+            end_game_timer: -1
+            mission_time_seconds: 0
+            allocator: allocator
+        }
+    }
+
+    fn update(mut self, delta_time: f32) {
+        // Update mission time
+        self.mission_time_seconds += @floatToInt(i32, delta_time)
+
+        // Update countdown timers
+        for i in 0..self.counter_count {
+            if self.counters[i].is_countdown_timer and self.counters[i].is_active {
+                self.counters[i].value -= 1
+
+                if self.counters[i].value < 0 {
+                    self.counters[i].value = 0
+                }
+            }
+        }
+
+        // Evaluate all active scripts
+        for i in 0..self.group_count {
+            if !self.script_groups[i].is_active {
+                continue
+            }
+
+            for j in 0..self.script_groups[i].script_count {
+                self.script_groups[i].scripts[j].evaluate_and_execute(&self)
+            }
+        }
+
+        // Handle end game timer
+        if self.end_game_timer >= 0 {
+            self.end_game_timer -= 1
+
+            if self.end_game_timer == 0 {
+                println("End game timer expired")
+                // TODO: Transition to results screen
+            }
+        }
+    }
+
+    fn get_counter(self, name: string): ?*ScriptCounter {
+        for i in 0..self.counter_count {
+            if self.counters[i].name == name {
+                return &self.counters[i]
+            }
+        }
+        return null
+    }
+
+    fn get_flag(self, name: string): ?*ScriptFlag {
+        for i in 0..self.flag_count {
+            if self.flags[i].name == name {
+                return &self.flags[i]
+            }
+        }
+        return null
+    }
+
+    fn set_counter(mut self, name: string, value: i32) {
+        let counter = self.get_counter_mut(name)
+
+        if counter {
+            counter.?.value = value
+        } else {
+            // Allocate new counter
+            if self.counter_count < MAX_COUNTERS {
+                self.counters[self.counter_count] = ScriptCounter.init(name)
+                self.counters[self.counter_count].value = value
+                self.counter_count += 1
+            }
+        }
+    }
+
+    fn add_counter(mut self, name: string, amount: i32) {
+        let counter = self.get_counter_mut(name)
+
+        if counter {
+            counter.?.value += amount
+        } else {
+            self.set_counter(name, amount)
+        }
+    }
+
+    fn set_flag(mut self, name: string, value: bool) {
+        let flag = self.get_flag_mut(name)
+
+        if flag {
+            flag.?.value = value
+        } else {
+            // Allocate new flag
+            if self.flag_count < MAX_FLAGS {
+                self.flags[self.flag_count] = ScriptFlag.init(name)
+                self.flags[self.flag_count].value = value
+                self.flag_count += 1
+            }
+        }
+    }
+
+    fn set_timer(mut self, name: string, seconds: i32) {
+        let counter = self.get_counter_mut(name)
+
+        if counter {
+            counter.?.value = seconds * 30  // 30 FPS
+            counter.?.is_countdown_timer = true
+        } else {
+            if self.counter_count < MAX_COUNTERS {
+                self.counters[self.counter_count] = ScriptCounter.init(name)
+                self.counters[self.counter_count].value = seconds * 30
+                self.counters[self.counter_count].is_countdown_timer = true
+                self.counter_count += 1
+            }
+        }
+    }
+
+    fn start_end_game_timer(mut self, frames: i32) {
+        self.end_game_timer = frames
+    }
+
+    fn get_counter_mut(mut self, name: string): ?*ScriptCounter {
+        for i in 0..self.counter_count {
+            if self.counters[i].name == name {
+                return &self.counters[i]
+            }
+        }
+        return null
+    }
+
+    fn get_flag_mut(mut self, name: string): ?*ScriptFlag {
+        for i in 0..self.flag_count {
+            if self.flags[i].name == name {
+                return &self.flags[i]
+            }
+        }
+        return null
+    }
+
+    fn print_debug_state(self) {
+        println("\n=== Script Engine State ===")
+        println("Mission Time: {self.mission_time_seconds}s")
+
+        println("\nCounters:")
+        for i in 0..self.counter_count {
+            let counter = &self.counters[i]
+            let timer_str = if counter.is_countdown_timer { " (timer)" } else { "" }
+            println("  {counter.name}: {counter.value}{timer_str}")
+        }
+
+        println("\nFlags:")
+        for i in 0..self.flag_count {
+            let flag = &self.flags[i]
+            let value_str = if flag.value { "TRUE" } else { "FALSE" }
+            println("  {flag.name}: {value_str}")
+        }
+
+        if self.end_game_victory {
+            println("\nGame State: VICTORY")
+        } else if self.end_game_defeat {
+            println("\nGame State: DEFEAT")
+        }
+    }
+}
+
+// Global script engine
+var g_script_engine: ?ScriptEngine = null
+
+export fn init_script_engine(allocator: Allocator) {
+    g_script_engine = ScriptEngine.init(allocator)
+}
+
+export fn update_script_engine(delta_time: f32) {
+    if !g_script_engine {
+        return
+    }
+
+    g_script_engine.?.update(delta_time)
+}
+
+export fn set_script_counter(name: string, value: i32) {
+    if !g_script_engine {
+        return
+    }
+
+    g_script_engine.?.set_counter(name, value)
+}
+
+export fn get_script_counter(name: string): i32 {
+    if !g_script_engine {
+        return 0
+    }
+
+    let counter = g_script_engine.?.get_counter(name)
+    if counter {
+        return counter.?.value
+    }
+
+    return 0
+}
+
+export fn set_script_flag(name: string, value: bool) {
+    if !g_script_engine {
+        return
+    }
+
+    g_script_engine.?.set_flag(name, value)
+}
+
+export fn shutdown_script_engine() {
+    g_script_engine = null
+}
+
+fn get_global_allocator(): Allocator {
+    // TODO: Return global allocator
+    return Allocator {}
+}

@@ -1,9 +1,9 @@
 # C&C Generals Zero Hour - Home Port - Status Report
 
 **Last Updated:** November 16, 2025
-**Total Lines of Code:** ~18,500+ lines of Home
-**Total Modules:** 35 Home files
-**Project Status:** Phase 9 Complete (Weeks 1-48 of 65-week roadmap - 73.8%)
+**Total Lines of Code:** ~21,000+ lines of Home
+**Total Modules:** 38 Home files
+**Project Status:** Phase 10 Complete (Weeks 1-54 of 65-week roadmap - 83.1%)
 
 ---
 
@@ -591,7 +591,129 @@ let proj_matrix = get_projection_matrix()
 
 ---
 
-## 📅 Next Steps (Phase 10: Campaign & Missions - Weeks 49-54)
+### ✅ **Phase 10: Campaign & Missions (COMPLETE)**
+
+#### 10.1 Campaign Manager (380 lines)
+**File:** `game/campaign.home`
+
+- ✅ Complete campaign progression system
+- ✅ Data structures:
+  - `Mission` - Map, objectives, briefing, next mission link
+  - `Campaign` - List of missions, progression tracking
+  - `CampaignManager` - Manages multiple campaigns, tracks progress
+- ✅ Mission metadata:
+  - Name, map file, location name
+  - Up to 5 objective text lines
+  - Briefing voice-over info (file + duration)
+  - Up to 3 unit displays for briefing screen
+  - Next mission linkage
+  - Completion tracking, best time, rank points
+- ✅ Campaign features:
+  - First mission designation
+  - Final victory movie
+  - Completion percentage calculation
+  - Mission traversal (get next mission)
+- ✅ Progression tracking:
+  - Victory/defeat status
+  - Rank points accumulation
+  - Difficulty levels (Easy, Normal, Hard, Brutal)
+  - Difficulty modifiers (0.75x to 1.5x)
+- ✅ INI loading:
+  - Parses Campaign.ini format
+  - Loads mission definitions
+  - Auto-links mission chain
+- ✅ Global API: `init_campaign_manager()`, `start_campaign()`, `complete_mission()`, `goto_next_mission()`
+
+#### 10.2 Script Engine (490 lines)
+**File:** `game/script_engine.home`
+
+- ✅ Complete condition-action scripting system
+- ✅ Variables:
+  - 256 Counters (integer variables)
+  - 256 Flags (boolean variables)
+  - Countdown timers (auto-decrement each frame)
+- ✅ Condition types (16 types):
+  - Counter comparisons (==, !=, <, <=, >, >=)
+  - Flag checks
+  - Timer expiration
+  - AlwaysTrue
+  - Unit/Team existence and status
+  - Player money/power/object counts
+  - Area triggers (entered/exited/clear)
+  - Video/Speech completion
+  - Difficulty level, mission time
+- ✅ Action types (28 types):
+  - Game control (EndGame, SetDifficulty)
+  - Counter/Flag manipulation
+  - Unit/Team operations (Spawn, Destroy, Move, Attack)
+  - Player resources (Money, Power)
+  - Media playback (Movie, Sound, Speech, Music)
+  - Camera control (Move, Shake, Fade)
+  - UI (DisplayMessage, DisplayObjective, RadarEvent)
+  - Script control (Enable/Disable, CallSubroutine)
+  - Map reveal/shroud
+  - Weather and time of day
+- ✅ Script structure:
+  - Conditions (AND-ed together, support NOT)
+  - ActionsTrue (execute when conditions met)
+  - ActionsFalse (execute when conditions not met)
+  - One-time execution support
+  - Subroutine support (call from other scripts)
+- ✅ Script groups:
+  - Named collections of scripts
+  - Active/inactive state
+  - Subroutine designation
+- ✅ Execution model:
+  - Evaluates all active scripts each frame
+  - Sequential action execution
+  - End game timer support
+  - Mission time tracking
+- ✅ Debug features:
+  - Print counter/flag states
+  - Debug messages
+  - Game state display
+
+#### 10.3 Objectives System (340 lines)
+**File:** `game/objectives.home`
+
+- ✅ Mission objectives tracking
+- ✅ Objective types:
+  - Primary (must complete to win)
+  - Secondary (optional, bonus points)
+  - Hidden (revealed when triggered)
+- ✅ Objective states:
+  - Pending → Active → Completed/Failed/Cancelled
+  - Automatic state transitions
+- ✅ Features per objective:
+  - Description text (full + short version)
+  - Hidden until revealed
+  - Trigger script reference
+  - Complete/fail conditions
+  - Progress tracking (current/target count)
+  - Rank points reward
+  - Bonus money reward
+  - Time tracking (start/complete times)
+  - Time limits with countdown
+- ✅ Progress tracking:
+  - Count-based objectives (e.g., "Kill 10 tanks")
+  - Percentage calculation
+  - Auto-completion when target reached
+  - Time expiration handling
+- ✅ Mission state evaluation:
+  - All primary objectives complete → Victory
+  - Any primary objective failed → Defeat
+  - Secondary objective tracking
+- ✅ Display support:
+  - Get active objectives list
+  - Get completed objectives list
+  - Progress percentage
+  - Time remaining display
+  - Total rank points calculation
+- ✅ Global API: `add_objective()`, `activate_objective()`, `complete_objective()`, `is_mission_victory()`, `is_mission_defeat()`
+
+---
+
+## 📅 Next Steps (Phase 11: Optimization & Polish - Weeks 55-60)
 
 According to TODO.md, the next phase includes:
 

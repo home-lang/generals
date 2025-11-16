@@ -1,0 +1,517 @@
+// C&C Generals Zero Hour - Home Port
+// Campaign Manager
+//
+// Original: CampaignManager.cpp/.h (EA Games)
+// Ported to Home with EA's campaign progression system
+//
+// Campaign structure from EA:
+// - Each faction (USA, China, GLA) has a campaign with ~7 missions
+// - Missions are linked: completing one unlocks the next
+// - Final mission shows victory movie
+// - Supports multiple difficulty levels
+// - Tracks rank points and progression
+//
+// Example campaign definition (from Data/INI/Campaign.ini):
+// ```ini
+// Campaign USACampaign
+//   Name = CAMPAIGN:USA
+//   FinalVictoryMovie = "USAVictory"
+//   FirstMission = USA01
+//
+//   Mission USA01
+//     Name = "First Strike"
+//     MapName = "USA_01.map"
+//     NextMission = USA02
+//     MovieLabel = "USA01Briefing"
+//     ObjectiveText1 = "OBJECTIVE:USA01_1"
+//     ObjectiveText2 = "OBJECTIVE:USA01_2"
+//     BriefingVoice = "USA01Voice"
+//     LocationName = "LOCATION:Baghdad"
+//   End
+// End
+// ```
+
+import basics/allocator
+import basics/string
+import tools/ini_parser
+
+const MAX_OBJECTIVE_LINES: u32 = 5
+const MAX_DISPLAYED_UNITS: u32 = 3
+const MAX_MISSIONS_PER_CAMPAIGN: u32 = 16
+
+// Game difficulty levels
+enum GameDifficulty {
+    Easy
+    Normal
+    Hard
+    Brutal
+}
+
+// Mission definition
+struct Mission {
+    name: string                                    // Mission name
+    map_name: string                                // Map file to load
+    next_mission: string                            // Next mission in chain
+    movie_label: string                             // Cutscene to play before mission
+    objective_labels: [MAX_OBJECTIVE_LINES]string  // Objective text labels
+    briefing_voice: string                          // Voice-over file for briefing
+    location_name: string                           // Mission location name
+    unit_names: [MAX_DISPLAYED_UNITS]string        // Units to display in briefing
+    voice_length_ms: i32                            // Voice-over duration
+    is_completed: bool                              // Has player completed this?
+    best_time_seconds: i32                          // Best completion time
+    rank_points_earned: i32                         // Points earned on completion
+
+    fn init(name: string): Mission {
+        return Mission {
+            name: name
+            map_name: ""
+            next_mission: ""
+            movie_label: ""
+            objective_labels: [""; MAX_OBJECTIVE_LINES]
+            briefing_voice: ""
+            location_name: ""
+            unit_names: [""; MAX_DISPLAYED_UNITS]
+            voice_length_ms: 0
+            is_completed: false
+            best_time_seconds: 0
+            rank_points_earned: 0
+        }
+    }
+
+    fn set_objective(mut self, index: u32, text: string) {
+        if index < MAX_OBJECTIVE_LINES {
+            self.objective_labels[index] = text
+        }
+    }
+
+    fn set_unit_display(mut self, index: u32, unit_name: string) {
+        if index < MAX_DISPLAYED_UNITS {
+            self.unit_names[index] = unit_name
+        }
+    }
+}
+
+// Campaign definition
+struct Campaign {
+    name: string                // Campaign internal name
+    display_name: string        // Localized display name
+    first_mission: string       // Starting mission
+    final_movie: string         // Victory movie to play
+    missions: []Mission         // List of missions
+    mission_count: usize
+    allocator: Allocator
+
+    fn init(allocator: Allocator, name: string): Campaign {
+        return Campaign {
+            name: name
+            display_name: name
+            first_mission: ""
+            final_movie: ""
+            missions: []
+            mission_count: 0
+            allocator: allocator
+        }
+    }
+
+    fn add_mission(mut self, mission: Mission) {
+        let new_missions = self.allocator.alloc(Mission, self.mission_count + 1)
+
+        for i in 0..self.mission_count {
+            new_missions[i] = self.missions[i]
+        }
+
+        new_missions[self.mission_count] = mission
+
+        if self.mission_count > 0 {
+            self.allocator.free(self.missions)
+        }
+
+        self.missions = new_missions
+        self.mission_count += 1
+    }
+
+    fn get_mission(self, mission_name: string): ?*Mission {
+        for i in 0..self.mission_count {
+            if self.missions[i].name == mission_name {
+                return &self.missions[i]
+            }
+        }
+        return null
+    }
+
+    fn get_next_mission(self, current: *Mission): ?*Mission {
+        if current.next_mission.len == 0 {
+            return null  // Campaign complete
+        }
+
+        return self.get_mission(current.next_mission)
+    }
+
+    fn get_first_mission(self): ?*Mission {
+        if self.first_mission.len == 0 {
+            return null
+        }
+
+        return self.get_mission(self.first_mission)
+    }
+
+    fn get_completion_percentage(self): f32 {
+        if self.mission_count == 0 {
+            return 0.0
+        }
+
+        let mut completed: usize = 0
+        for i in 0..self.mission_count {
+            if self.missions[i].is_completed {
+                completed += 1
+            }
+        }
+
+        return @intToFloat(f32, completed) / @intToFloat(f32, self.mission_count) * 100.0
+    }
+
+    fn deinit(mut self) {
+        if self.mission_count > 0 {
+            self.allocator.free(self.missions)
+        }
+    }
+}
+
+// Campaign manager (singleton)
+struct CampaignManager {
+    campaigns: []Campaign
+    campaign_count: usize
+    current_campaign: ?*Campaign
+    current_mission: ?*Mission
+    allocator: Allocator
+
+    // Progression tracking
+    is_victorious: bool
+    current_rank_points: i32
+    current_difficulty: GameDifficulty
+
+    fn init(allocator: Allocator): CampaignManager {
+        return CampaignManager {
+            campaigns: []
+            campaign_count: 0
+            current_campaign: null
+            current_mission: null
+            allocator: allocator
+            is_victorious: false
+            current_rank_points: 0
+            current_difficulty: GameDifficulty.Normal
+        }
+    }
+
+    fn add_campaign(mut self, campaign: Campaign) {
+        let new_campaigns = self.allocator.alloc(Campaign, self.campaign_count + 1)
+
+        for i in 0..self.campaign_count {
+            new_campaigns[i] = self.campaigns[i]
+        }
+
+        new_campaigns[self.campaign_count] = campaign
+
+        if self.campaign_count > 0 {
+            self.allocator.free(self.campaigns)
+        }
+
+        self.campaigns = new_campaigns
+        self.campaign_count += 1
+    }
+
+    fn get_campaign(mut self, campaign_name: string): ?*Campaign {
+        for i in 0..self.campaign_count {
+            if self.campaigns[i].name == campaign_name {
+                return &self.campaigns[i]
+            }
+        }
+        return null
+    }
+
+    fn set_campaign(mut self, campaign_name: string): bool {
+        let campaign = self.get_campaign(campaign_name)
+        if !campaign {
+            println("Campaign not found: {campaign_name}")
+            return false
+        }
+
+        self.current_campaign = campaign
+        self.current_mission = campaign.?.get_first_mission()
+
+        if !self.current_mission {
+            println("Campaign has no first mission!")
+            return false
+        }
+
+        println("Started campaign: {campaign.?.display_name}")
+        println("First mission: {self.current_mission.?.name}")
+
+        return true
+    }
+
+    fn set_campaign_and_mission(mut self, campaign_name: string, mission_name: string): bool {
+        let campaign = self.get_campaign(campaign_name)
+        if !campaign {
+            return false
+        }
+
+        self.current_campaign = campaign
+
+        let mission = campaign.?.get_mission(mission_name)
+        if !mission {
+            return false
+        }
+
+        self.current_mission = mission
+        return true
+    }
+
+    fn goto_next_mission(mut self): ?*Mission {
+        if !self.current_campaign or !self.current_mission {
+            return null
+        }
+
+        let next = self.current_campaign.?.get_next_mission(self.current_mission.?)
+
+        if next {
+            self.current_mission = next
+            println("Proceeding to next mission: {next.?.name}")
+        } else {
+            println("Campaign complete!")
+            self.is_victorious = true
+        }
+
+        return next
+    }
+
+    fn complete_current_mission(mut self, time_seconds: i32, rank_points: i32) {
+        if !self.current_mission {
+            return
+        }
+
+        self.current_mission.?.is_completed = true
+        self.current_mission.?.rank_points_earned = rank_points
+        self.current_rank_points += rank_points
+
+        // Update best time
+        if self.current_mission.?.best_time_seconds == 0 or time_seconds < self.current_mission.?.best_time_seconds {
+            self.current_mission.?.best_time_seconds = time_seconds
+        }
+
+        println("Mission completed: {self.current_mission.?.name}")
+        println("  Time: {time_seconds}s")
+        println("  Rank Points: +{rank_points}")
+        println("  Total Rank Points: {self.current_rank_points}")
+    }
+
+    fn get_current_map(self): string {
+        if !self.current_mission {
+            return ""
+        }
+
+        return self.current_mission.?.map_name
+    }
+
+    fn get_current_mission_number(self): i32 {
+        if !self.current_campaign or !self.current_mission {
+            return -1
+        }
+
+        for i in 0..self.current_campaign.?.mission_count {
+            if self.current_campaign.?.missions[i].name == self.current_mission.?.name {
+                return @intCast(i32, i + 1)
+            }
+        }
+
+        return -1
+    }
+
+    fn get_difficulty_modifier(self): f32 {
+        return match self.current_difficulty {
+            GameDifficulty.Easy => 0.75
+            GameDifficulty.Normal => 1.0
+            GameDifficulty.Hard => 1.25
+            GameDifficulty.Brutal => 1.5
+        }
+    }
+
+    fn load_campaigns_from_ini(mut self, filepath: string): bool {
+        let mut parser = INIParser.init(self.allocator)
+        let doc = parser.parse_file(filepath)
+
+        if !doc {
+            println("Failed to load campaigns from: {filepath}")
+            return false
+        }
+
+        // Parse Campaign sections
+        let campaign_sections = doc.?.get_all_sections("Campaign")
+
+        for campaign_section in campaign_sections {
+            let mut campaign = Campaign.init(self.allocator, campaign_section.name)
+
+            campaign.display_name = campaign_section.get_string("Name", campaign_section.name)
+            campaign.first_mission = campaign_section.get_string("FirstMission", "")
+            campaign.final_movie = campaign_section.get_string("FinalVictoryMovie", "")
+
+            // Parse Mission modules within campaign
+            let mission_modules = campaign_section.get_all_modules("Mission")
+
+            for mission_module in mission_modules {
+                let mut mission = Mission.init(mission_module.module_type)
+
+                mission.name = mission_module.get_string("Name", mission_module.module_type)
+                mission.map_name = mission_module.get_string("MapName", "")
+                mission.next_mission = mission_module.get_string("NextMission", "")
+                mission.movie_label = mission_module.get_string("MovieLabel", "")
+                mission.briefing_voice = mission_module.get_string("BriefingVoice", "")
+                mission.location_name = mission_module.get_string("LocationName", "")
+                mission.voice_length_ms = @intCast(i32, mission_module.get_int("VoiceLength", 0))
+
+                // Parse objectives
+                for i in 0..MAX_OBJECTIVE_LINES {
+                    let objective_key = "ObjectiveText{i + 1}"
+                    let objective_text = mission_module.get_string(objective_key, "")
+                    if objective_text.len > 0 {
+                        mission.set_objective(@intCast(u32, i), objective_text)
+                    }
+                }
+
+                // Parse unit displays
+                for i in 0..MAX_DISPLAYED_UNITS {
+                    let unit_key = "UnitName{i + 1}"
+                    let unit_name = mission_module.get_string(unit_key, "")
+                    if unit_name.len > 0 {
+                        mission.set_unit_display(@intCast(u32, i), unit_name)
+                    }
+                }
+
+                campaign.add_mission(mission)
+            }
+
+            println("Loaded campaign: {campaign.display_name} ({campaign.mission_count} missions)")
+            self.add_campaign(campaign)
+        }
+
+        return true
+    }
+
+    fn print_campaign_status(self) {
+        if !self.current_campaign {
+            println("No campaign active")
+            return
+        }
+
+        println("\n=== Campaign Status ===")
+        println("Campaign: {self.current_campaign.?.display_name}")
+        println("Progress: {self.current_campaign.?.get_completion_percentage():.1}%")
+        println("Rank Points: {self.current_rank_points}")
+        println("Difficulty: {self.current_difficulty}")
+
+        if self.current_mission {
+            println("\nCurrent Mission: {self.current_mission.?.name}")
+            println("  Map: {self.current_mission.?.map_name}")
+            println("  Location: {self.current_mission.?.location_name}")
+        }
+
+        println("\nMissions:")
+        for i in 0..self.current_campaign.?.mission_count {
+            let mission = &self.current_campaign.?.missions[i]
+            let status = if mission.is_completed { "✓" } else { " " }
+            println("  [{status}] {mission.name}")
+
+            if mission.is_completed {
+                println("      Best Time: {mission.best_time_seconds}s")
+                println("      Rank Points: {mission.rank_points_earned}")
+            }
+        }
+    }
+
+    fn deinit(mut self) {
+        for i in 0..self.campaign_count {
+            self.campaigns[i].deinit()
+        }
+
+        if self.campaign_count > 0 {
+            self.allocator.free(self.campaigns)
+        }
+    }
+}
+
+// Global campaign manager
+var g_campaign_manager: ?CampaignManager = null
+
+export fn init_campaign_manager(allocator: Allocator) {
+    g_campaign_manager = CampaignManager.init(allocator)
+}
+
+export fn load_campaigns(filepath: string): bool {
+    if !g_campaign_manager {
+        println("Campaign manager not initialized!")
+        return false
+    }
+
+    return g_campaign_manager.?.load_campaigns_from_ini(filepath)
+}
+
+export fn start_campaign(campaign_name: string): bool {
+    if !g_campaign_manager {
+        return false
+    }
+
+    return g_campaign_manager.?.set_campaign(campaign_name)
+}
+
+export fn get_current_campaign(): ?*Campaign {
+    if !g_campaign_manager {
+        return null
+    }
+
+    return g_campaign_manager.?.current_campaign
+}
+
+export fn get_current_mission(): ?*Mission {
+    if !g_campaign_manager {
+        return null
+    }
+
+    return g_campaign_manager.?.current_mission
+}
+
+export fn complete_mission(time_seconds: i32, rank_points: i32) {
+    if !g_campaign_manager {
+        return
+    }
+
+    g_campaign_manager.?.complete_current_mission(time_seconds, rank_points)
+}
+
+export fn goto_next_mission(): ?*Mission {
+    if !g_campaign_manager {
+        return null
+    }
+
+    return g_campaign_manager.?.goto_next_mission()
+}
+
+export fn set_difficulty(difficulty: GameDifficulty) {
+    if !g_campaign_manager {
+        return
+    }
+
+    g_campaign_manager.?.current_difficulty = difficulty
+}
+
+export fn shutdown_campaign_manager() {
+    if g_campaign_manager {
+        g_campaign_manager.?.deinit()
+        g_campaign_manager = null
+    }
+}
+
+fn get_global_allocator(): Allocator {
+    // TODO: Return global allocator
+    return Allocator {}
+}
