@@ -1,0 +1,568 @@
+// C&C Generals Zero Hour - Home Port
+// Platform Input Handling
+//
+// Original: Keyboard.cpp, Mouse.cpp (Westwood Studios/EA)
+// Ported to Home with modern input support
+
+import basics/allocator
+
+// Key codes (based on USB HID usage)
+enum Key {
+    Unknown = 0
+
+    // Letters
+    A = 4, B, C, D, E, F, G, H, I, J, K, L, M
+    N, O, P, Q, R, S, T, U, V, W, X, Y, Z
+
+    // Numbers
+    Num1 = 30, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0
+
+    // Function keys
+    F1 = 58, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
+
+    // Special keys
+    Escape = 41
+    Tab = 43
+    CapsLock = 57
+    LeftShift = 225
+    RightShift = 229
+    LeftControl = 224
+    RightControl = 228
+    LeftAlt = 226
+    RightAlt = 230
+    Space = 44
+    Enter = 40
+    Backspace = 42
+    Delete = 76
+    Insert = 73
+    Home = 74
+    End = 77
+    PageUp = 75
+    PageDown = 78
+
+    // Arrow keys
+    Up = 82
+    Down = 81
+    Left = 80
+    Right = 79
+
+    // Numpad
+    NumLock = 83
+    NumpadDivide = 84
+    NumpadMultiply = 85
+    NumpadMinus = 86
+    NumpadPlus = 87
+    NumpadEnter = 88
+    Numpad1 = 89, Numpad2, Numpad3, Numpad4, Numpad5
+    Numpad6, Numpad7, Numpad8, Numpad9, Numpad0
+    NumpadDecimal = 99
+}
+
+// Mouse buttons
+enum MouseButton {
+    Left = 0
+    Right = 1
+    Middle = 2
+    Button4 = 3
+    Button5 = 4
+}
+
+// Gamepad buttons (Xbox-style layout)
+enum GamepadButton {
+    A = 0
+    B = 1
+    X = 2
+    Y = 3
+    LeftBumper = 4
+    RightBumper = 5
+    Back = 6
+    Start = 7
+    LeftStick = 8
+    RightStick = 9
+    DpadUp = 10
+    DpadDown = 11
+    DpadLeft = 12
+    DpadRight = 13
+}
+
+// Input events
+enum InputEvent {
+    KeyPress { key: Key }
+    KeyRelease { key: Key }
+    KeyRepeat { key: Key }
+    MouseMove { x: i32, y: i32, delta_x: i32, delta_y: i32 }
+    MouseButtonPress { button: MouseButton, x: i32, y: i32 }
+    MouseButtonRelease { button: MouseButton, x: i32, y: i32 }
+    MouseWheel { delta: i32 }
+    GamepadButtonPress { gamepad_id: u32, button: GamepadButton }
+    GamepadButtonRelease { gamepad_id: u32, button: GamepadButton }
+    GamepadAxis { gamepad_id: u32, axis: u32, value: f32 }
+    TextInput { codepoint: u32 }
+}
+
+// Keyboard state tracker
+struct KeyboardState {
+    keys: [256]bool  // Current frame state
+    keys_prev: [256]bool  // Previous frame state
+
+    fn init(): KeyboardState {
+        return KeyboardState {
+            keys: [256]bool{ false }
+            keys_prev: [256]bool{ false }
+        }
+    }
+
+    fn update(mut self) {
+        // Copy current state to previous
+        @memcpy(&self.keys_prev[0], &self.keys[0], 256)
+    }
+
+    fn set_key(mut self, key: Key, pressed: bool) {
+        let key_code = @intCast(usize, @enumToInt(key))
+        if key_code < 256 {
+            self.keys[key_code] = pressed
+        }
+    }
+
+    fn is_key_down(self, key: Key): bool {
+        let key_code = @intCast(usize, @enumToInt(key))
+        if key_code < 256 {
+            return self.keys[key_code]
+        }
+        return false
+    }
+
+    fn is_key_pressed(self, key: Key): bool {
+        // Key was just pressed this frame
+        let key_code = @intCast(usize, @enumToInt(key))
+        if key_code < 256 {
+            return self.keys[key_code] and !self.keys_prev[key_code]
+        }
+        return false
+    }
+
+    fn is_key_released(self, key: Key): bool {
+        // Key was just released this frame
+        let key_code = @intCast(usize, @enumToInt(key))
+        if key_code < 256 {
+            return !self.keys[key_code] and self.keys_prev[key_code]
+        }
+        return false
+    }
+}
+
+// Mouse state tracker
+struct MouseState {
+    x: i32
+    y: i32
+    prev_x: i32
+    prev_y: i32
+    delta_x: i32
+    delta_y: i32
+    wheel_delta: i32
+    buttons: [8]bool  // Current frame state
+    buttons_prev: [8]bool  // Previous frame state
+
+    fn init(): MouseState {
+        return MouseState {
+            x: 0
+            y: 0
+            prev_x: 0
+            prev_y: 0
+            delta_x: 0
+            delta_y: 0
+            wheel_delta: 0
+            buttons: [8]bool{ false }
+            buttons_prev: [8]bool{ false }
+        }
+    }
+
+    fn update(mut self) {
+        // Copy current state to previous
+        self.prev_x = self.x
+        self.prev_y = self.y
+        self.delta_x = 0
+        self.delta_y = 0
+        self.wheel_delta = 0
+        @memcpy(&self.buttons_prev[0], &self.buttons[0], 8)
+    }
+
+    fn set_position(mut self, x: i32, y: i32) {
+        self.delta_x = x - self.x
+        self.delta_y = y - self.y
+        self.x = x
+        self.y = y
+    }
+
+    fn set_button(mut self, button: MouseButton, pressed: bool) {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 8 {
+            self.buttons[button_index] = pressed
+        }
+    }
+
+    fn add_wheel_delta(mut self, delta: i32) {
+        self.wheel_delta += delta
+    }
+
+    fn is_button_down(self, button: MouseButton): bool {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 8 {
+            return self.buttons[button_index]
+        }
+        return false
+    }
+
+    fn is_button_pressed(self, button: MouseButton): bool {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 8 {
+            return self.buttons[button_index] and !self.buttons_prev[button_index]
+        }
+        return false
+    }
+
+    fn is_button_released(self, button: MouseButton): bool {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 8 {
+            return !self.buttons[button_index] and self.buttons_prev[button_index]
+        }
+        return false
+    }
+
+    fn get_position(self): [2]i32 {
+        return [2]i32{ self.x, self.y }
+    }
+
+    fn get_delta(self): [2]i32 {
+        return [2]i32{ self.delta_x, self.delta_y }
+    }
+}
+
+// Gamepad state
+struct GamepadState {
+    id: u32
+    connected: bool
+    name: string
+
+    // Buttons
+    buttons: [16]bool
+    buttons_prev: [16]bool
+
+    // Axes (normalized -1.0 to 1.0)
+    left_stick_x: f32
+    left_stick_y: f32
+    right_stick_x: f32
+    right_stick_y: f32
+    left_trigger: f32
+    right_trigger: f32
+
+    fn init(id: u32): GamepadState {
+        return GamepadState {
+            id: id
+            connected: false
+            name: ""
+            buttons: [16]bool{ false }
+            buttons_prev: [16]bool{ false }
+            left_stick_x: 0.0
+            left_stick_y: 0.0
+            right_stick_x: 0.0
+            right_stick_y: 0.0
+            left_trigger: 0.0
+            right_trigger: 0.0
+        }
+    }
+
+    fn update(mut self) {
+        @memcpy(&self.buttons_prev[0], &self.buttons[0], 16)
+    }
+
+    fn set_button(mut self, button: GamepadButton, pressed: bool) {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 16 {
+            self.buttons[button_index] = pressed
+        }
+    }
+
+    fn is_button_down(self, button: GamepadButton): bool {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 16 {
+            return self.buttons[button_index]
+        }
+        return false
+    }
+
+    fn is_button_pressed(self, button: GamepadButton): bool {
+        let button_index = @intCast(usize, @enumToInt(button))
+        if button_index < 16 {
+            return self.buttons[button_index] and !self.buttons_prev[button_index]
+        }
+        return false
+    }
+
+    fn apply_deadzone(value: f32, deadzone: f32): f32 {
+        if value > -deadzone and value < deadzone {
+            return 0.0
+        }
+
+        // Rescale to account for deadzone
+        if value > 0.0 {
+            return (value - deadzone) / (1.0 - deadzone)
+        } else {
+            return (value + deadzone) / (1.0 - deadzone)
+        }
+    }
+
+    fn get_left_stick(self, deadzone: f32): [2]f32 {
+        return [2]f32{
+            apply_deadzone(self.left_stick_x, deadzone)
+            apply_deadzone(self.left_stick_y, deadzone)
+        }
+    }
+
+    fn get_right_stick(self, deadzone: f32): [2]f32 {
+        return [2]f32{
+            apply_deadzone(self.right_stick_x, deadzone)
+            apply_deadzone(self.right_stick_y, deadzone)
+        }
+    }
+}
+
+// Main input manager
+struct InputManager {
+    keyboard: KeyboardState
+    mouse: MouseState
+    gamepads: [4]GamepadState  // Support up to 4 gamepads
+    event_queue: []InputEvent
+    event_count: usize
+    allocator: Allocator
+
+    fn init(allocator: Allocator): InputManager {
+        return InputManager {
+            keyboard: KeyboardState.init()
+            mouse: MouseState.init()
+            gamepads: [4]GamepadState{
+                GamepadState.init(0)
+                GamepadState.init(1)
+                GamepadState.init(2)
+                GamepadState.init(3)
+            }
+            event_queue: allocator.alloc(InputEvent, 256)
+            event_count: 0
+            allocator: allocator
+        }
+    }
+
+    fn update(mut self) {
+        // Update state trackers for edge detection
+        self.keyboard.update()
+        self.mouse.update()
+
+        for i in 0..4 {
+            if self.gamepads[i].connected {
+                self.gamepads[i].update()
+            }
+        }
+
+        // Clear event queue
+        self.event_count = 0
+    }
+
+    fn push_event(mut self, event: InputEvent) {
+        if self.event_count < self.event_queue.len {
+            self.event_queue[self.event_count] = event
+            self.event_count += 1
+
+            // Update state based on event
+            match event {
+                InputEvent.KeyPress { key } => {
+                    self.keyboard.set_key(key, true)
+                }
+                InputEvent.KeyRelease { key } => {
+                    self.keyboard.set_key(key, false)
+                }
+                InputEvent.MouseMove { x, y, delta_x, delta_y } => {
+                    self.mouse.set_position(x, y)
+                }
+                InputEvent.MouseButtonPress { button, x, y } => {
+                    self.mouse.set_button(button, true)
+                }
+                InputEvent.MouseButtonRelease { button, x, y } => {
+                    self.mouse.set_button(button, false)
+                }
+                InputEvent.MouseWheel { delta } => {
+                    self.mouse.add_wheel_delta(delta)
+                }
+                InputEvent.GamepadButtonPress { gamepad_id, button } => {
+                    if gamepad_id < 4 {
+                        self.gamepads[gamepad_id].set_button(button, true)
+                    }
+                }
+                InputEvent.GamepadButtonRelease { gamepad_id, button } => {
+                    if gamepad_id < 4 {
+                        self.gamepads[gamepad_id].set_button(button, false)
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn get_events(self): []InputEvent {
+        return self.event_queue[0..self.event_count]
+    }
+
+    fn poll_gamepads(mut self) {
+        // Platform-specific gamepad polling
+        comptime if @import("builtin").os.tag == .windows {
+            self.poll_gamepads_xinput()
+        } else if @import("builtin").os.tag == .macos {
+            self.poll_gamepads_macos()
+        } else if @import("builtin").os.tag == .linux {
+            self.poll_gamepads_evdev()
+        }
+    }
+
+    fn poll_gamepads_xinput(mut self) {
+        // TODO: XInputGetState for each controller
+    }
+
+    fn poll_gamepads_macos(mut self) {
+        // TODO: IOKit HID manager or GCController
+    }
+
+    fn poll_gamepads_evdev(mut self) {
+        // TODO: /dev/input/eventX devices
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.event_queue)
+    }
+}
+
+// Global input manager
+var g_input: ?InputManager = null
+
+export fn init_input(allocator: Allocator) {
+    g_input = InputManager.init(allocator)
+}
+
+export fn shutdown_input() {
+    if g_input {
+        g_input.?.deinit()
+        g_input = null
+    }
+}
+
+export fn update_input() {
+    if g_input {
+        g_input.?.update()
+        g_input.?.poll_gamepads()
+    }
+}
+
+export fn push_input_event(event: InputEvent) {
+    if g_input {
+        g_input.?.push_event(event)
+    }
+}
+
+export fn get_input_events(): []InputEvent {
+    if g_input {
+        return g_input.?.get_events()
+    }
+    return []
+}
+
+// Keyboard queries
+export fn is_key_down(key: Key): bool {
+    if g_input {
+        return g_input.?.keyboard.is_key_down(key)
+    }
+    return false
+}
+
+export fn is_key_pressed(key: Key): bool {
+    if g_input {
+        return g_input.?.keyboard.is_key_pressed(key)
+    }
+    return false
+}
+
+export fn is_key_released(key: Key): bool {
+    if g_input {
+        return g_input.?.keyboard.is_key_released(key)
+    }
+    return false
+}
+
+// Mouse queries
+export fn get_mouse_position(): [2]i32 {
+    if g_input {
+        return g_input.?.mouse.get_position()
+    }
+    return [2]i32{ 0, 0 }
+}
+
+export fn get_mouse_delta(): [2]i32 {
+    if g_input {
+        return g_input.?.mouse.get_delta()
+    }
+    return [2]i32{ 0, 0 }
+}
+
+export fn is_mouse_button_down(button: MouseButton): bool {
+    if g_input {
+        return g_input.?.mouse.is_button_down(button)
+    }
+    return false
+}
+
+export fn is_mouse_button_pressed(button: MouseButton): bool {
+    if g_input {
+        return g_input.?.mouse.is_button_pressed(button)
+    }
+    return false
+}
+
+export fn get_mouse_wheel(): i32 {
+    if g_input {
+        return g_input.?.mouse.wheel_delta
+    }
+    return 0
+}
+
+// Gamepad queries
+export fn is_gamepad_connected(gamepad_id: u32): bool {
+    if g_input and gamepad_id < 4 {
+        return g_input.?.gamepads[gamepad_id].connected
+    }
+    return false
+}
+
+export fn is_gamepad_button_down(gamepad_id: u32, button: GamepadButton): bool {
+    if g_input and gamepad_id < 4 {
+        return g_input.?.gamepads[gamepad_id].is_button_down(button)
+    }
+    return false
+}
+
+export fn is_gamepad_button_pressed(gamepad_id: u32, button: GamepadButton): bool {
+    if g_input and gamepad_id < 4 {
+        return g_input.?.gamepads[gamepad_id].is_button_pressed(button)
+    }
+    return false
+}
+
+export fn get_gamepad_left_stick(gamepad_id: u32): [2]f32 {
+    if g_input and gamepad_id < 4 {
+        return g_input.?.gamepads[gamepad_id].get_left_stick(0.15)
+    }
+    return [2]f32{ 0.0, 0.0 }
+}
+
+export fn get_gamepad_right_stick(gamepad_id: u32): [2]f32 {
+    if g_input and gamepad_id < 4 {
+        return g_input.?.gamepads[gamepad_id].get_right_stick(0.15)
+    }
+    return [2]f32{ 0.0, 0.0 }
+}
