@@ -1,0 +1,436 @@
+// C&C Generals Zero Hour - Home Port
+// Network Foundation (Base networking types and utilities)
+//
+// Original: NetworkDefs.h, networkutil.h (Westwood Studios/EA)
+// Ported to Home with modern networking
+
+import basics/allocator
+import basics/string
+
+// Network configuration constants
+const MAX_PLAYERS: usize = 8
+const MAX_PACKET_SIZE: usize = 1400  // MTU - headers
+const DEFAULT_PORT: u16 = 8086
+const PROTOCOL_VERSION: u32 = 1
+
+// Network command types (from EA's NetCommandType enum)
+enum NetCommandType {
+    Invalid
+    GameCommand          // Game logic command (move unit, build, etc.)
+    Frame                // Frame synchronization message
+    AckStage1            // Acknowledgment stage 1 (received by host)
+    AckStage2            // Acknowledgment stage 2 (received by all players)
+    AckBoth              // Combined ACK
+    PlayerLeave          // Player disconnected
+    KeepAlive            // Keep connection alive
+    Chat                 // Chat message
+    RunAhead             // Latency hiding configuration
+    RunAheadMetrics      // Latency/FPS metrics
+    DisconnectPlayer     // Request player disconnect
+    DisconnectKeepAlive  // Disconnect keep alive
+    DisconnectChat       // Disconnect with chat message
+    DisconnectVote       // Vote to disconnect player
+    DisconnectFrame      // Frame at which disconnect occurs
+    Progress             // Loading progress
+    FileTransfer         // File transfer (maps, mods)
+    FileAnnounce         // Announce file availability
+    FileProgress         // File transfer progress
+    Wrapper              // Wrapper for chunked messages
+    FrameResendRequest   // Request to resend a frame
+}
+
+// Player connection state
+enum PlayerState {
+    Disconnected
+    Connecting
+    Loading
+    Ready
+    Playing
+    Disconnecting
+}
+
+// Network transport type
+enum TransportType {
+    UDP          // UDP for game data
+    TCP          // TCP for reliable transfers
+    LAN          // LAN discovery
+}
+
+// Player info
+struct PlayerInfo {
+    player_id: u8
+    slot_id: u8
+    name: string
+    state: PlayerState
+
+    // Network identity
+    ip_address: [4]u8
+    port: u16
+
+    // Connection quality
+    latency: u32  // Milliseconds
+    packet_loss: f32  // 0.0 to 1.0
+
+    // Game info
+    team: u8
+    color: u8
+    faction: string
+    is_ready: bool
+    is_host: bool
+    is_observer: bool
+
+    fn init(player_id: u8, name: string): PlayerInfo {
+        return PlayerInfo {
+            player_id: player_id
+            slot_id: player_id
+            name: name
+            state: PlayerState.Disconnected
+            ip_address: [0, 0, 0, 0]
+            port: 0
+            latency: 0
+            packet_loss: 0.0
+            team: 0
+            color: player_id
+            faction: "USA"
+            is_ready: false
+            is_host: false
+            is_observer: false
+        }
+    }
+
+    fn get_ip_string(self): string {
+        // Format IP address as string
+        // TODO: Implement proper string formatting
+        return "0.0.0.0"
+    }
+}
+
+// Packet header
+struct PacketHeader {
+    magic: u32  // Protocol identifier
+    version: u32
+    packet_type: NetCommandType
+    sequence_number: u32
+    timestamp: u32
+    sender_id: u8
+    payload_size: u16
+    checksum: u32
+
+    fn init(packet_type: NetCommandType, sender_id: u8, payload_size: u16): PacketHeader {
+        return PacketHeader {
+            magic: 0x47454E53  // "GENS"
+            version: PROTOCOL_VERSION
+            packet_type: packet_type
+            sequence_number: 0
+            timestamp: 0
+            sender_id: sender_id
+            payload_size: payload_size
+            checksum: 0
+        }
+    }
+
+    fn calculate_checksum(self, payload: []u8): u32 {
+        // Simple checksum (CRC32 would be better)
+        let mut sum: u32 = 0
+        for i in 0..payload.len {
+            sum = sum + @intCast(u32, payload[i])
+        }
+        return sum
+    }
+
+    fn validate(self, payload: []u8): bool {
+        if self.magic != 0x47454E53 {
+            return false
+        }
+
+        if self.version != PROTOCOL_VERSION {
+            return false
+        }
+
+        let expected_checksum = self.calculate_checksum(payload)
+        return self.checksum == expected_checksum
+    }
+}
+
+// Network packet
+struct NetworkPacket {
+    header: PacketHeader
+    payload: []u8
+    payload_length: usize
+
+    fn init(allocator: Allocator, packet_type: NetCommandType, sender_id: u8): NetworkPacket {
+        return NetworkPacket {
+            header: PacketHeader.init(packet_type, sender_id, 0)
+            payload: allocator.alloc(u8, MAX_PACKET_SIZE)
+            payload_length: 0
+        }
+    }
+
+    fn set_payload(mut self, data: []u8) {
+        let copy_len = if data.len > MAX_PACKET_SIZE { MAX_PACKET_SIZE } else { data.len }
+
+        for i in 0..copy_len {
+            self.payload[i] = data[i]
+        }
+
+        self.payload_length = copy_len
+        self.header.payload_size = @intCast(u16, copy_len)
+        self.header.checksum = self.header.calculate_checksum(self.payload[0..copy_len])
+    }
+
+    fn serialize(self, buffer: []u8): usize {
+        // Serialize header + payload into buffer
+        // TODO: Implement proper serialization
+        return 0
+    }
+
+    fn deserialize(mut self, buffer: []u8): bool {
+        // Deserialize buffer into header + payload
+        // TODO: Implement proper deserialization
+        return false
+    }
+}
+
+// Connection info
+struct Connection {
+    remote_player_id: u8
+    remote_ip: [4]u8
+    remote_port: u16
+
+    // Connection state
+    is_connected: bool
+    connection_time: f64
+    last_received_time: f64
+    last_sent_time: f64
+
+    // Reliability tracking
+    sequence_number: u32
+    last_acked_sequence: u32
+    pending_acks: []u32
+    pending_ack_count: usize
+
+    // Statistics
+    packets_sent: u32
+    packets_received: u32
+    bytes_sent: u64
+    bytes_received: u64
+    rtt: f32  // Round-trip time in ms
+
+    fn init(allocator: Allocator, player_id: u8): Connection {
+        return Connection {
+            remote_player_id: player_id
+            remote_ip: [0, 0, 0, 0]
+            remote_port: 0
+            is_connected: false
+            connection_time: 0.0
+            last_received_time: 0.0
+            last_sent_time: 0.0
+            sequence_number: 0
+            last_acked_sequence: 0
+            pending_acks: allocator.alloc(u32, 256)
+            pending_ack_count: 0
+            packets_sent: 0
+            packets_received: 0
+            bytes_sent: 0
+            bytes_received: 0
+            rtt: 0.0
+        }
+    }
+
+    fn send_packet(mut self, packet: *NetworkPacket) {
+        // Assign sequence number
+        self.sequence_number += 1
+        packet.header.sequence_number = self.sequence_number
+
+        // Add to pending ACKs
+        if self.pending_ack_count < self.pending_acks.len {
+            self.pending_acks[self.pending_ack_count] = self.sequence_number
+            self.pending_ack_count += 1
+        }
+
+        // TODO: Actually send packet over network
+
+        // Update statistics
+        self.packets_sent += 1
+        self.bytes_sent += @intCast(u64, packet.header.payload_size)
+        self.last_sent_time = get_current_time()
+    }
+
+    fn receive_packet(mut self, packet: *NetworkPacket) {
+        // Validate packet
+        if !packet.header.validate(packet.payload[0..packet.payload_length]) {
+            return
+        }
+
+        // Update statistics
+        self.packets_received += 1
+        self.bytes_received += @intCast(u64, packet.header.payload_size)
+        self.last_received_time = get_current_time()
+
+        // Calculate RTT if this is an ACK
+        if packet.header.packet_type == NetCommandType.AckStage1 or
+           packet.header.packet_type == NetCommandType.AckStage2 {
+            self.update_rtt(packet)
+        }
+    }
+
+    fn update_rtt(mut self, ack_packet: *NetworkPacket) {
+        // Calculate round-trip time based on ACK
+        let now = get_current_time()
+        let elapsed = @floatCast(f32, now - self.last_sent_time) * 1000.0
+
+        // Exponential moving average
+        if self.rtt == 0.0 {
+            self.rtt = elapsed
+        } else {
+            self.rtt = self.rtt * 0.9 + elapsed * 0.1
+        }
+    }
+
+    fn is_timeout(self, timeout_threshold: f64): bool {
+        let time_since_last_receive = get_current_time() - self.last_received_time
+        return time_since_last_receive > timeout_threshold
+    }
+}
+
+// Network statistics
+struct NetworkStats {
+    total_packets_sent: u64
+    total_packets_received: u64
+    total_bytes_sent: u64
+    total_bytes_received: u64
+
+    // Quality metrics
+    average_latency: f32
+    packet_loss_rate: f32
+    bandwidth_usage: f32  // KB/s
+
+    // Frame synchronization
+    current_frame: u32
+    frames_behind: i32  // Negative = ahead, positive = behind
+
+    fn init(): NetworkStats {
+        return NetworkStats {
+            total_packets_sent: 0
+            total_packets_received: 0
+            total_bytes_sent: 0
+            total_bytes_received: 0
+            average_latency: 0.0
+            packet_loss_rate: 0.0
+            bandwidth_usage: 0.0
+            current_frame: 0
+            frames_behind: 0
+        }
+    }
+
+    fn update_latency(mut self, connections: []Connection, connection_count: usize) {
+        let mut total_latency: f32 = 0.0
+        let mut count: u32 = 0
+
+        for i in 0..connection_count {
+            if connections[i].is_connected {
+                total_latency += connections[i].rtt
+                count += 1
+            }
+        }
+
+        if count > 0 {
+            self.average_latency = total_latency / @intToFloat(f32, count)
+        }
+    }
+
+    fn update_bandwidth(mut self, bytes_sent: u64, bytes_received: u64, delta_time: f32) {
+        let total_bytes = bytes_sent + bytes_received
+        let kb = @intToFloat(f32, total_bytes) / 1024.0
+        self.bandwidth_usage = kb / delta_time
+    }
+}
+
+// Network event types
+enum NetworkEventType {
+    PlayerJoined
+    PlayerLeft
+    PlayerReady
+    ChatMessage
+    ConnectionLost
+    PacketReceived
+    FileTransferStarted
+    FileTransferComplete
+}
+
+// Network event
+struct NetworkEvent {
+    event_type: NetworkEventType
+    player_id: u8
+    timestamp: f64
+    data: string
+
+    fn init(event_type: NetworkEventType, player_id: u8): NetworkEvent {
+        return NetworkEvent {
+            event_type: event_type
+            player_id: player_id
+            timestamp: get_current_time()
+            data: ""
+        }
+    }
+}
+
+// Utility functions
+
+fn get_current_time(): f64 {
+    // TODO: Implement platform-specific time function
+    return 0.0
+}
+
+fn serialize_u32(value: u32, buffer: []u8, offset: usize) {
+    buffer[offset + 0] = @intCast(u8, (value >> 24) & 0xFF)
+    buffer[offset + 1] = @intCast(u8, (value >> 16) & 0xFF)
+    buffer[offset + 2] = @intCast(u8, (value >> 8) & 0xFF)
+    buffer[offset + 3] = @intCast(u8, value & 0xFF)
+}
+
+fn deserialize_u32(buffer: []u8, offset: usize): u32 {
+    let mut value: u32 = 0
+    value |= @intCast(u32, buffer[offset + 0]) << 24
+    value |= @intCast(u32, buffer[offset + 1]) << 16
+    value |= @intCast(u32, buffer[offset + 2]) << 8
+    value |= @intCast(u32, buffer[offset + 3])
+    return value
+}
+
+fn serialize_u16(value: u16, buffer: []u8, offset: usize) {
+    buffer[offset + 0] = @intCast(u8, (value >> 8) & 0xFF)
+    buffer[offset + 1] = @intCast(u8, value & 0xFF)
+}
+
+fn deserialize_u16(buffer: []u8, offset: usize): u16 {
+    let mut value: u16 = 0
+    value |= @intCast(u16, buffer[offset + 0]) << 8
+    value |= @intCast(u16, buffer[offset + 1])
+    return value
+}
+
+fn serialize_f32(value: f32, buffer: []u8, offset: usize) {
+    // TODO: Implement proper float serialization
+    // For now, use bit cast
+    let bits = @bitCast(u32, value)
+    serialize_u32(bits, buffer, offset)
+}
+
+fn deserialize_f32(buffer: []u8, offset: usize): f32 {
+    let bits = deserialize_u32(buffer, offset)
+    return @bitCast(f32, bits)
+}
+
+// Export constants
+export fn get_max_players(): usize {
+    return MAX_PLAYERS
+}
+
+export fn get_default_port(): u16 {
+    return DEFAULT_PORT
+}
+
+export fn get_protocol_version(): u32 {
+    return PROTOCOL_VERSION
+}

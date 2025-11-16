@@ -1,0 +1,513 @@
+// C&C Generals Zero Hour - Home Port
+// Lockstep Networking (Deterministic frame synchronization)
+//
+// Original: FrameDataManager.cpp, FrameData.cpp (Westwood Studios/EA)
+// Ported to Home with deterministic gameplay synchronization
+
+import basics/allocator
+import network/network_foundation
+
+// Frame constants
+const FRAMES_PER_SECOND: u32 = 30  // Game runs at 30 FPS for network games
+const MAX_RUN_AHEAD_FRAMES: u32 = 8  // Maximum frames to run ahead of slowest player
+const DEFAULT_RUN_AHEAD: u32 = 3
+const FRAME_BUFFER_SIZE: usize = 256  // Circular buffer for frames
+
+// Frame data return status (from EA's FrameDataReturnType)
+enum FrameDataStatus {
+    Ready           // All commands for this frame are ready
+    NotReady        // Still waiting for commands
+    MissingPlayer   // Missing commands from a player
+    Timeout         // Frame timed out
+}
+
+// Game command (player action in the game)
+struct GameCommand {
+    command_id: u16
+    player_id: u8
+    execution_frame: u32
+    timestamp: u32
+
+    // Command type (from EA's GameMessage system)
+    command_type: GameCommandType
+
+    // Command parameters (max 16 bytes for most commands)
+    params: [16]u8
+    param_count: u8
+
+    fn init(): GameCommand {
+        return GameCommand {
+            command_id: 0
+            player_id: 0
+            execution_frame: 0
+            timestamp: 0
+            command_type: GameCommandType.Invalid
+            params: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            param_count: 0
+        }
+    }
+
+    fn add_entity_param(mut self, entity_id: u32) {
+        if self.param_count + 4 <= 16 {
+            serialize_u32(entity_id, &self.params, self.param_count)
+            self.param_count += 4
+        }
+    }
+
+    fn add_vec3_param(mut self, x: f32, y: f32, z: f32) {
+        if self.param_count + 12 <= 16 {
+            serialize_f32(x, &self.params, self.param_count)
+            serialize_f32(y, &self.params, self.param_count + 4)
+            serialize_f32(z, &self.params, self.param_count + 8)
+            self.param_count += 12
+        }
+    }
+}
+
+// Game command types (from EA's GameMessage::Type)
+enum GameCommandType {
+    Invalid
+    DoSelection          // Select units
+    DoMove               // Move units to position
+    DoAttack             // Attack target
+    DoAttackMove         // Attack-move to position
+    DoBuild              // Build structure
+    DoProduceUnit        // Queue unit production
+    DoCancelProduction   // Cancel production
+    DoSell               // Sell structure
+    DoRepair             // Repair structure
+    DoSetStance          // Set unit stance
+    DoSetRallyPoint      // Set rally point
+    DoUseSpecialPower    // Activate special power
+    DoUpgrade            // Research upgrade
+    DoFormation          // Change formation
+    DoGarrison           // Garrison units
+    DoEvacuate           // Evacuate garrison
+    DoStop               // Stop current action
+    ChatMessage          // Chat message
+    Surrender            // Player surrenders
+}
+
+// Frame command list
+struct FrameCommandList {
+    frame_number: u32
+    commands: []GameCommand
+    command_count: usize
+    max_commands: usize
+
+    // Command counts per player
+    player_command_counts: [MAX_PLAYERS]u32
+    expected_command_counts: [MAX_PLAYERS]u32
+
+    // Status
+    is_complete: bool
+    missing_players: u8  // Bitmask of players we're waiting for
+
+    fn init(allocator: Allocator, frame_number: u32): FrameCommandList {
+        return FrameCommandList {
+            frame_number: frame_number
+            commands: allocator.alloc(GameCommand, 256)
+            command_count: 0
+            max_commands: 256
+            player_command_counts: [0, 0, 0, 0, 0, 0, 0, 0]
+            expected_command_counts: [0, 0, 0, 0, 0, 0, 0, 0]
+            is_complete: false
+            missing_players: 0
+        }
+    }
+
+    fn add_command(mut self, command: GameCommand): bool {
+        if self.command_count >= self.max_commands {
+            return false
+        }
+
+        self.commands[self.command_count] = command
+        self.command_count += 1
+
+        // Track per-player command count
+        if command.player_id < MAX_PLAYERS {
+            self.player_command_counts[command.player_id] += 1
+        }
+
+        return true
+    }
+
+    fn set_expected_count(mut self, player_id: u8, count: u32) {
+        if player_id < MAX_PLAYERS {
+            self.expected_command_counts[player_id] = count
+        }
+    }
+
+    fn check_complete(mut self, active_players: u8): FrameDataStatus {
+        self.missing_players = 0
+
+        for player_id in 0..MAX_PLAYERS {
+            let player_bit = 1 << player_id
+
+            // Skip if player is not active
+            if (active_players & player_bit) == 0 {
+                continue
+            }
+
+            // Check if we have expected commands from this player
+            if self.player_command_counts[player_id] < self.expected_command_counts[player_id] {
+                self.missing_players |= player_bit
+            }
+        }
+
+        if self.missing_players == 0 {
+            self.is_complete = true
+            return FrameDataStatus.Ready
+        } else {
+            return FrameDataStatus.NotReady
+        }
+    }
+
+    fn clear(mut self) {
+        self.command_count = 0
+        self.is_complete = false
+        self.missing_players = 0
+
+        for i in 0..MAX_PLAYERS {
+            self.player_command_counts[i] = 0
+            self.expected_command_counts[i] = 0
+        }
+    }
+}
+
+// Frame data manager (from EA's FrameDataManager)
+struct FrameDataManager {
+    // Frame buffer (circular buffer)
+    frame_data: []FrameCommandList
+    buffer_size: usize
+
+    // Current frame tracking
+    current_frame: u32
+    latest_complete_frame: u32
+    execution_frame: u32  // Frame currently being executed
+
+    // Run-ahead control
+    run_ahead_frames: u32  // How many frames ahead we can run
+    max_run_ahead: u32
+
+    // Player tracking
+    active_players: u8  // Bitmask of active players
+    is_local: bool  // Are we the host?
+
+    // Synchronization
+    is_synchronized: bool
+    sync_timeout: f32
+    time_since_last_frame: f32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, is_local: bool): FrameDataManager {
+        let mut manager = FrameDataManager {
+            frame_data: allocator.alloc(FrameCommandList, FRAME_BUFFER_SIZE)
+            buffer_size: FRAME_BUFFER_SIZE
+            current_frame: 0
+            latest_complete_frame: 0
+            execution_frame: 0
+            run_ahead_frames: DEFAULT_RUN_AHEAD
+            max_run_ahead: MAX_RUN_AHEAD_FRAMES
+            active_players: 0
+            is_local: is_local
+            is_synchronized: false
+            sync_timeout: 5.0
+            time_since_last_frame: 0.0
+            allocator: allocator
+        }
+
+        // Initialize frame command lists
+        for i in 0..FRAME_BUFFER_SIZE {
+            manager.frame_data[i] = FrameCommandList.init(allocator, @intCast(u32, i))
+        }
+
+        return manager
+    }
+
+    fn update(mut self, delta_time: f32) {
+        self.time_since_last_frame += delta_time
+
+        // Fixed timestep: 1/30 = 0.0333 seconds per frame
+        let frame_time = 1.0 / @intToFloat(f32, FRAMES_PER_SECOND)
+
+        while self.time_since_last_frame >= frame_time {
+            self.time_since_last_frame -= frame_time
+            self.advance_frame()
+        }
+    }
+
+    fn advance_frame(mut self) {
+        // Check if we can execute the next frame
+        let next_frame = self.execution_frame + 1
+        let frame_index = self.get_frame_index(next_frame)
+        let frame = &self.frame_data[frame_index]
+
+        let status = frame.check_complete(self.active_players)
+
+        match status {
+            FrameDataStatus.Ready => {
+                // Execute all commands for this frame
+                self.execute_frame_commands(next_frame)
+                self.execution_frame = next_frame
+                self.latest_complete_frame = next_frame
+
+                // Clear the frame data for reuse
+                self.clear_frame(next_frame)
+            }
+            FrameDataStatus.NotReady => {
+                // Wait for more commands
+                // TODO: Request missing commands from players
+            }
+            FrameDataStatus.MissingPlayer => {
+                // TODO: Handle disconnected player
+            }
+            _ => {}
+        }
+    }
+
+    fn add_game_command(mut self, command: GameCommand) {
+        let frame_index = self.get_frame_index(command.execution_frame)
+        self.frame_data[frame_index].add_command(command)
+    }
+
+    fn set_frame_command_count(mut self, frame: u32, player_id: u8, count: u32) {
+        let frame_index = self.get_frame_index(frame)
+        self.frame_data[frame_index].set_expected_count(player_id, count)
+    }
+
+    fn all_commands_ready(self, frame: u32): FrameDataStatus {
+        let frame_index = self.get_frame_index(frame)
+        return self.frame_data[frame_index].check_complete(self.active_players)
+    }
+
+    fn execute_frame_commands(self, frame: u32) {
+        let frame_index = self.get_frame_index(frame)
+        let frame_list = &self.frame_data[frame_index]
+
+        // Execute all commands in order
+        for i in 0..frame_list.command_count {
+            let command = &frame_list.commands[i]
+            self.execute_command(command)
+        }
+    }
+
+    fn execute_command(self, command: *GameCommand) {
+        // Execute game command based on type
+        match command.command_type {
+            GameCommandType.DoMove => {
+                // Extract position from params
+                // TODO: Parse params and execute move command
+            }
+            GameCommandType.DoAttack => {
+                // TODO: Execute attack command
+            }
+            GameCommandType.DoBuild => {
+                // TODO: Execute build command
+            }
+            // ... handle other command types
+            _ => {}
+        }
+    }
+
+    fn clear_frame(mut self, frame: u32) {
+        let frame_index = self.get_frame_index(frame)
+        self.frame_data[frame_index].clear()
+    }
+
+    fn get_frame_index(self, frame: u32): usize {
+        return @intCast(usize, frame % @intCast(u32, self.buffer_size))
+    }
+
+    fn can_run_ahead(self): bool {
+        let frames_ahead = self.current_frame - self.execution_frame
+        return frames_ahead < self.run_ahead_frames
+    }
+
+    fn add_player(mut self, player_id: u8) {
+        if player_id < MAX_PLAYERS {
+            let player_bit = 1 << player_id
+            self.active_players |= player_bit
+        }
+    }
+
+    fn remove_player(mut self, player_id: u8) {
+        if player_id < MAX_PLAYERS {
+            let player_bit = 1 << player_id
+            self.active_players &= ~player_bit
+        }
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.frame_data)
+    }
+}
+
+// Command builder (helper for creating commands)
+struct CommandBuilder {
+    next_command_id: u16
+    local_player_id: u8
+    current_frame: u32
+
+    fn init(player_id: u8): CommandBuilder {
+        return CommandBuilder {
+            next_command_id: 1
+            local_player_id: player_id
+            current_frame: 0
+        }
+    }
+
+    fn create_move_command(mut self, entity_ids: []u32, entity_count: usize, target_x: f32, target_y: f32, target_z: f32): GameCommand {
+        let mut cmd = GameCommand.init()
+        cmd.command_id = self.next_command_id
+        cmd.player_id = self.local_player_id
+        cmd.execution_frame = self.current_frame + DEFAULT_RUN_AHEAD
+        cmd.command_type = GameCommandType.DoMove
+
+        // Add position to params
+        cmd.add_vec3_param(target_x, target_y, target_z)
+
+        // TODO: Store entity IDs (may need separate storage for large selections)
+
+        self.next_command_id += 1
+        return cmd
+    }
+
+    fn create_attack_command(mut self, attacker_ids: []u32, attacker_count: usize, target_id: u32): GameCommand {
+        let mut cmd = GameCommand.init()
+        cmd.command_id = self.next_command_id
+        cmd.player_id = self.local_player_id
+        cmd.execution_frame = self.current_frame + DEFAULT_RUN_AHEAD
+        cmd.command_type = GameCommandType.DoAttack
+
+        cmd.add_entity_param(target_id)
+
+        self.next_command_id += 1
+        return cmd
+    }
+
+    fn create_build_command(mut self, building_type: u8, position_x: f32, position_y: f32, position_z: f32): GameCommand {
+        let mut cmd = GameCommand.init()
+        cmd.command_id = self.next_command_id
+        cmd.player_id = self.local_player_id
+        cmd.execution_frame = self.current_frame + DEFAULT_RUN_AHEAD
+        cmd.command_type = GameCommandType.DoBuild
+
+        cmd.params[0] = building_type
+        cmd.param_count = 1
+        cmd.add_vec3_param(position_x, position_y, position_z)
+
+        self.next_command_id += 1
+        return cmd
+    }
+
+    fn update_current_frame(mut self, frame: u32) {
+        self.current_frame = frame
+    }
+}
+
+// Synchronization checker (ensures all clients are in sync)
+struct SyncChecker {
+    // CRC of game state per frame
+    frame_crcs: []u32
+    crc_buffer_size: usize
+
+    // Sync checking
+    check_interval: u32  // Check sync every N frames
+    last_check_frame: u32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): SyncChecker {
+        return SyncChecker {
+            frame_crcs: allocator.alloc(u32, 1024)
+            crc_buffer_size: 1024
+            check_interval: 30  // Check every 30 frames (1 second at 30 FPS)
+            last_check_frame: 0
+            allocator: allocator
+        }
+    }
+
+    fn record_frame_state(mut self, frame: u32, state_crc: u32) {
+        let index = @intCast(usize, frame % @intCast(u32, self.crc_buffer_size))
+        self.frame_crcs[index] = state_crc
+    }
+
+    fn should_check_sync(self, current_frame: u32): bool {
+        return (current_frame - self.last_check_frame) >= self.check_interval
+    }
+
+    fn calculate_game_state_crc(self): u32 {
+        // TODO: Calculate CRC of entire game state
+        // This includes:
+        // - All unit positions
+        // - All unit health values
+        // - All building states
+        // - Player resources
+        // - Tech levels
+        // etc.
+
+        return 0
+    }
+
+    fn verify_sync(mut self, frame: u32, remote_crc: u32): bool {
+        let index = @intCast(usize, frame % @intCast(u32, self.crc_buffer_size))
+        let local_crc = self.frame_crcs[index]
+
+        return local_crc == remote_crc
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.frame_crcs)
+    }
+}
+
+// Global lockstep manager
+var g_frame_manager: ?FrameDataManager = null
+var g_command_builder: ?CommandBuilder = null
+var g_sync_checker: ?SyncChecker = null
+
+export fn init_lockstep(allocator: Allocator, is_local: bool, player_id: u8) {
+    g_frame_manager = FrameDataManager.init(allocator, is_local)
+    g_command_builder = CommandBuilder.init(player_id)
+    g_sync_checker = SyncChecker.init(allocator)
+}
+
+export fn shutdown_lockstep() {
+    if g_frame_manager {
+        g_frame_manager.?.deinit()
+        g_frame_manager = null
+    }
+
+    if g_sync_checker {
+        g_sync_checker.?.deinit()
+        g_sync_checker = null
+    }
+
+    g_command_builder = null
+}
+
+export fn update_lockstep(delta_time: f32) {
+    if g_frame_manager {
+        g_frame_manager.?.update(delta_time)
+    }
+}
+
+export fn issue_move_command(entity_ids: []u32, count: usize, x: f32, y: f32, z: f32) {
+    if !g_command_builder or !g_frame_manager {
+        return
+    }
+
+    let cmd = g_command_builder.?.create_move_command(entity_ids, count, x, y, z)
+    g_frame_manager.?.add_game_command(cmd)
+
+    // TODO: Send command to other players over network
+}
+
+export fn get_current_execution_frame(): u32 {
+    if g_frame_manager {
+        return g_frame_manager.?.execution_frame
+    }
+    return 0
+}

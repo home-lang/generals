@@ -1,0 +1,529 @@
+// C&C Generals Zero Hour - Home Port
+// Skirmish AI (Computer Player)
+//
+// Original: AIPlayer.cpp, AIUpdate.cpp (Westwood Studios/EA)
+// Ported to Home with modern AI decision making
+
+import basics/allocator
+import engine/ecs
+import engine/math
+import game/unit
+import game/building
+import game/economy
+
+// AI difficulty levels
+enum AIDifficulty {
+    Easy
+    Medium
+    Hard
+    Brutal
+}
+
+// AI personality types (affects strategy)
+enum AIPersonality {
+    Balanced    // Mix of everything
+    Rusher      // Early aggression
+    Turtle      // Defensive, tech up
+    Harasser    // Hit and run tactics
+    Bomber      // Focus on aircraft
+}
+
+// AI state
+enum AIState {
+    Starting      // Initial base building
+    Expanding     // Building economy
+    Attacking     // Offensive operations
+    Defending     // Under attack
+    Recovering    // Rebuilding after losses
+    Winning       // Dominating
+    Desperate     // Last stand
+}
+
+// Build order item
+struct BuildOrderItem {
+    building_type: BuildingType
+    priority: u32
+    built: bool
+}
+
+// Attack wave
+struct AttackWave {
+    units: []Entity
+    unit_count: usize
+    target_position: Vec3
+    is_active: bool
+    created_time: f64
+}
+
+// AI player instance
+struct AIPlayer {
+    player_id: u32
+    team_id: u32
+
+    // Configuration
+    difficulty: AIDifficulty
+    personality: AIPersonality
+    faction: string  // "USA", "China", "GLA"
+
+    // Current state
+    state: AIState
+    last_state_change: f64
+
+    // Base location
+    base_position: Vec3
+    base_radius: f32
+
+    // Units & buildings
+    owned_units: []Entity
+    owned_unit_count: usize
+    owned_buildings: []Entity
+    owned_building_count: usize
+
+    // Build queue
+    build_order: []BuildOrderItem
+    build_order_count: usize
+    current_build_index: usize
+
+    // Attack management
+    attack_waves: []AttackWave
+    attack_wave_count: usize
+    time_since_last_attack: f64
+    attack_interval: f64  // Seconds between attacks
+
+    // Production targets
+    desired_infantry_count: u32
+    desired_tank_count: u32
+    desired_aircraft_count: u32
+
+    // Economy targets
+    desired_supply_centers: u32
+    desired_power: i32
+
+    // Threat assessment
+    enemy_threat_level: f32  // 0.0 to 1.0
+    is_under_attack: bool
+    last_attack_time: f64
+
+    // Decision timers
+    time_since_unit_build: f64
+    time_since_building_build: f64
+    time_since_tech_upgrade: f64
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, player_id: u32, difficulty: AIDifficulty): AIPlayer {
+        let attack_interval = match difficulty {
+            AIDifficulty.Easy => 180.0    // 3 minutes
+            AIDifficulty.Medium => 120.0  // 2 minutes
+            AIDifficulty.Hard => 60.0     // 1 minute
+            AIDifficulty.Brutal => 30.0   // 30 seconds
+        }
+
+        return AIPlayer {
+            player_id: player_id
+            team_id: player_id
+            difficulty: difficulty
+            personality: AIPersonality.Balanced
+            faction: "USA"
+            state: AIState.Starting
+            last_state_change: 0.0
+            base_position: Vec3.init(0.0, 0.0, 0.0)
+            base_radius: 50.0
+            owned_units: allocator.alloc(Entity, 512)
+            owned_unit_count: 0
+            owned_buildings: allocator.alloc(Entity, 128)
+            owned_building_count: 0
+            build_order: allocator.alloc(BuildOrderItem, 32)
+            build_order_count: 0
+            current_build_index: 0
+            attack_waves: allocator.alloc(AttackWave, 8)
+            attack_wave_count: 0
+            time_since_last_attack: 0.0
+            attack_interval: attack_interval
+            desired_infantry_count: 10
+            desired_tank_count: 5
+            desired_aircraft_count: 3
+            desired_supply_centers: 3
+            desired_power: 10
+            enemy_threat_level: 0.0
+            is_under_attack: false
+            last_attack_time: 0.0
+            time_since_unit_build: 0.0
+            time_since_building_build: 0.0
+            time_since_tech_upgrade: 0.0
+            allocator: allocator
+        }
+    }
+
+    fn update(mut self, delta_time: f32, current_time: f64) {
+        // Update timers
+        self.time_since_last_attack += delta_time
+        self.time_since_unit_build += delta_time
+        self.time_since_building_build += delta_time
+        self.time_since_tech_upgrade += delta_time
+
+        // Assess current situation
+        self.assess_situation()
+
+        // Update state machine
+        self.update_state_machine(current_time)
+
+        // Make decisions based on current state
+        match self.state {
+            AIState.Starting => {
+                self.execute_build_order()
+            }
+            AIState.Expanding => {
+                self.expand_economy()
+                self.build_military()
+            }
+            AIState.Attacking => {
+                self.manage_attacks()
+                self.build_military()
+            }
+            AIState.Defending => {
+                self.defend_base()
+                self.build_defenses()
+            }
+            AIState.Recovering => {
+                self.rebuild_forces()
+            }
+            _ => {}
+        }
+
+        // Always try to spend resources
+        self.produce_units()
+    }
+
+    fn assess_situation(mut self) {
+        // Count our forces
+        let our_strength = self.calculate_military_strength()
+
+        // TODO: Scan for enemy units and assess their strength
+        let enemy_strength = 0.0
+
+        // Calculate threat level
+        if our_strength > 0.0 {
+            self.enemy_threat_level = enemy_strength / our_strength
+        } else {
+            self.enemy_threat_level = 1.0
+        }
+
+        // Check if under attack
+        // TODO: Check if any owned buildings are taking damage
+    }
+
+    fn calculate_military_strength(self): f32 {
+        // Simple strength calculation based on unit count
+        // TODO: Weight by unit type and veterancy
+        return @intToFloat(f32, self.owned_unit_count) * 10.0
+    }
+
+    fn update_state_machine(mut self, current_time: f64) {
+        let time_in_state = current_time - self.last_state_change
+
+        match self.state {
+            AIState.Starting => {
+                // Move to expanding after initial build order
+                if self.current_build_index >= self.build_order_count {
+                    self.change_state(AIState.Expanding, current_time)
+                }
+            }
+            AIState.Expanding => {
+                // Attack when we have enough forces
+                let infantry_count = self.count_units_by_category(UnitCategory.Infantry)
+                let vehicle_count = self.count_units_by_category(UnitCategory.Vehicle)
+
+                if infantry_count >= self.desired_infantry_count or
+                   vehicle_count >= self.desired_tank_count {
+                    self.change_state(AIState.Attacking, current_time)
+                }
+
+                // Defend if under attack
+                if self.is_under_attack {
+                    self.change_state(AIState.Defending, current_time)
+                }
+            }
+            AIState.Attacking => {
+                // Return to expanding if forces depleted
+                if self.owned_unit_count < 5 {
+                    self.change_state(AIState.Expanding, current_time)
+                }
+
+                // Defend if base is under attack
+                if self.is_under_attack {
+                    self.change_state(AIState.Defending, current_time)
+                }
+            }
+            AIState.Defending => {
+                // Return to attacking when threat is gone
+                if !self.is_under_attack and time_in_state > 30.0 {
+                    self.change_state(AIState.Attacking, current_time)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn change_state(mut self, new_state: AIState, current_time: f64) {
+        self.state = new_state
+        self.last_state_change = current_time
+    }
+
+    fn execute_build_order(mut self) {
+        if self.current_build_index >= self.build_order_count {
+            return
+        }
+
+        let item = &self.build_order[self.current_build_index]
+
+        if !item.built {
+            // Try to build this structure
+            if self.try_build_structure(item.building_type) {
+                item.built = true
+                self.current_build_index += 1
+            }
+        }
+    }
+
+    fn expand_economy(mut self) {
+        // Build more supply centers if needed
+        let supply_center_count = self.count_buildings_by_type(BuildingType.Supply_Center)
+
+        if supply_center_count < self.desired_supply_centers {
+            self.try_build_structure(BuildingType.Supply_Center)
+        }
+
+        // Build power plants if low on power
+        let economy = get_player_economy(self.player_id)
+        if economy and economy.?.power_surplus < 2 {
+            self.try_build_structure(BuildingType.Command_Center)  // TODO: Power plant building type
+        }
+    }
+
+    fn build_military(mut self) {
+        // Ensure we have production buildings
+        if !self.has_building(BuildingType.Barracks) {
+            self.try_build_structure(BuildingType.Barracks)
+        }
+
+        if !self.has_building(BuildingType.War_Factory) {
+            self.try_build_structure(BuildingType.War_Factory)
+        }
+
+        // Build defenses
+        self.build_defenses()
+    }
+
+    fn build_defenses(mut self) {
+        // Build defensive structures around base
+        // TODO: Place Patriot missiles, Gattling cannons, etc.
+    }
+
+    fn defend_base(mut self) {
+        // Rally all units to base
+        // TODO: Issue defend orders to all military units
+    }
+
+    fn rebuild_forces(mut self) {
+        // Focus on unit production
+        self.produce_units()
+    }
+
+    fn produce_units(mut self) {
+        // Queue units at production buildings
+        let infantry_count = self.count_units_by_category(UnitCategory.Infantry)
+        let vehicle_count = self.count_units_by_category(UnitCategory.Vehicle)
+
+        // Build infantry if below target
+        if infantry_count < self.desired_infantry_count {
+            // TODO: Queue infantry at barracks
+        }
+
+        // Build vehicles if below target
+        if vehicle_count < self.desired_tank_count {
+            // TODO: Queue tanks at war factory
+        }
+    }
+
+    fn manage_attacks(mut self) {
+        // Launch attacks periodically
+        if self.time_since_last_attack >= self.attack_interval {
+            self.launch_attack()
+            self.time_since_last_attack = 0.0
+        }
+
+        // Update existing attack waves
+        for i in 0..self.attack_wave_count {
+            if self.attack_waves[i].is_active {
+                // TODO: Check if wave reached target or was destroyed
+            }
+        }
+    }
+
+    fn launch_attack(mut self) {
+        // Gather attack force
+        let mut wave = AttackWave {
+            units: self.allocator.alloc(Entity, 64)
+            unit_count: 0
+            target_position: Vec3.init(0.0, 0.0, 0.0)  // TODO: Find enemy base
+            is_active: true
+            created_time: 0.0  // TODO: Get current time
+        }
+
+        // Collect units for attack
+        // TODO: Select units that aren't busy
+
+        // Add wave to list
+        if self.attack_wave_count < self.attack_waves.len {
+            self.attack_waves[self.attack_wave_count] = wave
+            self.attack_wave_count += 1
+        }
+
+        // TODO: Issue attack-move orders to all units in wave
+    }
+
+    fn try_build_structure(mut self, building_type: BuildingType): bool {
+        // Check if we can afford it
+        // TODO: Get building cost
+        let cost = 500
+
+        if !can_afford(self.player_id, cost) {
+            return false
+        }
+
+        // Find build location near base
+        let build_pos = self.find_build_location(building_type)
+
+        // Attempt to place building
+        let entity = create_building(building_type, build_pos, self.player_id)
+
+        if entity {
+            // Deduct cost
+            spend_supplies(self.player_id, cost)
+
+            // Add to owned buildings
+            if self.owned_building_count < self.owned_buildings.len {
+                self.owned_buildings[self.owned_building_count] = entity.?
+                self.owned_building_count += 1
+            }
+
+            return true
+        }
+
+        return false
+    }
+
+    fn find_build_location(self, building_type: BuildingType): Vec3 {
+        // Simple spiral search around base
+        // TODO: Implement proper building placement
+        return self.base_position
+    }
+
+    fn has_building(self, building_type: BuildingType): bool {
+        // TODO: Check if we own this building type
+        return false
+    }
+
+    fn count_buildings_by_type(self, building_type: BuildingType): usize {
+        // TODO: Count buildings of specific type
+        return 0
+    }
+
+    fn count_units_by_category(self, category: UnitCategory): usize {
+        // TODO: Count units by category
+        return 0
+    }
+
+    fn get_player_economy(self, player_id: u32): ?*PlayerEconomy {
+        // TODO: Access economy manager
+        return null
+    }
+
+    fn can_afford(self, player_id: u32, cost: i32): bool {
+        let supplies = get_player_supplies(player_id)
+        return supplies >= cost
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.owned_units)
+        self.allocator.free(self.owned_buildings)
+        self.allocator.free(self.build_order)
+        self.allocator.free(self.attack_waves)
+    }
+}
+
+// Predefined build orders for each faction
+fn create_usa_build_order(allocator: Allocator): []BuildOrderItem {
+    let build_order = allocator.alloc(BuildOrderItem, 10)
+
+    build_order[0] = BuildOrderItem { building_type: BuildingType.Supply_Center, priority: 1, built: false }
+    build_order[1] = BuildOrderItem { building_type: BuildingType.Barracks, priority: 2, built: false }
+    build_order[2] = BuildOrderItem { building_type: BuildingType.Supply_Center, priority: 3, built: false }
+    build_order[3] = BuildOrderItem { building_type: BuildingType.War_Factory, priority: 4, built: false }
+    build_order[4] = BuildOrderItem { building_type: BuildingType.Airfield, priority: 5, built: false }
+    build_order[5] = BuildOrderItem { building_type: BuildingType.Strategy_Center, priority: 6, built: false }
+
+    return build_order
+}
+
+// AI Manager (manages all AI players)
+struct AIManager {
+    ai_players: []AIPlayer
+    ai_player_count: usize
+    allocator: Allocator
+
+    fn init(allocator: Allocator): AIManager {
+        return AIManager {
+            ai_players: allocator.alloc(AIPlayer, 8)
+            ai_player_count: 0
+            allocator: allocator
+        }
+    }
+
+    fn create_ai_player(mut self, player_id: u32, difficulty: AIDifficulty) {
+        if self.ai_player_count < self.ai_players.len {
+            self.ai_players[self.ai_player_count] = AIPlayer.init(self.allocator, player_id, difficulty)
+            self.ai_player_count += 1
+        }
+    }
+
+    fn update(mut self, delta_time: f32, current_time: f64) {
+        for i in 0..self.ai_player_count {
+            self.ai_players[i].update(delta_time, current_time)
+        }
+    }
+
+    fn deinit(mut self) {
+        for i in 0..self.ai_player_count {
+            self.ai_players[i].deinit()
+        }
+        self.allocator.free(self.ai_players)
+    }
+}
+
+// Global AI manager
+var g_ai_manager: ?AIManager = null
+
+export fn init_ai(allocator: Allocator) {
+    g_ai_manager = AIManager.init(allocator)
+}
+
+export fn shutdown_ai() {
+    if g_ai_manager {
+        g_ai_manager.?.deinit()
+        g_ai_manager = null
+    }
+}
+
+export fn create_ai_player(player_id: u32, difficulty: AIDifficulty) {
+    if g_ai_manager {
+        g_ai_manager.?.create_ai_player(player_id, difficulty)
+    }
+}
+
+export fn update_ai(delta_time: f32, current_time: f64) {
+    if g_ai_manager {
+        g_ai_manager.?.update(delta_time, current_time)
+    }
+}

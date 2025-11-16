@@ -1,0 +1,651 @@
+// C&C Generals Zero Hour - Home Port
+// Replay System (Record and playback game replays)
+//
+// Original: Replay.cpp, ReplayManager.cpp (Westwood Studios/EA)
+// Ported to Home with modern replay features
+
+import basics/allocator
+import basics/string
+import basics/filesystem
+import network/lockstep
+import network/lobby
+
+// Replay file format constants
+const REPLAY_MAGIC: u32 = 0x52455059  // "REPY"
+const REPLAY_VERSION: u32 = 1
+const MAX_REPLAY_SIZE: usize = 104857600  // 100 MB max replay file
+
+// Replay header
+struct ReplayHeader {
+    magic: u32
+    version: u32
+    header_size: u32
+
+    // Game info
+    game_name: string
+    map_name: string
+    map_crc: u32
+
+    // Timestamp
+    recorded_date: u64  // Unix timestamp
+    game_duration: u32  // Seconds
+
+    // Players
+    player_count: u8
+    player_names: [MAX_PLAYERS]string
+
+    // Game settings
+    starting_credits: u32
+    game_speed: GameSpeed
+    victory_condition: VictoryCondition
+
+    // Build info
+    game_version: string
+    build_number: u32
+
+    // Replay stats
+    total_frames: u32
+    total_commands: u32
+
+    fn init(): ReplayHeader {
+        return ReplayHeader {
+            magic: REPLAY_MAGIC
+            version: REPLAY_VERSION
+            header_size: 512  // Fixed header size
+            game_name: ""
+            map_name: ""
+            map_crc: 0
+            recorded_date: 0
+            game_duration: 0
+            player_count: 0
+            player_names: [
+                "", "", "", "", "", "", "", ""
+            ]
+            starting_credits: 10000
+            game_speed: GameSpeed.Normal
+            victory_condition: VictoryCondition.DestroyAll
+            game_version: "1.0"
+            build_number: 1
+            total_frames: 0
+            total_commands: 0
+        }
+    }
+
+    fn serialize(self, buffer: []u8): usize {
+        let mut offset: usize = 0
+
+        // Write magic and version
+        serialize_u32(self.magic, buffer, offset)
+        offset += 4
+        serialize_u32(self.version, buffer, offset)
+        offset += 4
+        serialize_u32(self.header_size, buffer, offset)
+        offset += 4
+
+        // TODO: Serialize rest of header fields
+
+        return offset
+    }
+
+    fn deserialize(mut self, buffer: []u8): bool {
+        let mut offset: usize = 0
+
+        // Read magic and verify
+        let magic = deserialize_u32(buffer, offset)
+        offset += 4
+
+        if magic != REPLAY_MAGIC {
+            return false
+        }
+
+        let version = deserialize_u32(buffer, offset)
+        offset += 4
+
+        if version != REPLAY_VERSION {
+            return false
+        }
+
+        self.magic = magic
+        self.version = version
+
+        // TODO: Deserialize rest of header fields
+
+        return true
+    }
+}
+
+// Replay command chunk (commands for one frame)
+struct ReplayCommandChunk {
+    frame_number: u32
+    command_count: u16
+    commands: []GameCommand
+
+    fn init(allocator: Allocator, frame: u32): ReplayCommandChunk {
+        return ReplayCommandChunk {
+            frame_number: frame
+            command_count: 0
+            commands: allocator.alloc(GameCommand, 32)
+        }
+    }
+
+    fn add_command(mut self, command: GameCommand) {
+        if self.command_count < self.commands.len {
+            self.commands[self.command_count] = command
+            self.command_count += 1
+        }
+    }
+
+    fn serialize(self, buffer: []u8, offset: usize): usize {
+        let mut pos = offset
+
+        // Write frame number
+        serialize_u32(self.frame_number, buffer, pos)
+        pos += 4
+
+        // Write command count
+        serialize_u16(self.command_count, buffer, pos)
+        pos += 2
+
+        // Write each command
+        for i in 0..self.command_count {
+            pos += self.serialize_command(&self.commands[i], buffer, pos)
+        }
+
+        return pos - offset
+    }
+
+    fn serialize_command(self, cmd: *GameCommand, buffer: []u8, offset: usize): usize {
+        let mut pos = offset
+
+        // Command ID
+        serialize_u16(cmd.command_id, buffer, pos)
+        pos += 2
+
+        // Player ID
+        buffer[pos] = cmd.player_id
+        pos += 1
+
+        // Execution frame
+        serialize_u32(cmd.execution_frame, buffer, pos)
+        pos += 4
+
+        // Timestamp
+        serialize_u32(cmd.timestamp, buffer, pos)
+        pos += 4
+
+        // Command type
+        buffer[pos] = @intCast(u8, @enumToInt(cmd.command_type))
+        pos += 1
+
+        // Parameters
+        buffer[pos] = cmd.param_count
+        pos += 1
+
+        for i in 0..cmd.param_count {
+            buffer[pos + i] = cmd.params[i]
+        }
+        pos += cmd.param_count
+
+        return pos - offset
+    }
+}
+
+// Replay recorder
+struct ReplayRecorder {
+    is_recording: bool
+    header: ReplayHeader
+
+    // Command storage
+    command_chunks: []ReplayCommandChunk
+    chunk_count: usize
+    current_chunk: ?ReplayCommandChunk
+
+    // Statistics
+    current_frame: u32
+    start_time: f64
+    total_commands_recorded: u32
+
+    // Output
+    output_file_path: string
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, game_name: string, map_name: string): ReplayRecorder {
+        let mut recorder = ReplayRecorder {
+            is_recording: false
+            header: ReplayHeader.init()
+            command_chunks: allocator.alloc(ReplayCommandChunk, 10000)
+            chunk_count: 0
+            current_chunk: null
+            current_frame: 0
+            start_time: 0.0
+            total_commands_recorded: 0
+            output_file_path: ""
+            allocator: allocator
+        }
+
+        recorder.header.game_name = game_name
+        recorder.header.map_name = map_name
+
+        return recorder
+    }
+
+    fn start_recording(mut self, file_path: string, lobby: *GameLobby) {
+        self.is_recording = true
+        self.output_file_path = file_path
+        self.start_time = get_current_time()
+
+        // Fill header from lobby info
+        self.header.game_name = lobby.settings.game_name
+        self.header.map_name = lobby.settings.map_name
+        self.header.map_crc = lobby.settings.map_crc
+        self.header.player_count = @intCast(u8, lobby.player_count)
+        self.header.starting_credits = lobby.settings.starting_credits
+        self.header.game_speed = lobby.settings.game_speed
+        self.header.victory_condition = lobby.settings.victory_condition
+        self.header.recorded_date = get_unix_timestamp()
+
+        // Copy player names
+        for i in 0..lobby.player_count {
+            if i < MAX_PLAYERS {
+                self.header.player_names[i] = lobby.players[i].name
+            }
+        }
+    }
+
+    fn stop_recording(mut self) {
+        if !self.is_recording {
+            return
+        }
+
+        self.is_recording = false
+
+        // Fill final stats
+        let end_time = get_current_time()
+        self.header.game_duration = @floatToInt(u32, end_time - self.start_time)
+        self.header.total_frames = self.current_frame
+        self.header.total_commands = self.total_commands_recorded
+
+        // Save replay to file
+        self.save_to_file()
+    }
+
+    fn record_command(mut self, command: GameCommand) {
+        if !self.is_recording {
+            return
+        }
+
+        // Check if we need a new chunk (new frame)
+        if !self.current_chunk or self.current_chunk.?.frame_number != command.execution_frame {
+            // Save previous chunk
+            if self.current_chunk {
+                if self.chunk_count < self.command_chunks.len {
+                    self.command_chunks[self.chunk_count] = self.current_chunk.?
+                    self.chunk_count += 1
+                }
+            }
+
+            // Create new chunk
+            self.current_chunk = ReplayCommandChunk.init(self.allocator, command.execution_frame)
+            self.current_frame = command.execution_frame
+        }
+
+        // Add command to current chunk
+        if self.current_chunk {
+            self.current_chunk.?.add_command(command)
+            self.total_commands_recorded += 1
+        }
+    }
+
+    fn save_to_file(self) {
+        // Create output buffer
+        let buffer = self.allocator.alloc(u8, MAX_REPLAY_SIZE)
+        let mut offset: usize = 0
+
+        // Write header
+        offset += self.header.serialize(buffer)
+
+        // Write all command chunks
+        for i in 0..self.chunk_count {
+            offset += self.command_chunks[i].serialize(buffer, offset)
+        }
+
+        // Write to file
+        let file_written = filesystem_write_file(self.output_file_path, buffer[0..offset])
+
+        self.allocator.free(buffer)
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.command_chunks)
+    }
+}
+
+// Replay player (playback replays)
+struct ReplayPlayer {
+    is_playing: bool
+    is_paused: bool
+
+    header: ReplayHeader
+
+    // Command data
+    command_chunks: []ReplayCommandChunk
+    chunk_count: usize
+    current_chunk_index: usize
+
+    // Playback state
+    current_frame: u32
+    playback_speed: f32  // 1.0 = normal, 2.0 = 2x speed, etc.
+
+    // Frame timing
+    time_accumulator: f32
+    frame_time: f32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): ReplayPlayer {
+        return ReplayPlayer {
+            is_playing: false
+            is_paused: false
+            header: ReplayHeader.init()
+            command_chunks: allocator.alloc(ReplayCommandChunk, 10000)
+            chunk_count: 0
+            current_chunk_index: 0
+            current_frame: 0
+            playback_speed: 1.0
+            time_accumulator: 0.0
+            frame_time: 1.0 / 30.0  // 30 FPS
+            allocator: allocator
+        }
+    }
+
+    fn load_replay(mut self, file_path: string): bool {
+        // Read replay file
+        let file_data = filesystem_read_file(file_path)
+
+        if !file_data {
+            return false
+        }
+
+        let buffer = file_data.?.data
+        let mut offset: usize = 0
+
+        // Parse header
+        if !self.header.deserialize(buffer) {
+            return false
+        }
+
+        offset += self.header.header_size
+
+        // Parse command chunks
+        self.chunk_count = 0
+
+        while offset < file_data.?.size {
+            if self.chunk_count >= self.command_chunks.len {
+                break
+            }
+
+            // Read frame number
+            let frame = deserialize_u32(buffer, offset)
+            offset += 4
+
+            // Read command count
+            let cmd_count = deserialize_u16(buffer, offset)
+            offset += 2
+
+            // Create chunk
+            let mut chunk = ReplayCommandChunk.init(self.allocator, frame)
+            chunk.command_count = cmd_count
+
+            // Read commands
+            for i in 0..cmd_count {
+                let cmd = self.deserialize_command(buffer, &offset)
+                chunk.commands[i] = cmd
+            }
+
+            self.command_chunks[self.chunk_count] = chunk
+            self.chunk_count += 1
+        }
+
+        return true
+    }
+
+    fn deserialize_command(self, buffer: []u8, offset: *usize): GameCommand {
+        let mut cmd = GameCommand.init()
+        let mut pos = offset.*
+
+        cmd.command_id = deserialize_u16(buffer, pos)
+        pos += 2
+
+        cmd.player_id = buffer[pos]
+        pos += 1
+
+        cmd.execution_frame = deserialize_u32(buffer, pos)
+        pos += 4
+
+        cmd.timestamp = deserialize_u32(buffer, pos)
+        pos += 4
+
+        cmd.command_type = @intToEnum(GameCommandType, buffer[pos])
+        pos += 1
+
+        cmd.param_count = buffer[pos]
+        pos += 1
+
+        for i in 0..cmd.param_count {
+            cmd.params[i] = buffer[pos + i]
+        }
+        pos += cmd.param_count
+
+        offset.* = pos
+        return cmd
+    }
+
+    fn start_playback(mut self) {
+        if self.chunk_count == 0 {
+            return
+        }
+
+        self.is_playing = true
+        self.is_paused = false
+        self.current_frame = 0
+        self.current_chunk_index = 0
+        self.time_accumulator = 0.0
+
+        // TODO: Initialize game state for replay
+    }
+
+    fn update(mut self, delta_time: f32) {
+        if !self.is_playing or self.is_paused {
+            return
+        }
+
+        self.time_accumulator += delta_time * self.playback_speed
+
+        // Process frames
+        while self.time_accumulator >= self.frame_time {
+            self.time_accumulator -= self.frame_time
+            self.advance_frame()
+        }
+    }
+
+    fn advance_frame(mut self) {
+        self.current_frame += 1
+
+        // Check if we've reached the end
+        if self.current_frame > self.header.total_frames {
+            self.is_playing = false
+            return
+        }
+
+        // Execute commands for this frame
+        if self.current_chunk_index < self.chunk_count {
+            let chunk = &self.command_chunks[self.current_chunk_index]
+
+            if chunk.frame_number == self.current_frame {
+                // Execute all commands in this chunk
+                for i in 0..chunk.command_count {
+                    self.execute_replay_command(&chunk.commands[i])
+                }
+
+                self.current_chunk_index += 1
+            }
+        }
+    }
+
+    fn execute_replay_command(self, command: *GameCommand) {
+        // Execute command in game
+        // TODO: Pass command to game logic
+    }
+
+    fn pause(mut self) {
+        self.is_paused = true
+    }
+
+    fn resume(mut self) {
+        self.is_paused = false
+    }
+
+    fn seek_to_frame(mut self, frame: u32) {
+        if frame > self.header.total_frames {
+            return
+        }
+
+        // Find chunk for this frame
+        for i in 0..self.chunk_count {
+            if self.command_chunks[i].frame_number >= frame {
+                self.current_chunk_index = i
+                self.current_frame = frame
+                break
+            }
+        }
+
+        // TODO: Rebuild game state up to this frame
+        // This requires re-executing all commands from start to frame
+    }
+
+    fn set_playback_speed(mut self, speed: f32) {
+        // Clamp between 0.25x and 8x
+        if speed < 0.25 {
+            self.playback_speed = 0.25
+        } else if speed > 8.0 {
+            self.playback_speed = 8.0
+        } else {
+            self.playback_speed = speed
+        }
+    }
+
+    fn get_progress_percentage(self): f32 {
+        if self.header.total_frames == 0 {
+            return 0.0
+        }
+
+        return @intToFloat(f32, self.current_frame) / @intToFloat(f32, self.header.total_frames)
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.command_chunks)
+    }
+}
+
+// Replay info (for replay browser)
+struct ReplayInfo {
+    file_path: string
+    header: ReplayHeader
+    file_size: u64
+
+    fn from_file(allocator: Allocator, file_path: string): ?ReplayInfo {
+        // Read just the header
+        let file_data = filesystem_read_file(file_path)
+
+        if !file_data {
+            return null
+        }
+
+        let mut header = ReplayHeader.init()
+        if !header.deserialize(file_data.?.data) {
+            return null
+        }
+
+        return ReplayInfo {
+            file_path: file_path
+            header: header
+            file_size: file_data.?.size
+        }
+    }
+}
+
+// Helper functions
+
+fn get_unix_timestamp(): u64 {
+    // TODO: Get current Unix timestamp
+    return 0
+}
+
+fn filesystem_write_file(path: string, data: []u8): bool {
+    // TODO: Implement file writing
+    return false
+}
+
+fn filesystem_read_file(path: string): ?FileData {
+    // TODO: Implement file reading
+    return null
+}
+
+struct FileData {
+    data: []u8
+    size: usize
+}
+
+// Global replay state
+var g_replay_recorder: ?ReplayRecorder = null
+var g_replay_player: ?ReplayPlayer = null
+
+export fn start_replay_recording(allocator: Allocator, file_path: string, lobby: *GameLobby) {
+    g_replay_recorder = ReplayRecorder.init(allocator, lobby.settings.game_name, lobby.settings.map_name)
+    g_replay_recorder.?.start_recording(file_path, lobby)
+}
+
+export fn stop_replay_recording() {
+    if g_replay_recorder {
+        g_replay_recorder.?.stop_recording()
+        g_replay_recorder.?.deinit()
+        g_replay_recorder = null
+    }
+}
+
+export fn record_game_command(command: GameCommand) {
+    if g_replay_recorder {
+        g_replay_recorder.?.record_command(command)
+    }
+}
+
+export fn load_and_play_replay(allocator: Allocator, file_path: string): bool {
+    g_replay_player = ReplayPlayer.init(allocator)
+
+    if !g_replay_player.?.load_replay(file_path) {
+        g_replay_player = null
+        return false
+    }
+
+    g_replay_player.?.start_playback()
+    return true
+}
+
+export fn update_replay_playback(delta_time: f32) {
+    if g_replay_player {
+        g_replay_player.?.update(delta_time)
+    }
+}
+
+export fn shutdown_replay() {
+    if g_replay_recorder {
+        g_replay_recorder.?.deinit()
+        g_replay_recorder = null
+    }
+
+    if g_replay_player {
+        g_replay_player.?.deinit()
+        g_replay_player = null
+    }
+}

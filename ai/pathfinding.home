@@ -1,0 +1,606 @@
+// C&C Generals Zero Hour - Home Port
+// Pathfinding System
+//
+// Original: Pathfinder.cpp (Westwood Studios/EA)
+// Ported to Home with A* and flow fields
+
+import basics/allocator
+import engine/math
+import engine/physics
+
+// Grid-based pathfinding for RTS
+const GRID_SIZE: usize = 256
+const CELL_SIZE: f32 = 2.0  // Each cell is 2x2 units
+
+// Cell types
+enum CellType {
+    Walkable
+    Blocked
+    Slow       // Difficult terrain (slower movement)
+    Water
+    Cliff
+}
+
+// Pathfinding grid cell
+struct PathCell {
+    x: usize
+    y: usize
+    type: CellType
+    cost: f32  // Movement cost multiplier
+    is_occupied: bool  // Unit occupying this cell
+}
+
+// Pathfinding node (for A*)
+struct PathNode {
+    cell: PathCell
+    g_cost: f32  // Cost from start
+    h_cost: f32  // Heuristic cost to goal
+    f_cost: f32  // Total cost (g + h)
+    parent: ?*PathNode
+}
+
+// Path result
+struct Path {
+    waypoints: []Vec3
+    waypoint_count: usize
+    total_cost: f32
+    is_valid: bool
+    allocator: Allocator
+
+    fn init(allocator: Allocator, max_waypoints: usize): Path {
+        return Path {
+            waypoints: allocator.alloc(Vec3, max_waypoints)
+            waypoint_count: 0
+            total_cost: 0.0
+            is_valid: false
+            allocator: allocator
+        }
+    }
+
+    fn add_waypoint(mut self, position: Vec3) {
+        if self.waypoint_count < self.waypoints.len {
+            self.waypoints[self.waypoint_count] = position
+            self.waypoint_count += 1
+        }
+    }
+
+    fn reverse(mut self) {
+        // Reverse waypoint order (A* builds path backwards)
+        for i in 0..(self.waypoint_count / 2) {
+            let j = self.waypoint_count - 1 - i
+            let temp = self.waypoints[i]
+            self.waypoints[i] = self.waypoints[j]
+            self.waypoints[j] = temp
+        }
+    }
+
+    fn get_next_waypoint(self, current_index: usize): ?Vec3 {
+        if current_index < self.waypoint_count {
+            return self.waypoints[current_index]
+        }
+        return null
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.waypoints)
+    }
+}
+
+// Pathfinding grid
+struct PathfindingGrid {
+    cells: []PathCell
+    width: usize
+    height: usize
+    cell_size: f32
+    world_offset: Vec3  // World position of grid (0,0)
+
+    fn init(allocator: Allocator, width: usize, height: usize, cell_size: f32): PathfindingGrid {
+        let total_cells = width * height
+        let cells = allocator.alloc(PathCell, total_cells)
+
+        // Initialize all cells as walkable
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x
+                cells[index] = PathCell {
+                    x: x
+                    y: y
+                    type: CellType.Walkable
+                    cost: 1.0
+                    is_occupied: false
+                }
+            }
+        }
+
+        return PathfindingGrid {
+            cells: cells
+            width: width
+            height: height
+            cell_size: cell_size
+            world_offset: Vec3.init(-@intToFloat(f32, width) * cell_size * 0.5, 0.0, -@intToFloat(f32, height) * cell_size * 0.5)
+        }
+    }
+
+    fn world_to_grid(self, world_pos: Vec3): [2]usize {
+        let local_x = world_pos.x - self.world_offset.x
+        let local_z = world_pos.z - self.world_offset.z
+
+        let grid_x = @floatToInt(usize, local_x / self.cell_size)
+        let grid_y = @floatToInt(usize, local_z / self.cell_size)
+
+        return [2]usize{
+            if grid_x >= self.width { self.width - 1 } else { grid_x },
+            if grid_y >= self.height { self.height - 1 } else { grid_y }
+        }
+    }
+
+    fn grid_to_world(self, grid_x: usize, grid_y: usize): Vec3 {
+        return Vec3 {
+            x: self.world_offset.x + @intToFloat(f32, grid_x) * self.cell_size + self.cell_size * 0.5
+            y: 0.0
+            z: self.world_offset.z + @intToFloat(f32, grid_y) * self.cell_size + self.cell_size * 0.5
+        }
+    }
+
+    fn get_cell(self, x: usize, y: usize): ?*PathCell {
+        if x >= self.width or y >= self.height {
+            return null
+        }
+
+        let index = y * self.width + x
+        return &self.cells[index]
+    }
+
+    fn is_walkable(self, x: usize, y: usize): bool {
+        let cell = self.get_cell(x, y)
+        if !cell {
+            return false
+        }
+
+        return cell.?.type == CellType.Walkable or cell.?.type == CellType.Slow
+    }
+
+    fn set_cell_type(mut self, x: usize, y: usize, type: CellType) {
+        let cell = self.get_cell(x, y)
+        if cell {
+            cell.?.type = type
+        }
+    }
+
+    fn set_occupied(mut self, x: usize, y: usize, occupied: bool) {
+        let cell = self.get_cell(x, y)
+        if cell {
+            cell.?.is_occupied = occupied
+        }
+    }
+}
+
+// A* pathfinding implementation
+struct AStarPathfinder {
+    grid: *PathfindingGrid
+    open_list: []PathNode
+    open_count: usize
+    closed_list: []bool
+    allocator: Allocator
+
+    fn init(allocator: Allocator, grid: *PathfindingGrid): AStarPathfinder {
+        let total_cells = grid.width * grid.height
+
+        return AStarPathfinder {
+            grid: grid
+            open_list: allocator.alloc(PathNode, 1024)
+            open_count: 0
+            closed_list: allocator.alloc(bool, total_cells)
+            allocator: allocator
+        }
+    }
+
+    fn find_path(mut self, start: Vec3, goal: Vec3): Path {
+        // Convert world positions to grid
+        let start_grid = self.grid.world_to_grid(start)
+        let goal_grid = self.grid.world_to_grid(goal)
+
+        // Clear open/closed lists
+        self.open_count = 0
+        for i in 0..self.closed_list.len {
+            self.closed_list[i] = false
+        }
+
+        // Create start node
+        let start_cell = self.grid.get_cell(start_grid[0], start_grid[1])
+        if !start_cell {
+            return Path.init(self.allocator, 0)
+        }
+
+        let mut start_node = PathNode {
+            cell: start_cell.?
+            g_cost: 0.0
+            h_cost: self.heuristic(start_grid[0], start_grid[1], goal_grid[0], goal_grid[1])
+            f_cost: 0.0
+            parent: null
+        }
+        start_node.f_cost = start_node.g_cost + start_node.h_cost
+
+        // Add start to open list
+        self.open_list[0] = start_node
+        self.open_count = 1
+
+        // A* main loop
+        while self.open_count > 0 {
+            // Find node with lowest f_cost
+            let current_index = self.find_lowest_f_cost()
+            let current = self.open_list[current_index]
+
+            // Check if we reached goal
+            if current.cell.x == goal_grid[0] and current.cell.y == goal_grid[1] {
+                return self.reconstruct_path(&current)
+            }
+
+            // Move current to closed list
+            self.remove_from_open(current_index)
+            let closed_index = current.cell.y * self.grid.width + current.cell.x
+            self.closed_list[closed_index] = true
+
+            // Check neighbors
+            self.process_neighbors(&current, goal_grid[0], goal_grid[1])
+        }
+
+        // No path found
+        let mut failed_path = Path.init(self.allocator, 0)
+        failed_path.is_valid = false
+        return failed_path
+    }
+
+    fn heuristic(self, x1: usize, y1: usize, x2: usize, y2: usize): f32 {
+        // Manhattan distance (good for grid-based movement)
+        let dx = if x2 > x1 { x2 - x1 } else { x1 - x2 }
+        let dy = if y2 > y1 { y2 - y1 } else { y1 - y2 }
+
+        return @intToFloat(f32, dx + dy)
+    }
+
+    fn find_lowest_f_cost(self): usize {
+        let mut lowest_index: usize = 0
+        let mut lowest_f = self.open_list[0].f_cost
+
+        for i in 1..self.open_count {
+            if self.open_list[i].f_cost < lowest_f {
+                lowest_f = self.open_list[i].f_cost
+                lowest_index = i
+            }
+        }
+
+        return lowest_index
+    }
+
+    fn remove_from_open(mut self, index: usize) {
+        // Swap with last element and decrease count
+        if index < self.open_count - 1 {
+            self.open_list[index] = self.open_list[self.open_count - 1]
+        }
+        self.open_count -= 1
+    }
+
+    fn process_neighbors(mut self, current: *PathNode, goal_x: usize, goal_y: usize) {
+        // Check 8 neighbors (orthogonal + diagonal)
+        const NEIGHBORS: [8][2]i32 = [8][2]i32{
+            [2]i32{0, -1},   // North
+            [2]i32{1, 0},    // East
+            [2]i32{0, 1},    // South
+            [2]i32{-1, 0},   // West
+            [2]i32{1, -1},   // NE
+            [2]i32{1, 1},    // SE
+            [2]i32{-1, 1},   // SW
+            [2]i32{-1, -1}   // NW
+        }
+
+        for i in 0..8 {
+            let nx = @intCast(i32, current.cell.x) + NEIGHBORS[i][0]
+            let ny = @intCast(i32, current.cell.y) + NEIGHBORS[i][1]
+
+            if nx < 0 or ny < 0 or nx >= @intCast(i32, self.grid.width) or ny >= @intCast(i32, self.grid.height) {
+                continue
+            }
+
+            let neighbor_x = @intCast(usize, nx)
+            let neighbor_y = @intCast(usize, ny)
+
+            // Check if walkable
+            if !self.grid.is_walkable(neighbor_x, neighbor_y) {
+                continue
+            }
+
+            // Check if in closed list
+            let closed_index = neighbor_y * self.grid.width + neighbor_x
+            if self.closed_list[closed_index] {
+                continue
+            }
+
+            // Calculate movement cost
+            let is_diagonal = (i >= 4)
+            let move_cost = if is_diagonal { 1.414 } else { 1.0 }
+            let neighbor_cell = self.grid.get_cell(neighbor_x, neighbor_y).?
+            let g_cost = current.g_cost + move_cost * neighbor_cell.cost
+
+            // Check if in open list
+            // TODO: Optimize this search
+            let mut in_open = false
+            for j in 0..self.open_count {
+                if self.open_list[j].cell.x == neighbor_x and self.open_list[j].cell.y == neighbor_y {
+                    // Already in open list, check if this path is better
+                    if g_cost < self.open_list[j].g_cost {
+                        self.open_list[j].g_cost = g_cost
+                        self.open_list[j].f_cost = g_cost + self.open_list[j].h_cost
+                        self.open_list[j].parent = current
+                    }
+                    in_open = true
+                    break
+                }
+            }
+
+            if !in_open {
+                // Add to open list
+                if self.open_count < self.open_list.len {
+                    let h_cost = self.heuristic(neighbor_x, neighbor_y, goal_x, goal_y)
+                    self.open_list[self.open_count] = PathNode {
+                        cell: neighbor_cell
+                        g_cost: g_cost
+                        h_cost: h_cost
+                        f_cost: g_cost + h_cost
+                        parent: current
+                    }
+                    self.open_count += 1
+                }
+            }
+        }
+    }
+
+    fn reconstruct_path(self, goal_node: *PathNode): Path {
+        let mut path = Path.init(self.allocator, 128)
+
+        // Walk backwards from goal to start
+        let mut current = goal_node
+        while current != null {
+            let world_pos = self.grid.grid_to_world(current.?.cell.x, current.?.cell.y)
+            path.add_waypoint(world_pos)
+
+            current = current.?.parent
+        }
+
+        // Reverse path (it was built backwards)
+        path.reverse()
+        path.is_valid = true
+        path.total_cost = goal_node.g_cost
+
+        return path
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.open_list)
+        self.allocator.free(self.closed_list)
+    }
+}
+
+// Flow field pathfinding (for large groups of units)
+struct FlowField {
+    grid: *PathfindingGrid
+    flow_directions: []Vec2  // Direction vector for each cell
+    costs: []f32  // Integration field (cost to goal)
+    allocator: Allocator
+
+    fn init(allocator: Allocator, grid: *PathfindingGrid): FlowField {
+        let total_cells = grid.width * grid.height
+
+        return FlowField {
+            grid: grid
+            flow_directions: allocator.alloc(Vec2, total_cells)
+            costs: allocator.alloc(f32, total_cells)
+            allocator: allocator
+        }
+    }
+
+    fn generate(mut self, goal: Vec3) {
+        // Convert goal to grid
+        let goal_grid = self.grid.world_to_grid(goal)
+
+        // Reset costs to infinity
+        for i in 0..self.costs.len {
+            self.costs[i] = 999999.0
+        }
+
+        // Set goal cost to 0
+        let goal_index = goal_grid[1] * self.grid.width + goal_grid[0]
+        self.costs[goal_index] = 0.0
+
+        // Dijkstra's algorithm to build cost field
+        self.build_cost_field(goal_grid[0], goal_grid[1])
+
+        // Generate flow directions from cost field
+        self.build_flow_field()
+    }
+
+    fn build_cost_field(mut self, goal_x: usize, goal_y: usize) {
+        // Simple wave propagation (Dijkstra-like)
+        let mut open_list = self.allocator.alloc([2]usize, 1024)
+        let mut open_count: usize = 1
+
+        open_list[0] = [2]usize{ goal_x, goal_y }
+
+        while open_count > 0 {
+            // Pop first element
+            let current = open_list[0]
+            open_count -= 1
+
+            // Shift list
+            for i in 0..open_count {
+                open_list[i] = open_list[i + 1]
+            }
+
+            let current_index = current[1] * self.grid.width + current[0]
+            let current_cost = self.costs[current_index]
+
+            // Check 4 neighbors (orthogonal only for cost field)
+            const NEIGHBORS: [4][2]i32 = [4][2]i32{
+                [2]i32{0, -1}, [2]i32{1, 0}, [2]i32{0, 1}, [2]i32{-1, 0}
+            }
+
+            for i in 0..4 {
+                let nx = @intCast(i32, current[0]) + NEIGHBORS[i][0]
+                let ny = @intCast(i32, current[1]) + NEIGHBORS[i][1]
+
+                if nx < 0 or ny < 0 or nx >= @intCast(i32, self.grid.width) or ny >= @intCast(i32, self.grid.height) {
+                    continue
+                }
+
+                let neighbor_x = @intCast(usize, nx)
+                let neighbor_y = @intCast(usize, ny)
+
+                if !self.grid.is_walkable(neighbor_x, neighbor_y) {
+                    continue
+                }
+
+                let neighbor_index = neighbor_y * self.grid.width + neighbor_x
+                let neighbor_cell = self.grid.get_cell(neighbor_x, neighbor_y).?
+                let new_cost = current_cost + neighbor_cell.cost
+
+                if new_cost < self.costs[neighbor_index] {
+                    self.costs[neighbor_index] = new_cost
+
+                    // Add to open list
+                    if open_count < open_list.len {
+                        open_list[open_count] = [2]usize{ neighbor_x, neighbor_y }
+                        open_count += 1
+                    }
+                }
+            }
+        }
+
+        self.allocator.free(open_list)
+    }
+
+    fn build_flow_field(mut self) {
+        // For each cell, find direction to lowest cost neighbor
+        for y in 0..self.grid.height {
+            for x in 0..self.grid.width {
+                let index = y * self.grid.width + x
+                let current_cost = self.costs[index]
+
+                // Find lowest cost neighbor
+                let mut best_dir = Vec2.init(0.0, 0.0)
+                let mut lowest_cost = current_cost
+
+                const NEIGHBORS: [8][3]f32 = [8][3]f32{
+                    [3]f32{0.0, -1.0, 1.0},    // North
+                    [3]f32{1.0, 0.0, 1.0},     // East
+                    [3]f32{0.0, 1.0, 1.0},     // South
+                    [3]f32{-1.0, 0.0, 1.0},    // West
+                    [3]f32{1.0, -1.0, 1.414},  // NE
+                    [3]f32{1.0, 1.0, 1.414},   // SE
+                    [3]f32{-1.0, 1.0, 1.414},  // SW
+                    [3]f32{-1.0, -1.0, 1.414}  // NW
+                }
+
+                for i in 0..8 {
+                    let nx = @intCast(i32, x) + @floatToInt(i32, NEIGHBORS[i][0])
+                    let ny = @intCast(i32, y) + @floatToInt(i32, NEIGHBORS[i][1])
+
+                    if nx < 0 or ny < 0 or nx >= @intCast(i32, self.grid.width) or ny >= @intCast(i32, self.grid.height) {
+                        continue
+                    }
+
+                    let neighbor_index = @intCast(usize, ny) * self.grid.width + @intCast(usize, nx)
+                    let neighbor_cost = self.costs[neighbor_index]
+
+                    if neighbor_cost < lowest_cost {
+                        lowest_cost = neighbor_cost
+                        best_dir = Vec2 {
+                            x: NEIGHBORS[i][0]
+                            y: NEIGHBORS[i][1]
+                        }
+                    }
+                }
+
+                // Normalize direction
+                if best_dir.x != 0.0 or best_dir.y != 0.0 {
+                    let len = @sqrt(best_dir.x * best_dir.x + best_dir.y * best_dir.y)
+                    best_dir.x /= len
+                    best_dir.y /= len
+                }
+
+                self.flow_directions[index] = best_dir
+            }
+        }
+    }
+
+    fn get_direction(self, position: Vec3): Vec2 {
+        let grid_pos = self.grid.world_to_grid(position)
+        let index = grid_pos[1] * self.grid.width + grid_pos[0]
+
+        if index < self.flow_directions.len {
+            return self.flow_directions[index]
+        }
+
+        return Vec2.init(0.0, 0.0)
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.flow_directions)
+        self.allocator.free(self.costs)
+    }
+}
+
+// Global pathfinding system
+var g_pathfinding_grid: ?PathfindingGrid = null
+var g_astar: ?AStarPathfinder = null
+var g_flow_field: ?FlowField = null
+
+export fn init_pathfinding(allocator: Allocator) {
+    g_pathfinding_grid = PathfindingGrid.init(allocator, GRID_SIZE, GRID_SIZE, CELL_SIZE)
+
+    if g_pathfinding_grid {
+        g_astar = AStarPathfinder.init(allocator, &g_pathfinding_grid.?)
+        g_flow_field = FlowField.init(allocator, &g_pathfinding_grid.?)
+    }
+}
+
+export fn shutdown_pathfinding() {
+    if g_astar {
+        g_astar.?.deinit()
+        g_astar = null
+    }
+
+    if g_flow_field {
+        g_flow_field.?.deinit()
+        g_flow_field = null
+    }
+
+    g_pathfinding_grid = null
+}
+
+export fn find_path(start: Vec3, goal: Vec3): Path {
+    if g_astar {
+        return g_astar.?.find_path(start, goal)
+    }
+
+    let allocator = Allocator.init()  // TODO: Use proper allocator
+    return Path.init(allocator, 0)
+}
+
+export fn generate_flow_field(goal: Vec3) {
+    if g_flow_field {
+        g_flow_field.?.generate(goal)
+    }
+}
+
+export fn get_flow_direction(position: Vec3): Vec2 {
+    if g_flow_field {
+        return g_flow_field.?.get_direction(position)
+    }
+    return Vec2.init(0.0, 0.0)
+}
+
+export fn set_cell_blocked(x: usize, y: usize, blocked: bool) {
+    if g_pathfinding_grid {
+        g_pathfinding_grid.?.set_cell_type(x, y, if blocked { CellType.Blocked } else { CellType.Walkable })
+    }
+}
