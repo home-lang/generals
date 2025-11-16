@@ -1,8 +1,8 @@
 # C&C Generals Zero Hour - Home Port - Status Report
 
 **Last Updated:** November 16, 2025
-**Total Lines of Code:** **28,363** lines of Home (from 500,000+ lines of C++ - **94.3% reduction**)
-**Total Modules:** **60** Home files (from 4,385 C++ files)
+**Total Lines of Code:** **30,554** lines of Home (from 500,000+ lines of C++ - **93.9% reduction**)
+**Total Modules:** **65** Home files (from 4,385 C++ files)
 **Project Status:** ✅ **ALL PHASES COMPLETE** (Weeks 1-65 of 65-week roadmap - **100%**)
 
 ---
@@ -978,10 +978,10 @@ particle_pool.release(particle)
 All 12 phases of the 65-week roadmap have been successfully completed!
 
 **Final Statistics:**
-- ✅ **28,363 lines** of Home code (from 500,000+ C++ lines)
-- ✅ **60 modules** (from 4,385 C++ files)
-- ✅ **94.3% code reduction** while maintaining full functionality
-- ✅ 60+ game systems fully implemented
+- ✅ **30,554 lines** of Home code (from 500,000+ C++ lines)
+- ✅ **65 modules** (from 4,385 C++ files)
+- ✅ **93.9% code reduction** while maintaining full functionality
+- ✅ 65 game systems fully implemented
 - ✅ **12/12 phases complete**
 - ✅ **100%** of planned features implemented
 - ✅ Comprehensive test coverage (Unit + Integration + Benchmarks)
@@ -1022,14 +1022,14 @@ All 12 phases of the 65-week roadmap have been successfully completed!
 
 | Metric | Value |
 |--------|-------|
-| **Total Lines of Home Code** | **28,363** |
-| **Number of Modules** | **60** |
+| **Total Lines of Home Code** | **30,554** |
+| **Number of Modules** | **65** |
 | **Original C++ Lines** | 500,000+ |
-| **Code Reduction** | **94.3%** |
+| **Code Reduction** | **93.9%** |
 | **Weeks Complete** | **65 / 65** ✅ |
 | **Progress** | **100%** 🎉 |
 | **Phases Complete** | **12 / 12** ✅ |
-| **Systems Implemented** | 60+ |
+| **Systems Implemented** | 65 |
 | **Memory Pools** | 3 tiers + Object pooling |
 | **Archive Support** | .big format |
 | **Platform Support** | Windows, macOS, Linux |

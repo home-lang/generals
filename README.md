@@ -3,11 +3,11 @@
 **A complete reimplementation of EA's AAA RTS game engine in the Home programming language**
 
 ![Progress](https://img.shields.io/badge/Progress-100%25-brightgreen)
-![Lines of Code](https://img.shields.io/badge/Lines%20of%20Code-28%2C363-blue)
-![Modules](https://img.shields.io/badge/Modules-60-orange)
+![Lines of Code](https://img.shields.io/badge/Lines%20of%20Code-30%2C554-blue)
+![Modules](https://img.shields.io/badge/Modules-65-orange)
 ![Phases Complete](https://img.shields.io/badge/Phases-12%2F12-brightgreen)
 ![Status](https://img.shields.io/badge/Status-Complete-success)
-![Code Reduction](https://img.shields.io/badge/Code%20Reduction-94.3%25-green)
+![Code Reduction](https://img.shields.io/badge/Code%20Reduction-93.9%25-green)
 
 ---
 
@@ -108,15 +108,15 @@ Command & Conquer: Generals – Zero Hour is a real-time strategy (RTS) game dev
 
 | Metric | Value |
 |--------|-------|
-| **Total Lines of Home Code** | **28,363** |
-| **Number of Modules** | **60** |
+| **Total Lines of Home Code** | **30,554** |
+| **Number of Modules** | **65** |
 | **Original C++ Lines** | 500,000+ |
-| **Code Reduction** | **94.3%** (500k → 28k) |
+| **Code Reduction** | **93.9%** (500k → 30.5k) |
 | **Weeks Complete** | **65 / 65** ✅ |
 | **Progress** | **100%** 🎉 |
 | **Phases Complete** | **12 / 12** ✅ |
 | **Original C++ Files Ported** | ~4,385 files |
-| **Systems Implemented** | 60+ |
+| **Systems Implemented** | 65 |
 | **Test Coverage** | Unit + Integration + Benchmarks |
 
 ---
@@ -144,6 +144,11 @@ generals/
 │   ├── building.home       # Building system (398 lines)
 │   ├── combat.home         # Combat mechanics (445 lines)
 │   ├── economy.home        # Resource system (289 lines)
+│   ├── player.home         # Player state management (549 lines)
+│   ├── team.home           # Team/alliance system (287 lines)
+│   ├── special_power.home  # Super weapons and powers (433 lines)
+│   ├── radar.home          # Fog of war and vision (445 lines)
+│   ├── savegame.home       # Save/load functionality (477 lines)
 │   ├── campaign.home       # Campaign manager (380 lines)
 │   ├── script_engine.home  # Mission scripting (490 lines)
 │   └── objectives.home     # Objectives tracking (340 lines)
@@ -363,6 +368,6 @@ This project is for educational and preservation purposes.
 
 **All 12 phases of the 65-week roadmap have been successfully completed!**
 
-This project represents a complete reimplementation of EA's C&C Generals Zero Hour (500,000+ lines of C++) in the Home programming language (26,200+ lines), preserving EA's original architecture while adding modern features, cross-platform support, and comprehensive testing.
+This project represents a complete reimplementation of EA's C&C Generals Zero Hour (500,000+ lines of C++) in the Home programming language (30,554 lines), preserving EA's original architecture while adding modern features, cross-platform support, and comprehensive testing.
 
 The game is now production-ready and available for all platforms (Windows, macOS, Linux)!
