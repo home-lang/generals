@@ -1,0 +1,478 @@
+// C&C Generals Zero Hour - Home Port
+// Mod Loader System
+//
+// Original: ModLoader, INILoader (EA's modding infrastructure)
+// Ported to Home with enhanced modding capabilities
+//
+// C&C Generals mod structure:
+// Mods/
+//   MyMod/
+//     mod.ini               - Mod metadata
+//     Data/
+//       INI/                - Modified game data
+//         Object/           - Custom units
+//         Weapon.ini        - Modified weapons
+//       W3D/                - Custom models
+//       Textures/           - Custom textures
+//       Audio/              - Custom sounds
+//       Maps/               - Custom maps
+//
+// Example mod.ini:
+// ```ini
+// Mod MyAwesomeMod
+//   Name = "My Awesome Mod"
+//   Version = "1.0"
+//   Author = "ModAuthor"
+//   Description = "Adds new units and balance changes"
+//   LoadOrder = 100
+//
+//   ; Asset overrides
+//   DataOverride = Data/INI/Object/CustomTank.ini
+//   ModelOverride = Data/W3D/CustomTank.w3d
+//   TextureOverride = Data/Textures/CustomTank.dds
+// End
+// ```
+
+import basics/allocator
+import basics/string
+import basics/filesystem
+import tools/ini_parser
+
+// Mod metadata
+struct ModInfo {
+    mod_id: string          // Unique identifier
+    name: string            // Display name
+    version: string         // Mod version
+    author: string
+    description: string
+    load_order: i32         // Higher = loads later (overrides earlier mods)
+    mod_directory: string   // Path to mod root
+    enabled: bool
+
+    dependencies: []string  // Other mods this depends on
+    conflicts: []string     // Mods that conflict with this one
+
+    fn init(mod_id: string): ModInfo {
+        return ModInfo {
+            mod_id: mod_id
+            name: ""
+            version: "1.0"
+            author: ""
+            description: ""
+            load_order: 100
+            mod_directory: ""
+            enabled: true
+            dependencies: []
+            conflicts: []
+        }
+    }
+}
+
+// Asset override (file replacement)
+struct AssetOverride {
+    mod_id: string          // Which mod provides this override
+    asset_type: string      // "Object", "Weapon", "Model", etc.
+    asset_name: string      // Asset identifier
+    file_path: string       // Path to override file
+    priority: i32           // Load order priority
+}
+
+// Mod load result
+enum ModLoadResult {
+    Success
+    NotFound
+    InvalidFormat
+    MissingDependency
+    ConflictDetected
+    ParseError
+}
+
+// Mod manager
+struct ModManager {
+    mods: []ModInfo
+    mod_count: usize
+    asset_overrides: []AssetOverride
+    override_count: usize
+    mods_directory: string
+    allocator: Allocator
+
+    // Game data database (populated from base game + mods)
+    loaded_objects: []INISection      // All loaded unit/building definitions
+    loaded_weapons: []INISection      // All loaded weapon definitions
+    loaded_upgrades: []INISection     // All loaded upgrade definitions
+
+    fn init(allocator: Allocator, mods_directory: string): ModManager {
+        return ModManager {
+            mods: []
+            mod_count: 0
+            asset_overrides: []
+            override_count: 0
+            mods_directory: mods_directory
+            allocator: allocator
+            loaded_objects: []
+            loaded_weapons: []
+            loaded_upgrades: []
+        }
+    }
+
+    fn scan_mods(mut self) {
+        println("Scanning for mods in: {self.mods_directory}")
+
+        let mod_dirs = filesystem_list_directories(self.mods_directory)
+
+        for mod_dir in mod_dirs {
+            let mod_ini_path = mod_dir + "/mod.ini"
+
+            if filesystem_file_exists(mod_ini_path) {
+                let mod_info = self.load_mod_metadata(mod_ini_path, mod_dir)
+
+                if mod_info {
+                    self.add_mod(mod_info.?)
+                    println("  Found mod: {mod_info.?.name} (v{mod_info.?.version})")
+                }
+            }
+        }
+
+        println("Total mods found: {self.mod_count}")
+    }
+
+    fn load_mod_metadata(mut self, mod_ini_path: string, mod_directory: string): ?ModInfo {
+        let mut parser = INIParser.init(self.allocator)
+        let doc = parser.parse_file(mod_ini_path)
+
+        if !doc {
+            return null
+        }
+
+        // Find "Mod" section
+        let sections = doc.?.get_all_sections("Mod")
+        if sections.len == 0 {
+            return null
+        }
+
+        let mod_section = sections[0]
+
+        let mut info = ModInfo.init(mod_section.name)
+        info.name = mod_section.get_string("Name", mod_section.name)
+        info.version = mod_section.get_string("Version", "1.0")
+        info.author = mod_section.get_string("Author", "Unknown")
+        info.description = mod_section.get_string("Description", "")
+        info.load_order = mod_section.get_int("LoadOrder", 100)
+        info.mod_directory = mod_directory
+
+        // Parse dependencies
+        let deps_str = mod_section.get_string("Dependencies", "")
+        if deps_str.len > 0 {
+            info.dependencies = deps_str.split(",")
+        }
+
+        // Parse conflicts
+        let conflicts_str = mod_section.get_string("Conflicts", "")
+        if conflicts_str.len > 0 {
+            info.conflicts = conflicts_str.split(",")
+        }
+
+        return info
+    }
+
+    fn add_mod(mut self, mod_info: ModInfo) {
+        let new_mods = self.allocator.alloc(ModInfo, self.mod_count + 1)
+
+        for i in 0..self.mod_count {
+            new_mods[i] = self.mods[i]
+        }
+
+        new_mods[self.mod_count] = mod_info
+
+        if self.mod_count > 0 {
+            self.allocator.free(self.mods)
+        }
+
+        self.mods = new_mods
+        self.mod_count += 1
+    }
+
+    fn sort_mods_by_load_order(mut self) {
+        // Sort by load_order (ascending - lower loads first)
+        for i in 0..self.mod_count {
+            for j in 0..(self.mod_count - i - 1) {
+                if self.mods[j].load_order > self.mods[j + 1].load_order {
+                    let temp = self.mods[j]
+                    self.mods[j] = self.mods[j + 1]
+                    self.mods[j + 1] = temp
+                }
+            }
+        }
+    }
+
+    fn validate_dependencies(self): bool {
+        for i in 0..self.mod_count {
+            let mod_info = &self.mods[i]
+
+            if !mod_info.enabled {
+                continue
+            }
+
+            // Check dependencies
+            for dep in mod_info.dependencies {
+                if !self.is_mod_loaded(dep) {
+                    println("Error: Mod '{mod_info.name}' requires '{dep}' which is not loaded")
+                    return false
+                }
+            }
+
+            // Check conflicts
+            for conflict in mod_info.conflicts {
+                if self.is_mod_loaded(conflict) {
+                    println("Error: Mod '{mod_info.name}' conflicts with '{conflict}'")
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
+    fn is_mod_loaded(self, mod_id: string): bool {
+        for i in 0..self.mod_count {
+            if self.mods[i].mod_id == mod_id and self.mods[i].enabled {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn load_all_mods(mut self): bool {
+        println("\n=== Loading Mods ===")
+
+        // Sort by load order
+        self.sort_mods_by_load_order()
+
+        // Validate dependencies
+        if !self.validate_dependencies() {
+            println("Mod validation failed!")
+            return false
+        }
+
+        // Load base game data first
+        println("Loading base game data...")
+        self.load_base_game_data()
+
+        // Load each mod in order
+        for i in 0..self.mod_count {
+            if self.mods[i].enabled {
+                println("Loading mod: {self.mods[i].name}")
+                self.load_mod(&self.mods[i])
+            }
+        }
+
+        println("\n=== Mod Loading Complete ===")
+        println("Total Objects Loaded: {self.loaded_objects.len}")
+        println("Total Weapons Loaded: {self.loaded_weapons.len}")
+        println("Total Upgrades Loaded: {self.loaded_upgrades.len}")
+
+        return true
+    }
+
+    fn load_base_game_data(mut self) {
+        // Load all base game INI files
+        self.load_ini_directory("Data/INI/Object/", "Object")
+        self.load_ini_file("Data/INI/Weapon.ini", "Weapon")
+        self.load_ini_file("Data/INI/Upgrade.ini", "Upgrade")
+        self.load_ini_file("Data/INI/Science.ini", "Science")
+        self.load_ini_file("Data/INI/CommandSet.ini", "CommandSet")
+    }
+
+    fn load_mod(mut self, mod_info: *ModInfo) {
+        // Load mod's Data/INI/ directory
+        let mod_ini_dir = mod_info.mod_directory + "/Data/INI/"
+
+        if filesystem_directory_exists(mod_ini_dir) {
+            // Load Object definitions
+            self.load_ini_directory(mod_ini_dir + "Object/", "Object")
+
+            // Load other INI files
+            self.load_ini_file(mod_ini_dir + "Weapon.ini", "Weapon")
+            self.load_ini_file(mod_ini_dir + "Upgrade.ini", "Upgrade")
+            self.load_ini_file(mod_ini_dir + "CommandSet.ini", "CommandSet")
+        }
+
+        // TODO: Load other asset types (models, textures, audio)
+    }
+
+    fn load_ini_directory(mut self, directory: string, section_type: string) {
+        let ini_files = filesystem_scan_directory(directory, "*.ini")
+
+        for ini_path in ini_files {
+            self.load_ini_file(ini_path, section_type)
+        }
+    }
+
+    fn load_ini_file(mut self, filepath: string, section_type: string) {
+        if !filesystem_file_exists(filepath) {
+            return
+        }
+
+        let mut parser = INIParser.init(self.allocator)
+        let doc = parser.parse_file(filepath)
+
+        if !doc {
+            println("  Warning: Failed to parse {filepath}")
+            return
+        }
+
+        // Get all sections of the specified type
+        let sections = doc.?.get_all_sections(section_type)
+
+        for section in sections {
+            // Check if this object already exists (mod override)
+            let existing_index = self.find_object_index(section.name)
+
+            if existing_index >= 0 {
+                // Override existing definition
+                println("  Override: {section.name}")
+                self.loaded_objects[@intCast(usize, existing_index)] = section.*
+            } else {
+                // Add new definition
+                self.add_object_definition(section.*)
+            }
+        }
+    }
+
+    fn find_object_index(self, object_name: string): i32 {
+        for i in 0..self.loaded_objects.len {
+            if self.loaded_objects[i].name == object_name {
+                return @intCast(i32, i)
+            }
+        }
+        return -1
+    }
+
+    fn add_object_definition(mut self, section: INISection) {
+        let new_objects = self.allocator.alloc(INISection, self.loaded_objects.len + 1)
+
+        for i in 0..self.loaded_objects.len {
+            new_objects[i] = self.loaded_objects[i]
+        }
+
+        new_objects[self.loaded_objects.len] = section
+
+        if self.loaded_objects.len > 0 {
+            self.allocator.free(self.loaded_objects)
+        }
+
+        self.loaded_objects = new_objects
+    }
+
+    fn get_object(self, object_name: string): ?*INISection {
+        for i in 0..self.loaded_objects.len {
+            if self.loaded_objects[i].name == object_name {
+                return &self.loaded_objects[i]
+            }
+        }
+        return null
+    }
+
+    fn get_all_objects_by_side(self, side: string): []*INISection {
+        let mut result: []*INISection = []
+
+        for i in 0..self.loaded_objects.len {
+            let side_value = self.loaded_objects[i].get_string("Side", "")
+            if side_value == side {
+                result = result.append(&self.loaded_objects[i])
+            }
+        }
+
+        return result
+    }
+
+    fn print_loaded_mods(self) {
+        println("\n=== Loaded Mods ===")
+
+        for i in 0..self.mod_count {
+            let mod_info = &self.mods[i]
+            let status = if mod_info.enabled { "ENABLED" } else { "DISABLED" }
+
+            println("{i + 1}. {mod_info.name} (v{mod_info.version}) [{status}]")
+            println("   Author: {mod_info.author}")
+            println("   Load Order: {mod_info.load_order}")
+
+            if mod_info.dependencies.len > 0 {
+                println("   Dependencies: {mod_info.dependencies}")
+            }
+        }
+    }
+
+    fn deinit(mut self) {
+        if self.mod_count > 0 {
+            self.allocator.free(self.mods)
+        }
+        if self.override_count > 0 {
+            self.allocator.free(self.asset_overrides)
+        }
+        if self.loaded_objects.len > 0 {
+            self.allocator.free(self.loaded_objects)
+        }
+    }
+}
+
+// Global mod manager
+var g_mod_manager: ?ModManager = null
+
+export fn init_mod_system(mods_directory: string) {
+    let allocator = get_global_allocator()
+    g_mod_manager = ModManager.init(allocator, mods_directory)
+}
+
+export fn load_all_mods(): bool {
+    if !g_mod_manager {
+        println("Error: Mod system not initialized")
+        return false
+    }
+
+    g_mod_manager.?.scan_mods()
+    g_mod_manager.?.print_loaded_mods()
+
+    return g_mod_manager.?.load_all_mods()
+}
+
+export fn get_object_definition(object_name: string): ?*INISection {
+    if !g_mod_manager {
+        return null
+    }
+
+    return g_mod_manager.?.get_object(object_name)
+}
+
+export fn shutdown_mod_system() {
+    if g_mod_manager {
+        g_mod_manager.?.deinit()
+        g_mod_manager = null
+    }
+}
+
+// Placeholder filesystem functions
+fn filesystem_list_directories(path: string): []string {
+    // TODO: Implement directory listing
+    return []
+}
+
+fn filesystem_file_exists(path: string): bool {
+    // TODO: Check if file exists
+    return false
+}
+
+fn filesystem_directory_exists(path: string): bool {
+    // TODO: Check if directory exists
+    return false
+}
+
+fn filesystem_scan_directory(dir: string, pattern: string): []string {
+    // TODO: Scan directory for files matching pattern
+    return []
+}
+
+fn get_global_allocator(): Allocator {
+    // TODO: Return global allocator
+    return Allocator {}
+}
