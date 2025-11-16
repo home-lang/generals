@@ -1,0 +1,432 @@
+// C&C Generals Zero Hour - Home Port
+// Behavior Tree System
+//
+// Modern AI behavior tree implementation for unit and AI decision making.
+// Behavior trees are more flexible and maintainable than traditional FSMs.
+//
+// Node types:
+// - Leaf nodes: Actions and Conditions
+// - Composite nodes: Sequence, Selector, Parallel
+// - Decorator nodes: Inverter, Repeater, UntilFail
+//
+// Usage:
+// ```
+// let tree = BehaviorTree.create("UnitAI")
+//
+// let root = tree.add_selector()  // Try behaviors in order
+// let attack_sequence = tree.add_sequence(root)
+//
+// tree.add_condition(attack_sequence, has_enemy_in_range)
+// tree.add_action(attack_sequence, attack_enemy)
+//
+// let patrol_sequence = tree.add_sequence(root)
+// tree.add_action(patrol_sequence, patrol_waypoints)
+//
+// // Each frame:
+// tree.tick(unit, delta_time)
+// ```
+
+import basics/allocator
+
+const MAX_TREE_NODES: u32 = 256
+
+// Behavior tree node status
+enum BehaviorStatus {
+    Success   // Node completed successfully
+    Failure   // Node failed
+    Running   // Node is still executing
+}
+
+// Node type
+enum NodeType {
+    // Leaf nodes
+    Action
+    Condition
+
+    // Composite nodes
+    Sequence   // Execute children in order, fail if any fails
+    Selector   // Try children in order, succeed on first success
+    Parallel   // Execute all children simultaneously
+
+    // Decorator nodes
+    Inverter    // Invert child result
+    Repeater    // Repeat child N times
+    UntilFail   // Repeat child until it fails
+    AlwaysSucceed  // Always return success regardless of child
+}
+
+// Behavior tree node
+struct BehaviorNode {
+    id: u32
+    node_type: NodeType
+    name: string
+
+    // Tree structure
+    parent_id: i32      // -1 if root
+    children_ids: [16]u32
+    child_count: u32
+
+    // Node-specific data
+    current_child: u32  // For sequence/selector progress
+
+    // Action/Condition function pointer
+    // (In real implementation, would be function pointer or trait object)
+    action_id: u32
+
+    // Decorator settings
+    repeat_count: u32
+    current_repeat: u32
+
+    fn init(id: u32, node_type: NodeType, name: string): BehaviorNode {
+        return BehaviorNode {
+            id: id
+            node_type: node_type
+            name: name
+            parent_id: -1
+            children_ids: [0; 16]
+            child_count: 0
+            current_child: 0
+            action_id: 0
+            repeat_count: 1
+            current_repeat: 0
+        }
+    }
+
+    fn add_child(mut self, child_id: u32) {
+        if self.child_count < 16 {
+            self.children_ids[self.child_count] = child_id
+            self.child_count += 1
+        }
+    }
+
+    fn reset(mut self) {
+        self.current_child = 0
+        self.current_repeat = 0
+    }
+}
+
+// Behavior tree
+struct BehaviorTree {
+    name: string
+    nodes: [MAX_TREE_NODES]BehaviorNode
+    node_count: u32
+    next_node_id: u32
+
+    root_id: u32
+
+    // Blackboard (shared data between nodes)
+    blackboard: Blackboard
+
+    allocator: Allocator
+
+    fn create(allocator: Allocator, name: string): BehaviorTree {
+        return BehaviorTree {
+            name: name
+            nodes: [BehaviorNode.init(0, NodeType.Action, ""); MAX_TREE_NODES]
+            node_count: 0
+            next_node_id: 1
+            root_id: 0
+            blackboard: Blackboard.init()
+            allocator: allocator
+        }
+    }
+
+    fn add_node(mut self, node_type: NodeType, name: string, parent_id: i32): u32 {
+        if self.node_count >= MAX_TREE_NODES {
+            println("BehaviorTree: Cannot add node - max limit reached")
+            return 0
+        }
+
+        let node_id = self.next_node_id
+        self.next_node_id += 1
+
+        self.nodes[self.node_count] = BehaviorNode.init(node_id, node_type, name)
+        self.nodes[self.node_count].parent_id = parent_id
+
+        // Add as child to parent
+        if parent_id >= 0 {
+            let parent = self.get_node(@intCast(u32, parent_id))
+            if parent {
+                parent.?.add_child(node_id)
+            }
+        } else {
+            // This is the root node
+            self.root_id = node_id
+        }
+
+        self.node_count += 1
+
+        return node_id
+    }
+
+    fn add_sequence(mut self, parent_id: i32): u32 {
+        return self.add_node(NodeType.Sequence, "Sequence", parent_id)
+    }
+
+    fn add_selector(mut self, parent_id: i32): u32 {
+        return self.add_node(NodeType.Selector, "Selector", parent_id)
+    }
+
+    fn add_parallel(mut self, parent_id: i32): u32 {
+        return self.add_node(NodeType.Parallel, "Parallel", parent_id)
+    }
+
+    fn add_action(mut self, parent_id: i32, name: string, action_id: u32): u32 {
+        let node_id = self.add_node(NodeType.Action, name, parent_id)
+        let node = self.get_node(node_id)
+        if node {
+            node.?.action_id = action_id
+        }
+        return node_id
+    }
+
+    fn add_condition(mut self, parent_id: i32, name: string, action_id: u32): u32 {
+        let node_id = self.add_node(NodeType.Condition, name, parent_id)
+        let node = self.get_node(node_id)
+        if node {
+            node.?.action_id = action_id
+        }
+        return node_id
+    }
+
+    fn get_node(mut self, node_id: u32): ?*BehaviorNode {
+        for i in 0..self.node_count {
+            if self.nodes[i].id == node_id {
+                return &self.nodes[i]
+            }
+        }
+        return null
+    }
+
+    fn tick(mut self, entity: *void, delta_time: f32): BehaviorStatus {
+        if self.root_id == 0 {
+            return BehaviorStatus.Failure
+        }
+
+        return self.tick_node(self.root_id, entity, delta_time)
+    }
+
+    fn tick_node(mut self, node_id: u32, entity: *void, delta_time: f32): BehaviorStatus {
+        let node = self.get_node(node_id)
+        if !node {
+            return BehaviorStatus.Failure
+        }
+
+        return match node.?.node_type {
+            NodeType.Action => self.tick_action(node.?, entity, delta_time)
+            NodeType.Condition => self.tick_condition(node.?, entity, delta_time)
+            NodeType.Sequence => self.tick_sequence(node.?, entity, delta_time)
+            NodeType.Selector => self.tick_selector(node.?, entity, delta_time)
+            NodeType.Parallel => self.tick_parallel(node.?, entity, delta_time)
+            NodeType.Inverter => self.tick_inverter(node.?, entity, delta_time)
+            NodeType.Repeater => self.tick_repeater(node.?, entity, delta_time)
+            NodeType.UntilFail => self.tick_until_fail(node.?, entity, delta_time)
+            NodeType.AlwaysSucceed => self.tick_always_succeed(node.?, entity, delta_time)
+        }
+    }
+
+    fn tick_action(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        // Execute action
+        // TODO: Call actual action function via action_id
+        return BehaviorStatus.Success
+    }
+
+    fn tick_condition(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        // Evaluate condition
+        // TODO: Call actual condition function via action_id
+        return BehaviorStatus.Success
+    }
+
+    fn tick_sequence(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        // Execute children in sequence
+        while node.current_child < node.child_count {
+            let child_id = node.children_ids[node.current_child]
+            let status = self.tick_node(child_id, entity, delta_time)
+
+            if status == BehaviorStatus.Failure {
+                node.reset()
+                return BehaviorStatus.Failure
+            }
+
+            if status == BehaviorStatus.Running {
+                return BehaviorStatus.Running
+            }
+
+            // Success - move to next child
+            node.current_child += 1
+        }
+
+        // All children succeeded
+        node.reset()
+        return BehaviorStatus.Success
+    }
+
+    fn tick_selector(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        // Try children until one succeeds
+        while node.current_child < node.child_count {
+            let child_id = node.children_ids[node.current_child]
+            let status = self.tick_node(child_id, entity, delta_time)
+
+            if status == BehaviorStatus.Success {
+                node.reset()
+                return BehaviorStatus.Success
+            }
+
+            if status == BehaviorStatus.Running {
+                return BehaviorStatus.Running
+            }
+
+            // Failure - try next child
+            node.current_child += 1
+        }
+
+        // All children failed
+        node.reset()
+        return BehaviorStatus.Failure
+    }
+
+    fn tick_parallel(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        // Execute all children simultaneously
+        let mut success_count: u32 = 0
+        let mut failure_count: u32 = 0
+        let mut running_count: u32 = 0
+
+        for i in 0..node.child_count {
+            let child_id = node.children_ids[i]
+            let status = self.tick_node(child_id, entity, delta_time)
+
+            if status == BehaviorStatus.Success {
+                success_count += 1
+            } else if status == BehaviorStatus.Failure {
+                failure_count += 1
+            } else {
+                running_count += 1
+            }
+        }
+
+        if running_count > 0 {
+            return BehaviorStatus.Running
+        }
+
+        if failure_count > 0 {
+            return BehaviorStatus.Failure
+        }
+
+        return BehaviorStatus.Success
+    }
+
+    fn tick_inverter(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        if node.child_count == 0 {
+            return BehaviorStatus.Failure
+        }
+
+        let child_id = node.children_ids[0]
+        let status = self.tick_node(child_id, entity, delta_time)
+
+        if status == BehaviorStatus.Running {
+            return BehaviorStatus.Running
+        }
+
+        return if status == BehaviorStatus.Success {
+            BehaviorStatus.Failure
+        } else {
+            BehaviorStatus.Success
+        }
+    }
+
+    fn tick_repeater(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        if node.child_count == 0 {
+            return BehaviorStatus.Failure
+        }
+
+        while node.current_repeat < node.repeat_count {
+            let child_id = node.children_ids[0]
+            let status = self.tick_node(child_id, entity, delta_time)
+
+            if status == BehaviorStatus.Running {
+                return BehaviorStatus.Running
+            }
+
+            if status == BehaviorStatus.Failure {
+                node.reset()
+                return BehaviorStatus.Failure
+            }
+
+            node.current_repeat += 1
+        }
+
+        node.reset()
+        return BehaviorStatus.Success
+    }
+
+    fn tick_until_fail(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        if node.child_count == 0 {
+            return BehaviorStatus.Failure
+        }
+
+        let child_id = node.children_ids[0]
+        let status = self.tick_node(child_id, entity, delta_time)
+
+        if status == BehaviorStatus.Failure {
+            return BehaviorStatus.Success
+        }
+
+        return BehaviorStatus.Running
+    }
+
+    fn tick_always_succeed(mut self, node: *BehaviorNode, entity: *void, delta_time: f32): BehaviorStatus {
+        if node.child_count == 0 {
+            return BehaviorStatus.Success
+        }
+
+        let child_id = node.children_ids[0]
+        self.tick_node(child_id, entity, delta_time)
+
+        return BehaviorStatus.Success
+    }
+
+    fn reset(mut self) {
+        for i in 0..self.node_count {
+            self.nodes[i].reset()
+        }
+    }
+}
+
+// Blackboard for shared data
+struct Blackboard {
+    // Simple key-value store
+    // In real implementation, would use HashMap<string, Value>
+
+    fn init(): Blackboard {
+        return Blackboard {}
+    }
+
+    fn set_value(mut self, key: string, value: i32) {
+        // TODO: Store value
+    }
+
+    fn get_value(self, key: string): i32 {
+        // TODO: Retrieve value
+        return 0
+    }
+}
+
+// Global behavior tree (or could have multiple trees)
+var g_behavior_tree: ?BehaviorTree = null
+
+export fn init_behavior_tree_system(allocator: Allocator) {
+    println("BehaviorTree: System initialized")
+}
+
+export fn shutdown_behavior_tree_system() {
+    println("BehaviorTree: System shutdown")
+}
+
+export fn create_behavior_tree(allocator: Allocator, name: string): BehaviorTree {
+    return BehaviorTree.create(allocator, name)
+}
+
+fn get_global_allocator(): Allocator {
+    // TODO: Return global allocator
+    return Allocator {}
+}
