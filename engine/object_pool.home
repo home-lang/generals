@@ -1,0 +1,424 @@
+// C&C Generals Zero Hour - Home Port
+// Object Pooling System
+//
+// Original: EA used custom memory pools (see memory.home)
+// Enhanced with typed object pooling for frequently allocated objects
+//
+// EA's memory strategy:
+// - 3-tier memory pooling (fixed-size blocks)
+// - Reduces allocation overhead
+// - Improves cache locality
+// - Prevents memory fragmentation
+//
+// This system adds object-level pooling for:
+// - Particles (thousands created/destroyed per frame)
+// - Projectiles (bullets, missiles, shells)
+// - Temporary effects (explosions, smoke, debris)
+// - Path nodes (for A* pathfinding)
+// - UI elements (tooltips, floating text)
+//
+// Benefits:
+// - Zero allocation cost after warmup
+// - Predictable memory usage
+// - Eliminates GC pressure
+// - Cache-friendly (objects in contiguous array)
+//
+// Usage:
+// ```
+// let particle_pool = ObjectPool<Particle>.init(allocator, 10000)
+//
+// // Acquire object from pool
+// let particle = particle_pool.acquire()
+// if particle {
+//     particle.?.position = Vec3.new(0.0, 0.0, 0.0)
+//     particle.?.velocity = Vec3.new(1.0, 0.0, 0.0)
+// }
+//
+// // Return object to pool when done
+// particle_pool.release(particle.?)
+// ```
+
+import basics/allocator
+
+const MAX_POOL_SIZE: u32 = 16384  // Max objects per pool
+
+// Object pool for a specific type
+struct ObjectPool<T> {
+    objects: []T           // All objects (allocated once)
+    free_list: []u32       // Indices of free objects
+    free_count: u32        // Number of free objects
+
+    active_count: u32      // Number of objects in use
+    peak_count: u32        // Peak usage
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, capacity: u32): ObjectPool<T> {
+        let size = if capacity > MAX_POOL_SIZE {
+            MAX_POOL_SIZE
+        } else {
+            capacity
+        }
+
+        // Allocate all objects upfront
+        let objects = allocator.alloc_array<T>(size)
+
+        // Initialize free list (all objects are free initially)
+        let free_list = allocator.alloc_array<u32>(size)
+        for i in 0..size {
+            free_list[i] = i
+        }
+
+        return ObjectPool<T> {
+            objects: objects
+            free_list: free_list
+            free_count: size
+            active_count: 0
+            peak_count: 0
+            allocator: allocator
+        }
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free_array(self.objects)
+        self.allocator.free_array(self.free_list)
+    }
+
+    fn acquire(mut self): ?*T {
+        if self.free_count == 0 {
+            println("ObjectPool: No free objects available!")
+            return null
+        }
+
+        // Pop from free list
+        self.free_count -= 1
+        let index = self.free_list[self.free_count]
+
+        self.active_count += 1
+
+        if self.active_count > self.peak_count {
+            self.peak_count = self.active_count
+        }
+
+        return &self.objects[index]
+    }
+
+    fn release(mut self, obj: *T) {
+        // Find index of object
+        let obj_ptr = @ptrToInt(obj)
+        let base_ptr = @ptrToInt(&self.objects[0])
+        let index = (obj_ptr - base_ptr) / @sizeOf(T)
+
+        // Validate index
+        if index >= self.objects.len {
+            println("ObjectPool: Invalid object released!")
+            return
+        }
+
+        // Add to free list
+        if self.free_count >= self.free_list.len {
+            println("ObjectPool: Free list overflow!")
+            return
+        }
+
+        self.free_list[self.free_count] = @intCast(u32, index)
+        self.free_count += 1
+        self.active_count -= 1
+
+        // Reset object (optional - depends on type T)
+        // self.objects[index] = T.default()
+    }
+
+    fn clear(mut self) {
+        // Return all objects to free list
+        for i in 0..self.objects.len {
+            self.free_list[i] = @intCast(u32, i)
+        }
+
+        self.free_count = @intCast(u32, self.objects.len)
+        self.active_count = 0
+    }
+
+    fn get_capacity(self): u32 {
+        return @intCast(u32, self.objects.len)
+    }
+
+    fn get_active_count(self): u32 {
+        return self.active_count
+    }
+
+    fn get_free_count(self): u32 {
+        return self.free_count
+    }
+
+    fn get_peak_count(self): u32 {
+        return self.peak_count
+    }
+
+    fn get_usage_percentage(self): f32 {
+        if self.objects.len == 0 {
+            return 0.0
+        }
+
+        return @intToFloat(f32, self.active_count) / @intToFloat(f32, self.objects.len) * 100.0
+    }
+
+    fn print_stats(self, pool_name: string) {
+        println("\n=== {pool_name} Pool Stats ===")
+        println("Capacity: {self.get_capacity()}")
+        println("Active: {self.active_count}")
+        println("Free: {self.free_count}")
+        println("Peak: {self.peak_count}")
+        println("Usage: {self.get_usage_percentage():.1}%")
+    }
+}
+
+// Handle-based object pool (safer, prevents use-after-free)
+struct ObjectHandle {
+    index: u32      // Index into pool
+    generation: u32 // Generation counter (detect stale handles)
+}
+
+struct ObjectSlot<T> {
+    object: T
+    generation: u32
+    is_active: bool
+}
+
+struct HandleObjectPool<T> {
+    slots: []ObjectSlot<T>
+    free_list: []u32
+    free_count: u32
+
+    active_count: u32
+    peak_count: u32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, capacity: u32): HandleObjectPool<T> {
+        let size = if capacity > MAX_POOL_SIZE {
+            MAX_POOL_SIZE
+        } else {
+            capacity
+        }
+
+        let slots = allocator.alloc_array<ObjectSlot<T>>(size)
+        for i in 0..size {
+            slots[i].generation = 0
+            slots[i].is_active = false
+        }
+
+        let free_list = allocator.alloc_array<u32>(size)
+        for i in 0..size {
+            free_list[i] = i
+        }
+
+        return HandleObjectPool<T> {
+            slots: slots
+            free_list: free_list
+            free_count: size
+            active_count: 0
+            peak_count: 0
+            allocator: allocator
+        }
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free_array(self.slots)
+        self.allocator.free_array(self.free_list)
+    }
+
+    fn acquire(mut self): ObjectHandle {
+        if self.free_count == 0 {
+            println("HandleObjectPool: No free objects available!")
+            return ObjectHandle {
+                index: 0xFFFFFFFF
+                generation: 0
+            }
+        }
+
+        self.free_count -= 1
+        let index = self.free_list[self.free_count]
+
+        self.slots[index].is_active = true
+        self.slots[index].generation += 1
+
+        self.active_count += 1
+
+        if self.active_count > self.peak_count {
+            self.peak_count = self.active_count
+        }
+
+        return ObjectHandle {
+            index: index
+            generation: self.slots[index].generation
+        }
+    }
+
+    fn release(mut self, handle: ObjectHandle) {
+        if !self.is_valid(handle) {
+            println("HandleObjectPool: Invalid handle released!")
+            return
+        }
+
+        self.slots[handle.index].is_active = false
+
+        self.free_list[self.free_count] = handle.index
+        self.free_count += 1
+        self.active_count -= 1
+    }
+
+    fn get(mut self, handle: ObjectHandle): ?*T {
+        if !self.is_valid(handle) {
+            return null
+        }
+
+        return &self.slots[handle.index].object
+    }
+
+    fn is_valid(self, handle: ObjectHandle): bool {
+        if handle.index >= self.slots.len {
+            return false
+        }
+
+        if handle.generation != self.slots[handle.index].generation {
+            return false  // Stale handle
+        }
+
+        if !self.slots[handle.index].is_active {
+            return false
+        }
+
+        return true
+    }
+
+    fn clear(mut self) {
+        for i in 0..self.slots.len {
+            self.slots[i].is_active = false
+            self.free_list[i] = @intCast(u32, i)
+        }
+
+        self.free_count = @intCast(u32, self.slots.len)
+        self.active_count = 0
+    }
+
+    fn print_stats(self, pool_name: string) {
+        println("\n=== {pool_name} Handle Pool Stats ===")
+        println("Capacity: {self.slots.len}")
+        println("Active: {self.active_count}")
+        println("Free: {self.free_count}")
+        println("Peak: {self.peak_count}")
+        println("Usage: {self.get_usage_percentage():.1}%")
+    }
+
+    fn get_usage_percentage(self): f32 {
+        if self.slots.len == 0 {
+            return 0.0
+        }
+
+        return @intToFloat(f32, self.active_count) / @intToFloat(f32, self.slots.len) * 100.0
+    }
+}
+
+// Global pool manager (optional - for centralized stats)
+struct PoolManager {
+    total_pools: u32
+    total_capacity: u32
+    total_active: u32
+    total_peak: u32
+
+    fn init(): PoolManager {
+        return PoolManager {
+            total_pools: 0
+            total_capacity: 0
+            total_active: 0
+            total_peak: 0
+        }
+    }
+
+    fn register_pool(mut self, capacity: u32) {
+        self.total_pools += 1
+        self.total_capacity += capacity
+    }
+
+    fn update_stats(mut self, active: u32, peak: u32) {
+        self.total_active += active
+        if peak > self.total_peak {
+            self.total_peak = peak
+        }
+    }
+
+    fn print_global_stats(self) {
+        println("\n=== Pool Manager Global Stats ===")
+        println("Total Pools: {self.total_pools}")
+        println("Total Capacity: {self.total_capacity}")
+        println("Total Active: {self.total_active}")
+        println("Total Peak: {self.total_peak}")
+
+        if self.total_capacity > 0 {
+            let usage = @intToFloat(f32, self.total_active) / @intToFloat(f32, self.total_capacity) * 100.0
+            println("Global Usage: {usage:.1}%")
+        }
+    }
+}
+
+// Example particle struct (for demonstration)
+struct Particle {
+    position: Vec3
+    velocity: Vec3
+    color: Vec4
+    size: f32
+    lifetime: f32
+    age: f32
+
+    fn default(): Particle {
+        return Particle {
+            position: Vec3.zero()
+            velocity: Vec3.zero()
+            color: Vec4.new(1.0, 1.0, 1.0, 1.0)
+            size: 1.0
+            lifetime: 1.0
+            age: 0.0
+        }
+    }
+}
+
+struct Vec3 {
+    x: f32
+    y: f32
+    z: f32
+
+    fn zero(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+struct Vec4 {
+    x: f32
+    y: f32
+    z: f32
+    w: f32
+
+    fn new(x: f32, y: f32, z: f32, w: f32): Vec4 {
+        return Vec4 { x: x, y: y, z: z, w: w }
+    }
+}
+
+// Global pool manager
+var g_pool_manager: ?PoolManager = null
+
+export fn init_pool_manager() {
+    g_pool_manager = PoolManager.init()
+    println("PoolManager: Initialized")
+}
+
+export fn shutdown_pool_manager() {
+    if !g_pool_manager {
+        return
+    }
+
+    g_pool_manager.?.print_global_stats()
+    g_pool_manager = null
+
+    println("PoolManager: Shutdown")
+}

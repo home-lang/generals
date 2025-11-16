@@ -1,0 +1,372 @@
+// C&C Generals Zero Hour - Home Port
+// Frame Rate Limiter
+//
+// Original: FrameRateLimit.h (EA Games)
+// Ported to Home with EA's FPS limiting system
+//
+// EA's frame rate control:
+// - Configurable FPS cap (30, 60, 120, 144, 240, uncapped)
+// - High-precision waiting using performance counter
+// - Separate logic and render FPS
+// - Logic runs at fixed 30 FPS (LOGICFRAMES_PER_SECOND)
+// - Render can run at higher FPS
+//
+// Usage:
+// ```
+// let limiter = FrameRateLimiter.init()
+// limiter.set_target_fps(60)
+//
+// loop {
+//     limiter.wait()  // Sleep until next frame
+//     update_game()
+//     render_game()
+// }
+// ```
+
+import basics/time
+
+const LOGICFRAMES_PER_SECOND: u32 = 30  // EA's fixed logic rate
+
+// Common FPS presets matching EA's system
+const FPS_PRESET_30: u32 = 30
+const FPS_PRESET_60: u32 = 60
+const FPS_PRESET_120: u32 = 120
+const FPS_PRESET_144: u32 = 144
+const FPS_PRESET_240: u32 = 240
+const FPS_PRESET_UNCAPPED: u32 = 1000000
+
+// Frame rate limiter
+struct FrameRateLimiter {
+    target_fps: u32
+    target_frame_time_ns: i64
+
+    last_frame_time_ns: i64
+    frame_start_time_ns: i64
+
+    // Statistics
+    actual_fps: f32
+    frame_time_ms: f32
+
+    // FPS history for smoothing
+    fps_history: [60]f32
+    fps_history_index: u32
+    fps_history_count: u32
+
+    fn init(): FrameRateLimiter {
+        return FrameRateLimiter {
+            target_fps: FPS_PRESET_60
+            target_frame_time_ns: 16666666  // ~60 FPS
+            last_frame_time_ns: get_time_nanoseconds()
+            frame_start_time_ns: get_time_nanoseconds()
+            actual_fps: 60.0
+            frame_time_ms: 16.66
+            fps_history: [60.0; 60]
+            fps_history_index: 0
+            fps_history_count: 0
+        }
+    }
+
+    fn set_target_fps(mut self, fps: u32) {
+        self.target_fps = fps
+
+        if fps >= FPS_PRESET_UNCAPPED {
+            self.target_frame_time_ns = 0  // No limit
+        } else {
+            // Calculate target frame time in nanoseconds
+            self.target_frame_time_ns = 1000000000 / @intCast(i64, fps)
+        }
+
+        println("FrameLimiter: Target FPS set to {fps}")
+    }
+
+    fn set_preset(mut self, preset: FPSPreset) {
+        let fps = match preset {
+            FPSPreset.FPS30 => FPS_PRESET_30
+            FPSPreset.FPS60 => FPS_PRESET_60
+            FPSPreset.FPS120 => FPS_PRESET_120
+            FPSPreset.FPS144 => FPS_PRESET_144
+            FPSPreset.FPS240 => FPS_PRESET_240
+            FPSPreset.Uncapped => FPS_PRESET_UNCAPPED
+        }
+
+        self.set_target_fps(fps)
+    }
+
+    fn begin_frame(mut self) {
+        self.frame_start_time_ns = get_time_nanoseconds()
+    }
+
+    fn wait(mut self) {
+        if self.target_frame_time_ns == 0 {
+            // Uncapped - no waiting
+            self.update_stats()
+            return
+        }
+
+        let now = get_time_nanoseconds()
+        let elapsed_ns = now - self.last_frame_time_ns
+
+        if elapsed_ns < self.target_frame_time_ns {
+            let sleep_ns = self.target_frame_time_ns - elapsed_ns
+
+            // Sleep for most of the time
+            if sleep_ns > 1000000 {  // > 1ms
+                sleep_milliseconds(@intCast(u32, sleep_ns / 1000000))
+            }
+
+            // Busy-wait for the rest (more precise)
+            loop {
+                now = get_time_nanoseconds()
+                if now - self.last_frame_time_ns >= self.target_frame_time_ns {
+                    break
+                }
+            }
+        }
+
+        self.last_frame_time_ns = now
+        self.update_stats()
+    }
+
+    fn update_stats(mut self) {
+        let now = get_time_nanoseconds()
+        let frame_time_ns = now - self.frame_start_time_ns
+
+        self.frame_time_ms = @intToFloat(f32, frame_time_ns) / 1000000.0
+
+        if frame_time_ns > 0 {
+            let current_fps = 1000000000.0 / @intToFloat(f32, frame_time_ns)
+
+            // Store in history
+            self.fps_history[self.fps_history_index] = current_fps
+            self.fps_history_index = (self.fps_history_index + 1) % 60
+
+            if self.fps_history_count < 60 {
+                self.fps_history_count += 1
+            }
+
+            // Calculate smoothed FPS
+            let mut total_fps: f32 = 0.0
+            for i in 0..self.fps_history_count {
+                total_fps += self.fps_history[i]
+            }
+
+            self.actual_fps = total_fps / @intToFloat(f32, self.fps_history_count)
+        }
+    }
+
+    fn get_fps(self): f32 {
+        return self.actual_fps
+    }
+
+    fn get_frame_time_ms(self): f32 {
+        return self.frame_time_ms
+    }
+
+    fn get_target_fps(self): u32 {
+        return self.target_fps
+    }
+}
+
+// FPS presets enum
+enum FPSPreset {
+    FPS30
+    FPS60
+    FPS120
+    FPS144
+    FPS240
+    Uncapped
+}
+
+// Logic timestep manager (EA's fixed timestep system)
+struct LogicTimestep {
+    logic_hz: u32           // Fixed logic rate (30 Hz)
+    logic_dt: f32           // Fixed logic delta time (1/30 = 0.0333s)
+
+    accumulator: f32        // Accumulated time for logic updates
+
+    max_accumulator: f32    // Prevent spiral of death
+
+    fn init(): LogicTimestep {
+        let hz = LOGICFRAMES_PER_SECOND
+        let dt = 1.0 / @intToFloat(f32, hz)
+
+        return LogicTimestep {
+            logic_hz: hz
+            logic_dt: dt
+            accumulator: 0.0
+            max_accumulator: dt * 5.0  // Max 5 frames behind
+        }
+    }
+
+    fn update(mut self, delta_time: f32): u32 {
+        self.accumulator += delta_time
+
+        // Clamp accumulator to prevent spiral of death
+        if self.accumulator > self.max_accumulator {
+            self.accumulator = self.max_accumulator
+        }
+
+        // Run logic updates in fixed steps
+        let mut logic_steps: u32 = 0
+
+        while self.accumulator >= self.logic_dt {
+            self.accumulator -= self.logic_dt
+            logic_steps += 1
+        }
+
+        return logic_steps
+    }
+
+    fn get_alpha(self): f32 {
+        // Interpolation alpha for rendering between logic frames
+        return self.accumulator / self.logic_dt
+    }
+
+    fn get_fixed_dt(self): f32 {
+        return self.logic_dt
+    }
+}
+
+// FPS preset cycling (EA's system for changing FPS in-game)
+struct FPSPresetCycler {
+    presets: []u32
+    current_index: u32
+
+    fn init(): FPSPresetCycler {
+        return FPSPresetCycler {
+            presets: [
+                FPS_PRESET_30,
+                FPS_PRESET_60,
+                FPS_PRESET_120,
+                FPS_PRESET_144,
+                FPS_PRESET_240,
+                FPS_PRESET_UNCAPPED
+            ]
+            current_index: 1  // Start at 60 FPS
+        }
+    }
+
+    fn get_current_fps(self): u32 {
+        return self.presets[self.current_index]
+    }
+
+    fn next_preset(mut self): u32 {
+        self.current_index = (self.current_index + 1) % self.presets.len
+        return self.get_current_fps()
+    }
+
+    fn prev_preset(mut self): u32 {
+        if self.current_index == 0 {
+            self.current_index = self.presets.len - 1
+        } else {
+            self.current_index -= 1
+        }
+        return self.get_current_fps()
+    }
+
+    fn set_fps(mut self, fps: u32): bool {
+        for i in 0..self.presets.len {
+            if self.presets[i] == fps {
+                self.current_index = i
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Global frame limiter
+var g_frame_limiter: ?FrameRateLimiter = null
+var g_logic_timestep: ?LogicTimestep = null
+
+export fn init_frame_limiter() {
+    g_frame_limiter = FrameRateLimiter.init()
+    g_logic_timestep = LogicTimestep.init()
+
+    println("FrameLimiter: Initialized (target: 60 FPS)")
+}
+
+export fn shutdown_frame_limiter() {
+    g_frame_limiter = null
+    g_logic_timestep = null
+
+    println("FrameLimiter: Shutdown")
+}
+
+export fn set_target_fps(fps: u32) {
+    if !g_frame_limiter {
+        return
+    }
+
+    g_frame_limiter.?.set_target_fps(fps)
+}
+
+export fn begin_frame() {
+    if !g_frame_limiter {
+        return
+    }
+
+    g_frame_limiter.?.begin_frame()
+}
+
+export fn wait_for_next_frame() {
+    if !g_frame_limiter {
+        return
+    }
+
+    g_frame_limiter.?.wait()
+}
+
+export fn get_current_fps(): f32 {
+    if !g_frame_limiter {
+        return 0.0
+    }
+
+    return g_frame_limiter.?.get_fps()
+}
+
+export fn get_frame_time(): f32 {
+    if !g_frame_limiter {
+        return 0.0
+    }
+
+    return g_frame_limiter.?.get_frame_time_ms()
+}
+
+export fn get_logic_updates(delta_time: f32): u32 {
+    if !g_logic_timestep {
+        return 1  // Fallback: one logic update per frame
+    }
+
+    return g_logic_timestep.?.update(delta_time)
+}
+
+export fn get_logic_alpha(): f32 {
+    if !g_logic_timestep {
+        return 1.0
+    }
+
+    return g_logic_timestep.?.get_alpha()
+}
+
+export fn get_fixed_logic_dt(): f32 {
+    if !g_logic_timestep {
+        return 0.0333
+    }
+
+    return g_logic_timestep.?.get_fixed_dt()
+}
+
+// Platform-specific timing functions
+fn get_time_nanoseconds(): i64 {
+    // TODO: Use platform-specific monotonic clock
+    // On Windows: QueryPerformanceCounter
+    // On macOS/Linux: clock_gettime(CLOCK_MONOTONIC)
+    return 0
+}
+
+fn sleep_milliseconds(ms: u32) {
+    // TODO: Platform-specific sleep
+    // On Windows: Sleep(ms)
+    // On POSIX: usleep(ms * 1000)
+}

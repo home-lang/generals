@@ -1,4 +1,4 @@
-# Command & Conquer: Generals Zero Hour - Home Language Port
+# Command & Conquer: Generals – Zero Hour
 
 **A complete reimplementation of EA's AAA RTS game engine in the Home programming language**
 
@@ -11,7 +11,7 @@
 
 ## 📖 Overview
 
-This project is a faithful port of Command & Conquer: Generals Zero Hour from C++ to the **Home programming language**. The original game consisted of 4,385 C++ source files totaling over 500,000 lines of code. This port preserves EA's original architecture while leveraging Home's modern features for safety, performance, and cross-platform support.
+This project is a faithful port of Command & Conquer: Generals – Zero Hour from C++ to the **Home programming language**. The original game consisted of 4,385 C++ source files totaling over 500,000 lines of code. This port preserves EA's original architecture while leveraging Home's modern features for safety, performance, and cross-platform support.
 
 **Original Source**: `~/Code/generals-old` (EA's C++20 codebase with GPL-3.0 license)
 **Target Platform**: Windows, macOS, Linux
@@ -21,7 +21,7 @@ This project is a faithful port of Command & Conquer: Generals Zero Hour from C+
 
 ## 🎮 What Is This?
 
-Command & Conquer: Generals Zero Hour is a real-time strategy (RTS) game developed by EA Pacific and released in 2003. This project:
+Command & Conquer: Generals – Zero Hour is a real-time strategy (RTS) game developed by EA Pacific and released in 2003. This project:
 
 - ✅ Preserves EA's exact file formats (.w3d models, .big archives, .ini data files)
 - ✅ Implements EA's game architecture (ECS, script engine, campaign system)

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Refactoring the Command & Conquer: Generals Zero Hour C++ codebase (4,385 source files) to the Home programming language. This is a complete reimplementation of a AAA RTS game engine with modern language features.
+Refactoring the Command & Conquer: Generals – Zero Hour C++ codebase (4,385 source files) to the Home programming language. This is a complete reimplementation of a AAA RTS game engine with modern language features.
 
 **Original:** ~/Code/generals-old (C++20 codebase)
 **Target:** ~/Code/generals (Home language)

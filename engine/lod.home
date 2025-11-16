@@ -1,0 +1,495 @@
+// C&C Generals Zero Hour - Home Port
+// Level of Detail (LOD) System
+//
+// Original: GameLOD.cpp/.h (EA Games)
+// Ported to Home with EA's static and dynamic LOD architecture
+//
+// EA's LOD system:
+// - Static LOD: User-configured quality settings (Low/Medium/High/Very High/Custom)
+// - Dynamic LOD: Auto-adjusts based on current FPS to maintain target framerate
+// - Settings affect: particles, shadows, textures, audio, visual effects
+//
+// LOD adjusts:
+// - Max particle count
+// - Shadow quality (volumetric vs decals)
+// - Texture resolution
+// - Audio channels
+// - Visual effects (tree sway, cloud maps, water effects)
+// - Tank track length
+// - Building scaffolds
+
+import basics/allocator
+
+// Static LOD levels (user-configurable presets)
+enum StaticLODLevel {
+    Low         // Minimum quality for low-end systems
+    Medium      // Balanced quality/performance
+    High        // High quality for modern systems
+    VeryHigh    // Maximum quality
+    Custom      // User-defined custom settings
+}
+
+// Dynamic LOD levels (runtime FPS-based adjustment)
+enum DynamicLODLevel {
+    Low         // < 20 FPS - aggressive culling
+    Medium      // 20-40 FPS - moderate quality
+    High        // 40-50 FPS - good quality
+    VeryHigh    // 50+ FPS - maximum quality
+}
+
+// Particle priority (determines which particles get culled first)
+enum ParticlePriority {
+    VeryLow     // Dust, minor debris
+    Low         // Small explosions, muzzle flashes
+    Medium      // Unit effects, smoke
+    High        // Important explosions, special effects
+    Critical    // Never cull (nuclear explosion, superweapon)
+}
+
+// Static LOD configuration
+struct StaticLODConfig {
+    // Performance targets
+    min_fps: i32                        // Minimum FPS for this level
+    min_processor_fps: i32              // Minimum CPU time
+
+    // Audio
+    audio_samples_2d: i32               // UI sound channels
+    audio_samples_3d: i32               // World sound channels
+    audio_stream_count: i32             // Music/voice streams
+
+    // Particles
+    max_particle_count: i32             // Maximum active particles
+
+    // Shadows
+    use_shadow_volumes: bool            // 3D volumetric shadows
+    use_shadow_decals: bool             // 2D decal shadows
+
+    // Visual effects
+    use_cloud_map: bool                 // Cloud shadows on terrain
+    use_light_map: bool                 // Terrain detail lighting
+    show_soft_water_edge: bool          // Water edge feathering
+    use_tree_sway: bool                 // Wind effect on trees
+    use_emissive_night_materials: bool  // Night building lighting
+    use_buildup_scaffolds: bool         // Construction scaffolding
+
+    // Tank tracks
+    max_tank_track_edges: i32           // Track segments
+    max_tank_track_opaque_edges: i32    // Fully visible segments
+    max_tank_track_fade_delay: i32      // Fade time (frames)
+
+    // Textures
+    texture_reduction: i32              // Mip level reduction (0-3)
+
+    // Performance
+    use_fps_limit: bool                 // Cap FPS to target
+    enable_dynamic_lod: bool            // Enable dynamic adjustments
+    use_trees: bool                     // Render trees
+
+    fn init(level: StaticLODLevel): StaticLODConfig {
+        return match level {
+            StaticLODLevel.Low => StaticLODConfig {
+                min_fps: 30
+                min_processor_fps: 15
+                audio_samples_2d: 8
+                audio_samples_3d: 8
+                audio_stream_count: 1
+                max_particle_count: 1000
+                use_shadow_volumes: false
+                use_shadow_decals: true
+                use_cloud_map: false
+                use_light_map: false
+                show_soft_water_edge: false
+                use_tree_sway: false
+                use_emissive_night_materials: false
+                use_buildup_scaffolds: false
+                max_tank_track_edges: 50
+                max_tank_track_opaque_edges: 25
+                max_tank_track_fade_delay: 180
+                texture_reduction: 2
+                use_fps_limit: true
+                enable_dynamic_lod: true
+                use_trees: true
+            }
+
+            StaticLODLevel.Medium => StaticLODConfig {
+                min_fps: 40
+                min_processor_fps: 20
+                audio_samples_2d: 16
+                audio_samples_3d: 16
+                audio_stream_count: 2
+                max_particle_count: 2500
+                use_shadow_volumes: false
+                use_shadow_decals: true
+                use_cloud_map: true
+                use_light_map: true
+                show_soft_water_edge: false
+                use_tree_sway: true
+                use_emissive_night_materials: true
+                use_buildup_scaffolds: true
+                max_tank_track_edges: 100
+                max_tank_track_opaque_edges: 50
+                max_tank_track_fade_delay: 300
+                texture_reduction: 1
+                use_fps_limit: false
+                enable_dynamic_lod: true
+                use_trees: true
+            }
+
+            StaticLODLevel.High => StaticLODConfig {
+                min_fps: 50
+                min_processor_fps: 25
+                audio_samples_2d: 24
+                audio_samples_3d: 24
+                audio_stream_count: 3
+                max_particle_count: 5000
+                use_shadow_volumes: true
+                use_shadow_decals: false
+                use_cloud_map: true
+                use_light_map: true
+                show_soft_water_edge: true
+                use_tree_sway: true
+                use_emissive_night_materials: true
+                use_buildup_scaffolds: true
+                max_tank_track_edges: 200
+                max_tank_track_opaque_edges: 100
+                max_tank_track_fade_delay: 450
+                texture_reduction: 0
+                use_fps_limit: false
+                enable_dynamic_lod: false
+                use_trees: true
+            }
+
+            StaticLODLevel.VeryHigh => StaticLODConfig {
+                min_fps: 60
+                min_processor_fps: 30
+                audio_samples_2d: 32
+                audio_samples_3d: 32
+                audio_stream_count: 4
+                max_particle_count: 8000
+                use_shadow_volumes: true
+                use_shadow_decals: false
+                use_cloud_map: true
+                use_light_map: true
+                show_soft_water_edge: true
+                use_tree_sway: true
+                use_emissive_night_materials: true
+                use_buildup_scaffolds: true
+                max_tank_track_edges: 300
+                max_tank_track_opaque_edges: 150
+                max_tank_track_fade_delay: 600
+                texture_reduction: 0
+                use_fps_limit: false
+                enable_dynamic_lod: false
+                use_trees: true
+            }
+
+            _ => StaticLODConfig.init(StaticLODLevel.Medium)  // Default to medium
+        }
+    }
+}
+
+// Dynamic LOD configuration (FPS-based)
+struct DynamicLODConfig {
+    min_fps: i32                            // FPS threshold for this level
+    particle_skip_mask: u32                 // Render every Nth particle (mask)
+    debris_skip_mask: u32                   // Render every Nth debris
+    slow_death_scale: f32                   // Death animation speed (< 1.0 = faster)
+    min_particle_priority: ParticlePriority // Cull particles below this priority
+    min_particle_skip_priority: ParticlePriority // Never skip above this priority
+
+    fn init(level: DynamicLODLevel): DynamicLODConfig {
+        return match level {
+            DynamicLODLevel.Low => DynamicLODConfig {
+                min_fps: 20
+                particle_skip_mask: 0x3        // Render 1/4 particles
+                debris_skip_mask: 0x7          // Render 1/8 debris
+                slow_death_scale: 0.5          // 2x faster deaths
+                min_particle_priority: ParticlePriority.High
+                min_particle_skip_priority: ParticlePriority.Critical
+            }
+
+            DynamicLODLevel.Medium => DynamicLODConfig {
+                min_fps: 40
+                particle_skip_mask: 0x1        // Render 1/2 particles
+                debris_skip_mask: 0x3          // Render 1/4 debris
+                slow_death_scale: 0.75
+                min_particle_priority: ParticlePriority.Medium
+                min_particle_skip_priority: ParticlePriority.High
+            }
+
+            DynamicLODLevel.High => DynamicLODConfig {
+                min_fps: 50
+                particle_skip_mask: 0x0        // Render all particles
+                debris_skip_mask: 0x1          // Render 1/2 debris
+                slow_death_scale: 1.0
+                min_particle_priority: ParticlePriority.Low
+                min_particle_skip_priority: ParticlePriority.Medium
+            }
+
+            DynamicLODLevel.VeryHigh => DynamicLODConfig {
+                min_fps: 60
+                particle_skip_mask: 0x0        // Render all
+                debris_skip_mask: 0x0          // Render all
+                slow_death_scale: 1.0
+                min_particle_priority: ParticlePriority.VeryLow
+                min_particle_skip_priority: ParticlePriority.Low
+            }
+        }
+    }
+}
+
+// LOD Manager (singleton)
+struct LODManager {
+    // Current LOD levels
+    static_level: StaticLODLevel
+    dynamic_level: DynamicLODLevel
+
+    // Current configurations
+    static_config: StaticLODConfig
+    dynamic_config: DynamicLODConfig
+
+    // Performance tracking
+    average_fps: f32
+    fps_history: [60]f32            // Last 60 frames
+    fps_history_index: u32
+
+    // Dynamic adjustment counters
+    particle_generation_count: u32  // For skip mask
+    debris_generation_count: u32    // For skip mask
+
+    // System specs (for auto-detection)
+    cpu_mhz: i32
+    ram_mb: i32
+    gpu_name: string
+
+    fn init(): LODManager {
+        return LODManager {
+            static_level: StaticLODLevel.Medium
+            dynamic_level: DynamicLODLevel.High
+            static_config: StaticLODConfig.init(StaticLODLevel.Medium)
+            dynamic_config: DynamicLODConfig.init(DynamicLODLevel.High)
+            average_fps: 60.0
+            fps_history: [0.0; 60]
+            fps_history_index: 0
+            particle_generation_count: 0
+            debris_generation_count: 0
+            cpu_mhz: 0
+            ram_mb: 0
+            gpu_name: ""
+        }
+    }
+
+    fn set_static_level(mut self, level: StaticLODLevel) {
+        self.static_level = level
+        self.static_config = StaticLODConfig.init(level)
+
+        println("Static LOD set to: {self.get_static_level_name()}")
+        self.print_static_settings()
+    }
+
+    fn set_dynamic_level(mut self, level: DynamicLODLevel) {
+        self.dynamic_level = level
+        self.dynamic_config = DynamicLODConfig.init(level)
+
+        println("Dynamic LOD set to: {self.get_dynamic_level_name()}")
+    }
+
+    fn update_fps(mut self, current_fps: f32) {
+        // Add to history
+        self.fps_history[self.fps_history_index] = current_fps
+        self.fps_history_index = (self.fps_history_index + 1) % 60
+
+        // Calculate average FPS
+        let mut total: f32 = 0.0
+        for i in 0..60 {
+            total += self.fps_history[i]
+        }
+        self.average_fps = total / 60.0
+
+        // Auto-adjust dynamic LOD if enabled
+        if self.static_config.enable_dynamic_lod {
+            self.auto_adjust_dynamic_lod()
+        }
+    }
+
+    fn auto_adjust_dynamic_lod(mut self) {
+        let target_level = if self.average_fps < 20.0 {
+            DynamicLODLevel.Low
+        } else if self.average_fps < 40.0 {
+            DynamicLODLevel.Medium
+        } else if self.average_fps < 50.0 {
+            DynamicLODLevel.High
+        } else {
+            DynamicLODLevel.VeryHigh
+        }
+
+        if target_level != self.dynamic_level {
+            println("Auto-adjusting dynamic LOD: {self.average_fps:.1} FPS")
+            self.set_dynamic_level(target_level)
+        }
+    }
+
+    fn should_skip_particle(mut self, priority: ParticlePriority): bool {
+        // Never skip critical priority
+        if @enumToInt(priority) >= @enumToInt(self.dynamic_config.min_particle_skip_priority) {
+            return false
+        }
+
+        // Skip if below minimum priority
+        if @enumToInt(priority) < @enumToInt(self.dynamic_config.min_particle_priority) {
+            return true
+        }
+
+        // Use skip mask for random culling
+        self.particle_generation_count += 1
+        return (self.particle_generation_count & self.dynamic_config.particle_skip_mask) != self.dynamic_config.particle_skip_mask
+    }
+
+    fn should_skip_debris(mut self): bool {
+        self.debris_generation_count += 1
+        return (self.debris_generation_count & self.dynamic_config.debris_skip_mask) != self.dynamic_config.debris_skip_mask
+    }
+
+    fn get_death_animation_speed(self): f32 {
+        return self.dynamic_config.slow_death_scale
+    }
+
+    fn get_texture_reduction(self): i32 {
+        return self.static_config.texture_reduction
+    }
+
+    fn get_max_particle_count(self): i32 {
+        return self.static_config.max_particle_count
+    }
+
+    fn get_static_level_name(self): string {
+        return match self.static_level {
+            StaticLODLevel.Low => "Low"
+            StaticLODLevel.Medium => "Medium"
+            StaticLODLevel.High => "High"
+            StaticLODLevel.VeryHigh => "Very High"
+            StaticLODLevel.Custom => "Custom"
+        }
+    }
+
+    fn get_dynamic_level_name(self): string {
+        return match self.dynamic_level {
+            DynamicLODLevel.Low => "Low"
+            DynamicLODLevel.Medium => "Medium"
+            DynamicLODLevel.High => "High"
+            DynamicLODLevel.VeryHigh => "Very High"
+        }
+    }
+
+    fn print_static_settings(self) {
+        println("\n=== Static LOD Settings ===")
+        println("Max Particles: {self.static_config.max_particle_count}")
+        println("Shadow Volumes: {self.static_config.use_shadow_volumes}")
+        println("Shadow Decals: {self.static_config.use_shadow_decals}")
+        println("Cloud Map: {self.static_config.use_cloud_map}")
+        println("Light Map: {self.static_config.use_light_map}")
+        println("Soft Water Edge: {self.static_config.show_soft_water_edge}")
+        println("Tree Sway: {self.static_config.use_tree_sway}")
+        println("Texture Reduction: {self.static_config.texture_reduction}")
+        println("Audio 2D: {self.static_config.audio_samples_2d} channels")
+        println("Audio 3D: {self.static_config.audio_samples_3d} channels")
+        println("Dynamic LOD: {self.static_config.enable_dynamic_lod}")
+    }
+
+    fn print_performance_stats(self) {
+        println("\n=== Performance Stats ===")
+        println("Average FPS: {self.average_fps:.1}")
+        println("Static LOD: {self.get_static_level_name()}")
+        println("Dynamic LOD: {self.get_dynamic_level_name()}")
+        println("Particles Generated: {self.particle_generation_count}")
+        println("Debris Generated: {self.debris_generation_count}")
+    }
+
+    fn detect_system_specs(mut self) {
+        // TODO: Implement system detection
+        // For now, use placeholder values
+        self.cpu_mhz = 3000  // 3.0 GHz
+        self.ram_mb = 8192   // 8 GB
+        self.gpu_name = "Unknown GPU"
+
+        println("Detected System Specs:")
+        println("  CPU: {self.cpu_mhz} MHz")
+        println("  RAM: {self.ram_mb} MB")
+        println("  GPU: {self.gpu_name}")
+    }
+
+    fn recommend_static_lod(self): StaticLODLevel {
+        // Auto-detect best LOD level based on system specs
+        if self.cpu_mhz < 2000 or self.ram_mb < 2048 {
+            return StaticLODLevel.Low
+        } else if self.cpu_mhz < 2500 or self.ram_mb < 4096 {
+            return StaticLODLevel.Medium
+        } else if self.cpu_mhz < 3000 or self.ram_mb < 6144 {
+            return StaticLODLevel.High
+        } else {
+            return StaticLODLevel.VeryHigh
+        }
+    }
+}
+
+// Global LOD manager
+var g_lod_manager: ?LODManager = null
+
+export fn init_lod_manager() {
+    g_lod_manager = LODManager.init()
+
+    // Detect system and set recommended LOD
+    g_lod_manager.?.detect_system_specs()
+
+    let recommended = g_lod_manager.?.recommend_static_lod()
+    println("Recommended LOD level: {g_lod_manager.?.get_static_level_name()}")
+
+    g_lod_manager.?.set_static_level(recommended)
+}
+
+export fn set_static_lod_level(level: StaticLODLevel) {
+    if !g_lod_manager {
+        return
+    }
+
+    g_lod_manager.?.set_static_level(level)
+}
+
+export fn update_lod_fps(current_fps: f32) {
+    if !g_lod_manager {
+        return
+    }
+
+    g_lod_manager.?.update_fps(current_fps)
+}
+
+export fn should_skip_particle(priority: ParticlePriority): bool {
+    if !g_lod_manager {
+        return false
+    }
+
+    return g_lod_manager.?.should_skip_particle(priority)
+}
+
+export fn should_skip_debris(): bool {
+    if !g_lod_manager {
+        return false
+    }
+
+    return g_lod_manager.?.should_skip_debris()
+}
+
+export fn get_lod_texture_reduction(): i32 {
+    if !g_lod_manager {
+        return 0
+    }
+
+    return g_lod_manager.?.get_texture_reduction()
+}
+
+export fn shutdown_lod_manager() {
+    if g_lod_manager {
+        g_lod_manager.?.print_performance_stats()
+        g_lod_manager = null
+    }
+}
