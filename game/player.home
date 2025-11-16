@@ -1,0 +1,549 @@
+// C&C Generals Zero Hour - Home Port
+// Player Management System
+//
+// Original: Player.cpp (123KB - Westwood Studios/EA)
+// Manages player state, resources, diplomacy, and game statistics
+//
+// This is one of the largest systems in the original C++ codebase,
+// handling all per-player state including:
+// - Money and resource management
+// - Power generation and consumption
+// - Science/tech tree progression
+// - Diplomacy and team relationships
+// - Build restrictions and unlocks
+// - Player statistics and scoring
+// - Handicap/difficulty modifiers
+
+import basics/allocator
+
+const MAX_PLAYERS: u32 = 8
+const MAX_PLAYER_NAME_LENGTH: u32 = 64
+
+// Player faction
+enum Faction {
+    USA
+    China
+    GLA
+    Neutral
+}
+
+// Player type
+enum PlayerType {
+    Human
+    AI
+    Observer
+    Replay
+}
+
+// Diplomacy stance
+enum DiplomacyStance {
+    Neutral
+    Ally
+    Enemy
+}
+
+// Player color
+enum PlayerColor {
+    Red
+    Blue
+    Green
+    Yellow
+    Orange
+    Purple
+    Cyan
+    White
+}
+
+// Player difficulty (affects AI and game balance)
+enum Difficulty {
+    Easy        // 0.75x handicap
+    Normal      // 1.0x handicap
+    Hard        // 1.25x handicap
+    Brutal      // 1.5x handicap
+}
+
+// Player state
+enum PlayerState {
+    Active
+    Defeated
+    Victorious
+    Disconnected
+    Observer
+}
+
+// Player statistics
+struct PlayerStats {
+    // Combat
+    units_killed: u32
+    units_lost: u32
+    buildings_destroyed: u32
+    buildings_lost: u32
+
+    // Resources
+    money_earned: u32
+    money_spent: u32
+    supplies_collected: u32
+
+    // Production
+    units_produced: u32
+    buildings_constructed: u32
+
+    // Combat effectiveness
+    damage_dealt: f32
+    damage_received: f32
+    accuracy: f32  // Hit percentage
+
+    // Experience
+    total_experience_gained: u32
+    veteran_units_created: u32
+
+    // Time
+    time_played_seconds: u32
+
+    fn init(): PlayerStats {
+        return PlayerStats {
+            units_killed: 0
+            units_lost: 0
+            buildings_destroyed: 0
+            buildings_lost: 0
+            money_earned: 0
+            money_spent: 0
+            supplies_collected: 0
+            units_produced: 0
+            buildings_constructed: 0
+            damage_dealt: 0.0
+            damage_received: 0.0
+            accuracy: 0.0
+            total_experience_gained: 0
+            veteran_units_created: 0
+            time_played_seconds: 0
+        }
+    }
+
+    fn get_kill_death_ratio(self): f32 {
+        if self.units_lost == 0 {
+            return @intToFloat(f32, self.units_killed)
+        }
+        return @intToFloat(f32, self.units_killed) / @intToFloat(f32, self.units_lost)
+    }
+
+    fn get_destruction_ratio(self): f32 {
+        if self.buildings_lost == 0 {
+            return @intToFloat(f32, self.buildings_destroyed)
+        }
+        return @intToFloat(f32, self.buildings_destroyed) / @intToFloat(f32, self.buildings_lost)
+    }
+}
+
+// Player definition
+struct Player {
+    id: u32
+    name: string
+
+    // Faction and type
+    faction: Faction
+    player_type: PlayerType
+    color: PlayerColor
+
+    // State
+    state: PlayerState
+    difficulty: Difficulty
+    handicap_multiplier: f32  // Difficulty modifier (0.75 to 1.5)
+
+    // Team and diplomacy
+    team_id: i32  // -1 if no team
+    diplomacy: [MAX_PLAYERS]DiplomacyStance  // Stance toward each player
+
+    // Resources
+    money: u32
+    power_generated: u32
+    power_consumed: u32
+    supplies: u32
+
+    // Science/tech
+    science_points: u32
+    unlocked_sciences: [64]bool  // Bit flags for unlocked techs
+
+    // Build restrictions
+    can_build_superweapons: bool
+    rank_points: u32  // For unlocking generals powers
+
+    // Statistics
+    stats: PlayerStats
+
+    // Object tracking
+    unit_count: u32
+    building_count: u32
+    max_unit_count: u32  // Population cap
+
+    // Visibility and fog of war
+    has_radar: bool
+    radar_range: f32
+
+    // Special states
+    is_defeated: bool
+    is_victorious: bool
+    defeat_time: f32
+    victory_time: f32
+
+    fn init(id: u32, name: string, faction: Faction, player_type: PlayerType): Player {
+        return Player {
+            id: id
+            name: name
+            faction: faction
+            player_type: player_type
+            color: @intCast(PlayerColor, id)  // Default color from ID
+            state: PlayerState.Active
+            difficulty: Difficulty.Normal
+            handicap_multiplier: 1.0
+            team_id: -1
+            diplomacy: [DiplomacyStance.Neutral; MAX_PLAYERS]
+            money: 0
+            power_generated: 0
+            power_consumed: 0
+            supplies: 0
+            science_points: 0
+            unlocked_sciences: [false; 64]
+            can_build_superweapons: true
+            rank_points: 0
+            stats: PlayerStats.init()
+            unit_count: 0
+            building_count: 0
+            max_unit_count: 100  // Default population cap
+            has_radar: false
+            radar_range: 0.0
+            is_defeated: false
+            is_victorious: false
+            defeat_time: 0.0
+            victory_time: 0.0
+        }
+    }
+
+    // Money management
+    fn add_money(mut self, amount: u32) {
+        self.money += amount
+        self.stats.money_earned += amount
+    }
+
+    fn spend_money(mut self, amount: u32): bool {
+        if self.money >= amount {
+            self.money -= amount
+            self.stats.money_spent += amount
+            return true
+        }
+        return false
+    }
+
+    fn can_afford(self, cost: u32): bool {
+        return self.money >= cost
+    }
+
+    // Power management
+    fn add_power_generator(mut self, power: u32) {
+        self.power_generated += power
+    }
+
+    fn remove_power_generator(mut self, power: u32) {
+        if self.power_generated >= power {
+            self.power_generated -= power
+        }
+    }
+
+    fn add_power_consumer(mut self, power: u32) {
+        self.power_consumed += power
+    }
+
+    fn remove_power_consumer(mut self, power: u32) {
+        if self.power_consumed >= power {
+            self.power_consumed -= power
+        }
+    }
+
+    fn has_power(self): bool {
+        return self.power_generated >= self.power_consumed
+    }
+
+    fn get_power_percentage(self): f32 {
+        if self.power_consumed == 0 {
+            return 1.0
+        }
+        let ratio = @intToFloat(f32, self.power_generated) / @intToFloat(f32, self.power_consumed)
+        if ratio > 1.0 {
+            return 1.0
+        }
+        return ratio
+    }
+
+    // Science/tech
+    fn unlock_science(mut self, science_id: u32) {
+        if science_id < 64 {
+            self.unlocked_sciences[science_id] = true
+        }
+    }
+
+    fn has_science(self, science_id: u32): bool {
+        if science_id >= 64 {
+            return false
+        }
+        return self.unlocked_sciences[science_id]
+    }
+
+    fn add_science_points(mut self, points: u32) {
+        self.science_points += points
+    }
+
+    // Diplomacy
+    fn set_diplomacy(mut self, other_player_id: u32, stance: DiplomacyStance) {
+        if other_player_id < MAX_PLAYERS {
+            self.diplomacy[other_player_id] = stance
+        }
+    }
+
+    fn is_ally(self, other_player_id: u32): bool {
+        if other_player_id >= MAX_PLAYERS {
+            return false
+        }
+        return self.diplomacy[other_player_id] == DiplomacyStance.Ally
+    }
+
+    fn is_enemy(self, other_player_id: u32): bool {
+        if other_player_id >= MAX_PLAYERS {
+            return false
+        }
+        return self.diplomacy[other_player_id] == DiplomacyStance.Enemy
+    }
+
+    // State management
+    fn defeat(mut self, game_time: f32) {
+        self.state = PlayerState.Defeated
+        self.is_defeated = true
+        self.defeat_time = game_time
+    }
+
+    fn victory(mut self, game_time: f32) {
+        self.state = PlayerState.Victorious
+        self.is_victorious = true
+        self.victory_time = game_time
+    }
+
+    fn is_active(self): bool {
+        return self.state == PlayerState.Active
+    }
+
+    // Population management
+    fn can_build_unit(self): bool {
+        return self.unit_count < self.max_unit_count
+    }
+
+    fn add_unit(mut self) {
+        self.unit_count += 1
+        self.stats.units_produced += 1
+    }
+
+    fn remove_unit(mut self) {
+        if self.unit_count > 0 {
+            self.unit_count -= 1
+        }
+    }
+
+    fn add_building(mut self) {
+        self.building_count += 1
+        self.stats.buildings_constructed += 1
+    }
+
+    fn remove_building(mut self) {
+        if self.building_count > 0 {
+            self.building_count -= 1
+        }
+    }
+
+    // Statistics tracking
+    fn record_unit_kill(mut self) {
+        self.stats.units_killed += 1
+    }
+
+    fn record_unit_loss(mut self) {
+        self.stats.units_lost += 1
+    }
+
+    fn record_building_destroyed(mut self) {
+        self.stats.buildings_destroyed += 1
+    }
+
+    fn record_building_lost(mut self) {
+        self.stats.buildings_lost += 1
+    }
+
+    fn record_damage_dealt(mut self, damage: f32) {
+        self.stats.damage_dealt += damage
+    }
+
+    fn record_damage_received(mut self, damage: f32) {
+        self.stats.damage_received += damage
+    }
+
+    // Rank/experience
+    fn add_rank_points(mut self, points: u32) {
+        self.rank_points += points
+    }
+
+    fn get_rank_level(self): u32 {
+        // Rank levels every 1000 points
+        return self.rank_points / 1000
+    }
+}
+
+// Player manager (global singleton)
+struct PlayerManager {
+    players: [MAX_PLAYERS]Player
+    player_count: u32
+    local_player_id: u32  // Human player in single-player
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): PlayerManager {
+        return PlayerManager {
+            players: [Player.init(0, "", Faction.USA, PlayerType.AI); MAX_PLAYERS]
+            player_count: 0
+            local_player_id: 0
+            allocator: allocator
+        }
+    }
+
+    fn add_player(mut self, name: string, faction: Faction, player_type: PlayerType): u32 {
+        if self.player_count >= MAX_PLAYERS {
+            println("PlayerManager: Cannot add player - max limit reached")
+            return 0
+        }
+
+        let player_id = self.player_count
+        self.players[player_id] = Player.init(player_id, name, faction, player_type)
+        self.player_count += 1
+
+        if player_type == PlayerType.Human {
+            self.local_player_id = player_id
+        }
+
+        return player_id
+    }
+
+    fn get_player(mut self, player_id: u32): ?*Player {
+        if player_id >= self.player_count {
+            return null
+        }
+        return &self.players[player_id]
+    }
+
+    fn get_local_player(mut self): ?*Player {
+        return self.get_player(self.local_player_id)
+    }
+
+    fn set_team(mut self, player_id: u32, team_id: i32) {
+        let player = self.get_player(player_id)
+        if player {
+            player.?.team_id = team_id
+
+            // Auto-set diplomacy with team members
+            for i in 0..self.player_count {
+                if i != player_id && self.players[i].team_id == team_id {
+                    player.?.set_diplomacy(i, DiplomacyStance.Ally)
+                    self.players[i].set_diplomacy(player_id, DiplomacyStance.Ally)
+                }
+            }
+        }
+    }
+
+    fn update(mut self, delta_time: f32) {
+        // Update all active players
+        for i in 0..self.player_count {
+            if self.players[i].is_active() {
+                self.players[i].stats.time_played_seconds += @floatToInt(u32, delta_time)
+            }
+        }
+    }
+
+    fn get_active_player_count(self): u32 {
+        let mut count: u32 = 0
+        for i in 0..self.player_count {
+            if self.players[i].is_active() {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn get_winning_player(self): ?u32 {
+        for i in 0..self.player_count {
+            if self.players[i].is_victorious {
+                return i
+            }
+        }
+        return null
+    }
+
+    fn is_game_over(self): bool {
+        let active_count = self.get_active_player_count()
+        if active_count <= 1 {
+            return true
+        }
+
+        // Check if all remaining players are on same team
+        let mut first_team: i32 = -1
+        for i in 0..self.player_count {
+            if self.players[i].is_active() {
+                if first_team == -1 {
+                    first_team = self.players[i].team_id
+                } else if first_team != self.players[i].team_id {
+                    return false  // Different teams still active
+                }
+            }
+        }
+
+        return true
+    }
+}
+
+// Global player manager
+var g_player_manager: ?PlayerManager = null
+
+export fn init_player_manager(allocator: Allocator) {
+    g_player_manager = PlayerManager.init(allocator)
+    println("PlayerManager: System initialized")
+}
+
+export fn shutdown_player_manager() {
+    g_player_manager = null
+    println("PlayerManager: System shutdown")
+}
+
+export fn add_player(name: string, faction: Faction, player_type: PlayerType): u32 {
+    if g_player_manager {
+        return g_player_manager.?.add_player(name, faction, player_type)
+    }
+    return 0
+}
+
+export fn get_player(player_id: u32): ?*Player {
+    if g_player_manager {
+        return g_player_manager.?.get_player(player_id)
+    }
+    return null
+}
+
+export fn get_local_player(): ?*Player {
+    if g_player_manager {
+        return g_player_manager.?.get_local_player()
+    }
+    return null
+}
+
+export fn update_players(delta_time: f32) {
+    if g_player_manager {
+        g_player_manager.?.update(delta_time)
+    }
+}
+
+fn get_global_allocator(): Allocator {
+    // TODO: Return global allocator
+    return Allocator {}
+}
