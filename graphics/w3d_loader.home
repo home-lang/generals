@@ -1,0 +1,307 @@
+// C&C Generals Zero Hour - Home Port
+// W3D File Format Loader
+//
+// Original: W3D format (Westwood 3D)
+// Ported to Home with modern file I/O
+
+import basics/allocator
+import core/filesystem
+import core/archive
+import graphics/mesh
+
+// W3D chunk types
+const W3D_CHUNK_MESH: u32 = 0x00000000
+const W3D_CHUNK_VERTICES: u32 = 0x00000002
+const W3D_CHUNK_VERTEX_NORMALS: u32 = 0x00000003
+const W3D_CHUNK_MESH_HEADER: u32 = 0x0000001F
+const W3D_CHUNK_TRIANGLES: u32 = 0x00000020
+const W3D_CHUNK_VERTEX_SHADE_INDICES: u32 = 0x00000022
+const W3D_CHUNK_MATERIAL_INFO: u32 = 0x00000028
+const W3D_CHUNK_VERTEX_MATERIALS: u32 = 0x00000029
+const W3D_CHUNK_TEXTURES: u32 = 0x00000030
+const W3D_CHUNK_MATERIAL_PASS: u32 = 0x00000038
+const W3D_CHUNK_VERTEX_MAP: u32 = 0x0000003C
+const W3D_CHUNK_VERTEX_INFLUENCES: u32 = 0x0000003E
+
+// W3D file header structure
+struct W3DChunkHeader {
+    chunk_type: u32
+    chunk_size: u32
+}
+
+// W3D mesh header
+struct W3DMeshHeader {
+    version: u32
+    attributes: u32
+    mesh_name: [32]u8
+    container_name: [32]u8
+    num_triangles: u32
+    num_vertices: u32
+    num_materials: u32
+    damage_stages: u32
+    sort_level: u32
+    prelighting_flags: u32
+    future_count: u32
+    vertex_channels: u32
+    face_channels: u32
+    min_corner: Vec3
+    max_corner: Vec3
+    sphere_center: Vec3
+    sphere_radius: f32
+}
+
+// W3D triangle structure
+struct W3DTriangle {
+    v_index: [3]u32
+    attributes: u32
+    normal: Vec3
+    distance: f32
+}
+
+// W3D material info
+struct W3DMaterial {
+    pass_count: u32
+    vertex_material_count: u32
+    shader_count: u32
+    texture_count: u32
+}
+
+// W3D file loader
+struct W3DLoader {
+    allocator: Allocator
+
+    fn init(allocator: Allocator): W3DLoader {
+        return W3DLoader {
+            allocator: allocator
+        }
+    }
+
+    fn load_from_file(mut self, path: string): ?Model {
+        // Open file
+        let file = open_file(path, FILE_READ | FILE_BINARY)
+        if !file {
+            return null
+        }
+
+        // Read file data
+        let file_size = file.?.size
+        let data = self.allocator.alloc(u8, file_size)
+        let bytes_read = file.?.read(data)
+
+        if !bytes_read or bytes_read.? != file_size {
+            self.allocator.free(data)
+            file.?.close()
+            return null
+        }
+
+        file.?.close()
+
+        // Parse W3D chunks
+        let model = self.parse_w3d(data)
+
+        self.allocator.free(data)
+        return model
+    }
+
+    fn parse_w3d(mut self, data: []u8): ?Model {
+        let mut model = Model.init(self.allocator, "")
+        let mut offset: usize = 0
+
+        while offset < data.len {
+            // Read chunk header
+            if offset + 8 > data.len {
+                break
+            }
+
+            let chunk_type = read_u32(&data[offset])
+            let chunk_size = read_u32(&data[offset + 4])
+            offset += 8
+
+            if offset + chunk_size > data.len {
+                break
+            }
+
+            // Parse chunk based on type
+            match chunk_type {
+                W3D_CHUNK_MESH => {
+                    self.parse_mesh_chunk(&mut model, &data[offset..(offset + chunk_size)])
+                }
+                _ => {
+                    // Skip unknown chunks
+                }
+            }
+
+            offset += chunk_size
+        }
+
+        return model
+    }
+
+    fn parse_mesh_chunk(mut self, model: *Model, data: []u8) {
+        let mut mesh = Mesh.init(self.allocator, "", 4096, 16384)
+        let mut offset: usize = 0
+
+        while offset < data.len {
+            if offset + 8 > data.len {
+                break
+            }
+
+            let chunk_type = read_u32(&data[offset])
+            let chunk_size = read_u32(&data[offset + 4])
+            offset += 8
+
+            if offset + chunk_size > data.len {
+                break
+            }
+
+            match chunk_type {
+                W3D_CHUNK_MESH_HEADER => {
+                    self.parse_mesh_header(&mut mesh, &data[offset..(offset + chunk_size)])
+                }
+                W3D_CHUNK_VERTICES => {
+                    self.parse_vertices(&mut mesh, &data[offset..(offset + chunk_size)])
+                }
+                W3D_CHUNK_VERTEX_NORMALS => {
+                    self.parse_normals(&mut mesh, &data[offset..(offset + chunk_size)])
+                }
+                W3D_CHUNK_TRIANGLES => {
+                    self.parse_triangles(&mut mesh, &data[offset..(offset + chunk_size)])
+                }
+                W3D_CHUNK_VERTEX_MAP => {
+                    self.parse_uvs(&mut mesh, &data[offset..(offset + chunk_size)])
+                }
+                _ => {
+                    // Skip unknown sub-chunks
+                }
+            }
+
+            offset += chunk_size
+        }
+
+        model.add_mesh(mesh)
+    }
+
+    fn parse_mesh_header(self, mesh: *Mesh, data: []u8) {
+        if data.len < @sizeOf(W3DMeshHeader) {
+            return
+        }
+
+        // Read mesh name (first 32 bytes after version/attributes)
+        let name_offset: usize = 8
+        let mut name_len: usize = 0
+        while name_len < 32 and data[name_offset + name_len] != 0 {
+            name_len += 1
+        }
+
+        mesh.name = data[name_offset..(name_offset + name_len)]
+    }
+
+    fn parse_vertices(self, mesh: *Mesh, data: []u8) {
+        let vertex_count = data.len / 12  // Each vertex is 3 floats (12 bytes)
+
+        for i in 0..vertex_count {
+            let offset = i * 12
+
+            let vertex = Vertex {
+                position: Vec3 {
+                    x: read_f32(&data[offset])
+                    y: read_f32(&data[offset + 4])
+                    z: read_f32(&data[offset + 8])
+                }
+                normal: Vec3.init(0.0, 0.0, 1.0)
+                color: 0xFFFFFFFF
+                uv0: Vec2.init(0.0, 0.0)
+                uv1: Vec2.init(0.0, 0.0)
+                tangent: Vec3.init(0.0, 0.0, 0.0)
+                binormal: Vec3.init(0.0, 0.0, 0.0)
+            }
+
+            mesh.add_vertex(vertex)
+        }
+    }
+
+    fn parse_normals(self, mesh: *Mesh, data: []u8) {
+        let normal_count = data.len / 12
+        let max_count = mesh.vertex_count.min(normal_count)
+
+        for i in 0..max_count {
+            let offset = i * 12
+
+            mesh.vertices[i].normal = Vec3 {
+                x: read_f32(&data[offset])
+                y: read_f32(&data[offset + 4])
+                z: read_f32(&data[offset + 8])
+            }
+        }
+    }
+
+    fn parse_triangles(self, mesh: *Mesh, data: []u8) {
+        let triangle_size: usize = 32  // W3DTriangle struct size
+        let triangle_count = data.len / triangle_size
+
+        for i in 0..triangle_count {
+            let offset = i * triangle_size
+
+            let v0 = read_u32(&data[offset])
+            let v1 = read_u32(&data[offset + 4])
+            let v2 = read_u32(&data[offset + 8])
+
+            mesh.add_triangle(v0, v1, v2)
+        }
+    }
+
+    fn parse_uvs(self, mesh: *Mesh, data: []u8) {
+        let uv_count = data.len / 8  // Each UV is 2 floats (8 bytes)
+        let max_count = mesh.vertex_count.min(uv_count)
+
+        for i in 0..max_count {
+            let offset = i * 8
+
+            mesh.vertices[i].uv0 = Vec2 {
+                x: read_f32(&data[offset])
+                y: read_f32(&data[offset + 4])
+            }
+        }
+    }
+}
+
+// Utility functions for reading binary data
+
+fn read_u32(data: []u8): u32 {
+    // Little-endian read
+    return (@intCast(u32, data[0])) |
+           (@intCast(u32, data[1]) << 8) |
+           (@intCast(u32, data[2]) << 16) |
+           (@intCast(u32, data[3]) << 24)
+}
+
+fn read_f32(data: []u8): f32 {
+    let value = read_u32(data)
+    return @bitCast(f32, value)
+}
+
+fn read_vec3(data: []u8): Vec3 {
+    return Vec3 {
+        x: read_f32(&data[0])
+        y: read_f32(&data[4])
+        z: read_f32(&data[8])
+    }
+}
+
+// Global W3D loader instance
+var g_w3d_loader: ?W3DLoader = null
+
+export fn init_w3d_loader(allocator: Allocator) {
+    g_w3d_loader = W3DLoader.init(allocator)
+}
+
+export fn shutdown_w3d_loader() {
+    g_w3d_loader = null
+}
+
+export fn load_w3d_model(path: string): ?Model {
+    if g_w3d_loader {
+        return g_w3d_loader.?.load_from_file(path)
+    }
+    return null
+}

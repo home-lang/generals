@@ -1,0 +1,398 @@
+// C&C Generals Zero Hour - Home Port
+// Core Filesystem System
+//
+// Original: FileSystem.cpp (Westwood Studios/EA)
+// Ported to Home with modern async I/O support
+
+import basics/allocator
+import basics/io
+import core/string
+
+// File access modes
+const FILE_READ: u32 = 0x00000001
+const FILE_WRITE: u32 = 0x00000002
+const FILE_READWRITE: u32 = FILE_READ | FILE_WRITE
+const FILE_APPEND: u32 = 0x00000004
+const FILE_CREATE: u32 = 0x00000008
+const FILE_TRUNCATE: u32 = 0x00000010
+const FILE_TEXT: u32 = 0x00000020
+const FILE_BINARY: u32 = 0x00000040
+const FILE_STREAMING: u32 = 0x00000100
+
+// Seek modes
+enum SeekMode {
+    Start
+    Current
+    End
+}
+
+// File information
+struct FileInfo {
+    size: usize
+    timestamp: i64
+    is_directory: bool
+    is_archive: bool
+}
+
+// File handle abstraction
+struct File {
+    path: string
+    access_mode: u32
+    is_open: bool
+    position: usize
+    size: usize
+
+    // For regular files
+    handle: ?*u8
+
+    // For archive files
+    archive_data: ?[]u8
+
+    fn init(path: string, mode: u32): File {
+        return File {
+            path: path
+            access_mode: mode
+            is_open: false
+            position: 0
+            size: 0
+            handle: null
+            archive_data: null
+        }
+    }
+
+    fn read(mut self, buffer: []u8): ?usize {
+        if !self.is_open {
+            return null
+        }
+
+        if self.archive_data {
+            // Reading from archive (memory)
+            let data = self.archive_data.?
+            let bytes_available = self.size - self.position
+            let bytes_to_read = buffer.len.min(bytes_available)
+
+            @memcpy(buffer.ptr, &data[self.position], bytes_to_read)
+            self.position += bytes_to_read
+
+            return bytes_to_read
+        } else if self.handle {
+            // Reading from regular file
+            // TODO: Use Zig 0.16-dev async I/O here
+            // For now, placeholder for file read
+            return null
+        }
+
+        return null
+    }
+
+    fn write(mut self, data: []u8): ?usize {
+        if !self.is_open {
+            return null
+        }
+
+        if (self.access_mode & FILE_WRITE) == 0 {
+            return null
+        }
+
+        // TODO: Implement file writing
+        // Can use Zig 0.16-dev async I/O
+        return null
+    }
+
+    fn seek(mut self, offset: isize, mode: SeekMode): bool {
+        if !self.is_open {
+            return false
+        }
+
+        let new_pos: isize = match mode {
+            SeekMode.Start => offset
+            SeekMode.Current => @intCast(isize, self.position) + offset
+            SeekMode.End => @intCast(isize, self.size) + offset
+        }
+
+        if new_pos < 0 or new_pos > @intCast(isize, self.size) {
+            return false
+        }
+
+        self.position = @intCast(usize, new_pos)
+        return true
+    }
+
+    fn tell(self): usize {
+        return self.position
+    }
+
+    fn eof(self): bool {
+        return self.position >= self.size
+    }
+
+    fn close(mut self) {
+        if self.handle {
+            // TODO: Close file handle
+            self.handle = null
+        }
+
+        self.is_open = false
+    }
+}
+
+// Directory entry for wildcard searches
+struct DirectoryEntry {
+    name: string
+    is_directory: bool
+    size: usize
+}
+
+// Filesystem abstraction (supports local files + archives)
+struct FileSystem {
+    allocator: Allocator
+    local_path: string
+    archives: []*ArchiveFile
+    file_cache: FileExistCache
+
+    fn init(allocator: Allocator, base_path: string): FileSystem {
+        return FileSystem {
+            allocator: allocator
+            local_path: base_path
+            archives: allocator.alloc(*ArchiveFile, 16)  // Max 16 archives
+            file_cache: FileExistCache.init(allocator)
+        }
+    }
+
+    fn open_file(mut self, path: string, mode: u32): ?File {
+        // First check local filesystem
+        if self.file_exists_local(path) {
+            return self.open_local_file(path, mode)
+        }
+
+        // Then check archives in priority order
+        for archive in self.archives {
+            if archive.has_file(path) {
+                return archive.open_file(path)
+            }
+        }
+
+        // File not found
+        if (mode & FILE_CREATE) != 0 {
+            // Create new local file
+            return self.create_local_file(path, mode)
+        }
+
+        return null
+    }
+
+    fn file_exists(self, path: string): bool {
+        // Check cache first
+        if self.file_cache.has(path) {
+            return self.file_cache.get(path)
+        }
+
+        // Check local filesystem
+        if self.file_exists_local(path) {
+            self.file_cache.set(path, true)
+            return true
+        }
+
+        // Check archives
+        for archive in self.archives {
+            if archive.has_file(path) {
+                self.file_cache.set(path, true)
+                return true
+            }
+        }
+
+        self.file_cache.set(path, false)
+        return false
+    }
+
+    fn get_file_info(self, path: string): ?FileInfo {
+        // Try local first
+        if self.file_exists_local(path) {
+            return self.get_local_file_info(path)
+        }
+
+        // Try archives
+        for archive in self.archives {
+            if archive.has_file(path) {
+                return archive.get_file_info(path)
+            }
+        }
+
+        return null
+    }
+
+    fn list_files(self, directory: string, pattern: string, recursive: bool): []DirectoryEntry {
+        let mut entries = self.allocator.alloc(DirectoryEntry, 256)
+        let mut count: usize = 0
+
+        // List from local filesystem
+        // TODO: Implement directory traversal
+
+        // List from archives
+        for archive in self.archives {
+            let archive_entries = archive.list_files(directory, pattern, recursive)
+            for entry in archive_entries {
+                if count < 256 {
+                    entries[count] = entry
+                    count += 1
+                }
+            }
+        }
+
+        return entries[0..count]
+    }
+
+    fn add_archive(mut self, archive: *ArchiveFile) {
+        for i in 0..self.archives.len {
+            if self.archives[i] == null {
+                self.archives[i] = archive
+                return
+            }
+        }
+    }
+
+    fn normalize_path(path: string): string {
+        // Convert backslashes to forward slashes
+        // Remove duplicate slashes
+        // TODO: Implement path normalization
+        return path
+    }
+
+    // Private methods
+
+    fn file_exists_local(self, path: string): bool {
+        // TODO: Check if file exists on local filesystem
+        return false
+    }
+
+    fn open_local_file(self, path: string, mode: u32): ?File {
+        // TODO: Open file from local filesystem
+        return null
+    }
+
+    fn create_local_file(self, path: string, mode: u32): ?File {
+        // TODO: Create new file on local filesystem
+        return null
+    }
+
+    fn get_local_file_info(self, path: string): ?FileInfo {
+        // TODO: Get file info from local filesystem
+        return null
+    }
+
+    fn deinit(mut self) {
+        self.file_cache.deinit()
+        self.allocator.free(self.archives)
+    }
+}
+
+// File existence cache (thread-safe)
+struct FileExistCache {
+    map: []FileExistEntry
+    capacity: usize
+    count: usize
+    allocator: Allocator
+
+    fn init(allocator: Allocator): FileExistCache {
+        const capacity: usize = 1024
+        return FileExistCache {
+            map: allocator.alloc(FileExistEntry, capacity)
+            capacity: capacity
+            count: 0
+            allocator: allocator
+        }
+    }
+
+    fn has(self, path: string): bool {
+        for i in 0..self.count {
+            if string_eq(self.map[i].path, path) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get(self, path: string): bool {
+        for i in 0..self.count {
+            if string_eq(self.map[i].path, path) {
+                return self.map[i].exists
+            }
+        }
+        return false
+    }
+
+    fn set(mut self, path: string, exists: bool) {
+        // Check if already exists
+        for i in 0..self.count {
+            if string_eq(self.map[i].path, path) {
+                self.map[i].exists = exists
+                return
+            }
+        }
+
+        // Add new entry
+        if self.count < self.capacity {
+            self.map[self.count] = FileExistEntry {
+                path: path
+                exists: exists
+            }
+            self.count += 1
+        }
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.map)
+    }
+}
+
+struct FileExistEntry {
+    path: string
+    exists: bool
+}
+
+// Forward declaration for archive support
+struct ArchiveFile {
+    fn has_file(self, path: string): bool {
+        return false
+    }
+
+    fn open_file(self, path: string): ?File {
+        return null
+    }
+
+    fn get_file_info(self, path: string): ?FileInfo {
+        return null
+    }
+
+    fn list_files(self, directory: string, pattern: string, recursive: bool): []DirectoryEntry {
+        return []
+    }
+}
+
+// Global filesystem instance
+var g_filesystem: ?FileSystem = null
+
+export fn init_filesystem(allocator: Allocator, base_path: string) {
+    g_filesystem = FileSystem.init(allocator, base_path)
+}
+
+export fn shutdown_filesystem() {
+    if g_filesystem {
+        g_filesystem.?.deinit()
+        g_filesystem = null
+    }
+}
+
+export fn open_file(path: string, mode: u32): ?File {
+    if g_filesystem {
+        return g_filesystem.?.open_file(path, mode)
+    }
+    return null
+}
+
+export fn file_exists(path: string): bool {
+    if g_filesystem {
+        return g_filesystem.?.file_exists(path)
+    }
+    return false
+}

@@ -1,0 +1,306 @@
+// C&C Generals Zero Hour - Home Port
+// Graphics Mesh System
+//
+// Original: DynamicMesh.cpp, MeshGeometry.cpp (Westwood Studios/EA)
+// Ported to Home with modern GPU API support
+
+import basics/allocator
+import core/memory
+
+// Vertex format flags
+const VERTEX_POSITION: u32 = 0x0001
+const VERTEX_NORMAL: u32 = 0x0002
+const VERTEX_COLOR: u32 = 0x0004
+const VERTEX_UV0: u32 = 0x0008
+const VERTEX_UV1: u32 = 0x0010
+const VERTEX_TANGENT: u32 = 0x0020
+const VERTEX_BINORMAL: u32 = 0x0040
+
+// Vertex structure (full format)
+struct Vertex {
+    position: Vec3
+    normal: Vec3
+    color: u32
+    uv0: Vec2
+    uv1: Vec2
+    tangent: Vec3
+    binormal: Vec3
+}
+
+// 3D Vector
+struct Vec3 {
+    x: f32
+    y: f32
+    z: f32
+
+    fn init(x: f32, y: f32, z: f32): Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn dot(self, other: Vec3): f32 {
+        return self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn length(self): f32 {
+        return @sqrt(self.dot(self))
+    }
+
+    fn normalize(self): Vec3 {
+        let len = self.length()
+        if len > 0.0001 {
+            return Vec3 {
+                x: self.x / len
+                y: self.y / len
+                z: self.z / len
+            }
+        }
+        return self
+    }
+
+    fn cross(self, other: Vec3): Vec3 {
+        return Vec3 {
+            x: self.y * other.z - self.z * other.y
+            y: self.z * other.x - self.x * other.z
+            z: self.x * other.y - self.y * other.x
+        }
+    }
+}
+
+// 2D Vector (UV coordinates)
+struct Vec2 {
+    x: f32
+    y: f32
+
+    fn init(x: f32, y: f32): Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+}
+
+// Triangle index (3 vertices)
+struct Triangle {
+    v0: u32
+    v1: u32
+    v2: u32
+}
+
+// Material properties
+struct Material {
+    name: string
+    diffuse_color: Vec3
+    specular_color: Vec3
+    emissive_color: Vec3
+    shininess: f32
+    opacity: f32
+    texture_name: string
+}
+
+// Mesh bounding box
+struct BoundingBox {
+    min: Vec3
+    max: Vec3
+
+    fn init(): BoundingBox {
+        return BoundingBox {
+            min: Vec3.init(1e10, 1e10, 1e10)
+            max: Vec3.init(-1e10, -1e10, -1e10)
+        }
+    }
+
+    fn expand(mut self, point: Vec3) {
+        if point.x < self.min.x { self.min.x = point.x }
+        if point.y < self.min.y { self.min.y = point.y }
+        if point.z < self.min.z { self.min.z = point.z }
+
+        if point.x > self.max.x { self.max.x = point.x }
+        if point.y > self.max.y { self.max.y = point.y }
+        if point.z > self.max.z { self.max.z = point.z }
+    }
+
+    fn center(self): Vec3 {
+        return Vec3 {
+            x: (self.min.x + self.max.x) * 0.5
+            y: (self.min.y + self.max.y) * 0.5
+            z: (self.min.z + self.max.z) * 0.5
+        }
+    }
+
+    fn size(self): Vec3 {
+        return Vec3 {
+            x: self.max.x - self.min.x
+            y: self.max.y - self.min.y
+            z: self.max.z - self.min.z
+        }
+    }
+}
+
+// Mesh geometry (vertices + indices)
+struct Mesh {
+    name: string
+    vertices: []Vertex
+    indices: []u32
+    vertex_count: usize
+    index_count: usize
+    vertex_format: u32
+    material_index: i32
+    bounds: BoundingBox
+    allocator: Allocator
+
+    fn init(allocator: Allocator, name: string, max_vertices: usize, max_indices: usize): Mesh {
+        return Mesh {
+            name: name
+            vertices: allocator.alloc(Vertex, max_vertices)
+            indices: allocator.alloc(u32, max_indices)
+            vertex_count: 0
+            index_count: 0
+            vertex_format: VERTEX_POSITION | VERTEX_NORMAL | VERTEX_UV0
+            material_index: -1
+            bounds: BoundingBox.init()
+            allocator: allocator
+        }
+    }
+
+    fn add_vertex(mut self, vertex: Vertex) {
+        if self.vertex_count < self.vertices.len {
+            self.vertices[self.vertex_count] = vertex
+            self.vertex_count += 1
+
+            // Update bounding box
+            self.bounds.expand(vertex.position)
+        }
+    }
+
+    fn add_triangle(mut self, v0: u32, v1: u32, v2: u32) {
+        if self.index_count + 3 <= self.indices.len {
+            self.indices[self.index_count] = v0
+            self.indices[self.index_count + 1] = v1
+            self.indices[self.index_count + 2] = v2
+            self.index_count += 3
+        }
+    }
+
+    fn compute_normals(mut self) {
+        // Reset normals
+        for i in 0..self.vertex_count {
+            self.vertices[i].normal = Vec3.init(0.0, 0.0, 0.0)
+        }
+
+        // Accumulate face normals
+        let mut i: usize = 0
+        while i < self.index_count {
+            let i0 = self.indices[i]
+            let i1 = self.indices[i + 1]
+            let i2 = self.indices[i + 2]
+
+            let v0 = self.vertices[i0].position
+            let v1 = self.vertices[i1].position
+            let v2 = self.vertices[i2].position
+
+            // Compute face normal
+            let edge1 = Vec3 {
+                x: v1.x - v0.x
+                y: v1.y - v0.y
+                z: v1.z - v0.z
+            }
+            let edge2 = Vec3 {
+                x: v2.x - v0.x
+                y: v2.y - v0.y
+                z: v2.z - v0.z
+            }
+            let normal = edge1.cross(edge2)
+
+            // Add to vertex normals
+            self.vertices[i0].normal.x += normal.x
+            self.vertices[i0].normal.y += normal.y
+            self.vertices[i0].normal.z += normal.z
+
+            self.vertices[i1].normal.x += normal.x
+            self.vertices[i1].normal.y += normal.y
+            self.vertices[i1].normal.z += normal.z
+
+            self.vertices[i2].normal.x += normal.x
+            self.vertices[i2].normal.y += normal.y
+            self.vertices[i2].normal.z += normal.z
+
+            i += 3
+        }
+
+        // Normalize vertex normals
+        for i in 0..self.vertex_count {
+            self.vertices[i].normal = self.vertices[i].normal.normalize()
+        }
+    }
+
+    fn compute_tangents(mut self) {
+        // TODO: Compute tangent space for normal mapping
+        // Requires UV coordinates and normal computation first
+    }
+
+    fn get_triangle_count(self): usize {
+        return self.index_count / 3
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.vertices)
+        self.allocator.free(self.indices)
+    }
+}
+
+// Model (collection of meshes)
+struct Model {
+    name: string
+    meshes: []Mesh
+    mesh_count: usize
+    materials: []Material
+    material_count: usize
+    bounds: BoundingBox
+    allocator: Allocator
+
+    fn init(allocator: Allocator, name: string): Model {
+        return Model {
+            name: name
+            meshes: allocator.alloc(Mesh, 32)  // Max 32 sub-meshes
+            mesh_count: 0
+            materials: allocator.alloc(Material, 16)  // Max 16 materials
+            material_count: 0
+            bounds: BoundingBox.init()
+            allocator: allocator
+        }
+    }
+
+    fn add_mesh(mut self, mesh: Mesh) {
+        if self.mesh_count < self.meshes.len {
+            self.meshes[self.mesh_count] = mesh
+            self.mesh_count += 1
+
+            // Update model bounding box
+            self.bounds.expand(mesh.bounds.min)
+            self.bounds.expand(mesh.bounds.max)
+        }
+    }
+
+    fn add_material(mut self, material: Material): i32 {
+        if self.material_count < self.materials.len {
+            self.materials[self.material_count] = material
+            let index = @intCast(i32, self.material_count)
+            self.material_count += 1
+            return index
+        }
+        return -1
+    }
+
+    fn get_total_triangle_count(self): usize {
+        let mut total: usize = 0
+        for i in 0..self.mesh_count {
+            total += self.meshes[i].get_triangle_count()
+        }
+        return total
+    }
+
+    fn deinit(mut self) {
+        for i in 0..self.mesh_count {
+            self.meshes[i].deinit()
+        }
+        self.allocator.free(self.meshes)
+        self.allocator.free(self.materials)
+    }
+}
