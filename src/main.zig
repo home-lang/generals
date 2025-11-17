@@ -20,6 +20,10 @@ const buildings = @import("game_data/buildings.zig");
 const weapons = @import("game_data/weapons.zig");
 const upgrades = @import("game_data/upgrades.zig");
 const maps = @import("game_data/maps.zig");
+const missions = @import("game_data/missions.zig");
+
+// Include AI system
+const ai = @import("ai/ai.zig");
 
 // Game subsystems (stubs that will be compiled in)
 const Vec3 = math3d_module.Vec3;
@@ -115,11 +119,24 @@ fn initNetwork(allocator: std.mem.Allocator) !void {
 
 /// Initialize AI subsystem
 fn initAI(allocator: std.mem.Allocator) !void {
-    _ = allocator;
+    // Initialize demo AI player directly to demonstrate the system
+    var demo_ai = try ai.AIPlayer.init(
+        allocator,
+        1,
+        "USA",
+        ai.tactics.TacticalAI.AIDifficulty.Medium,
+        128,
+        128,
+    );
+    defer demo_ai.deinit();
+
     std.debug.print("  - Pathfinding: A* with hierarchical grid\n", .{});
-    std.debug.print("  - Behavior trees loaded: 45\n", .{});
+    std.debug.print("  - Behavior trees: Tactical decision system\n", .{});
     std.debug.print("  - AI difficulty levels: 5\n", .{});
-    std.debug.print("  - Unit behaviors: 127\n", .{});
+    std.debug.print("  - Build orders: Dynamic economy management\n", .{});
+
+    const debug_info = demo_ai.getDebugInfo();
+    std.debug.print("  - Demo AI initialized: Player {} ({s})\n", .{ debug_info.player_id, debug_info.faction });
 }
 
 /// Load game data
@@ -147,7 +164,10 @@ fn loadGameData(allocator: std.mem.Allocator) !void {
     const map_count = maps.MAP_DATABASE.len;
     std.debug.print("  - Loading maps ({} maps loaded)...\n", .{map_count});
 
-    std.debug.print("  - Loading campaigns (3 campaigns, 24 missions)...\n", .{});
+    // Load actual mission database
+    const campaign_count = missions.getCampaignCount();
+    const mission_count = missions.getMissionCount();
+    std.debug.print("  - Loading campaigns ({} campaigns, {} missions)...\n", .{ campaign_count, mission_count });
 
     // Show some sample data to prove it's real
     std.debug.print("\n  Sample Units:\n", .{});
@@ -229,6 +249,11 @@ fn gameLoop(state: *GameState) !void {
 
 /// Display project information
 fn displayProjectInfo() void {
+    const total_weapons = weapons.WEAPON_DATABASE.len;
+    const total_missions = missions.getMissionCount();
+    const total_units = units.UNIT_DATABASE.len;
+    const total_buildings = buildings.BUILDING_DATABASE.len;
+
     std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
     std.debug.print("Project Information\n", .{});
     std.debug.print("=" ** 60 ++ "\n\n", .{});
@@ -247,10 +272,10 @@ fn displayProjectInfo() void {
     std.debug.print("  ✓ Special Powers (Super weapons)\n", .{});
     std.debug.print("  ✓ Fog of War & Radar\n", .{});
     std.debug.print("  ✓ Save/Load System\n", .{});
-    std.debug.print("  ✓ Unit & Building Management (321 types)\n", .{});
-    std.debug.print("  ✓ Combat System (156 weapons)\n", .{});
+    std.debug.print("  ✓ Unit & Building Management ({} types)\n", .{total_units + total_buildings});
+    std.debug.print("  ✓ Combat System ({} weapons)\n", .{total_weapons});
     std.debug.print("  ✓ AI (Pathfinding, Behavior Trees)\n", .{});
-    std.debug.print("  ✓ Campaign & Missions (24 missions)\n", .{});
+    std.debug.print("  ✓ Campaign & Missions ({} missions)\n", .{total_missions});
     std.debug.print("  ✓ Multiplayer (Lockstep Networking)\n", .{});
     std.debug.print("  ✓ Graphics (Metal/DirectX/Vulkan)\n", .{});
     std.debug.print("  ✓ Audio Engine (Music + SFX)\n", .{});
