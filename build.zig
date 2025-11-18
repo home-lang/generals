@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
     // Install executable
     b.installArtifact(exe);
 
+    // Install game assets (INI files, models, textures, audio, maps)
+    const install_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("assets"),
+        .install_dir = .bin,
+        .install_subdir = "assets",
+    });
+    b.getInstallStep().dependOn(&install_assets.step);
+
     // Create run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
