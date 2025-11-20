@@ -1,0 +1,1347 @@
+// Advanced Rendering for C&C Generals Zero Hour
+// Lighting, shadows, water rendering, post-processing
+// Written in Home language
+
+// Light types
+enum LightType {
+    POINT = 0,
+    DIRECTIONAL = 1,
+    SPOT = 2,
+}
+
+// Shadow quality
+enum ShadowQuality {
+    LOW = 0,
+    MEDIUM = 1,
+    HIGH = 2,
+    ULTRA = 3,
+}
+
+// Post-processing effects
+enum PostProcessEffect {
+    BLOOM = 0,
+    HDR = 1,
+    SSAO = 2,
+    MOTION_BLUR = 3,
+    DOF = 4,
+    COLOR_GRADING = 5,
+}
+
+// Point light
+struct PointLight {
+    id: Int,
+    position: Vec3,
+    color: Color,
+    intensity: Float,
+    radius: Float,
+    cast_shadows: Bool,
+    enabled: Bool,
+
+    fn init(id: Int, x: Float, y: Float, z: Float) -> PointLight {
+        return PointLight {
+            id: id,
+            position: Vec3::init(x, y, z),
+            color: Color::init(1.0, 1.0, 1.0, 1.0),
+            intensity: 1.0,
+            radius: 10.0,
+            cast_shadows: false,
+            enabled: true,
+        }
+    }
+
+    fn set_color(self, r: Float, g: Float, b: Float) {
+        self.color = Color::init(r, g, b, 1.0)
+    }
+
+    fn set_intensity(self, intensity: Float) {
+        self.intensity = intensity
+    }
+
+    fn set_radius(self, radius: Float) {
+        self.radius = radius
+    }
+
+    fn enable_shadows(self) {
+        self.cast_shadows = true
+    }
+
+    fn disable_shadows(self) {
+        self.cast_shadows = false
+    }
+
+    fn calculate_attenuation(self, distance: Float) -> Float {
+        if distance >= self.radius {
+            return 0.0
+        }
+
+        let linear = 4.5 / self.radius
+        let quadratic = 75.0 / (self.radius * self.radius)
+
+        let attenuation = 1.0 / (1.0 + linear * distance + quadratic * distance * distance)
+        return attenuation
+    }
+
+    fn is_affecting_point(self, x: Float, y: Float, z: Float) -> Bool {
+        let dx = x - self.position.x
+        let dy = y - self.position.y
+        let dz = z - self.position.z
+        let dist_sq = dx * dx + dy * dy + dz * dz
+        return dist_sq <= (self.radius * self.radius)
+    }
+}
+
+// Directional light (sun/moon)
+struct DirectionalLight {
+    direction: Vec3,
+    color: Color,
+    intensity: Float,
+    cast_shadows: Bool,
+    shadow_distance: Float,
+    shadow_cascades: Int,
+
+    fn init() -> DirectionalLight {
+        return DirectionalLight {
+            direction: Vec3::init(0.5, -1.0, 0.5),
+            color: Color::init(1.0, 0.95, 0.9, 1.0),
+            intensity: 1.0,
+            cast_shadows: true,
+            shadow_distance: 100.0,
+            shadow_cascades: 4,
+        }
+    }
+
+    fn set_direction(self, x: Float, y: Float, z: Float) {
+        self.direction = Vec3::init(x, y, z)
+        self.normalize_direction()
+    }
+
+    fn normalize_direction(self) {
+        let len = sqrt(
+            self.direction.x * self.direction.x +
+            self.direction.y * self.direction.y +
+            self.direction.z * self.direction.z
+        )
+        if len > 0.0 {
+            self.direction.x = self.direction.x / len
+            self.direction.y = self.direction.y / len
+            self.direction.z = self.direction.z / len
+        }
+    }
+
+    fn set_color(self, r: Float, g: Float, b: Float) {
+        self.color = Color::init(r, g, b, 1.0)
+    }
+
+    fn set_intensity(self, intensity: Float) {
+        self.intensity = intensity
+    }
+
+    fn set_shadow_cascades(self, cascades: Int) {
+        self.shadow_cascades = min(cascades, 4)
+    }
+}
+
+// Spot light
+struct SpotLight {
+    id: Int,
+    position: Vec3,
+    direction: Vec3,
+    color: Color,
+    intensity: Float,
+    radius: Float,
+    inner_angle: Float,
+    outer_angle: Float,
+    cast_shadows: Bool,
+    enabled: Bool,
+
+    fn init(id: Int, x: Float, y: Float, z: Float) -> SpotLight {
+        return SpotLight {
+            id: id,
+            position: Vec3::init(x, y, z),
+            direction: Vec3::init(0.0, -1.0, 0.0),
+            color: Color::init(1.0, 1.0, 1.0, 1.0),
+            intensity: 1.0,
+            radius: 15.0,
+            inner_angle: 30.0,
+            outer_angle: 45.0,
+            cast_shadows: true,
+            enabled: true,
+        }
+    }
+
+    fn set_direction(self, x: Float, y: Float, z: Float) {
+        self.direction = Vec3::init(x, y, z)
+        self.normalize_direction()
+    }
+
+    fn normalize_direction(self) {
+        let len = sqrt(
+            self.direction.x * self.direction.x +
+            self.direction.y * self.direction.y +
+            self.direction.z * self.direction.z
+        )
+        if len > 0.0 {
+            self.direction.x = self.direction.x / len
+            self.direction.y = self.direction.y / len
+            self.direction.z = self.direction.z / len
+        }
+    }
+
+    fn calculate_spot_factor(self, to_light: Vec3) -> Float {
+        let dot = -(to_light.x * self.direction.x + to_light.y * self.direction.y + to_light.z * self.direction.z)
+
+        let inner_cos = cos(self.inner_angle * 0.0174533)  // deg to rad
+        let outer_cos = cos(self.outer_angle * 0.0174533)
+
+        if dot > inner_cos {
+            return 1.0
+        } else if dot > outer_cos {
+            return (dot - outer_cos) / (inner_cos - outer_cos)
+        }
+
+        return 0.0
+    }
+}
+
+// Shadow map
+struct ShadowMap {
+    resolution: Int,
+    cascade_splits: Collection<Float>,
+    shadow_bias: Float,
+    pcf_samples: Int,
+    quality: ShadowQuality,
+
+    fn init(quality: ShadowQuality) -> ShadowMap {
+        let resolution = match quality {
+            ShadowQuality::LOW => 512,
+            ShadowQuality::MEDIUM => 1024,
+            ShadowQuality::HIGH => 2048,
+            ShadowQuality::ULTRA => 4096,
+            _ => 1024,
+        }
+
+        let pcf_samples = match quality {
+            ShadowQuality::LOW => 4,
+            ShadowQuality::MEDIUM => 9,
+            ShadowQuality::HIGH => 16,
+            ShadowQuality::ULTRA => 25,
+            _ => 9,
+        }
+
+        return ShadowMap {
+            resolution: resolution,
+            cascade_splits: Collection::new(),
+            shadow_bias: 0.005,
+            pcf_samples: pcf_samples,
+            quality: quality,
+        }
+    }
+
+    fn calculate_cascade_splits(self, near: Float, far: Float, num_cascades: Int) {
+        self.cascade_splits.clear()
+
+        for i in 0..num_cascades {
+            let p = (i + 1) as Float / num_cascades as Float
+            let log_split = near * pow(far / near, p)
+            let uniform_split = near + (far - near) * p
+
+            // Blend between logarithmic and uniform
+            let split = 0.5 * log_split + 0.5 * uniform_split
+            self.cascade_splits.add(split)
+        }
+    }
+
+    fn get_cascade_for_depth(self, depth: Float) -> Int {
+        for i in 0..self.cascade_splits.count() {
+            if depth < self.cascade_splits.get(i) {
+                return i
+            }
+        }
+        return self.cascade_splits.count() - 1
+    }
+
+    fn set_quality(self, quality: ShadowQuality) {
+        self.quality = quality
+
+        self.resolution = match quality {
+            ShadowQuality::LOW => 512,
+            ShadowQuality::MEDIUM => 1024,
+            ShadowQuality::HIGH => 2048,
+            ShadowQuality::ULTRA => 4096,
+            _ => 1024,
+        }
+
+        self.pcf_samples = match quality {
+            ShadowQuality::LOW => 4,
+            ShadowQuality::MEDIUM => 9,
+            ShadowQuality::HIGH => 16,
+            ShadowQuality::ULTRA => 25,
+            _ => 9,
+        }
+    }
+}
+
+// Water surface
+struct WaterSurface {
+    position: Vec3,
+    width: Float,
+    height: Float,
+    wave_amplitude: Float,
+    wave_frequency: Float,
+    wave_speed: Float,
+    time: Float,
+    reflection_enabled: Bool,
+    refraction_enabled: Bool,
+    foam_enabled: Bool,
+
+    fn init(x: Float, y: Float, z: Float, width: Float, height: Float) -> WaterSurface {
+        return WaterSurface {
+            position: Vec3::init(x, y, z),
+            width: width,
+            height: height,
+            wave_amplitude: 0.2,
+            wave_frequency: 2.0,
+            wave_speed: 1.0,
+            time: 0.0,
+            reflection_enabled: true,
+            refraction_enabled: true,
+            foam_enabled: true,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.time = self.time + delta_time * self.wave_speed
+    }
+
+    fn get_height_at(self, x: Float, z: Float) -> Float {
+        let local_x = x - self.position.x
+        let local_z = z - self.position.z
+
+        // Simple wave function
+        let wave1 = sin(local_x * self.wave_frequency + self.time) * self.wave_amplitude
+        let wave2 = sin(local_z * self.wave_frequency * 1.3 + self.time * 0.7) * self.wave_amplitude * 0.5
+
+        return self.position.y + wave1 + wave2
+    }
+
+    fn get_normal_at(self, x: Float, z: Float) -> Vec3 {
+        let epsilon = 0.1
+
+        let h_center = self.get_height_at(x, z)
+        let h_right = self.get_height_at(x + epsilon, z)
+        let h_forward = self.get_height_at(x, z + epsilon)
+
+        let dx = h_right - h_center
+        let dz = h_forward - h_center
+
+        let normal = Vec3::init(-dx, epsilon, -dz)
+        return self.normalize_vec3(normal)
+    }
+
+    fn normalize_vec3(self, v: Vec3) -> Vec3 {
+        let len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+        if len > 0.0 {
+            return Vec3::init(v.x / len, v.y / len, v.z / len)
+        }
+        return Vec3::init(0.0, 1.0, 0.0)
+    }
+
+    fn set_wave_parameters(self, amplitude: Float, frequency: Float, speed: Float) {
+        self.wave_amplitude = amplitude
+        self.wave_frequency = frequency
+        self.wave_speed = speed
+    }
+
+    fn enable_reflections(self) {
+        self.reflection_enabled = true
+    }
+
+    fn disable_reflections(self) {
+        self.reflection_enabled = false
+    }
+}
+
+// Bloom effect
+struct BloomEffect {
+    enabled: Bool,
+    threshold: Float,
+    intensity: Float,
+    blur_passes: Int,
+
+    fn init() -> BloomEffect {
+        return BloomEffect {
+            enabled: true,
+            threshold: 1.0,
+            intensity: 0.5,
+            blur_passes: 5,
+        }
+    }
+
+    fn set_threshold(self, threshold: Float) {
+        self.threshold = threshold
+    }
+
+    fn set_intensity(self, intensity: Float) {
+        self.intensity = intensity
+    }
+
+    fn set_blur_passes(self, passes: Int) {
+        self.blur_passes = min(passes, 10)
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+}
+
+// HDR (High Dynamic Range)
+struct HDREffect {
+    enabled: Bool,
+    exposure: Float,
+    gamma: Float,
+    tone_mapping: ToneMappingMode,
+
+    fn init() -> HDREffect {
+        return HDREffect {
+            enabled: true,
+            exposure: 1.0,
+            gamma: 2.2,
+            tone_mapping: ToneMappingMode::REINHARD,
+        }
+    }
+
+    fn set_exposure(self, exposure: Float) {
+        self.exposure = exposure
+    }
+
+    fn set_gamma(self, gamma: Float) {
+        self.gamma = gamma
+    }
+
+    fn set_tone_mapping(self, mode: ToneMappingMode) {
+        self.tone_mapping = mode
+    }
+
+    fn apply_tone_mapping(self, color: Vec3) -> Vec3 {
+        match self.tone_mapping {
+            ToneMappingMode::REINHARD => return self.reinhard(color),
+            ToneMappingMode::UNCHARTED => return self.uncharted2(color),
+            ToneMappingMode::ACES => return self.aces(color),
+            _ => return color,
+        }
+    }
+
+    fn reinhard(self, color: Vec3) -> Vec3 {
+        let mapped_x = color.x / (color.x + 1.0)
+        let mapped_y = color.y / (color.y + 1.0)
+        let mapped_z = color.z / (color.z + 1.0)
+        return Vec3::init(mapped_x, mapped_y, mapped_z)
+    }
+
+    fn uncharted2(self, color: Vec3) -> Vec3 {
+        // Simplified Uncharted 2 tone mapping
+        let A = 0.15
+        let B = 0.50
+        let C = 0.10
+        let D = 0.20
+        let E = 0.02
+        let F = 0.30
+
+        let mapped_x = ((color.x * (A * color.x + C * B) + D * E) / (color.x * (A * color.x + B) + D * F)) - E / F
+        let mapped_y = ((color.y * (A * color.y + C * B) + D * E) / (color.y * (A * color.y + B) + D * F)) - E / F
+        let mapped_z = ((color.z * (A * color.z + C * B) + D * E) / (color.z * (A * color.z + B) + D * F)) - E / F
+
+        return Vec3::init(mapped_x, mapped_y, mapped_z)
+    }
+
+    fn aces(self, color: Vec3) -> Vec3 {
+        // ACES Filmic tone mapping
+        let a = 2.51
+        let b = 0.03
+        let c = 2.43
+        let d = 0.59
+        let e = 0.14
+
+        let mapped_x = (color.x * (a * color.x + b)) / (color.x * (c * color.x + d) + e)
+        let mapped_y = (color.y * (a * color.y + b)) / (color.y * (c * color.y + d) + e)
+        let mapped_z = (color.z * (a * color.z + b)) / (color.z * (c * color.z + d) + e)
+
+        return Vec3::init(mapped_x, mapped_y, mapped_z)
+    }
+}
+
+// SSAO (Screen Space Ambient Occlusion)
+struct SSAOEffect {
+    enabled: Bool,
+    radius: Float,
+    bias: Float,
+    sample_count: Int,
+    intensity: Float,
+
+    fn init() -> SSAOEffect {
+        return SSAOEffect {
+            enabled: false,
+            radius: 0.5,
+            bias: 0.025,
+            sample_count: 16,
+            intensity: 1.0,
+        }
+    }
+
+    fn set_radius(self, radius: Float) {
+        self.radius = radius
+    }
+
+    fn set_intensity(self, intensity: Float) {
+        self.intensity = intensity
+    }
+
+    fn set_sample_count(self, count: Int) {
+        self.sample_count = min(count, 64)
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+}
+
+// Depth of Field
+struct DOFEffect {
+    enabled: Bool,
+    focal_distance: Float,
+    focal_range: Float,
+    blur_amount: Float,
+
+    fn init() -> DOFEffect {
+        return DOFEffect {
+            enabled: false,
+            focal_distance: 10.0,
+            focal_range: 5.0,
+            blur_amount: 1.0,
+        }
+    }
+
+    fn set_focal_distance(self, distance: Float) {
+        self.focal_distance = distance
+    }
+
+    fn set_focal_range(self, range: Float) {
+        self.focal_range = range
+    }
+
+    fn calculate_blur_amount(self, depth: Float) -> Float {
+        let distance_from_focus = abs(depth - self.focal_distance)
+
+        if distance_from_focus < self.focal_range {
+            return 0.0
+        }
+
+        let blur = (distance_from_focus - self.focal_range) / self.focal_range
+        return min(blur * self.blur_amount, 1.0)
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+}
+
+// Color grading
+struct ColorGrading {
+    enabled: Bool,
+    temperature: Float,
+    tint: Float,
+    saturation: Float,
+    contrast: Float,
+    brightness: Float,
+
+    fn init() -> ColorGrading {
+        return ColorGrading {
+            enabled: false,
+            temperature: 0.0,
+            tint: 0.0,
+            saturation: 1.0,
+            contrast: 1.0,
+            brightness: 1.0,
+        }
+    }
+
+    fn apply(self, color: Vec3) -> Vec3 {
+        let result = color
+
+        // Apply brightness
+        result.x = result.x * self.brightness
+        result.y = result.y * self.brightness
+        result.z = result.z * self.brightness
+
+        // Apply contrast
+        result.x = (result.x - 0.5) * self.contrast + 0.5
+        result.y = (result.y - 0.5) * self.contrast + 0.5
+        result.z = (result.z - 0.5) * self.contrast + 0.5
+
+        // Apply saturation
+        let luminance = 0.299 * result.x + 0.587 * result.y + 0.114 * result.z
+        result.x = luminance + (result.x - luminance) * self.saturation
+        result.y = luminance + (result.y - luminance) * self.saturation
+        result.z = luminance + (result.z - luminance) * self.saturation
+
+        return result
+    }
+
+    fn set_temperature(self, temp: Float) {
+        self.temperature = temp
+    }
+
+    fn set_saturation(self, sat: Float) {
+        self.saturation = sat
+    }
+
+    fn set_contrast(self, contrast: Float) {
+        self.contrast = contrast
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+}
+
+// Lighting manager
+struct LightingManager {
+    directional_light: DirectionalLight,
+    point_lights: Collection<PointLight>,
+    spot_lights: Collection<SpotLight>,
+    ambient_color: Color,
+    ambient_intensity: Float,
+    max_point_lights: Int,
+    max_spot_lights: Int,
+
+    fn init() -> LightingManager {
+        return LightingManager {
+            directional_light: DirectionalLight::init(),
+            point_lights: Collection::new(),
+            spot_lights: Collection::new(),
+            ambient_color: Color::init(0.2, 0.2, 0.2, 1.0),
+            ambient_intensity: 0.3,
+            max_point_lights: 32,
+            max_spot_lights: 16,
+        }
+    }
+
+    fn add_point_light(self, x: Float, y: Float, z: Float) -> Int {
+        if self.point_lights.count() >= self.max_point_lights {
+            return -1
+        }
+
+        let id = self.point_lights.count()
+        let light = PointLight::init(id, x, y, z)
+        self.point_lights.add(light)
+        return id
+    }
+
+    fn remove_point_light(self, id: Int) {
+        for i in 0..self.point_lights.count() {
+            let light = self.point_lights.get(i)
+            if light.id == id {
+                self.point_lights.remove_at(i)
+                return
+            }
+        }
+    }
+
+    fn add_spot_light(self, x: Float, y: Float, z: Float) -> Int {
+        if self.spot_lights.count() >= self.max_spot_lights {
+            return -1
+        }
+
+        let id = self.spot_lights.count()
+        let light = SpotLight::init(id, x, y, z)
+        self.spot_lights.add(light)
+        return id
+    }
+
+    fn remove_spot_light(self, id: Int) {
+        for i in 0..self.spot_lights.count() {
+            let light = self.spot_lights.get(i)
+            if light.id == id {
+                self.spot_lights.remove_at(i)
+                return
+            }
+        }
+    }
+
+    fn set_ambient_light(self, r: Float, g: Float, b: Float, intensity: Float) {
+        self.ambient_color = Color::init(r, g, b, 1.0)
+        self.ambient_intensity = intensity
+    }
+
+    fn get_point_light_count(self) -> Int {
+        return self.point_lights.count()
+    }
+
+    fn get_spot_light_count(self) -> Int {
+        return self.spot_lights.count()
+    }
+
+    fn cull_lights(self, camera_pos: Vec3, view_distance: Float) -> Collection<Int> {
+        let visible_lights = Collection::new()
+
+        for i in 0..self.point_lights.count() {
+            let light = self.point_lights.get(i)
+            if light.enabled {
+                let dx = light.position.x - camera_pos.x
+                let dy = light.position.y - camera_pos.y
+                let dz = light.position.z - camera_pos.z
+                let dist_sq = dx * dx + dy * dy + dz * dz
+
+                if dist_sq <= (view_distance * view_distance) {
+                    visible_lights.add(light.id)
+                }
+            }
+        }
+
+        return visible_lights
+    }
+}
+
+// Post-processing manager
+struct PostProcessingManager {
+    bloom: BloomEffect,
+    hdr: HDREffect,
+    ssao: SSAOEffect,
+    dof: DOFEffect,
+    color_grading: ColorGrading,
+
+    fn init() -> PostProcessingManager {
+        return PostProcessingManager {
+            bloom: BloomEffect::init(),
+            hdr: HDREffect::init(),
+            ssao: SSAOEffect::init(),
+            dof: DOFEffect::init(),
+            color_grading: ColorGrading::init(),
+        }
+    }
+
+    fn enable_effect(self, effect: PostProcessEffect) {
+        match effect {
+            PostProcessEffect::BLOOM => self.bloom.enable(),
+            PostProcessEffect::HDR => self.hdr.enabled = true,
+            PostProcessEffect::SSAO => self.ssao.enable(),
+            PostProcessEffect::DOF => self.dof.enable(),
+            PostProcessEffect::COLOR_GRADING => self.color_grading.enable(),
+            _ => {},
+        }
+    }
+
+    fn disable_effect(self, effect: PostProcessEffect) {
+        match effect {
+            PostProcessEffect::BLOOM => self.bloom.disable(),
+            PostProcessEffect::HDR => self.hdr.enabled = false,
+            PostProcessEffect::SSAO => self.ssao.disable(),
+            PostProcessEffect::DOF => self.dof.disable(),
+            PostProcessEffect::COLOR_GRADING => self.color_grading.disable(),
+            _ => {},
+        }
+    }
+
+    fn is_effect_enabled(self, effect: PostProcessEffect) -> Bool {
+        match effect {
+            PostProcessEffect::BLOOM => return self.bloom.enabled,
+            PostProcessEffect::HDR => return self.hdr.enabled,
+            PostProcessEffect::SSAO => return self.ssao.enabled,
+            PostProcessEffect::DOF => return self.dof.enabled,
+            PostProcessEffect::COLOR_GRADING => return self.color_grading.enabled,
+            _ => return false,
+        }
+    }
+}
+
+// Advanced renderer
+struct AdvancedRenderer {
+    lighting: LightingManager,
+    shadows: ShadowMap,
+    water_surfaces: Collection<WaterSurface>,
+    post_processing: PostProcessingManager,
+    render_water: Bool,
+    render_shadows: Bool,
+
+    fn init() -> AdvancedRenderer {
+        return AdvancedRenderer {
+            lighting: LightingManager::init(),
+            shadows: ShadowMap::init(ShadowQuality::MEDIUM),
+            water_surfaces: Collection::new(),
+            post_processing: PostProcessingManager::init(),
+            render_water: true,
+            render_shadows: true,
+        }
+    }
+
+    fn add_water_surface(self, x: Float, y: Float, z: Float, width: Float, height: Float) -> Int {
+        let water = WaterSurface::init(x, y, z, width, height)
+        self.water_surfaces.add(water)
+        return self.water_surfaces.count() - 1
+    }
+
+    fn update(self, delta_time: Float) {
+        // Update water animation
+        for i in 0..self.water_surfaces.count() {
+            let water = self.water_surfaces.get(i)
+            water.update(delta_time)
+        }
+    }
+
+    fn set_shadow_quality(self, quality: ShadowQuality) {
+        self.shadows.set_quality(quality)
+    }
+
+    fn enable_shadows(self) {
+        self.render_shadows = true
+    }
+
+    fn disable_shadows(self) {
+        self.render_shadows = false
+    }
+
+    fn enable_water(self) {
+        self.render_water = true
+    }
+
+    fn disable_water(self) {
+        self.render_water = false
+    }
+
+    fn get_water_count(self) -> Int {
+        return self.water_surfaces.count()
+    }
+}
+
+// Helper structs
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+struct Color {
+    r: Float,
+    g: Float,
+    b: Float,
+    a: Float,
+
+    fn init(r: Float, g: Float, b: Float, a: Float) -> Color {
+        return Color { r: r, g: g, b: b, a: a }
+    }
+}
+
+enum ToneMappingMode {
+    REINHARD = 0,
+    UNCHARTED = 1,
+    ACES = 2,
+}
+
+// Helper functions
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let guess = x / 2.0
+    let epsilon = 0.01
+    let max_iter = 10
+    let iter = 0
+    while iter < max_iter {
+        let next = (guess + x / guess) / 2.0
+        if abs(next - guess) < epsilon {
+            return next
+        }
+        guess = next
+        iter = iter + 1
+    }
+    return guess
+}
+
+fn abs(x: Float) -> Float {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+fn min(a: Int, b: Int) -> Int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn pow(base: Float, exp: Float) -> Float {
+    if exp == 0.0 {
+        return 1.0
+    }
+    let result = base
+    let count = exp as Int
+    for i in 1..count {
+        result = result * base
+    }
+    return result
+}
+
+fn sin(x: Float) -> Float {
+    // Simple sine approximation using Taylor series
+    let x_mod = x % 6.28318530718  // 2*PI
+    let x2 = x_mod * x_mod
+    let x3 = x2 * x_mod
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+
+    return x_mod - (x3 / 6.0) + (x5 / 120.0) - (x7 / 5040.0)
+}
+
+fn cos(x: Float) -> Float {
+    return sin(x + 1.5707963268)  // PI/2
+}
+
+// Tests
+test "PointLight: init" {
+    let light = PointLight::init(0, 10.0, 20.0, 5.0)
+
+    assert light.id == 0
+    assert light.position.x == 10.0
+    assert light.intensity == 1.0
+    assert light.enabled
+}
+
+test "PointLight: set color" {
+    let light = PointLight::init(0, 0.0, 0.0, 0.0)
+
+    light.set_color(1.0, 0.5, 0.0)
+
+    assert light.color.r == 1.0
+    assert light.color.g == 0.5
+}
+
+test "PointLight: set intensity" {
+    let light = PointLight::init(0, 0.0, 0.0, 0.0)
+
+    light.set_intensity(2.0)
+
+    assert light.intensity == 2.0
+}
+
+test "PointLight: enable shadows" {
+    let light = PointLight::init(0, 0.0, 0.0, 0.0)
+
+    light.enable_shadows()
+
+    assert light.cast_shadows
+}
+
+test "PointLight: calculate attenuation" {
+    let light = PointLight::init(0, 0.0, 0.0, 0.0)
+    light.set_radius(10.0)
+
+    let att_close = light.calculate_attenuation(2.0)
+    let att_far = light.calculate_attenuation(9.0)
+
+    assert att_close > att_far
+}
+
+test "PointLight: is affecting point" {
+    let light = PointLight::init(0, 0.0, 0.0, 0.0)
+    light.set_radius(10.0)
+
+    assert light.is_affecting_point(5.0, 0.0, 0.0)
+    assert !light.is_affecting_point(15.0, 0.0, 0.0)
+}
+
+test "DirectionalLight: init" {
+    let light = DirectionalLight::init()
+
+    assert light.intensity == 1.0
+    assert light.cast_shadows
+    assert light.shadow_cascades == 4
+}
+
+test "DirectionalLight: set direction" {
+    let light = DirectionalLight::init()
+
+    light.set_direction(1.0, -1.0, 0.0)
+
+    assert light.direction.x > 0.0
+}
+
+test "DirectionalLight: set color" {
+    let light = DirectionalLight::init()
+
+    light.set_color(1.0, 0.8, 0.6)
+
+    assert light.color.r == 1.0
+}
+
+test "DirectionalLight: set shadow cascades" {
+    let light = DirectionalLight::init()
+
+    light.set_shadow_cascades(3)
+
+    assert light.shadow_cascades == 3
+}
+
+test "SpotLight: init" {
+    let light = SpotLight::init(0, 10.0, 20.0, 5.0)
+
+    assert light.id == 0
+    assert light.enabled
+    assert light.inner_angle == 30.0
+}
+
+test "SpotLight: set direction" {
+    let light = SpotLight::init(0, 0.0, 0.0, 0.0)
+
+    light.set_direction(0.0, -1.0, 0.5)
+
+    assert light.direction.y < 0.0
+}
+
+test "ShadowMap: init" {
+    let shadows = ShadowMap::init(ShadowQuality::MEDIUM)
+
+    assert shadows.resolution == 1024
+    assert shadows.pcf_samples == 9
+}
+
+test "ShadowMap: set quality" {
+    let shadows = ShadowMap::init(ShadowQuality::LOW)
+
+    shadows.set_quality(ShadowQuality::HIGH)
+
+    assert shadows.resolution == 2048
+    assert shadows.pcf_samples == 16
+}
+
+test "ShadowMap: calculate cascade splits" {
+    let shadows = ShadowMap::init(ShadowQuality::MEDIUM)
+
+    shadows.calculate_cascade_splits(1.0, 100.0, 4)
+
+    assert shadows.cascade_splits.count() == 4
+}
+
+test "ShadowMap: get cascade for depth" {
+    let shadows = ShadowMap::init(ShadowQuality::MEDIUM)
+
+    shadows.calculate_cascade_splits(1.0, 100.0, 4)
+    let cascade = shadows.get_cascade_for_depth(25.0)
+
+    assert cascade >= 0 && cascade < 4
+}
+
+test "WaterSurface: init" {
+    let water = WaterSurface::init(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    assert water.width == 100.0
+    assert water.height == 100.0
+    assert water.reflection_enabled
+}
+
+test "WaterSurface: update" {
+    let water = WaterSurface::init(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    let initial_time = water.time
+    water.update(0.016)
+
+    assert water.time > initial_time
+}
+
+test "WaterSurface: get height at" {
+    let water = WaterSurface::init(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    let height = water.get_height_at(10.0, 10.0)
+
+    assert height >= water.position.y - water.wave_amplitude
+}
+
+test "WaterSurface: set wave parameters" {
+    let water = WaterSurface::init(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    water.set_wave_parameters(0.5, 3.0, 2.0)
+
+    assert water.wave_amplitude == 0.5
+    assert water.wave_frequency == 3.0
+}
+
+test "BloomEffect: init" {
+    let bloom = BloomEffect::init()
+
+    assert bloom.enabled
+    assert bloom.threshold == 1.0
+    assert bloom.blur_passes == 5
+}
+
+test "BloomEffect: set threshold" {
+    let bloom = BloomEffect::init()
+
+    bloom.set_threshold(1.5)
+
+    assert bloom.threshold == 1.5
+}
+
+test "BloomEffect: set intensity" {
+    let bloom = BloomEffect::init()
+
+    bloom.set_intensity(0.8)
+
+    assert bloom.intensity == 0.8
+}
+
+test "HDREffect: init" {
+    let hdr = HDREffect::init()
+
+    assert hdr.enabled
+    assert hdr.exposure == 1.0
+    assert hdr.gamma == 2.2
+}
+
+test "HDREffect: set exposure" {
+    let hdr = HDREffect::init()
+
+    hdr.set_exposure(1.5)
+
+    assert hdr.exposure == 1.5
+}
+
+test "HDREffect: set tone mapping" {
+    let hdr = HDREffect::init()
+
+    hdr.set_tone_mapping(ToneMappingMode::ACES)
+
+    assert hdr.tone_mapping == ToneMappingMode::ACES
+}
+
+test "SSAOEffect: init" {
+    let ssao = SSAOEffect::init()
+
+    assert !ssao.enabled
+    assert ssao.radius == 0.5
+    assert ssao.sample_count == 16
+}
+
+test "SSAOEffect: enable" {
+    let ssao = SSAOEffect::init()
+
+    ssao.enable()
+
+    assert ssao.enabled
+}
+
+test "SSAOEffect: set radius" {
+    let ssao = SSAOEffect::init()
+
+    ssao.set_radius(1.0)
+
+    assert ssao.radius == 1.0
+}
+
+test "DOFEffect: init" {
+    let dof = DOFEffect::init()
+
+    assert !dof.enabled
+    assert dof.focal_distance == 10.0
+}
+
+test "DOFEffect: set focal distance" {
+    let dof = DOFEffect::init()
+
+    dof.set_focal_distance(20.0)
+
+    assert dof.focal_distance == 20.0
+}
+
+test "DOFEffect: calculate blur amount" {
+    let dof = DOFEffect::init()
+    dof.focal_distance = 10.0
+    dof.focal_range = 5.0
+
+    let blur_in_focus = dof.calculate_blur_amount(10.0)
+    let blur_out_of_focus = dof.calculate_blur_amount(25.0)
+
+    assert blur_in_focus == 0.0
+    assert blur_out_of_focus > 0.0
+}
+
+test "ColorGrading: init" {
+    let grading = ColorGrading::init()
+
+    assert !grading.enabled
+    assert grading.saturation == 1.0
+    assert grading.contrast == 1.0
+}
+
+test "ColorGrading: set saturation" {
+    let grading = ColorGrading::init()
+
+    grading.set_saturation(1.5)
+
+    assert grading.saturation == 1.5
+}
+
+test "ColorGrading: apply" {
+    let grading = ColorGrading::init()
+    grading.brightness = 1.2
+
+    let color = Vec3::init(0.5, 0.5, 0.5)
+    let result = grading.apply(color)
+
+    assert result.x > color.x
+}
+
+test "LightingManager: init" {
+    let manager = LightingManager::init()
+
+    assert manager.get_point_light_count() == 0
+    assert manager.get_spot_light_count() == 0
+}
+
+test "LightingManager: add point light" {
+    let manager = LightingManager::init()
+
+    let id = manager.add_point_light(10.0, 20.0, 5.0)
+
+    assert id == 0
+    assert manager.get_point_light_count() == 1
+}
+
+test "LightingManager: remove point light" {
+    let manager = LightingManager::init()
+
+    let id = manager.add_point_light(10.0, 20.0, 5.0)
+    manager.remove_point_light(id)
+
+    assert manager.get_point_light_count() == 0
+}
+
+test "LightingManager: add spot light" {
+    let manager = LightingManager::init()
+
+    let id = manager.add_spot_light(10.0, 20.0, 5.0)
+
+    assert id == 0
+    assert manager.get_spot_light_count() == 1
+}
+
+test "LightingManager: set ambient light" {
+    let manager = LightingManager::init()
+
+    manager.set_ambient_light(0.3, 0.3, 0.3, 0.5)
+
+    assert manager.ambient_intensity == 0.5
+}
+
+test "LightingManager: cull lights" {
+    let manager = LightingManager::init()
+
+    manager.add_point_light(10.0, 0.0, 0.0)
+    manager.add_point_light(100.0, 0.0, 0.0)
+
+    let camera_pos = Vec3::init(0.0, 0.0, 0.0)
+    let visible = manager.cull_lights(camera_pos, 50.0)
+
+    assert visible.count() == 1
+}
+
+test "PostProcessingManager: init" {
+    let manager = PostProcessingManager::init()
+
+    assert manager.bloom.enabled
+    assert manager.hdr.enabled
+}
+
+test "PostProcessingManager: enable effect" {
+    let manager = PostProcessingManager::init()
+
+    manager.disable_effect(PostProcessEffect::BLOOM)
+    manager.enable_effect(PostProcessEffect::BLOOM)
+
+    assert manager.is_effect_enabled(PostProcessEffect::BLOOM)
+}
+
+test "PostProcessingManager: disable effect" {
+    let manager = PostProcessingManager::init()
+
+    manager.disable_effect(PostProcessEffect::BLOOM)
+
+    assert !manager.is_effect_enabled(PostProcessEffect::BLOOM)
+}
+
+test "AdvancedRenderer: init" {
+    let renderer = AdvancedRenderer::init()
+
+    assert renderer.render_water
+    assert renderer.render_shadows
+}
+
+test "AdvancedRenderer: add water surface" {
+    let renderer = AdvancedRenderer::init()
+
+    let id = renderer.add_water_surface(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    assert id == 0
+    assert renderer.get_water_count() == 1
+}
+
+test "AdvancedRenderer: set shadow quality" {
+    let renderer = AdvancedRenderer::init()
+
+    renderer.set_shadow_quality(ShadowQuality::HIGH)
+
+    assert renderer.shadows.quality == ShadowQuality::HIGH
+}
+
+test "AdvancedRenderer: enable/disable shadows" {
+    let renderer = AdvancedRenderer::init()
+
+    renderer.disable_shadows()
+    assert !renderer.render_shadows
+
+    renderer.enable_shadows()
+    assert renderer.render_shadows
+}
+
+test "AdvancedRenderer: enable/disable water" {
+    let renderer = AdvancedRenderer::init()
+
+    renderer.disable_water()
+    assert !renderer.render_water
+
+    renderer.enable_water()
+    assert renderer.render_water
+}
+
+test "AdvancedRenderer: update" {
+    let renderer = AdvancedRenderer::init()
+
+    renderer.add_water_surface(0.0, 0.0, 0.0, 100.0, 100.0)
+
+    let water = renderer.water_surfaces.get(0)
+    let initial_time = water.time
+
+    renderer.update(0.016)
+
+    assert water.time > initial_time
+}

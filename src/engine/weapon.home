@@ -1,0 +1,599 @@
+// Weapon system for C&C Generals Zero Hour
+// Based on Thyme's weapon.h - Weapon templates and firing logic
+// Written in Home language
+
+// Attack types
+enum AttackType {
+    PER_SHOT,      // Each bullet
+    PER_ATTACK,    // Each attack command
+    PER_CLIP,      // Each clip reload
+}
+
+// Auto reload behavior
+enum AutoReloadsClip {
+    YES,               // Reloads automatically
+    NO,                // Manual reload only
+    RETURN_TO_BASE,    // Return to base to reload
+}
+
+// Weapon collision flags
+enum WeaponCollide {
+    ALLIES = 1,
+    ENEMIES = 2,
+    STRUCTURES = 4,
+    SHRUBBERY = 8,
+    PROJECTILES = 16,
+    WALLS = 32,
+    SMALL_MISSILES = 64,
+    BALLISTIC_MISSILES = 128,
+    CONTROLLED_STRUCTURES = 256,
+}
+
+// What the weapon can attack
+enum WeaponAnti {
+    AIRBORNE_VEHICLE = 1,
+    GROUND = 2,
+    PROJECTILE = 4,
+    SMALL_MISSILE = 8,
+    MINE = 16,
+    AIRBORNE_INFANTRY = 32,
+    BALLISTIC_MISSILE = 64,
+    PARACHUTE = 128,
+}
+
+// Who the weapon affects
+enum WeaponAffects {
+    SELF = 1,
+    ALLIES = 2,
+    ENEMIES = 4,
+    NEUTRALS = 8,
+    SUICIDE = 16,
+    NOT_SIMILAR = 32,
+    NOT_AIRBORNE = 64,
+}
+
+// Weapon bonus conditions
+enum WeaponBonusCondition {
+    GARRISONED = 0,
+    HORDE = 1,
+    CONTINUOUS_FIRE_MEAN = 2,
+    CONTINUOUS_FIRE_FAST = 3,
+    NATIONALISM = 4,
+    PLAYER_UPGRADE = 5,
+    DRONE_SPOTTING = 6,
+    DEMORALIZED = 7,
+    ENTHUSIASTIC = 8,
+    VETERAN = 9,
+    ELITE = 10,
+    HERO = 11,
+    BATTLEPLAN_BOMBARDMENT = 12,
+    BATTLEPLAN_HOLDTHELINE = 13,
+    BATTLEPLAN_SEARCHANDDESTROY = 14,
+    SUBLIMINAL = 15,
+    SOLO_HUMAN_EASY = 16,
+    SOLO_HUMAN_NORMAL = 17,
+    SOLO_HUMAN_HARD = 18,
+    SOLO_AI_EASY = 19,
+    SOLO_AI_NORMAL = 20,
+    SOLO_AI_HARD = 21,
+    TARGET_FAERIE_FIRE = 22,
+    FANATICISM = 23,
+    FRENZY_ONE = 24,
+    FRENZY_TWO = 25,
+    FRENZY_THREE = 26,
+}
+
+// Weapon bonus fields
+enum WeaponBonusField {
+    DAMAGE = 0,
+    RADIUS = 1,
+    RANGE = 2,
+    RATE_OF_FIRE = 3,
+    PRE_ATTACK = 4,
+}
+
+// Weapon bonus (multipliers for various stats)
+struct WeaponBonus {
+    damage: Float,
+    radius: Float,
+    range: Float,
+    rate_of_fire: Float,
+    pre_attack: Float,
+
+    fn init() -> WeaponBonus {
+        return WeaponBonus {
+            damage: 1.0,
+            radius: 1.0,
+            range: 1.0,
+            rate_of_fire: 1.0,
+            pre_attack: 1.0,
+        }
+    }
+
+    fn get_field(self, field: WeaponBonusField) -> Float {
+        return match field {
+            WeaponBonusField::DAMAGE => self.damage,
+            WeaponBonusField::RADIUS => self.radius,
+            WeaponBonusField::RANGE => self.range,
+            WeaponBonusField::RATE_OF_FIRE => self.rate_of_fire,
+            WeaponBonusField::PRE_ATTACK => self.pre_attack,
+        }
+    }
+
+    fn set_field(self, field: WeaponBonusField, value: Float) {
+        match field {
+            WeaponBonusField::DAMAGE => self.damage = value,
+            WeaponBonusField::RADIUS => self.radius = value,
+            WeaponBonusField::RANGE => self.range = value,
+            WeaponBonusField::RATE_OF_FIRE => self.rate_of_fire = value,
+            WeaponBonusField::PRE_ATTACK => self.pre_attack = value,
+        }
+    }
+
+    fn apply(self, other: WeaponBonus) -> WeaponBonus {
+        return WeaponBonus {
+            damage: self.damage * other.damage,
+            radius: self.radius * other.radius,
+            range: self.range * other.range,
+            rate_of_fire: self.rate_of_fire * other.rate_of_fire,
+            pre_attack: self.pre_attack * other.pre_attack,
+        }
+    }
+}
+
+// Weapon template - static data for a weapon type
+struct WeaponTemplate {
+    name: String,
+
+    // Basic properties
+    attack_range: Float,
+    minimum_attack_range: Float,
+    weapon_speed: Float,  // Projectile speed
+    weapon_recoil: Float,
+
+    // Damage
+    primary_damage: Float,
+    primary_damage_radius: Float,
+    secondary_damage: Float,
+    secondary_damage_radius: Float,
+    scatter_radius: Float,
+    radius_damage_angle: Float,
+
+    // Timing
+    delay_between_shots: Int,      // Milliseconds
+    clip_size: Int,
+    clip_reload_time: Int,         // Milliseconds
+    pre_attack_delay: Int,         // Milliseconds
+    pre_attack_type: AttackType,
+    auto_reload_when_idle: Int,    // Frames
+
+    // Behavior flags
+    auto_reloads_clip: AutoReloadsClip,
+    show_ammo_pips: Bool,
+    capable_of_following_waypoint: Bool,
+    damage_dealt_at_self_position: Bool,
+    leech_range_weapon: Bool,
+    play_fx_when_stealthed: Bool,
+
+    // Targeting
+    anti_mask: Int,                // WeaponAnti bitfield
+    collide_mask: Int,             // WeaponCollide bitfield
+    affects_mask: Int,             // WeaponAffects bitfield
+    min_target_pitch: Float,
+    max_target_pitch: Float,
+    continue_attack_range: Float,
+    request_assist_range: Float,
+    aim_delta: Float,
+
+    // Barrel configuration
+    shots_per_barrel: Int,
+
+    // Projectile
+    projectile_template_name: String,
+
+    // Effects
+    fire_fx_name: String,
+    fire_sound_name: String,
+    laser_name: String,
+    laser_bone_name: String,
+
+    // Continuous fire (A-10 gun, etc.)
+    continuous_fire_cost_frames: Int,
+    continuous_fire_one_shots_needed: Int,
+    continuous_fire_two_shots_needed: Int,
+    fire_sound_loop_time: Int,
+
+    // Scatter
+    scatter_target_scalar: Float,
+
+    // Timing delays
+    suspend_fx_delay: Int,
+}
+
+// Weapon instance (per-unit weapon)
+struct Weapon {
+    template: WeaponTemplate,
+
+    // Current state
+    current_clip_ammo: Int,
+    last_shot_frame: Int,
+    reload_start_frame: Int,
+    is_reloading: Bool,
+    is_locked: Bool,
+    target_id: Int,
+
+    // Firing tracking
+    shots_fired_this_clip: Int,
+    consecutive_shots_at_target: Int,
+    continuous_fire_one_count: Int,
+    continuous_fire_two_count: Int,
+
+    fn init(template: WeaponTemplate) -> Weapon {
+        return Weapon {
+            template: template,
+            current_clip_ammo: template.clip_size,
+            last_shot_frame: 0,
+            reload_start_frame: 0,
+            is_reloading: false,
+            is_locked: false,
+            target_id: -1,
+            shots_fired_this_clip: 0,
+            consecutive_shots_at_target: 0,
+            continuous_fire_one_count: 0,
+            continuous_fire_two_count: 0,
+        }
+    }
+
+    fn get_attack_range(self, bonus: WeaponBonus) -> Float {
+        return self.template.attack_range * bonus.range
+    }
+
+    fn get_minimum_attack_range(self) -> Float {
+        return self.template.minimum_attack_range
+    }
+
+    fn get_delay_between_shots(self, bonus: WeaponBonus) -> Int {
+        return (self.template.delay_between_shots as Float / bonus.rate_of_fire) as Int
+    }
+
+    fn get_clip_reload_time(self, bonus: WeaponBonus) -> Int {
+        return (self.template.clip_reload_time as Float / bonus.rate_of_fire) as Int
+    }
+
+    fn get_pre_attack_delay(self, bonus: WeaponBonus) -> Int {
+        return (self.template.pre_attack_delay as Float * bonus.pre_attack) as Int
+    }
+
+    fn get_primary_damage(self, bonus: WeaponBonus) -> Float {
+        return self.template.primary_damage * bonus.damage
+    }
+
+    fn get_primary_damage_radius(self, bonus: WeaponBonus) -> Float {
+        return self.template.primary_damage_radius * bonus.radius
+    }
+
+    fn can_fire(self, current_frame: Int) -> Bool {
+        if self.is_locked {
+            return false
+        }
+        if self.is_reloading {
+            return false
+        }
+        if self.current_clip_ammo <= 0 {
+            return false
+        }
+
+        let frames_since_last_shot = current_frame - self.last_shot_frame
+        let bonus = WeaponBonus::init()  // TODO: Get actual bonuses
+        let required_delay = self.get_delay_between_shots(bonus) / 16  // Convert ms to frames (60fps)
+
+        return frames_since_last_shot >= required_delay
+    }
+
+    fn fire(self, current_frame: Int, target_id: Int) -> Bool {
+        if !self.can_fire(current_frame) {
+            return false
+        }
+
+        self.current_clip_ammo = self.current_clip_ammo - 1
+        self.last_shot_frame = current_frame
+        self.shots_fired_this_clip = self.shots_fired_this_clip + 1
+
+        if target_id == self.target_id {
+            self.consecutive_shots_at_target = self.consecutive_shots_at_target + 1
+        } else {
+            self.target_id = target_id
+            self.consecutive_shots_at_target = 1
+        }
+
+        // Check if need to reload
+        if self.current_clip_ammo <= 0 {
+            self.start_reload(current_frame)
+        }
+
+        return true
+    }
+
+    fn start_reload(self, current_frame: Int) {
+        if self.template.auto_reloads_clip == AutoReloadsClip::NO {
+            return  // No auto-reload
+        }
+
+        self.is_reloading = true
+        self.reload_start_frame = current_frame
+    }
+
+    fn update(self, current_frame: Int) {
+        if self.is_reloading {
+            let bonus = WeaponBonus::init()  // TODO: Get actual bonuses
+            let reload_time_frames = self.get_clip_reload_time(bonus) / 16  // Convert ms to frames
+            let frames_reloading = current_frame - self.reload_start_frame
+
+            if frames_reloading >= reload_time_frames {
+                // Reload complete
+                self.is_reloading = false
+                self.current_clip_ammo = self.template.clip_size
+                self.shots_fired_this_clip = 0
+            }
+        }
+    }
+
+    fn get_percent_ready_to_fire(self, current_frame: Int) -> Float {
+        if self.is_reloading {
+            let bonus = WeaponBonus::init()
+            let reload_time_frames = self.get_clip_reload_time(bonus) / 16
+            let frames_reloading = current_frame - self.reload_start_frame
+            return (frames_reloading as Float) / (reload_time_frames as Float) * 100.0
+        }
+
+        if self.current_clip_ammo <= 0 {
+            return 0.0
+        }
+
+        let frames_since_last_shot = current_frame - self.last_shot_frame
+        let bonus = WeaponBonus::init()
+        let required_delay = self.get_delay_between_shots(bonus) / 16
+
+        if frames_since_last_shot >= required_delay {
+            return 100.0
+        }
+
+        return (frames_since_last_shot as Float) / (required_delay as Float) * 100.0
+    }
+
+    fn is_out_of_ammo(self) -> Bool {
+        return self.current_clip_ammo <= 0 && !self.is_reloading
+    }
+}
+
+// Weapon slot types
+enum WeaponSlot {
+    PRIMARY = 0,
+    SECONDARY = 1,
+    TERTIARY = 2,
+}
+
+// WeaponSet - Collection of weapons on a unit
+struct WeaponSet {
+    weapons: Collection<Weapon>,
+    current_weapon_index: Int,
+    share_reload_time: Bool,
+
+    fn init() -> WeaponSet {
+        return WeaponSet {
+            weapons: Collection::new(),
+            current_weapon_index: 0,
+            share_reload_time: false,
+        }
+    }
+
+    fn add_weapon(self, weapon: Weapon) {
+        self.weapons.add(weapon)
+    }
+
+    fn get_weapon(self, slot: WeaponSlot) -> Weapon? {
+        let index = slot as Int
+        if index < self.weapons.count() {
+            return self.weapons.get(index)
+        }
+        return null
+    }
+
+    fn get_current_weapon(self) -> Weapon? {
+        if self.current_weapon_index < self.weapons.count() {
+            return self.weapons.get(self.current_weapon_index)
+        }
+        return null
+    }
+
+    fn update(self, current_frame: Int) {
+        for weapon in self.weapons {
+            weapon.update(current_frame)
+        }
+    }
+}
+
+// Tests
+test "WeaponBonus: init and apply" {
+    let bonus1 = WeaponBonus::init()
+    assert bonus1.damage == 1.0
+    assert bonus1.range == 1.0
+
+    let bonus2 = WeaponBonus {
+        damage: 1.5,
+        radius: 1.0,
+        range: 1.2,
+        rate_of_fire: 0.8,
+        pre_attack: 1.0,
+    }
+
+    let combined = bonus1.apply(bonus2)
+    assert combined.damage == 1.5
+    assert combined.range == 1.2
+    assert combined.rate_of_fire == 0.8
+}
+
+test "Weapon: fire and reload" {
+    let template = WeaponTemplate {
+        name: "M16",
+        attack_range: 150.0,
+        minimum_attack_range: 0.0,
+        weapon_speed: 1000.0,
+        weapon_recoil: 1.0,
+        primary_damage: 25.0,
+        primary_damage_radius: 0.0,
+        secondary_damage: 0.0,
+        secondary_damage_radius: 0.0,
+        scatter_radius: 2.0,
+        radius_damage_angle: 0.0,
+        delay_between_shots: 100,  // 100ms between shots
+        clip_size: 30,
+        clip_reload_time: 2000,  // 2 seconds
+        pre_attack_delay: 0,
+        pre_attack_type: AttackType::PER_SHOT,
+        auto_reload_when_idle: 60,
+        auto_reloads_clip: AutoReloadsClip::YES,
+        show_ammo_pips: true,
+        capable_of_following_waypoint: false,
+        damage_dealt_at_self_position: false,
+        leech_range_weapon: false,
+        play_fx_when_stealthed: false,
+        anti_mask: WeaponAnti::GROUND as Int,
+        collide_mask: WeaponCollide::ENEMIES as Int,
+        affects_mask: WeaponAffects::ENEMIES as Int,
+        min_target_pitch: -45.0,
+        max_target_pitch: 45.0,
+        continue_attack_range: 200.0,
+        request_assist_range: 300.0,
+        aim_delta: 1.0,
+        shots_per_barrel: 1,
+        projectile_template_name: "",
+        fire_fx_name: "",
+        fire_sound_name: "",
+        laser_name: "",
+        laser_bone_name: "",
+        continuous_fire_cost_frames: 0,
+        continuous_fire_one_shots_needed: 0,
+        continuous_fire_two_shots_needed: 0,
+        fire_sound_loop_time: 0,
+        scatter_target_scalar: 1.0,
+        suspend_fx_delay: 0,
+    }
+
+    let weapon = Weapon::init(template)
+    assert weapon.current_clip_ammo == 30
+
+    // Fire weapon
+    let fired = weapon.fire(0, 100)
+    assert fired
+    assert weapon.current_clip_ammo == 29
+}
+
+test "Weapon: clip empty triggers reload" {
+    let template = WeaponTemplate {
+        name: "Pistol",
+        attack_range: 100.0,
+        minimum_attack_range: 0.0,
+        weapon_speed: 500.0,
+        weapon_recoil: 0.5,
+        primary_damage: 15.0,
+        primary_damage_radius: 0.0,
+        secondary_damage: 0.0,
+        secondary_damage_radius: 0.0,
+        scatter_radius: 1.0,
+        radius_damage_angle: 0.0,
+        delay_between_shots: 500,
+        clip_size: 1,  // Single shot
+        clip_reload_time: 1000,
+        pre_attack_delay: 0,
+        pre_attack_type: AttackType::PER_SHOT,
+        auto_reload_when_idle: 60,
+        auto_reloads_clip: AutoReloadsClip::YES,
+        show_ammo_pips: false,
+        capable_of_following_waypoint: false,
+        damage_dealt_at_self_position: false,
+        leech_range_weapon: false,
+        play_fx_when_stealthed: false,
+        anti_mask: WeaponAnti::GROUND as Int,
+        collide_mask: WeaponCollide::ENEMIES as Int,
+        affects_mask: WeaponAffects::ENEMIES as Int,
+        min_target_pitch: 0.0,
+        max_target_pitch: 0.0,
+        continue_attack_range: 150.0,
+        request_assist_range: 200.0,
+        aim_delta: 1.0,
+        shots_per_barrel: 1,
+        projectile_template_name: "",
+        fire_fx_name: "",
+        fire_sound_name: "",
+        laser_name: "",
+        laser_bone_name: "",
+        continuous_fire_cost_frames: 0,
+        continuous_fire_one_shots_needed: 0,
+        continuous_fire_two_shots_needed: 0,
+        fire_sound_loop_time: 0,
+        scatter_target_scalar: 1.0,
+        suspend_fx_delay: 0,
+    }
+
+    let weapon = Weapon::init(template)
+    assert weapon.current_clip_ammo == 1
+
+    weapon.fire(0, 100)
+    assert weapon.current_clip_ammo == 0
+    assert weapon.is_reloading
+}
+
+test "WeaponSet: multiple weapons" {
+    let template1 = WeaponTemplate {
+        name: "MachineGun",
+        attack_range: 200.0,
+        minimum_attack_range: 0.0,
+        weapon_speed: 1000.0,
+        weapon_recoil: 1.0,
+        primary_damage: 10.0,
+        primary_damage_radius: 0.0,
+        secondary_damage: 0.0,
+        secondary_damage_radius: 0.0,
+        scatter_radius: 5.0,
+        radius_damage_angle: 0.0,
+        delay_between_shots: 50,
+        clip_size: 100,
+        clip_reload_time: 3000,
+        pre_attack_delay: 0,
+        pre_attack_type: AttackType::PER_SHOT,
+        auto_reload_when_idle: 120,
+        auto_reloads_clip: AutoReloadsClip::YES,
+        show_ammo_pips: true,
+        capable_of_following_waypoint: false,
+        damage_dealt_at_self_position: false,
+        leech_range_weapon: false,
+        play_fx_when_stealthed: false,
+        anti_mask: WeaponAnti::GROUND as Int,
+        collide_mask: WeaponCollide::ENEMIES as Int,
+        affects_mask: WeaponAffects::ENEMIES as Int,
+        min_target_pitch: 0.0,
+        max_target_pitch: 0.0,
+        continue_attack_range: 250.0,
+        request_assist_range: 300.0,
+        aim_delta: 1.0,
+        shots_per_barrel: 1,
+        projectile_template_name: "",
+        fire_fx_name: "",
+        fire_sound_name: "",
+        laser_name: "",
+        laser_bone_name: "",
+        continuous_fire_cost_frames: 0,
+        continuous_fire_one_shots_needed: 0,
+        continuous_fire_two_shots_needed: 0,
+        fire_sound_loop_time: 0,
+        scatter_target_scalar: 1.0,
+        suspend_fx_delay: 0,
+    }
+
+    let weapon_set = WeaponSet::init()
+    weapon_set.add_weapon(Weapon::init(template1))
+
+    let weapon = weapon_set.get_current_weapon()?
+    assert weapon.template.name == "MachineGun"
+}

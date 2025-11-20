@@ -1,0 +1,919 @@
+// Script and trigger system for C&C Generals Zero Hour
+// Mission scripting, map triggers, conditions, actions
+// Written in Home language
+
+import world
+import player
+import object
+
+// Script value types
+enum ScriptValueType {
+    BOOL = 0,
+    INT = 1,
+    FLOAT = 2,
+    STRING = 3,
+    POSITION = 4,
+    OBJECT = 5,
+    PLAYER = 6,
+    TEAM = 7,
+}
+
+// Script value container
+struct ScriptValue {
+    value_type: ScriptValueType,
+    bool_value: Bool,
+    int_value: Int,
+    float_value: Float,
+    string_value: String,
+
+    fn init_bool(value: Bool) -> ScriptValue {
+        return ScriptValue {
+            value_type: ScriptValueType::BOOL,
+            bool_value: value,
+            int_value: 0,
+            float_value: 0.0,
+            string_value: "",
+        }
+    }
+
+    fn init_int(value: Int) -> ScriptValue {
+        return ScriptValue {
+            value_type: ScriptValueType::INT,
+            bool_value: false,
+            int_value: value,
+            float_value: 0.0,
+            string_value: "",
+        }
+    }
+
+    fn init_float(value: Float) -> ScriptValue {
+        return ScriptValue {
+            value_type: ScriptValueType::FLOAT,
+            bool_value: false,
+            int_value: 0,
+            float_value: value,
+            string_value: "",
+        }
+    }
+
+    fn init_string(value: String) -> ScriptValue {
+        return ScriptValue {
+            value_type: ScriptValueType::STRING,
+            bool_value: false,
+            int_value: 0,
+            float_value: 0.0,
+            string_value: value,
+        }
+    }
+
+    fn as_bool(self) -> Bool {
+        return match self.value_type {
+            ScriptValueType::BOOL => self.bool_value,
+            ScriptValueType::INT => self.int_value != 0,
+            ScriptValueType::FLOAT => self.float_value != 0.0,
+            _ => false,
+        }
+    }
+
+    fn as_int(self) -> Int {
+        return match self.value_type {
+            ScriptValueType::BOOL => if self.bool_value { 1 } else { 0 },
+            ScriptValueType::INT => self.int_value,
+            ScriptValueType::FLOAT => self.float_value as Int,
+            _ => 0,
+        }
+    }
+}
+
+// Condition types
+enum ConditionType {
+    // Player conditions
+    PLAYER_MONEY_GREATER = 0,
+    PLAYER_MONEY_LESS = 1,
+    PLAYER_POWER_GREATER = 2,
+    PLAYER_HAS_UPGRADE = 3,
+    PLAYER_DEFEATED = 4,
+
+    // Object conditions
+    OBJECT_EXISTS = 10,
+    OBJECT_DESTROYED = 11,
+    OBJECT_HEALTH_LESS = 12,
+    OBJECT_IN_AREA = 13,
+    OBJECT_OWNED_BY = 14,
+
+    // Counter conditions
+    COUNTER_EQUALS = 20,
+    COUNTER_GREATER = 21,
+    COUNTER_LESS = 22,
+
+    // Timer conditions
+    TIMER_EXPIRED = 30,
+    GAME_TIME_ELAPSED = 31,
+
+    // Flag conditions
+    FLAG_TRUE = 40,
+    FLAG_FALSE = 41,
+
+    // Comparison
+    VALUE_EQUALS = 50,
+    VALUE_NOT_EQUALS = 51,
+    VALUE_GREATER = 52,
+    VALUE_LESS = 53,
+}
+
+// Condition
+struct Condition {
+    id: Int,
+    condition_type: ConditionType,
+    parameters: Collection<ScriptValue>,
+    is_inverted: Bool,
+
+    fn init(id: Int, condition_type: ConditionType) -> Condition {
+        return Condition {
+            id: id,
+            condition_type: condition_type,
+            parameters: Collection::new(),
+            is_inverted: false,
+        }
+    }
+
+    fn add_parameter(self, value: ScriptValue) {
+        self.parameters.add(value)
+    }
+
+    fn invert(self) {
+        self.is_inverted = !self.is_inverted
+    }
+
+    fn evaluate(self, context: ScriptContext) -> Bool {
+        let result = self.evaluate_internal(context)
+        if self.is_inverted {
+            return !result
+        }
+        return result
+    }
+
+    fn evaluate_internal(self, context: ScriptContext) -> Bool {
+        return match self.condition_type {
+            ConditionType::PLAYER_MONEY_GREATER => {
+                if self.parameters.count() >= 2 {
+                    let player_id = self.parameters.get(0).as_int()
+                    let amount = self.parameters.get(1).as_float()
+                    return context.get_player_money(player_id) > amount
+                }
+                return false
+            },
+            ConditionType::FLAG_TRUE => {
+                if self.parameters.count() >= 1 {
+                    let flag_name = self.parameters.get(0).string_value
+                    return context.get_flag(flag_name)
+                }
+                return false
+            },
+            ConditionType::COUNTER_GREATER => {
+                if self.parameters.count() >= 2 {
+                    let counter_name = self.parameters.get(0).string_value
+                    let value = self.parameters.get(1).as_int()
+                    return context.get_counter(counter_name) > value
+                }
+                return false
+            },
+            _ => false,
+        }
+    }
+}
+
+// Action types
+enum ActionType {
+    // Player actions
+    GIVE_MONEY = 0,
+    TAKE_MONEY = 1,
+    SET_PLAYER_DEFEATED = 2,
+    SET_PLAYER_VICTORIOUS = 3,
+
+    // Object actions
+    CREATE_OBJECT = 10,
+    DESTROY_OBJECT = 11,
+    MOVE_OBJECT = 12,
+    DAMAGE_OBJECT = 13,
+    HEAL_OBJECT = 14,
+
+    // Counter actions
+    SET_COUNTER = 20,
+    INCREMENT_COUNTER = 21,
+    DECREMENT_COUNTER = 22,
+
+    // Timer actions
+    START_TIMER = 30,
+    STOP_TIMER = 31,
+    RESET_TIMER = 32,
+
+    // Flag actions
+    SET_FLAG = 40,
+    CLEAR_FLAG = 41,
+
+    // UI actions
+    DISPLAY_TEXT = 50,
+    PLAY_SOUND = 51,
+    SHOW_OBJECTIVES = 52,
+    CAMERA_MOVE = 53,
+
+    // Game actions
+    VICTORY = 60,
+    DEFEAT = 61,
+    END_MISSION = 62,
+}
+
+// Action
+struct Action {
+    id: Int,
+    action_type: ActionType,
+    parameters: Collection<ScriptValue>,
+
+    fn init(id: Int, action_type: ActionType) -> Action {
+        return Action {
+            id: id,
+            action_type: action_type,
+            parameters: Collection::new(),
+        }
+    }
+
+    fn add_parameter(self, value: ScriptValue) {
+        self.parameters.add(value)
+    }
+
+    fn execute(self, context: ScriptContext) {
+        match self.action_type {
+            ActionType::GIVE_MONEY => {
+                if self.parameters.count() >= 2 {
+                    let player_id = self.parameters.get(0).as_int()
+                    let amount = self.parameters.get(1).as_float()
+                    context.give_player_money(player_id, amount)
+                }
+            },
+            ActionType::SET_FLAG => {
+                if self.parameters.count() >= 1 {
+                    let flag_name = self.parameters.get(0).string_value
+                    context.set_flag(flag_name, true)
+                }
+            },
+            ActionType::INCREMENT_COUNTER => {
+                if self.parameters.count() >= 1 {
+                    let counter_name = self.parameters.get(0).string_value
+                    let current = context.get_counter(counter_name)
+                    context.set_counter(counter_name, current + 1)
+                }
+            },
+            ActionType::DISPLAY_TEXT => {
+                if self.parameters.count() >= 1 {
+                    let text = self.parameters.get(0).string_value
+                    context.display_message(text)
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+// Trigger - conditions + actions
+struct Trigger {
+    id: Int,
+    name: String,
+    enabled: Bool,
+    fire_once: Bool,
+    has_fired: Bool,
+    conditions: Collection<Condition>,
+    actions: Collection<Action>,
+    condition_mode: ConditionMode,
+
+    fn init(id: Int, name: String) -> Trigger {
+        return Trigger {
+            id: id,
+            name: name,
+            enabled: true,
+            fire_once: true,
+            has_fired: false,
+            conditions: Collection::new(),
+            actions: Collection::new(),
+            condition_mode: ConditionMode::ALL,
+        }
+    }
+
+    fn add_condition(self, condition: Condition) {
+        self.conditions.add(condition)
+    }
+
+    fn add_action(self, action: Action) {
+        self.actions.add(action)
+    }
+
+    fn set_repeating(self) {
+        self.fire_once = false
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+
+    fn check_and_fire(self, context: ScriptContext) -> Bool {
+        if !self.enabled {
+            return false
+        }
+
+        if self.fire_once && self.has_fired {
+            return false
+        }
+
+        if self.check_conditions(context) {
+            self.fire(context)
+            return true
+        }
+
+        return false
+    }
+
+    fn check_conditions(self, context: ScriptContext) -> Bool {
+        if self.conditions.count() == 0 {
+            return true
+        }
+
+        match self.condition_mode {
+            ConditionMode::ALL => {
+                for condition in self.conditions {
+                    if !condition.evaluate(context) {
+                        return false
+                    }
+                }
+                return true
+            },
+            ConditionMode::ANY => {
+                for condition in self.conditions {
+                    if condition.evaluate(context) {
+                        return true
+                    }
+                }
+                return false
+            },
+        }
+    }
+
+    fn fire(self, context: ScriptContext) {
+        for action in self.actions {
+            action.execute(context)
+        }
+
+        self.has_fired = true
+    }
+
+    fn reset(self) {
+        self.has_fired = false
+    }
+}
+
+enum ConditionMode {
+    ALL = 0,  // All conditions must be true (AND)
+    ANY = 1,  // Any condition must be true (OR)
+}
+
+// Script context - game state for scripts
+struct ScriptContext {
+    flags: Collection<ScriptFlag>,
+    counters: Collection<ScriptCounter>,
+    timers: Collection<ScriptTimer>,
+    message_queue: Collection<String>,
+
+    fn init() -> ScriptContext {
+        return ScriptContext {
+            flags: Collection::new(),
+            counters: Collection::new(),
+            timers: Collection::new(),
+            message_queue: Collection::new(),
+        }
+    }
+
+    fn get_flag(self, name: String) -> Bool {
+        for flag in self.flags {
+            if flag.name == name {
+                return flag.value
+            }
+        }
+        return false
+    }
+
+    fn set_flag(self, name: String, value: Bool) {
+        for flag in self.flags {
+            if flag.name == name {
+                flag.value = value
+                return
+            }
+        }
+
+        let flag = ScriptFlag::init(name, value)
+        self.flags.add(flag)
+    }
+
+    fn get_counter(self, name: String) -> Int {
+        for counter in self.counters {
+            if counter.name == name {
+                return counter.value
+            }
+        }
+        return 0
+    }
+
+    fn set_counter(self, name: String, value: Int) {
+        for counter in self.counters {
+            if counter.name == name {
+                counter.value = value
+                return
+            }
+        }
+
+        let counter = ScriptCounter::init(name, value)
+        self.counters.add(counter)
+    }
+
+    fn get_player_money(self, player_id: Int) -> Float {
+        // TODO: Get actual player money
+        return 0.0
+    }
+
+    fn give_player_money(self, player_id: Int, amount: Float) {
+        // TODO: Give actual player money
+    }
+
+    fn display_message(self, message: String) {
+        self.message_queue.add(message)
+    }
+
+    fn get_messages(self) -> Collection<String> {
+        return self.message_queue
+    }
+
+    fn clear_messages(self) {
+        self.message_queue.clear()
+    }
+
+    fn update_timers(self, delta_time: Float) {
+        for timer in self.timers {
+            timer.update(delta_time)
+        }
+    }
+}
+
+struct ScriptFlag {
+    name: String,
+    value: Bool,
+
+    fn init(name: String, value: Bool) -> ScriptFlag {
+        return ScriptFlag {
+            name: name,
+            value: value,
+        }
+    }
+}
+
+struct ScriptCounter {
+    name: String,
+    value: Int,
+
+    fn init(name: String, value: Int) -> ScriptCounter {
+        return ScriptCounter {
+            name: name,
+            value: value,
+        }
+    }
+}
+
+struct ScriptTimer {
+    name: String,
+    duration: Float,
+    elapsed: Float,
+    is_running: Bool,
+    is_expired: Bool,
+
+    fn init(name: String, duration: Float) -> ScriptTimer {
+        return ScriptTimer {
+            name: name,
+            duration: duration,
+            elapsed: 0.0,
+            is_running: false,
+            is_expired: false,
+        }
+    }
+
+    fn start(self) {
+        self.is_running = true
+        self.elapsed = 0.0
+        self.is_expired = false
+    }
+
+    fn stop(self) {
+        self.is_running = false
+    }
+
+    fn reset(self) {
+        self.elapsed = 0.0
+        self.is_expired = false
+    }
+
+    fn update(self, delta_time: Float) {
+        if !self.is_running {
+            return
+        }
+
+        self.elapsed = self.elapsed + delta_time
+
+        if self.elapsed >= self.duration {
+            self.is_expired = true
+            self.is_running = false
+        }
+    }
+}
+
+// Script manager
+struct ScriptManager {
+    triggers: Collection<Trigger>,
+    context: ScriptContext,
+    next_trigger_id: Int,
+
+    fn init() -> ScriptManager {
+        return ScriptManager {
+            triggers: Collection::new(),
+            context: ScriptContext::init(),
+            next_trigger_id: 0,
+        }
+    }
+
+    fn create_trigger(self, name: String) -> Int {
+        let trigger = Trigger::init(self.next_trigger_id, name)
+        self.next_trigger_id = self.next_trigger_id + 1
+        self.triggers.add(trigger)
+        return trigger.id
+    }
+
+    fn get_trigger(self, trigger_id: Int) -> Trigger? {
+        for trigger in self.triggers {
+            if trigger.id == trigger_id {
+                return trigger
+            }
+        }
+        return null
+    }
+
+    fn enable_trigger(self, trigger_id: Int) {
+        if let Some(trigger) = self.get_trigger(trigger_id) {
+            trigger.enable()
+        }
+    }
+
+    fn disable_trigger(self, trigger_id: Int) {
+        if let Some(trigger) = self.get_trigger(trigger_id) {
+            trigger.disable()
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.context.update_timers(delta_time)
+
+        for trigger in self.triggers {
+            trigger.check_and_fire(self.context)
+        }
+    }
+
+    fn get_trigger_count(self) -> Int {
+        return self.triggers.count()
+    }
+
+    fn clear_all_triggers(self) {
+        self.triggers.clear()
+    }
+
+    fn reset_all_triggers(self) {
+        for trigger in self.triggers {
+            trigger.reset()
+        }
+    }
+}
+
+// Tests
+test "ScriptValue: bool" {
+    let value = ScriptValue::init_bool(true)
+
+    assert value.value_type == ScriptValueType::BOOL
+    assert value.as_bool()
+    assert value.as_int() == 1
+}
+
+test "ScriptValue: int" {
+    let value = ScriptValue::init_int(42)
+
+    assert value.value_type == ScriptValueType::INT
+    assert value.as_int() == 42
+    assert value.as_bool()
+}
+
+test "ScriptValue: float" {
+    let value = ScriptValue::init_float(3.14)
+
+    assert value.value_type == ScriptValueType::FLOAT
+    assert value.as_int() == 3
+}
+
+test "Condition: init" {
+    let condition = Condition::init(0, ConditionType::FLAG_TRUE)
+
+    assert condition.id == 0
+    assert !condition.is_inverted
+}
+
+test "Condition: add parameters" {
+    let condition = Condition::init(0, ConditionType::COUNTER_GREATER)
+
+    condition.add_parameter(ScriptValue::init_string("enemies_killed"))
+    condition.add_parameter(ScriptValue::init_int(10))
+
+    assert condition.parameters.count() == 2
+}
+
+test "Condition: invert" {
+    let condition = Condition::init(0, ConditionType::FLAG_TRUE)
+
+    condition.invert()
+    assert condition.is_inverted
+
+    condition.invert()
+    assert !condition.is_inverted
+}
+
+test "Condition: evaluate flag" {
+    let condition = Condition::init(0, ConditionType::FLAG_TRUE)
+    condition.add_parameter(ScriptValue::init_string("mission_started"))
+
+    let context = ScriptContext::init()
+    context.set_flag("mission_started", true)
+
+    assert condition.evaluate(context)
+}
+
+test "Action: init" {
+    let action = Action::init(0, ActionType::GIVE_MONEY)
+
+    assert action.id == 0
+    assert action.action_type == ActionType::GIVE_MONEY
+}
+
+test "Action: add parameters" {
+    let action = Action::init(0, ActionType::GIVE_MONEY)
+
+    action.add_parameter(ScriptValue::init_int(0))
+    action.add_parameter(ScriptValue::init_float(1000.0))
+
+    assert action.parameters.count() == 2
+}
+
+test "Action: execute set flag" {
+    let action = Action::init(0, ActionType::SET_FLAG)
+    action.add_parameter(ScriptValue::init_string("test_flag"))
+
+    let context = ScriptContext::init()
+    action.execute(context)
+
+    assert context.get_flag("test_flag")
+}
+
+test "Action: execute increment counter" {
+    let action = Action::init(0, ActionType::INCREMENT_COUNTER)
+    action.add_parameter(ScriptValue::init_string("kills"))
+
+    let context = ScriptContext::init()
+    context.set_counter("kills", 5)
+
+    action.execute(context)
+    assert context.get_counter("kills") == 6
+}
+
+test "Trigger: init" {
+    let trigger = Trigger::init(0, "TestTrigger")
+
+    assert trigger.name == "TestTrigger"
+    assert trigger.enabled
+    assert trigger.fire_once
+    assert !trigger.has_fired
+}
+
+test "Trigger: add condition and action" {
+    let trigger = Trigger::init(0, "Test")
+
+    let condition = Condition::init(0, ConditionType::FLAG_TRUE)
+    let action = Action::init(0, ActionType::SET_FLAG)
+
+    trigger.add_condition(condition)
+    trigger.add_action(action)
+
+    assert trigger.conditions.count() == 1
+    assert trigger.actions.count() == 1
+}
+
+test "Trigger: set repeating" {
+    let trigger = Trigger::init(0, "Repeating")
+
+    trigger.set_repeating()
+    assert !trigger.fire_once
+}
+
+test "Trigger: enable and disable" {
+    let trigger = Trigger::init(0, "Test")
+
+    trigger.disable()
+    assert !trigger.enabled
+
+    trigger.enable()
+    assert trigger.enabled
+}
+
+test "Trigger: check and fire" {
+    let trigger = Trigger::init(0, "Test")
+
+    let condition = Condition::init(0, ConditionType::FLAG_TRUE)
+    condition.add_parameter(ScriptValue::init_string("ready"))
+
+    let action = Action::init(0, ActionType::SET_FLAG)
+    action.add_parameter(ScriptValue::init_string("started"))
+
+    trigger.add_condition(condition)
+    trigger.add_action(action)
+
+    let context = ScriptContext::init()
+    context.set_flag("ready", true)
+
+    let fired = trigger.check_and_fire(context)
+    assert fired
+    assert trigger.has_fired
+    assert context.get_flag("started")
+}
+
+test "Trigger: fire once" {
+    let trigger = Trigger::init(0, "Once")
+
+    let action = Action::init(0, ActionType::SET_FLAG)
+    action.add_parameter(ScriptValue::init_string("fired"))
+    trigger.add_action(action)
+
+    let context = ScriptContext::init()
+
+    trigger.check_and_fire(context)
+    assert trigger.has_fired
+
+    let fired_again = trigger.check_and_fire(context)
+    assert !fired_again
+}
+
+test "Trigger: repeating" {
+    let trigger = Trigger::init(0, "Repeat")
+    trigger.set_repeating()
+
+    let action = Action::init(0, ActionType::INCREMENT_COUNTER)
+    action.add_parameter(ScriptValue::init_string("count"))
+    trigger.add_action(action)
+
+    let context = ScriptContext::init()
+
+    trigger.check_and_fire(context)
+    trigger.check_and_fire(context)
+    trigger.check_and_fire(context)
+
+    assert context.get_counter("count") == 3
+}
+
+test "ScriptContext: flags" {
+    let context = ScriptContext::init()
+
+    assert !context.get_flag("test")
+
+    context.set_flag("test", true)
+    assert context.get_flag("test")
+
+    context.set_flag("test", false)
+    assert !context.get_flag("test")
+}
+
+test "ScriptContext: counters" {
+    let context = ScriptContext::init()
+
+    assert context.get_counter("score") == 0
+
+    context.set_counter("score", 100)
+    assert context.get_counter("score") == 100
+
+    context.set_counter("score", 200)
+    assert context.get_counter("score") == 200
+}
+
+test "ScriptContext: messages" {
+    let context = ScriptContext::init()
+
+    context.display_message("Hello")
+    context.display_message("World")
+
+    let messages = context.get_messages()
+    assert messages.count() == 2
+
+    context.clear_messages()
+    assert context.get_messages().count() == 0
+}
+
+test "ScriptTimer: lifecycle" {
+    let timer = ScriptTimer::init("test", 5.0)
+
+    assert !timer.is_running
+    assert !timer.is_expired
+
+    timer.start()
+    assert timer.is_running
+
+    timer.update(3.0)
+    assert !timer.is_expired
+
+    timer.update(3.0)
+    assert timer.is_expired
+    assert !timer.is_running
+}
+
+test "ScriptTimer: stop and reset" {
+    let timer = ScriptTimer::init("test", 5.0)
+
+    timer.start()
+    timer.update(2.0)
+    timer.stop()
+
+    assert !timer.is_running
+    assert timer.elapsed == 2.0
+
+    timer.reset()
+    assert timer.elapsed == 0.0
+    assert !timer.is_expired
+}
+
+test "ScriptManager: create trigger" {
+    let manager = ScriptManager::init()
+
+    let trigger_id = manager.create_trigger("Test")
+    assert trigger_id == 0
+    assert manager.get_trigger_count() == 1
+}
+
+test "ScriptManager: get trigger" {
+    let manager = ScriptManager::init()
+
+    let trigger_id = manager.create_trigger("Test")
+    let trigger = manager.get_trigger(trigger_id)?
+
+    assert trigger.name == "Test"
+}
+
+test "ScriptManager: enable and disable" {
+    let manager = ScriptManager::init()
+
+    let trigger_id = manager.create_trigger("Test")
+
+    manager.disable_trigger(trigger_id)
+    let trigger = manager.get_trigger(trigger_id)?
+    assert !trigger.enabled
+
+    manager.enable_trigger(trigger_id)
+    assert trigger.enabled
+}
+
+test "ScriptManager: reset all" {
+    let manager = ScriptManager::init()
+
+    let trigger_id = manager.create_trigger("Test")
+    let trigger = manager.get_trigger(trigger_id)?
+
+    let action = Action::init(0, ActionType::SET_FLAG)
+    action.add_parameter(ScriptValue::init_string("fired"))
+    trigger.add_action(action)
+
+    manager.update(0.016)
+    assert trigger.has_fired
+
+    manager.reset_all_triggers()
+    assert !trigger.has_fired
+}
+
+test "ScriptManager: clear all" {
+    let manager = ScriptManager::init()
+
+    manager.create_trigger("Test1")
+    manager.create_trigger("Test2")
+
+    assert manager.get_trigger_count() == 2
+
+    manager.clear_all_triggers()
+    assert manager.get_trigger_count() == 0
+}

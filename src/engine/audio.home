@@ -1,0 +1,736 @@
+// Audio system for C&C Generals Zero Hour
+// Music, sound effects, voice lines, ambient sounds
+// Written in Home language
+
+// Sound types
+enum SoundType {
+    EFFECT = 0,
+    MUSIC = 1,
+    VOICE = 2,
+    AMBIENT = 3,
+    UI = 4,
+}
+
+// Sound priority
+enum SoundPriority {
+    LOW = 0,
+    NORMAL = 1,
+    HIGH = 2,
+    CRITICAL = 3,
+}
+
+// Sound instance
+struct Sound {
+    id: Int,
+    filename: String,
+    sound_type: SoundType,
+    priority: SoundPriority,
+    volume: Float,
+    pitch: Float,
+    is_looping: Bool,
+    is_3d: Bool,
+    position: Vec3?,
+    max_distance: Float,
+
+    fn init(id: Int, filename: String, sound_type: SoundType) -> Sound {
+        return Sound {
+            id: id,
+            filename: filename,
+            sound_type: sound_type,
+            priority: SoundPriority::NORMAL,
+            volume: 1.0,
+            pitch: 1.0,
+            is_looping: false,
+            is_3d: false,
+            position: null,
+            max_distance: 1000.0,
+        }
+    }
+
+    fn set_3d_position(self, pos: Vec3) {
+        self.is_3d = true
+        self.position = pos
+    }
+
+    fn set_volume(self, volume: Float) {
+        self.volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_pitch(self, pitch: Float) {
+        self.pitch = clamp(pitch, 0.1, 2.0)
+    }
+
+    fn calculate_volume_from_distance(self, listener_pos: Vec3) -> Float {
+        if !self.is_3d {
+            return self.volume
+        }
+
+        if let Some(sound_pos) = self.position {
+            let distance = Vec3::distance(listener_pos, sound_pos)
+
+            if distance >= self.max_distance {
+                return 0.0
+            }
+
+            let attenuation = 1.0 - (distance / self.max_distance)
+            return self.volume * attenuation
+        }
+
+        return self.volume
+    }
+}
+
+// Active sound playback
+struct PlayingSound {
+    sound: Sound,
+    is_playing: Bool,
+    current_time: Float,
+    duration: Float,
+    fade_target: Float,
+    fade_speed: Float,
+
+    fn init(sound: Sound, duration: Float) -> PlayingSound {
+        return PlayingSound {
+            sound: sound,
+            is_playing: true,
+            current_time: 0.0,
+            duration: duration,
+            fade_target: sound.volume,
+            fade_speed: 0.0,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        if !self.is_playing {
+            return
+        }
+
+        self.current_time = self.current_time + delta_time
+
+        // Handle fading
+        if self.fade_speed != 0.0 {
+            if self.sound.volume < self.fade_target {
+                self.sound.volume = self.sound.volume + (self.fade_speed * delta_time)
+                if self.sound.volume >= self.fade_target {
+                    self.sound.volume = self.fade_target
+                    self.fade_speed = 0.0
+                }
+            } else if self.sound.volume > self.fade_target {
+                self.sound.volume = self.sound.volume - (self.fade_speed * delta_time)
+                if self.sound.volume <= self.fade_target {
+                    self.sound.volume = self.fade_target
+                    self.fade_speed = 0.0
+
+                    // Stop if faded to zero
+                    if self.fade_target == 0.0 {
+                        self.is_playing = false
+                    }
+                }
+            }
+        }
+
+        // Check if finished
+        if !self.sound.is_looping && self.current_time >= self.duration {
+            self.is_playing = false
+        }
+    }
+
+    fn stop(self) {
+        self.is_playing = false
+    }
+
+    fn pause(self) {
+        self.is_playing = false
+    }
+
+    fn resume(self) {
+        self.is_playing = true
+    }
+
+    fn fade_to(self, target_volume: Float, duration: Float) {
+        self.fade_target = clamp(target_volume, 0.0, 1.0)
+        if duration > 0.0 {
+            self.fade_speed = abs(self.fade_target - self.sound.volume) / duration
+        } else {
+            self.sound.volume = self.fade_target
+            self.fade_speed = 0.0
+        }
+    }
+
+    fn fade_out(self, duration: Float) {
+        self.fade_to(0.0, duration)
+    }
+
+    fn is_finished(self) -> Bool {
+        return !self.is_playing
+    }
+}
+
+// Music track
+struct MusicTrack {
+    name: String,
+    filename: String,
+    faction: String?,
+    situation: MusicSituation,
+    duration: Float,
+
+    fn init(name: String, filename: String) -> MusicTrack {
+        return MusicTrack {
+            name: name,
+            filename: filename,
+            faction: null,
+            situation: MusicSituation::MENU,
+            duration: 180.0,
+        }
+    }
+
+    fn set_faction(self, faction: String) {
+        self.faction = faction
+    }
+}
+
+enum MusicSituation {
+    MENU = 0,
+    PEACE = 1,
+    TENSION = 2,
+    COMBAT = 3,
+    VICTORY = 4,
+    DEFEAT = 5,
+}
+
+// Voice line
+struct VoiceLine {
+    id: String,
+    filename: String,
+    text: String,
+    priority: SoundPriority,
+
+    fn init(id: String, filename: String, text: String) -> VoiceLine {
+        return VoiceLine {
+            id: id,
+            filename: filename,
+            text: text,
+            priority: SoundPriority::HIGH,
+        }
+    }
+}
+
+// Music manager
+struct MusicManager {
+    tracks: Collection<MusicTrack>,
+    current_track: MusicTrack?,
+    current_situation: MusicSituation,
+    master_volume: Float,
+    is_playing: Bool,
+    crossfade_duration: Float,
+
+    fn init() -> MusicManager {
+        return MusicManager {
+            tracks: Collection::new(),
+            current_track: null,
+            current_situation: MusicSituation::MENU,
+            master_volume: 0.7,
+            is_playing: false,
+            crossfade_duration: 2.0,
+        }
+    }
+
+    fn add_track(self, track: MusicTrack) {
+        self.tracks.add(track)
+    }
+
+    fn play_for_situation(self, situation: MusicSituation) {
+        self.current_situation = situation
+
+        // Find appropriate track
+        for track in self.tracks {
+            if track.situation == situation {
+                self.play_track(track)
+                return
+            }
+        }
+    }
+
+    fn play_track(self, track: MusicTrack) {
+        self.current_track = track
+        self.is_playing = true
+    }
+
+    fn stop(self) {
+        self.is_playing = false
+        self.current_track = null
+    }
+
+    fn set_volume(self, volume: Float) {
+        self.master_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn get_current_track_name(self) -> String? {
+        if let Some(track) = self.current_track {
+            return track.name
+        }
+        return null
+    }
+}
+
+// Audio manager - coordinates all audio
+struct AudioManager {
+    playing_sounds: Collection<PlayingSound>,
+    music_manager: MusicManager,
+    listener_position: Vec3,
+    master_volume: Float,
+    sfx_volume: Float,
+    music_volume: Float,
+    voice_volume: Float,
+    max_concurrent_sounds: Int,
+    next_sound_id: Int,
+
+    fn init() -> AudioManager {
+        return AudioManager {
+            playing_sounds: Collection::new(),
+            music_manager: MusicManager::init(),
+            listener_position: Vec3::init(0.0, 0.0, 0.0),
+            master_volume: 1.0,
+            sfx_volume: 0.8,
+            music_volume: 0.7,
+            voice_volume: 1.0,
+            max_concurrent_sounds: 32,
+            next_sound_id: 0,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        // Update all playing sounds
+        let mut i = 0
+        while i < self.playing_sounds.count() {
+            let playing = self.playing_sounds.get(i)
+            playing.update(delta_time)
+
+            if playing.is_finished() {
+                self.playing_sounds.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    fn play_sound(self, filename: String, sound_type: SoundType) -> Int {
+        let sound = Sound::init(self.next_sound_id, filename, sound_type)
+        self.next_sound_id = self.next_sound_id + 1
+
+        self.apply_volume_for_type(sound)
+
+        let playing = PlayingSound::init(sound, 1.0)
+        self.playing_sounds.add(playing)
+
+        self.limit_concurrent_sounds()
+
+        return sound.id
+    }
+
+    fn play_sound_3d(self, filename: String, position: Vec3) -> Int {
+        let sound = Sound::init(self.next_sound_id, filename, SoundType::EFFECT)
+        sound.set_3d_position(position)
+        self.next_sound_id = self.next_sound_id + 1
+
+        self.apply_volume_for_type(sound)
+
+        let playing = PlayingSound::init(sound, 1.0)
+        self.playing_sounds.add(playing)
+
+        self.limit_concurrent_sounds()
+
+        return sound.id
+    }
+
+    fn play_voice_line(self, line: VoiceLine) -> Int {
+        let sound = Sound::init(self.next_sound_id, line.filename, SoundType::VOICE)
+        sound.priority = line.priority
+        self.next_sound_id = self.next_sound_id + 1
+
+        self.apply_volume_for_type(sound)
+
+        let playing = PlayingSound::init(sound, 3.0)
+        self.playing_sounds.add(playing)
+
+        return sound.id
+    }
+
+    fn stop_sound(self, sound_id: Int) {
+        for playing in self.playing_sounds {
+            if playing.sound.id == sound_id {
+                playing.stop()
+                return
+            }
+        }
+    }
+
+    fn stop_all_sounds(self) {
+        for playing in self.playing_sounds {
+            playing.stop()
+        }
+        self.playing_sounds.clear()
+    }
+
+    fn apply_volume_for_type(self, sound: Sound) {
+        let type_volume = match sound.sound_type {
+            SoundType::EFFECT => self.sfx_volume,
+            SoundType::MUSIC => self.music_volume,
+            SoundType::VOICE => self.voice_volume,
+            SoundType::AMBIENT => self.sfx_volume,
+            SoundType::UI => self.sfx_volume,
+        }
+
+        sound.volume = sound.volume * type_volume * self.master_volume
+    }
+
+    fn limit_concurrent_sounds(self) {
+        if self.playing_sounds.count() <= self.max_concurrent_sounds {
+            return
+        }
+
+        // Remove lowest priority sounds
+        while self.playing_sounds.count() > self.max_concurrent_sounds {
+            let lowest_index = self.find_lowest_priority_sound()
+            self.playing_sounds.remove(lowest_index)
+        }
+    }
+
+    fn find_lowest_priority_sound(self) -> Int {
+        let lowest_index = 0
+        let lowest_priority = SoundPriority::CRITICAL
+
+        for i in 0..self.playing_sounds.count() {
+            let playing = self.playing_sounds.get(i)
+            if playing.sound.priority < lowest_priority {
+                lowest_priority = playing.sound.priority
+                lowest_index = i
+            }
+        }
+
+        return lowest_index
+    }
+
+    fn set_listener_position(self, pos: Vec3) {
+        self.listener_position = pos
+
+        // Update 3D sound volumes
+        for playing in self.playing_sounds {
+            if playing.sound.is_3d {
+                let volume = playing.sound.calculate_volume_from_distance(self.listener_position)
+                playing.sound.volume = volume
+            }
+        }
+    }
+
+    fn set_master_volume(self, volume: Float) {
+        self.master_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_sfx_volume(self, volume: Float) {
+        self.sfx_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_music_volume(self, volume: Float) {
+        self.music_volume = clamp(volume, 0.0, 1.0)
+        self.music_manager.set_volume(volume)
+    }
+
+    fn get_playing_count(self) -> Int {
+        return self.playing_sounds.count()
+    }
+}
+
+// Helper structs
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn distance(a: Vec3, b: Vec3) -> Float {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dz = b.z - a.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+}
+
+// Helper functions
+fn clamp(value: Float, min_val: Float, max_val: Float) -> Float {
+    if value < min_val { return min_val }
+    if value > max_val { return max_val }
+    return value
+}
+
+fn abs(x: Float) -> Float {
+    if x < 0.0 { return -x } else { return x }
+}
+
+fn sqrt(x: Float) -> Float {
+    return x ** 0.5
+}
+
+// Tests
+test "Sound: init" {
+    let sound = Sound::init(0, "explosion.wav", SoundType::EFFECT)
+
+    assert sound.filename == "explosion.wav"
+    assert sound.volume == 1.0
+    assert !sound.is_looping
+    assert !sound.is_3d
+}
+
+test "Sound: set volume and pitch" {
+    let sound = Sound::init(0, "test.wav", SoundType::EFFECT)
+
+    sound.set_volume(0.5)
+    assert sound.volume == 0.5
+
+    sound.set_volume(2.0)
+    assert sound.volume == 1.0  // Clamped
+
+    sound.set_pitch(1.5)
+    assert sound.pitch == 1.5
+}
+
+test "Sound: 3D positioning" {
+    let sound = Sound::init(0, "gunshot.wav", SoundType::EFFECT)
+
+    assert !sound.is_3d
+
+    sound.set_3d_position(Vec3::init(100.0, 0.0, 100.0))
+    assert sound.is_3d
+    assert sound.position != null
+}
+
+test "Sound: distance attenuation" {
+    let sound = Sound::init(0, "ambient.wav", SoundType::AMBIENT)
+    sound.set_3d_position(Vec3::init(100.0, 0.0, 0.0))
+    sound.max_distance = 100.0
+
+    let listener = Vec3::init(0.0, 0.0, 0.0)
+
+    // At max distance, should be silent
+    let volume_far = sound.calculate_volume_from_distance(listener)
+    assert volume_far == 0.0
+
+    // At half distance, should be half volume
+    let listener_close = Vec3::init(50.0, 0.0, 0.0)
+    let volume_close = sound.calculate_volume_from_distance(listener_close)
+    assert volume_close == 0.5
+}
+
+test "PlayingSound: update" {
+    let sound = Sound::init(0, "test.wav", SoundType::EFFECT)
+    let playing = PlayingSound::init(sound, 2.0)
+
+    assert playing.is_playing
+    assert playing.current_time == 0.0
+
+    playing.update(1.0)
+    assert playing.current_time == 1.0
+    assert playing.is_playing
+
+    playing.update(1.5)
+    assert !playing.is_playing  // Should finish
+}
+
+test "PlayingSound: looping" {
+    let sound = Sound::init(0, "loop.wav", SoundType::MUSIC)
+    sound.is_looping = true
+
+    let playing = PlayingSound::init(sound, 2.0)
+    playing.update(3.0)
+
+    assert playing.is_playing  // Should keep playing
+}
+
+test "PlayingSound: pause and resume" {
+    let sound = Sound::init(0, "test.wav", SoundType::EFFECT)
+    let playing = PlayingSound::init(sound, 2.0)
+
+    playing.pause()
+    assert !playing.is_playing
+
+    playing.update(1.0)
+    assert playing.current_time == 0.0  // No progress when paused
+
+    playing.resume()
+    assert playing.is_playing
+}
+
+test "PlayingSound: fade" {
+    let sound = Sound::init(0, "music.wav", SoundType::MUSIC)
+    let playing = PlayingSound::init(sound, 10.0)
+
+    playing.fade_to(0.5, 1.0)
+    assert playing.fade_target == 0.5
+
+    playing.update(0.5)
+    assert sound.volume < 1.0 && sound.volume > 0.5
+
+    playing.update(0.5)
+    assert sound.volume == 0.5
+}
+
+test "PlayingSound: fade out" {
+    let sound = Sound::init(0, "ending.wav", SoundType::MUSIC)
+    let playing = PlayingSound::init(sound, 10.0)
+
+    playing.fade_out(1.0)
+    playing.update(1.0)
+
+    assert !playing.is_playing  // Should stop after fading to zero
+}
+
+test "MusicTrack: init" {
+    let track = MusicTrack::init("USA Theme", "usa_theme.mp3")
+
+    assert track.name == "USA Theme"
+    assert track.filename == "usa_theme.mp3"
+    assert track.situation == MusicSituation::MENU
+}
+
+test "MusicTrack: faction" {
+    let track = MusicTrack::init("Combat Music", "combat.mp3")
+    track.set_faction("USA")
+    track.situation = MusicSituation::COMBAT
+
+    assert track.faction == "USA"
+    assert track.situation == MusicSituation::COMBAT
+}
+
+test "VoiceLine: init" {
+    let line = VoiceLine::init("UNIT_SELECT", "ranger_yes.wav", "Yes sir!")
+
+    assert line.id == "UNIT_SELECT"
+    assert line.text == "Yes sir!"
+    assert line.priority == SoundPriority::HIGH
+}
+
+test "MusicManager: add and play tracks" {
+    let manager = MusicManager::init()
+
+    let track = MusicTrack::init("Menu Theme", "menu.mp3")
+    track.situation = MusicSituation::MENU
+
+    manager.add_track(track)
+    manager.play_for_situation(MusicSituation::MENU)
+
+    assert manager.is_playing
+    assert manager.get_current_track_name() == "Menu Theme"
+}
+
+test "MusicManager: volume" {
+    let manager = MusicManager::init()
+
+    manager.set_volume(0.5)
+    assert manager.master_volume == 0.5
+
+    manager.set_volume(2.0)
+    assert manager.master_volume == 1.0  // Clamped
+}
+
+test "AudioManager: init" {
+    let manager = AudioManager::init()
+
+    assert manager.get_playing_count() == 0
+    assert manager.master_volume == 1.0
+    assert manager.max_concurrent_sounds == 32
+}
+
+test "AudioManager: play sound" {
+    let manager = AudioManager::init()
+
+    let id = manager.play_sound("explosion.wav", SoundType::EFFECT)
+    assert id == 0
+    assert manager.get_playing_count() == 1
+
+    let id2 = manager.play_sound("gunshot.wav", SoundType::EFFECT)
+    assert id2 == 1
+    assert manager.get_playing_count() == 2
+}
+
+test "AudioManager: stop sound" {
+    let manager = AudioManager::init()
+
+    let id = manager.play_sound("test.wav", SoundType::EFFECT)
+    assert manager.get_playing_count() == 1
+
+    manager.stop_sound(id)
+    manager.update(0.016)
+
+    assert manager.get_playing_count() == 0
+}
+
+test "AudioManager: stop all sounds" {
+    let manager = AudioManager::init()
+
+    manager.play_sound("sound1.wav", SoundType::EFFECT)
+    manager.play_sound("sound2.wav", SoundType::EFFECT)
+    manager.play_sound("sound3.wav", SoundType::EFFECT)
+
+    assert manager.get_playing_count() == 3
+
+    manager.stop_all_sounds()
+    assert manager.get_playing_count() == 0
+}
+
+test "AudioManager: 3D sound" {
+    let manager = AudioManager::init()
+    manager.set_listener_position(Vec3::init(0.0, 0.0, 0.0))
+
+    let pos = Vec3::init(100.0, 0.0, 0.0)
+    let id = manager.play_sound_3d("explosion.wav", pos)
+
+    assert manager.get_playing_count() == 1
+}
+
+test "AudioManager: voice lines" {
+    let manager = AudioManager::init()
+
+    let line = VoiceLine::init("ATTACK", "attack.wav", "Attack!")
+    let id = manager.play_voice_line(line)
+
+    assert manager.get_playing_count() == 1
+}
+
+test "AudioManager: volume settings" {
+    let manager = AudioManager::init()
+
+    manager.set_master_volume(0.8)
+    assert manager.master_volume == 0.8
+
+    manager.set_sfx_volume(0.6)
+    assert manager.sfx_volume == 0.6
+
+    manager.set_music_volume(0.5)
+    assert manager.music_volume == 0.5
+}
+
+test "AudioManager: concurrent sound limit" {
+    let manager = AudioManager::init()
+    manager.max_concurrent_sounds = 3
+
+    for i in 0..5 {
+        manager.play_sound("sound.wav", SoundType::EFFECT)
+    }
+
+    assert manager.get_playing_count() == 3  // Limited
+}
+
+test "AudioManager: update removes finished" {
+    let manager = AudioManager::init()
+
+    manager.play_sound("short.wav", SoundType::EFFECT)
+    manager.update(0.5)
+
+    assert manager.get_playing_count() == 1
+
+    manager.update(2.0)
+    assert manager.get_playing_count() == 0  // Finished and removed
+}

@@ -1,0 +1,517 @@
+// World/Map/Game State system for C&C Generals Zero Hour
+// Based on Thyme's gamelogic.h and world.h
+// Written in Home language
+
+import player
+import thing
+
+// Game difficulty
+enum GameDifficulty {
+    EASY = 0,
+    NORMAL = 1,
+    HARD = 2,
+    BRUTAL = 3,
+}
+
+// Game mode
+enum GameMode {
+    SINGLEPLAYER = 0,
+    SKIRMISH = 1,
+    MULTIPLAYER = 2,
+    REPLAY = 3,
+}
+
+// Weather types
+enum WeatherType {
+    NORMAL = 0,
+    SNOWY = 1,
+    RAINY = 2,
+    SANDSTORM = 3,
+}
+
+// Time of day
+enum TimeOfDay {
+    MORNING = 0,
+    AFTERNOON = 1,
+    EVENING = 2,
+    NIGHT = 3,
+}
+
+// Map data
+struct Map {
+    name: String,
+    description: String,
+    width: Int,           // In cells
+    height: Int,          // In cells
+    cell_size: Float,     // World units per cell
+    player_count: Int,
+    is_multiplayer: Bool,
+
+    // Terrain
+    heightmap: Collection<Float>,
+    texture_indices: Collection<Int>,
+
+    // Weather
+    weather: WeatherType,
+    time_of_day: TimeOfDay,
+
+    fn init(name: String, width: Int, height: Int, cell_size: Float) -> Map {
+        let total_cells = width * height
+        let heightmap = Collection::new()
+        let texture_indices = Collection::new()
+
+        // Initialize flat terrain
+        for i in 0..total_cells {
+            heightmap.add(0.0)
+            texture_indices.add(0)
+        }
+
+        return Map {
+            name: name,
+            description: "",
+            width: width,
+            height: height,
+            cell_size: cell_size,
+            player_count: 2,
+            is_multiplayer: false,
+            heightmap: heightmap,
+            texture_indices: texture_indices,
+            weather: WeatherType::NORMAL,
+            time_of_day: TimeOfDay::AFTERNOON,
+        }
+    }
+
+    fn get_height_at(self, x: Int, y: Int) -> Float {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return 0.0
+        }
+        let index = y * self.width + x
+        return self.heightmap.get(index)
+    }
+
+    fn set_height_at(self, x: Int, y: Int, height: Float) {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return
+        }
+        let index = y * self.width + x
+        self.heightmap.set(index, height)
+    }
+
+    fn get_world_width(self) -> Float {
+        return (self.width as Float) * self.cell_size
+    }
+
+    fn get_world_height(self) -> Float {
+        return (self.height as Float) * self.cell_size
+    }
+
+    fn world_to_cell(self, world_x: Float, world_y: Float) -> (Int, Int) {
+        let cell_x = (world_x / self.cell_size) as Int
+        let cell_y = (world_y / self.cell_size) as Int
+        return (cell_x, cell_y)
+    }
+
+    fn cell_to_world(self, cell_x: Int, cell_y: Int) -> (Float, Float) {
+        let world_x = (cell_x as Float) * self.cell_size + (self.cell_size / 2.0)
+        let world_y = (cell_y as Float) * self.cell_size + (self.cell_size / 2.0)
+        return (world_x, world_y)
+    }
+
+    fn is_valid_cell(self, x: Int, y: Int) -> Bool {
+        return x >= 0 && x < self.width && y >= 0 && y < self.height
+    }
+}
+
+// Game state
+struct GameState {
+    // Game info
+    mode: GameMode,
+    difficulty: GameDifficulty,
+    is_paused: Bool,
+    is_game_over: Bool,
+    winning_player_id: Int,
+
+    // Timing
+    current_frame: Int,
+    game_time_seconds: Float,
+    delta_time: Float,
+
+    // Map
+    map: Map,
+
+    // Players
+    player_manager: player::PlayerManager,
+
+    // Objects/Things (simplified - real implementation would be more complex)
+    next_object_id: Int,
+
+    // Game rules
+    starting_money: Float,
+    fog_of_war_enabled: Bool,
+    allow_cheats: Bool,
+    build_time_multiplier: Float,
+
+    fn init(map: Map, mode: GameMode) -> GameState {
+        return GameState {
+            mode: mode,
+            difficulty: GameDifficulty::NORMAL,
+            is_paused: false,
+            is_game_over: false,
+            winning_player_id: -1,
+            current_frame: 0,
+            game_time_seconds: 0.0,
+            delta_time: 1.0 / 60.0,  // 60 FPS
+            map: map,
+            player_manager: player::PlayerManager::init(),
+            next_object_id: 0,
+            starting_money: 10000.0,
+            fog_of_war_enabled: true,
+            allow_cheats: false,
+            build_time_multiplier: 1.0,
+        }
+    }
+
+    fn update(self) {
+        if self.is_paused || self.is_game_over {
+            return
+        }
+
+        self.current_frame = self.current_frame + 1
+        self.game_time_seconds = self.game_time_seconds + self.delta_time
+
+        // Update game logic
+        self.check_victory_conditions()
+    }
+
+    fn check_victory_conditions(self) {
+        let alive_players = self.player_manager.get_alive_players()
+
+        if alive_players.count() == 0 {
+            // Everyone lost (draw or error)
+            self.end_game(-1)
+            return
+        }
+
+        if alive_players.count() == 1 {
+            // Single player remaining wins
+            let winner = alive_players.get(0)
+            self.end_game(winner.player_id)
+            return
+        }
+
+        // Check if all alive players are on same team
+        let first_player = alive_players.get(0)
+        let all_same_team = true
+
+        for player in alive_players {
+            if player.team_id != first_player.team_id {
+                all_same_team = false
+                break
+            }
+        }
+
+        if all_same_team {
+            // Team victory
+            self.end_game(first_player.player_id)
+        }
+    }
+
+    fn end_game(self, winning_player_id: Int) {
+        self.is_game_over = true
+        self.winning_player_id = winning_player_id
+    }
+
+    fn pause(self) {
+        self.is_paused = true
+    }
+
+    fn resume(self) {
+        self.is_paused = false
+    }
+
+    fn toggle_pause(self) {
+        self.is_paused = !self.is_paused
+    }
+
+    fn get_next_object_id(self) -> Int {
+        let id = self.next_object_id
+        self.next_object_id = self.next_object_id + 1
+        return id
+    }
+
+    fn get_game_time(self) -> Float {
+        return self.game_time_seconds
+    }
+
+    fn get_current_frame(self) -> Int {
+        return self.current_frame
+    }
+
+    fn is_game_active(self) -> Bool {
+        return !self.is_paused && !self.is_game_over
+    }
+
+    fn add_player(self, player: player::Player) {
+        self.player_manager.add_player(player)
+
+        // Award starting money
+        player.add_money(self.starting_money)
+    }
+
+    fn get_player(self, player_id: Int) -> player::Player? {
+        return self.player_manager.get_player(player_id)
+    }
+
+    fn get_local_player(self) -> player::Player? {
+        return self.player_manager.get_local_player()
+    }
+}
+
+// Game session - Top-level container
+struct GameSession {
+    state: GameState,
+    is_active: Bool,
+
+    fn init(map: Map, mode: GameMode) -> GameSession {
+        return GameSession {
+            state: GameState::init(map, mode),
+            is_active: false,
+        }
+    }
+
+    fn start(self) {
+        self.is_active = true
+    }
+
+    fn stop(self) {
+        self.is_active = false
+    }
+
+    fn update(self) {
+        if !self.is_active {
+            return
+        }
+
+        self.state.update()
+    }
+
+    fn get_state(self) -> GameState {
+        return self.state
+    }
+}
+
+// Skirmish game setup
+struct SkirmishSetup {
+    map_name: String,
+    player_count: Int,
+    starting_money: Float,
+    build_speed: Float,
+    fog_of_war: Bool,
+    allow_cheats: Bool,
+
+    fn default() -> SkirmishSetup {
+        return SkirmishSetup {
+            map_name: "Tournament_Desert",
+            player_count: 2,
+            starting_money: 10000.0,
+            build_speed: 1.0,
+            fog_of_war: true,
+            allow_cheats: false,
+        }
+    }
+
+    fn create_session(self) -> GameSession {
+        // Create map
+        let map = Map::init(self.map_name, 200, 200, 10.0)
+        map.player_count = self.player_count
+        map.is_multiplayer = true
+
+        // Create game state
+        let session = GameSession::init(map, GameMode::SKIRMISH)
+        session.state.starting_money = self.starting_money
+        session.state.build_time_multiplier = self.build_speed
+        session.state.fog_of_war_enabled = self.fog_of_war
+        session.state.allow_cheats = self.allow_cheats
+
+        return session
+    }
+}
+
+// Tests
+test "Map: init and dimensions" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+
+    assert map.width == 100
+    assert map.height == 100
+    assert map.get_world_width() == 1000.0
+    assert map.get_world_height() == 1000.0
+}
+
+test "Map: height manipulation" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+
+    assert map.get_height_at(50, 50) == 0.0
+
+    map.set_height_at(50, 50, 100.0)
+    assert map.get_height_at(50, 50) == 100.0
+}
+
+test "Map: coordinate conversion" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+
+    let (cell_x, cell_y) = map.world_to_cell(55.0, 75.0)
+    assert cell_x == 5
+    assert cell_y == 7
+
+    let (world_x, world_y) = map.cell_to_world(5, 7)
+    assert world_x == 55.0
+    assert world_y == 75.0
+}
+
+test "Map: valid cell check" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+
+    assert map.is_valid_cell(50, 50)
+    assert map.is_valid_cell(0, 0)
+    assert map.is_valid_cell(99, 99)
+    assert !map.is_valid_cell(-1, 50)
+    assert !map.is_valid_cell(50, 100)
+}
+
+test "GameState: init and update" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+
+    assert state.current_frame == 0
+    assert state.game_time_seconds == 0.0
+    assert !state.is_game_over
+
+    state.update()
+    assert state.current_frame == 1
+}
+
+test "GameState: pause and resume" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+
+    assert !state.is_paused
+
+    state.pause()
+    assert state.is_paused
+    assert !state.is_game_active()
+
+    state.update()
+    assert state.current_frame == 0  // No update while paused
+
+    state.resume()
+    assert !state.is_paused
+    assert state.is_game_active()
+
+    state.update()
+    assert state.current_frame == 1
+}
+
+test "GameState: object ID generation" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+
+    let id1 = state.get_next_object_id()
+    let id2 = state.get_next_object_id()
+    let id3 = state.get_next_object_id()
+
+    assert id1 == 0
+    assert id2 == 1
+    assert id3 == 2
+}
+
+test "GameState: victory conditions - single survivor" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+
+    let player1 = player::Player::init(0, "Player 1", player::PlayerType::HUMAN, player::FactionType::USA, 0)
+    let player2 = player::Player::init(1, "Player 2", player::PlayerType::COMPUTER, player::FactionType::CHINA, 1)
+
+    state.add_player(player1)
+    state.add_player(player2)
+
+    assert !state.is_game_over
+
+    // Player 2 is defeated
+    player2.set_defeated(true)
+
+    state.check_victory_conditions()
+    assert state.is_game_over
+    assert state.winning_player_id == 0
+}
+
+test "GameState: victory conditions - team victory" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+
+    // Team 0: Players 0, 1
+    // Team 1: Player 2
+    let player1 = player::Player::init(0, "Player 1", player::PlayerType::HUMAN, player::FactionType::USA, 0)
+    let player2 = player::Player::init(1, "Player 2", player::PlayerType::HUMAN, player::FactionType::USA, 0)
+    let player3 = player::Player::init(2, "Player 3", player::PlayerType::COMPUTER, player::FactionType::CHINA, 1)
+
+    state.add_player(player1)
+    state.add_player(player2)
+    state.add_player(player3)
+
+    // Player 3 defeated
+    player3.set_defeated(true)
+
+    state.check_victory_conditions()
+    assert state.is_game_over
+}
+
+test "GameState: starting money" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let state = GameState::init(map, GameMode::SKIRMISH)
+    state.starting_money = 5000.0
+
+    let player = player::Player::init(0, "Player 1", player::PlayerType::HUMAN, player::FactionType::USA, 0)
+    state.add_player(player)
+
+    assert player.get_money() == 5000.0
+}
+
+test "GameSession: start and stop" {
+    let map = Map::init("TestMap", 100, 100, 10.0)
+    let session = GameSession::init(map, GameMode::SKIRMISH)
+
+    assert !session.is_active
+
+    session.start()
+    assert session.is_active
+
+    session.update()
+    assert session.state.current_frame == 1
+
+    session.stop()
+    assert !session.is_active
+
+    session.update()
+    assert session.state.current_frame == 1  // No update when stopped
+}
+
+test "SkirmishSetup: default settings" {
+    let setup = SkirmishSetup::default()
+
+    assert setup.player_count == 2
+    assert setup.starting_money == 10000.0
+    assert setup.build_speed == 1.0
+    assert setup.fog_of_war
+}
+
+test "SkirmishSetup: create session" {
+    let setup = SkirmishSetup::default()
+    setup.starting_money = 15000.0
+    setup.fog_of_war = false
+
+    let session = setup.create_session()
+
+    assert session.state.starting_money == 15000.0
+    assert !session.state.fog_of_war_enabled
+    assert session.state.mode == GameMode::SKIRMISH
+}

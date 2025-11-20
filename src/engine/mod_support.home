@@ -1,0 +1,878 @@
+// Mod Support for C&C Generals Zero Hour
+// Mod loading, asset overrides, script API, custom maps, conflict resolution
+// Written in Home language
+
+// Mod types
+enum ModType {
+    TOTAL_CONVERSION = 0,
+    GAMEPLAY = 1,
+    VISUAL = 2,
+    AUDIO = 3,
+    MAP_PACK = 4,
+    SCRIPT = 5,
+}
+
+// Mod load priority
+enum ModPriority {
+    LOW = 0,
+    NORMAL = 1,
+    HIGH = 2,
+    CRITICAL = 3,
+}
+
+// Asset override types
+enum AssetType {
+    TEXTURE = 0,
+    MODEL = 1,
+    AUDIO = 2,
+    SCRIPT = 3,
+    CONFIG = 4,
+    MAP = 5,
+}
+
+// Mod manifest
+struct ModManifest {
+    id: String,
+    name: String,
+    version: String,
+    author: String,
+    description: String,
+    mod_type: ModType,
+    priority: ModPriority,
+    dependencies: Collection<String>,
+    conflicts: Collection<String>,
+    asset_overrides: Collection<AssetOverride>,
+
+    fn init(id: String, name: String, version: String) -> ModManifest {
+        return ModManifest {
+            id: id,
+            name: name,
+            version: version,
+            author: "",
+            description: "",
+            mod_type: ModType::GAMEPLAY,
+            priority: ModPriority::NORMAL,
+            dependencies: Collection::new(),
+            conflicts: Collection::new(),
+            asset_overrides: Collection::new(),
+        }
+    }
+
+    fn set_author(self, author: String) {
+        self.author = author
+    }
+
+    fn set_description(self, description: String) {
+        self.description = description
+    }
+
+    fn set_type(self, mod_type: ModType) {
+        self.mod_type = mod_type
+    }
+
+    fn set_priority(self, priority: ModPriority) {
+        self.priority = priority
+    }
+
+    fn add_dependency(self, mod_id: String) {
+        self.dependencies.add(mod_id)
+    }
+
+    fn add_conflict(self, mod_id: String) {
+        self.conflicts.add(mod_id)
+    }
+
+    fn add_asset_override(self, asset: AssetOverride) {
+        self.asset_overrides.add(asset)
+    }
+
+    fn has_dependency(self, mod_id: String) -> Bool {
+        return self.dependencies.index_of(mod_id) != -1
+    }
+
+    fn conflicts_with(self, mod_id: String) -> Bool {
+        return self.conflicts.index_of(mod_id) != -1
+    }
+
+    fn get_dependency_count(self) -> Int {
+        return self.dependencies.count()
+    }
+}
+
+// Asset override
+struct AssetOverride {
+    asset_type: AssetType,
+    original_path: String,
+    override_path: String,
+
+    fn init(asset_type: AssetType, original: String, override: String) -> AssetOverride {
+        return AssetOverride {
+            asset_type: asset_type,
+            original_path: original,
+            override_path: override,
+        }
+    }
+}
+
+// Loaded mod
+struct LoadedMod {
+    manifest: ModManifest,
+    base_path: String,
+    is_enabled: Bool,
+    load_order: Int,
+
+    fn init(manifest: ModManifest, base_path: String) -> LoadedMod {
+        return LoadedMod {
+            manifest: manifest,
+            base_path: base_path,
+            is_enabled: true,
+            load_order: 0,
+        }
+    }
+
+    fn enable(self) {
+        self.is_enabled = true
+    }
+
+    fn disable(self) {
+        self.is_enabled = false
+    }
+
+    fn set_load_order(self, order: Int) {
+        self.load_order = order
+    }
+
+    fn get_asset_path(self, relative_path: String) -> String {
+        return self.base_path + "/" + relative_path
+    }
+}
+
+// Mod conflict
+struct ModConflict {
+    mod_a_id: String,
+    mod_b_id: String,
+    conflict_type: ConflictType,
+    description: String,
+
+    fn init(mod_a: String, mod_b: String, conflict_type: ConflictType) -> ModConflict {
+        return ModConflict {
+            mod_a_id: mod_a,
+            mod_b_id: mod_b,
+            conflict_type: conflict_type,
+            description: "",
+        }
+    }
+
+    fn set_description(self, description: String) {
+        self.description = description
+    }
+}
+
+// Conflict resolution
+enum ConflictType {
+    ASSET_OVERRIDE = 0,
+    INCOMPATIBLE = 1,
+    DEPENDENCY_MISSING = 2,
+}
+
+enum ConflictResolution {
+    DISABLE_MOD_A = 0,
+    DISABLE_MOD_B = 1,
+    MERGE = 2,
+    USE_PRIORITY = 3,
+}
+
+// Mod loader
+struct ModLoader {
+    loaded_mods: Collection<LoadedMod>,
+    conflicts: Collection<ModConflict>,
+    asset_registry: AssetRegistry,
+
+    fn init() -> ModLoader {
+        return ModLoader {
+            loaded_mods: Collection::new(),
+            conflicts: Collection::new(),
+            asset_registry: AssetRegistry::init(),
+        }
+    }
+
+    fn load_mod(self, manifest: ModManifest, base_path: String) -> Bool {
+        // Check dependencies
+        for i in 0..manifest.dependencies.count() {
+            let dep_id = manifest.dependencies.get(i)
+            if !self.is_mod_loaded(dep_id) {
+                let conflict = ModConflict::init(manifest.id, dep_id, ConflictType::DEPENDENCY_MISSING)
+                self.conflicts.add(conflict)
+                return false
+            }
+        }
+
+        // Check conflicts
+        for i in 0..manifest.conflicts.count() {
+            let conflict_id = manifest.conflicts.get(i)
+            if self.is_mod_loaded(conflict_id) {
+                let conflict = ModConflict::init(manifest.id, conflict_id, ConflictType::INCOMPATIBLE)
+                self.conflicts.add(conflict)
+                return false
+            }
+        }
+
+        // Load mod
+        let loaded_mod = LoadedMod::init(manifest, base_path)
+        loaded_mod.set_load_order(self.loaded_mods.count())
+        self.loaded_mods.add(loaded_mod)
+
+        // Register asset overrides
+        for i in 0..manifest.asset_overrides.count() {
+            let override = manifest.asset_overrides.get(i)
+            self.asset_registry.register_override(manifest.id, override)
+        }
+
+        return true
+    }
+
+    fn unload_mod(self, mod_id: String) -> Bool {
+        for i in 0..self.loaded_mods.count() {
+            let mod = self.loaded_mods.get(i)
+            if mod.manifest.id == mod_id {
+                self.loaded_mods.remove_at(i)
+                self.asset_registry.unregister_mod(mod_id)
+                return true
+            }
+        }
+        return false
+    }
+
+    fn is_mod_loaded(self, mod_id: String) -> Bool {
+        for i in 0..self.loaded_mods.count() {
+            let mod = self.loaded_mods.get(i)
+            if mod.manifest.id == mod_id {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get_mod(self, mod_id: String) -> LoadedMod? {
+        for i in 0..self.loaded_mods.count() {
+            let mod = self.loaded_mods.get(i)
+            if mod.manifest.id == mod_id {
+                return mod
+            }
+        }
+        return null
+    }
+
+    fn resolve_asset_path(self, original_path: String) -> String {
+        return self.asset_registry.resolve_path(original_path)
+    }
+
+    fn sort_by_load_order(self) {
+        // Simple bubble sort by load order
+        let n = self.loaded_mods.count()
+        for i in 0..n {
+            for j in 0..(n - i - 1) {
+                let mod_a = self.loaded_mods.get(j)
+                let mod_b = self.loaded_mods.get(j + 1)
+
+                if mod_a.load_order > mod_b.load_order {
+                    // Swap
+                    self.loaded_mods.set(j, mod_b)
+                    self.loaded_mods.set(j + 1, mod_a)
+                }
+            }
+        }
+    }
+
+    fn get_loaded_mod_count(self) -> Int {
+        return self.loaded_mods.count()
+    }
+
+    fn get_conflict_count(self) -> Int {
+        return self.conflicts.count()
+    }
+
+    fn has_conflicts(self) -> Bool {
+        return self.conflicts.count() > 0
+    }
+}
+
+// Asset registry
+struct AssetRegistry {
+    overrides: Collection<RegisteredOverride>,
+
+    fn init() -> AssetRegistry {
+        return AssetRegistry {
+            overrides: Collection::new(),
+        }
+    }
+
+    fn register_override(self, mod_id: String, override: AssetOverride) {
+        let registered = RegisteredOverride::init(mod_id, override)
+        self.overrides.add(registered)
+    }
+
+    fn unregister_mod(self, mod_id: String) {
+        let i = 0
+        while i < self.overrides.count() {
+            let override = self.overrides.get(i)
+            if override.mod_id == mod_id {
+                self.overrides.remove_at(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    fn resolve_path(self, original_path: String) -> String {
+        // Check overrides in reverse order (last loaded = highest priority)
+        let i = self.overrides.count() - 1
+        while i >= 0 {
+            let override = self.overrides.get(i)
+            if override.override.original_path == original_path {
+                return override.override.override_path
+            }
+            i = i - 1
+        }
+
+        return original_path
+    }
+
+    fn get_override_count(self) -> Int {
+        return self.overrides.count()
+    }
+
+    fn clear(self) {
+        self.overrides.clear()
+    }
+}
+
+// Registered override
+struct RegisteredOverride {
+    mod_id: String,
+    override: AssetOverride,
+
+    fn init(mod_id: String, override: AssetOverride) -> RegisteredOverride {
+        return RegisteredOverride {
+            mod_id: mod_id,
+            override: override,
+        }
+    }
+}
+
+// Script API
+struct ScriptAPI {
+    registered_functions: Collection<ScriptFunction>,
+
+    fn init() -> ScriptAPI {
+        return ScriptAPI {
+            registered_functions: Collection::new(),
+        }
+    }
+
+    fn register_function(self, name: String, description: String) {
+        let func = ScriptFunction::init(name, description)
+        self.registered_functions.add(func)
+    }
+
+    fn has_function(self, name: String) -> Bool {
+        for i in 0..self.registered_functions.count() {
+            let func = self.registered_functions.get(i)
+            if func.name == name {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get_function_count(self) -> Int {
+        return self.registered_functions.count()
+    }
+}
+
+// Script function
+struct ScriptFunction {
+    name: String,
+    description: String,
+
+    fn init(name: String, description: String) -> ScriptFunction {
+        return ScriptFunction {
+            name: name,
+            description: description,
+        }
+    }
+}
+
+// Custom map support
+struct CustomMapManager {
+    maps: Collection<CustomMap>,
+
+    fn init() -> CustomMapManager {
+        return CustomMapManager {
+            maps: Collection::new(),
+        }
+    }
+
+    fn register_map(self, map: CustomMap) {
+        self.maps.add(map)
+    }
+
+    fn get_map(self, map_name: String) -> CustomMap? {
+        for i in 0..self.maps.count() {
+            let map = self.maps.get(i)
+            if map.name == map_name {
+                return map
+            }
+        }
+        return null
+    }
+
+    fn get_map_count(self) -> Int {
+        return self.maps.count()
+    }
+
+    fn get_maps_by_author(self, author: String) -> Collection<CustomMap> {
+        let results = Collection::new()
+
+        for i in 0..self.maps.count() {
+            let map = self.maps.get(i)
+            if map.author == author {
+                results.add(map)
+            }
+        }
+
+        return results
+    }
+}
+
+// Custom map
+struct CustomMap {
+    name: String,
+    author: String,
+    description: String,
+    file_path: String,
+    player_count: Int,
+    is_validated: Bool,
+
+    fn init(name: String, file_path: String) -> CustomMap {
+        return CustomMap {
+            name: name,
+            author: "",
+            description: "",
+            file_path: file_path,
+            player_count: 2,
+            is_validated: false,
+        }
+    }
+
+    fn set_author(self, author: String) {
+        self.author = author
+    }
+
+    fn set_description(self, description: String) {
+        self.description = description
+    }
+
+    fn set_player_count(self, count: Int) {
+        self.player_count = count
+    }
+
+    fn mark_validated(self) {
+        self.is_validated = true
+    }
+}
+
+// Mod manager
+struct ModManager {
+    loader: ModLoader,
+    script_api: ScriptAPI,
+    map_manager: CustomMapManager,
+
+    fn init() -> ModManager {
+        return ModManager {
+            loader: ModLoader::init(),
+            script_api: ScriptAPI::init(),
+            map_manager: CustomMapManager::init(),
+        }
+    }
+
+    fn load_mod(self, manifest: ModManifest, base_path: String) -> Bool {
+        return self.loader.load_mod(manifest, base_path)
+    }
+
+    fn unload_mod(self, mod_id: String) -> Bool {
+        return self.loader.unload_mod(mod_id)
+    }
+
+    fn resolve_asset(self, original_path: String) -> String {
+        return self.loader.resolve_asset_path(original_path)
+    }
+
+    fn register_script_function(self, name: String, description: String) {
+        self.script_api.register_function(name, description)
+    }
+
+    fn register_custom_map(self, map: CustomMap) {
+        self.map_manager.register_map(map)
+    }
+
+    fn get_loaded_mod_count(self) -> Int {
+        return self.loader.get_loaded_mod_count()
+    }
+
+    fn has_conflicts(self) -> Bool {
+        return self.loader.has_conflicts()
+    }
+
+    fn get_custom_map_count(self) -> Int {
+        return self.map_manager.get_map_count()
+    }
+}
+
+// Tests
+test "ModManifest: init" {
+    let manifest = ModManifest::init("test_mod", "Test Mod", "1.0.0")
+
+    assert manifest.id == "test_mod"
+    assert manifest.name == "Test Mod"
+    assert manifest.version == "1.0.0"
+}
+
+test "ModManifest: set author" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    manifest.set_author("John Doe")
+
+    assert manifest.author == "John Doe"
+}
+
+test "ModManifest: add dependency" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    manifest.add_dependency("base_mod")
+
+    assert manifest.get_dependency_count() == 1
+    assert manifest.has_dependency("base_mod")
+}
+
+test "ModManifest: add conflict" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    manifest.add_conflict("incompatible_mod")
+
+    assert manifest.conflicts_with("incompatible_mod")
+}
+
+test "ModManifest: add asset override" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+    let override = AssetOverride::init(AssetType::TEXTURE, "original.png", "override.png")
+
+    manifest.add_asset_override(override)
+
+    assert manifest.asset_overrides.count() == 1
+}
+
+test "ModManifest: set priority" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    manifest.set_priority(ModPriority::HIGH)
+
+    assert manifest.priority == ModPriority::HIGH
+}
+
+test "AssetOverride: init" {
+    let override = AssetOverride::init(AssetType::MODEL, "tank.w3d", "new_tank.w3d")
+
+    assert override.asset_type == AssetType::MODEL
+    assert override.original_path == "tank.w3d"
+    assert override.override_path == "new_tank.w3d"
+}
+
+test "LoadedMod: init" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+    let mod = LoadedMod::init(manifest, "/mods/test")
+
+    assert mod.base_path == "/mods/test"
+    assert mod.is_enabled
+}
+
+test "LoadedMod: enable and disable" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+    let mod = LoadedMod::init(manifest, "/mods/test")
+
+    mod.disable()
+    assert !mod.is_enabled
+
+    mod.enable()
+    assert mod.is_enabled
+}
+
+test "LoadedMod: set load order" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+    let mod = LoadedMod::init(manifest, "/mods/test")
+
+    mod.set_load_order(5)
+
+    assert mod.load_order == 5
+}
+
+test "LoadedMod: get asset path" {
+    let manifest = ModManifest::init("test", "Test", "1.0")
+    let mod = LoadedMod::init(manifest, "/mods/test")
+
+    let path = mod.get_asset_path("textures/tank.png")
+
+    assert path == "/mods/test/textures/tank.png"
+}
+
+test "ModConflict: init" {
+    let conflict = ModConflict::init("mod_a", "mod_b", ConflictType::INCOMPATIBLE)
+
+    assert conflict.mod_a_id == "mod_a"
+    assert conflict.mod_b_id == "mod_b"
+    assert conflict.conflict_type == ConflictType::INCOMPATIBLE
+}
+
+test "ModLoader: init" {
+    let loader = ModLoader::init()
+
+    assert loader.get_loaded_mod_count() == 0
+    assert !loader.has_conflicts()
+}
+
+test "ModLoader: load mod" {
+    let loader = ModLoader::init()
+    let manifest = ModManifest::init("test_mod", "Test", "1.0")
+
+    let success = loader.load_mod(manifest, "/mods/test")
+
+    assert success
+    assert loader.get_loaded_mod_count() == 1
+}
+
+test "ModLoader: is mod loaded" {
+    let loader = ModLoader::init()
+    let manifest = ModManifest::init("test_mod", "Test", "1.0")
+
+    loader.load_mod(manifest, "/mods/test")
+
+    assert loader.is_mod_loaded("test_mod")
+    assert !loader.is_mod_loaded("other_mod")
+}
+
+test "ModLoader: unload mod" {
+    let loader = ModLoader::init()
+    let manifest = ModManifest::init("test_mod", "Test", "1.0")
+
+    loader.load_mod(manifest, "/mods/test")
+    let success = loader.unload_mod("test_mod")
+
+    assert success
+    assert loader.get_loaded_mod_count() == 0
+}
+
+test "ModLoader: dependency check" {
+    let loader = ModLoader::init()
+
+    let base_manifest = ModManifest::init("base", "Base", "1.0")
+    loader.load_mod(base_manifest, "/mods/base")
+
+    let dependent_manifest = ModManifest::init("dependent", "Dependent", "1.0")
+    dependent_manifest.add_dependency("base")
+
+    let success = loader.load_mod(dependent_manifest, "/mods/dependent")
+
+    assert success
+}
+
+test "ModLoader: missing dependency" {
+    let loader = ModLoader::init()
+
+    let manifest = ModManifest::init("dependent", "Dependent", "1.0")
+    manifest.add_dependency("missing_mod")
+
+    let success = loader.load_mod(manifest, "/mods/dependent")
+
+    assert !success
+    assert loader.has_conflicts()
+}
+
+test "ModLoader: conflict detection" {
+    let loader = ModLoader::init()
+
+    let mod_a = ModManifest::init("mod_a", "Mod A", "1.0")
+    loader.load_mod(mod_a, "/mods/a")
+
+    let mod_b = ModManifest::init("mod_b", "Mod B", "1.0")
+    mod_b.add_conflict("mod_a")
+
+    let success = loader.load_mod(mod_b, "/mods/b")
+
+    assert !success
+    assert loader.has_conflicts()
+}
+
+test "AssetRegistry: init" {
+    let registry = AssetRegistry::init()
+
+    assert registry.get_override_count() == 0
+}
+
+test "AssetRegistry: register override" {
+    let registry = AssetRegistry::init()
+    let override = AssetOverride::init(AssetType::TEXTURE, "old.png", "new.png")
+
+    registry.register_override("test_mod", override)
+
+    assert registry.get_override_count() == 1
+}
+
+test "AssetRegistry: resolve path" {
+    let registry = AssetRegistry::init()
+    let override = AssetOverride::init(AssetType::TEXTURE, "old.png", "new.png")
+
+    registry.register_override("test_mod", override)
+
+    let resolved = registry.resolve_path("old.png")
+
+    assert resolved == "new.png"
+}
+
+test "AssetRegistry: unregister mod" {
+    let registry = AssetRegistry::init()
+    let override = AssetOverride::init(AssetType::TEXTURE, "old.png", "new.png")
+
+    registry.register_override("test_mod", override)
+    registry.unregister_mod("test_mod")
+
+    assert registry.get_override_count() == 0
+}
+
+test "ScriptAPI: init" {
+    let api = ScriptAPI::init()
+
+    assert api.get_function_count() == 0
+}
+
+test "ScriptAPI: register function" {
+    let api = ScriptAPI::init()
+
+    api.register_function("spawn_unit", "Spawns a unit at location")
+
+    assert api.get_function_count() == 1
+    assert api.has_function("spawn_unit")
+}
+
+test "CustomMap: init" {
+    let map = CustomMap::init("Desert Storm", "/maps/desert.map")
+
+    assert map.name == "Desert Storm"
+    assert map.file_path == "/maps/desert.map"
+    assert !map.is_validated
+}
+
+test "CustomMap: set author" {
+    let map = CustomMap::init("Test Map", "/maps/test.map")
+
+    map.set_author("MapMaker123")
+
+    assert map.author == "MapMaker123"
+}
+
+test "CustomMap: mark validated" {
+    let map = CustomMap::init("Test Map", "/maps/test.map")
+
+    map.mark_validated()
+
+    assert map.is_validated
+}
+
+test "CustomMapManager: init" {
+    let manager = CustomMapManager::init()
+
+    assert manager.get_map_count() == 0
+}
+
+test "CustomMapManager: register map" {
+    let manager = CustomMapManager::init()
+    let map = CustomMap::init("Test Map", "/maps/test.map")
+
+    manager.register_map(map)
+
+    assert manager.get_map_count() == 1
+}
+
+test "CustomMapManager: get map" {
+    let manager = CustomMapManager::init()
+    let map = CustomMap::init("Test Map", "/maps/test.map")
+
+    manager.register_map(map)
+
+    let found = manager.get_map("Test Map")
+
+    assert found != null
+}
+
+test "CustomMapManager: get maps by author" {
+    let manager = CustomMapManager::init()
+
+    let map1 = CustomMap::init("Map 1", "/maps/1.map")
+    map1.set_author("Author1")
+
+    let map2 = CustomMap::init("Map 2", "/maps/2.map")
+    map2.set_author("Author1")
+
+    manager.register_map(map1)
+    manager.register_map(map2)
+
+    let maps = manager.get_maps_by_author("Author1")
+
+    assert maps.count() == 2
+}
+
+test "ModManager: init" {
+    let manager = ModManager::init()
+
+    assert manager.get_loaded_mod_count() == 0
+}
+
+test "ModManager: load mod" {
+    let manager = ModManager::init()
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    let success = manager.load_mod(manifest, "/mods/test")
+
+    assert success
+    assert manager.get_loaded_mod_count() == 1
+}
+
+test "ModManager: resolve asset" {
+    let manager = ModManager::init()
+    let manifest = ModManifest::init("test", "Test", "1.0")
+
+    let override = AssetOverride::init(AssetType::TEXTURE, "tank.png", "new_tank.png")
+    manifest.add_asset_override(override)
+
+    manager.load_mod(manifest, "/mods/test")
+
+    let resolved = manager.resolve_asset("tank.png")
+
+    assert resolved == "new_tank.png"
+}
+
+test "ModManager: register script function" {
+    let manager = ModManager::init()
+
+    manager.register_script_function("test_func", "Test function")
+
+    assert manager.script_api.has_function("test_func")
+}
+
+test "ModManager: register custom map" {
+    let manager = ModManager::init()
+    let map = CustomMap::init("Test", "/maps/test.map")
+
+    manager.register_custom_map(map)
+
+    assert manager.get_custom_map_count() == 1
+}

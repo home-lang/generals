@@ -1,0 +1,603 @@
+// Collision detection for C&C Generals Zero Hour
+// Spatial partitioning, collision queries, obstacle avoidance
+// Written in Home language
+
+// Bounding shapes
+enum BoundingShape {
+    CIRCLE = 0,
+    BOX = 1,
+    CAPSULE = 2,
+}
+
+// Collision layer
+enum CollisionLayer {
+    TERRAIN = 0,
+    UNITS = 1,
+    BUILDINGS = 2,
+    PROJECTILES = 3,
+    PARTICLES = 4,
+}
+
+// Axis-aligned bounding box
+struct AABB {
+    min_x: Float,
+    min_y: Float,
+    max_x: Float,
+    max_y: Float,
+
+    fn init(min_x: Float, min_y: Float, max_x: Float, max_y: Float) -> AABB {
+        return AABB {
+            min_x: min_x,
+            min_y: min_y,
+            max_x: max_x,
+            max_y: max_y,
+        }
+    }
+
+    fn from_center(center_x: Float, center_y: Float, half_width: Float, half_height: Float) -> AABB {
+        return AABB::init(
+            center_x - half_width,
+            center_y - half_height,
+            center_x + half_width,
+            center_y + half_height
+        )
+    }
+
+    fn contains_point(self, x: Float, y: Float) -> Bool {
+        return x >= self.min_x && x <= self.max_x &&
+               y >= self.min_y && y <= self.max_y
+    }
+
+    fn intersects(self, other: AABB) -> Bool {
+        return !(self.max_x < other.min_x ||
+                 self.min_x > other.max_x ||
+                 self.max_y < other.min_y ||
+                 self.min_y > other.max_y)
+    }
+
+    fn get_center(self) -> (Float, Float) {
+        return (
+            (self.min_x + self.max_x) / 2.0,
+            (self.min_y + self.max_y) / 2.0
+        )
+    }
+
+    fn get_width(self) -> Float {
+        return self.max_x - self.min_x
+    }
+
+    fn get_height(self) -> Float {
+        return self.max_y - self.min_y
+    }
+}
+
+// Circle for collision
+struct Circle {
+    center_x: Float,
+    center_y: Float,
+    radius: Float,
+
+    fn init(center_x: Float, center_y: Float, radius: Float) -> Circle {
+        return Circle {
+            center_x: center_x,
+            center_y: center_y,
+            radius: radius,
+        }
+    }
+
+    fn contains_point(self, x: Float, y: Float) -> Bool {
+        let dx = x - self.center_x
+        let dy = y - self.center_y
+        let distance_sq = dx * dx + dy * dy
+        return distance_sq <= (self.radius * self.radius)
+    }
+
+    fn intersects(self, other: Circle) -> Bool {
+        let dx = other.center_x - self.center_x
+        let dy = other.center_y - self.center_y
+        let distance_sq = dx * dx + dy * dy
+        let radius_sum = self.radius + other.radius
+        return distance_sq <= (radius_sum * radius_sum)
+    }
+
+    fn intersects_aabb(self, aabb: AABB) -> Bool {
+        let closest_x = clamp(self.center_x, aabb.min_x, aabb.max_x)
+        let closest_y = clamp(self.center_y, aabb.min_y, aabb.max_y)
+
+        let dx = self.center_x - closest_x
+        let dy = self.center_y - closest_y
+        let distance_sq = dx * dx + dy * dy
+
+        return distance_sq <= (self.radius * self.radius)
+    }
+}
+
+// Collision body
+struct CollisionBody {
+    id: Int,
+    shape: BoundingShape,
+    layer: CollisionLayer,
+    aabb: AABB,
+    circle: Circle,
+    is_static: Bool,
+    is_enabled: Bool,
+
+    fn init_circle(id: Int, x: Float, y: Float, radius: Float, layer: CollisionLayer) -> CollisionBody {
+        return CollisionBody {
+            id: id,
+            shape: BoundingShape::CIRCLE,
+            layer: layer,
+            aabb: AABB::from_center(x, y, radius, radius),
+            circle: Circle::init(x, y, radius),
+            is_static: false,
+            is_enabled: true,
+        }
+    }
+
+    fn init_box(id: Int, x: Float, y: Float, width: Float, height: Float, layer: CollisionLayer) -> CollisionBody {
+        return CollisionBody {
+            id: id,
+            shape: BoundingShape::BOX,
+            layer: layer,
+            aabb: AABB::from_center(x, y, width / 2.0, height / 2.0),
+            circle: Circle::init(x, y, 0.0),
+            is_static: false,
+            is_enabled: true,
+        }
+    }
+
+    fn set_position(self, x: Float, y: Float) {
+        match self.shape {
+            BoundingShape::CIRCLE => {
+                self.circle.center_x = x
+                self.circle.center_y = y
+                let r = self.circle.radius
+                self.aabb = AABB::from_center(x, y, r, r)
+            },
+            BoundingShape::BOX => {
+                let hw = self.aabb.get_width() / 2.0
+                let hh = self.aabb.get_height() / 2.0
+                self.aabb = AABB::from_center(x, y, hw, hh)
+            },
+            _ => {},
+        }
+    }
+
+    fn test_collision(self, other: CollisionBody) -> Bool {
+        if !self.is_enabled || !other.is_enabled {
+            return false
+        }
+
+        // Quick AABB test first
+        if !self.aabb.intersects(other.aabb) {
+            return false
+        }
+
+        // Shape-specific tests
+        match self.shape {
+            BoundingShape::CIRCLE => {
+                match other.shape {
+                    BoundingShape::CIRCLE => return self.circle.intersects(other.circle),
+                    BoundingShape::BOX => return self.circle.intersects_aabb(other.aabb),
+                    _ => return false,
+                }
+            },
+            BoundingShape::BOX => {
+                match other.shape {
+                    BoundingShape::CIRCLE => return other.circle.intersects_aabb(self.aabb),
+                    BoundingShape::BOX => return self.aabb.intersects(other.aabb),
+                    _ => return false,
+                }
+            },
+            _ => return false,
+        }
+    }
+}
+
+// Spatial grid cell
+struct GridCell {
+    bodies: Collection<Int>,  // Body IDs
+
+    fn init() -> GridCell {
+        return GridCell {
+            bodies: Collection::new(),
+        }
+    }
+
+    fn add_body(self, body_id: Int) {
+        self.bodies.add(body_id)
+    }
+
+    fn remove_body(self, body_id: Int) {
+        for i in 0..self.bodies.count() {
+            if self.bodies.get(i) == body_id {
+                self.bodies.remove(i)
+                return
+            }
+        }
+    }
+
+    fn clear(self) {
+        self.bodies.clear()
+    }
+
+    fn get_count(self) -> Int {
+        return self.bodies.count()
+    }
+}
+
+// Spatial partitioning grid
+struct SpatialGrid {
+    width: Int,
+    height: Int,
+    cell_size: Float,
+    cells: Collection<Collection<GridCell>>,
+    bodies: Collection<CollisionBody>,
+
+    fn init(width: Int, height: Int, cell_size: Float) -> SpatialGrid {
+        let grid = SpatialGrid {
+            width: width,
+            height: height,
+            cell_size: cell_size,
+            cells: Collection::new(),
+            bodies: Collection::new(),
+        }
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(GridCell::init())
+            }
+            grid.cells.add(row)
+        }
+
+        return grid
+    }
+
+    fn add_body(self, body: CollisionBody) {
+        self.bodies.add(body)
+        self.insert_body_into_grid(body)
+    }
+
+    fn remove_body(self, body_id: Int) {
+        for i in 0..self.bodies.count() {
+            let body = self.bodies.get(i)
+            if body.id == body_id {
+                self.remove_body_from_grid(body)
+                self.bodies.remove(i)
+                return
+            }
+        }
+    }
+
+    fn update_body(self, body_id: Int, x: Float, y: Float) {
+        for body in self.bodies {
+            if body.id == body_id {
+                self.remove_body_from_grid(body)
+                body.set_position(x, y)
+                self.insert_body_into_grid(body)
+                return
+            }
+        }
+    }
+
+    fn insert_body_into_grid(self, body: CollisionBody) {
+        let cells = self.get_cells_for_aabb(body.aabb)
+        for (cx, cy) in cells {
+            if let Some(cell) = self.get_cell(cx, cy) {
+                cell.add_body(body.id)
+            }
+        }
+    }
+
+    fn remove_body_from_grid(self, body: CollisionBody) {
+        let cells = self.get_cells_for_aabb(body.aabb)
+        for (cx, cy) in cells {
+            if let Some(cell) = self.get_cell(cx, cy) {
+                cell.remove_body(body.id)
+            }
+        }
+    }
+
+    fn get_cells_for_aabb(self, aabb: AABB) -> Collection<(Int, Int)> {
+        let cells = Collection::new()
+
+        let min_cell_x = max_int(0, (aabb.min_x / self.cell_size) as Int)
+        let min_cell_y = max_int(0, (aabb.min_y / self.cell_size) as Int)
+        let max_cell_x = min_int(self.width - 1, (aabb.max_x / self.cell_size) as Int)
+        let max_cell_y = min_int(self.height - 1, (aabb.max_y / self.cell_size) as Int)
+
+        for cy in min_cell_y..(max_cell_y + 1) {
+            for cx in min_cell_x..(max_cell_x + 1) {
+                cells.add((cx, cy))
+            }
+        }
+
+        return cells
+    }
+
+    fn get_cell(self, x: Int, y: Int) -> GridCell? {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.cells.get(y)
+            return row.get(x)
+        }
+        return null
+    }
+
+    fn query_region(self, aabb: AABB) -> Collection<Int> {
+        let result = Collection::new()
+        let cells = self.get_cells_for_aabb(aabb)
+
+        for (cx, cy) in cells {
+            if let Some(cell) = self.get_cell(cx, cy) {
+                for body_id in cell.bodies {
+                    if !result.contains(body_id) {
+                        result.add(body_id)
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    fn query_circle(self, x: Float, y: Float, radius: Float) -> Collection<Int> {
+        let aabb = AABB::from_center(x, y, radius, radius)
+        let candidates = self.query_region(aabb)
+        let result = Collection::new()
+
+        let query_circle = Circle::init(x, y, radius)
+
+        for body_id in candidates {
+            if let Some(body) = self.get_body(body_id) {
+                if body.shape == BoundingShape::CIRCLE {
+                    if query_circle.intersects(body.circle) {
+                        result.add(body_id)
+                    }
+                } else if body.shape == BoundingShape::BOX {
+                    if query_circle.intersects_aabb(body.aabb) {
+                        result.add(body_id)
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    fn get_body(self, body_id: Int) -> CollisionBody? {
+        for body in self.bodies {
+            if body.id == body_id {
+                return body
+            }
+        }
+        return null
+    }
+
+    fn get_body_count(self) -> Int {
+        return self.bodies.count()
+    }
+
+    fn clear(self) {
+        self.bodies.clear()
+        for row in self.cells {
+            for cell in row {
+                cell.clear()
+            }
+        }
+    }
+}
+
+// Helper functions
+fn clamp(value: Float, min_val: Float, max_val: Float) -> Float {
+    if value < min_val { return min_val }
+    if value > max_val { return max_val }
+    return value
+}
+
+fn min_int(a: Int, b: Int) -> Int {
+    if a < b { return a } else { return b }
+}
+
+fn max_int(a: Int, b: Int) -> Int {
+    if a > b { return a } else { return b }
+}
+
+// Tests
+test "AABB: init" {
+    let aabb = AABB::init(0.0, 0.0, 10.0, 10.0)
+
+    assert aabb.min_x == 0.0
+    assert aabb.max_x == 10.0
+}
+
+test "AABB: from center" {
+    let aabb = AABB::from_center(5.0, 5.0, 2.5, 2.5)
+
+    assert aabb.min_x == 2.5
+    assert aabb.max_x == 7.5
+}
+
+test "AABB: contains point" {
+    let aabb = AABB::init(0.0, 0.0, 10.0, 10.0)
+
+    assert aabb.contains_point(5.0, 5.0)
+    assert !aabb.contains_point(15.0, 5.0)
+}
+
+test "AABB: intersects" {
+    let aabb1 = AABB::init(0.0, 0.0, 10.0, 10.0)
+    let aabb2 = AABB::init(5.0, 5.0, 15.0, 15.0)
+    let aabb3 = AABB::init(20.0, 20.0, 30.0, 30.0)
+
+    assert aabb1.intersects(aabb2)
+    assert !aabb1.intersects(aabb3)
+}
+
+test "AABB: get dimensions" {
+    let aabb = AABB::init(0.0, 0.0, 10.0, 20.0)
+
+    assert aabb.get_width() == 10.0
+    assert aabb.get_height() == 20.0
+
+    let (cx, cy) = aabb.get_center()
+    assert cx == 5.0
+    assert cy == 10.0
+}
+
+test "Circle: init" {
+    let circle = Circle::init(5.0, 5.0, 3.0)
+
+    assert circle.center_x == 5.0
+    assert circle.radius == 3.0
+}
+
+test "Circle: contains point" {
+    let circle = Circle::init(0.0, 0.0, 5.0)
+
+    assert circle.contains_point(3.0, 0.0)
+    assert !circle.contains_point(10.0, 0.0)
+}
+
+test "Circle: intersects circle" {
+    let circle1 = Circle::init(0.0, 0.0, 5.0)
+    let circle2 = Circle::init(8.0, 0.0, 5.0)
+    let circle3 = Circle::init(20.0, 0.0, 5.0)
+
+    assert circle1.intersects(circle2)
+    assert !circle1.intersects(circle3)
+}
+
+test "Circle: intersects AABB" {
+    let circle = Circle::init(5.0, 5.0, 3.0)
+    let aabb1 = AABB::init(0.0, 0.0, 10.0, 10.0)
+    let aabb2 = AABB::init(20.0, 20.0, 30.0, 30.0)
+
+    assert circle.intersects_aabb(aabb1)
+    assert !circle.intersects_aabb(aabb2)
+}
+
+test "CollisionBody: init circle" {
+    let body = CollisionBody::init_circle(0, 10.0, 10.0, 5.0, CollisionLayer::UNITS)
+
+    assert body.id == 0
+    assert body.shape == BoundingShape::CIRCLE
+    assert body.circle.radius == 5.0
+}
+
+test "CollisionBody: init box" {
+    let body = CollisionBody::init_box(0, 10.0, 10.0, 20.0, 10.0, CollisionLayer::BUILDINGS)
+
+    assert body.shape == BoundingShape::BOX
+    assert body.aabb.get_width() == 20.0
+}
+
+test "CollisionBody: set position" {
+    let body = CollisionBody::init_circle(0, 0.0, 0.0, 5.0, CollisionLayer::UNITS)
+
+    body.set_position(10.0, 10.0)
+
+    assert body.circle.center_x == 10.0
+    assert body.circle.center_y == 10.0
+}
+
+test "CollisionBody: test collision circles" {
+    let body1 = CollisionBody::init_circle(0, 0.0, 0.0, 5.0, CollisionLayer::UNITS)
+    let body2 = CollisionBody::init_circle(1, 8.0, 0.0, 5.0, CollisionLayer::UNITS)
+    let body3 = CollisionBody::init_circle(2, 20.0, 0.0, 5.0, CollisionLayer::UNITS)
+
+    assert body1.test_collision(body2)
+    assert !body1.test_collision(body3)
+}
+
+test "CollisionBody: test collision circle box" {
+    let circle = CollisionBody::init_circle(0, 5.0, 5.0, 3.0, CollisionLayer::UNITS)
+    let box = CollisionBody::init_box(1, 10.0, 5.0, 10.0, 10.0, CollisionLayer::BUILDINGS)
+    let far_box = CollisionBody::init_box(2, 50.0, 50.0, 10.0, 10.0, CollisionLayer::BUILDINGS)
+
+    assert circle.test_collision(box)
+    assert !circle.test_collision(far_box)
+}
+
+test "GridCell: add and remove" {
+    let cell = GridCell::init()
+
+    assert cell.get_count() == 0
+
+    cell.add_body(100)
+    cell.add_body(101)
+
+    assert cell.get_count() == 2
+
+    cell.remove_body(100)
+    assert cell.get_count() == 1
+}
+
+test "SpatialGrid: init" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    assert grid.width == 10
+    assert grid.height == 10
+    assert grid.cell_size == 10.0
+}
+
+test "SpatialGrid: add and remove body" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    let body = CollisionBody::init_circle(0, 5.0, 5.0, 2.0, CollisionLayer::UNITS)
+    grid.add_body(body)
+
+    assert grid.get_body_count() == 1
+
+    grid.remove_body(0)
+    assert grid.get_body_count() == 0
+}
+
+test "SpatialGrid: update body position" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    let body = CollisionBody::init_circle(0, 5.0, 5.0, 2.0, CollisionLayer::UNITS)
+    grid.add_body(body)
+
+    grid.update_body(0, 15.0, 15.0)
+
+    let updated = grid.get_body(0)?
+    assert updated.circle.center_x == 15.0
+}
+
+test "SpatialGrid: query region" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    grid.add_body(CollisionBody::init_circle(0, 5.0, 5.0, 2.0, CollisionLayer::UNITS))
+    grid.add_body(CollisionBody::init_circle(1, 25.0, 25.0, 2.0, CollisionLayer::UNITS))
+    grid.add_body(CollisionBody::init_circle(2, 50.0, 50.0, 2.0, CollisionLayer::UNITS))
+
+    let query_aabb = AABB::init(0.0, 0.0, 30.0, 30.0)
+    let results = grid.query_region(query_aabb)
+
+    assert results.count() == 2  // Bodies 0 and 1
+}
+
+test "SpatialGrid: query circle" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    grid.add_body(CollisionBody::init_circle(0, 10.0, 10.0, 2.0, CollisionLayer::UNITS))
+    grid.add_body(CollisionBody::init_circle(1, 15.0, 10.0, 2.0, CollisionLayer::UNITS))
+    grid.add_body(CollisionBody::init_circle(2, 50.0, 50.0, 2.0, CollisionLayer::UNITS))
+
+    let results = grid.query_circle(10.0, 10.0, 10.0)
+
+    assert results.count() == 2  // Bodies 0 and 1
+}
+
+test "SpatialGrid: clear" {
+    let grid = SpatialGrid::init(10, 10, 10.0)
+
+    grid.add_body(CollisionBody::init_circle(0, 5.0, 5.0, 2.0, CollisionLayer::UNITS))
+    grid.add_body(CollisionBody::init_circle(1, 15.0, 15.0, 2.0, CollisionLayer::UNITS))
+
+    assert grid.get_body_count() == 2
+
+    grid.clear()
+    assert grid.get_body_count() == 0
+}

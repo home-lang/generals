@@ -1,0 +1,549 @@
+// Body/Health system for C&C Generals Zero Hour
+// Based on Thyme's bodymodule.h - Health, damage, and repair
+// Written in Home language
+
+// Body damage states
+enum BodyDamageType {
+    PRISTINE = 0,        // 100% health
+    DAMAGED = 1,         // 75-99% health
+    REALLYDAMAGED = 2,   // 25-74% health
+    RUBBLE = 3,          // 1-24% health
+    DESTROYED = 4,       // 0% health
+}
+
+// How to change max health
+enum MaxHealthChangeType {
+    SAME_CURRENTHEALTH,       // Keep current health value
+    PRESERVE_RATIO,           // Keep same percentage
+    ADD_CURRENT_HEALTH_TOO,   // Add delta to current too
+}
+
+// Armor set types (different armor configs)
+enum ArmorSetType {
+    DEFAULT = 0,
+    PLAYER_UPGRADE = 1,
+    NATIONALISM = 2,
+    VETERANCY = 3,
+    CRATEUPGRADE = 4,
+}
+
+// Body module - Manages health and damage
+struct Body {
+    // Health stats
+    max_health: Float,
+    initial_health: Float,
+    current_health: Float,
+    previous_health: Float,
+
+    // Subdual damage (non-lethal, recovers over time)
+    subdual_damage: Float,
+    subdual_damage_heal_rate: Int,    // Frames between heals
+    subdual_damage_heal_amount: Float,
+    last_subdual_heal_frame: Int,
+
+    // Damage state
+    damage_state: BodyDamageType,
+    is_aflame: Bool,
+    front_crushed: Bool,
+    back_crushed: Bool,
+    is_indestructible: Bool,
+
+    // Damage tracking
+    last_damage_frame: Int,
+    last_healing_frame: Int,
+    last_attacker_id: Int,
+    damage_scalar: Float,
+
+    // Armor
+    armor_set_flags: Int,  // Bitfield of ArmorSetType
+
+    fn init(max_health: Float) -> Body {
+        return Body {
+            max_health: max_health,
+            initial_health: max_health,
+            current_health: max_health,
+            previous_health: max_health,
+            subdual_damage: 0.0,
+            subdual_damage_heal_rate: 60,  // 1 second at 60fps
+            subdual_damage_heal_amount: 1.0,
+            last_subdual_heal_frame: 0,
+            damage_state: BodyDamageType::PRISTINE,
+            is_aflame: false,
+            front_crushed: false,
+            back_crushed: false,
+            is_indestructible: false,
+            last_damage_frame: 0,
+            last_healing_frame: 0,
+            last_attacker_id: -1,
+            damage_scalar: 1.0,
+            armor_set_flags: 0,
+        }
+    }
+
+    fn get_health(self) -> Float {
+        return self.current_health
+    }
+
+    fn get_max_health(self) -> Float {
+        return self.max_health
+    }
+
+    fn get_initial_health(self) -> Float {
+        return self.initial_health
+    }
+
+    fn get_health_percentage(self) -> Float {
+        if self.max_health <= 0.0 {
+            return 0.0
+        }
+        return (self.current_health / self.max_health) * 100.0
+    }
+
+    fn set_max_health(self, new_max: Float, change_type: MaxHealthChangeType) {
+        let old_max = self.max_health
+        self.max_health = new_max
+
+        match change_type {
+            MaxHealthChangeType::SAME_CURRENTHEALTH => {
+                // Keep current health the same
+            },
+            MaxHealthChangeType::PRESERVE_RATIO => {
+                // Keep same percentage
+                if old_max > 0.0 {
+                    let ratio = self.current_health / old_max
+                    self.current_health = new_max * ratio
+                }
+            },
+            MaxHealthChangeType::ADD_CURRENT_HEALTH_TOO => {
+                // Add the delta
+                let delta = new_max - old_max
+                self.current_health = self.current_health + delta
+            },
+        }
+
+        // Clamp current health
+        if self.current_health > self.max_health {
+            self.current_health = self.max_health
+        }
+
+        self.update_damage_state()
+    }
+
+    fn set_initial_health(self, initial_percent: Int) {
+        let percent = initial_percent as Float / 100.0
+        self.initial_health = self.max_health * percent
+        self.current_health = self.initial_health
+        self.previous_health = self.current_health
+        self.update_damage_state()
+    }
+
+    fn attempt_damage(self, damage: Float, attacker_id: Int, current_frame: Int) {
+        if self.is_indestructible {
+            return
+        }
+
+        self.previous_health = self.current_health
+
+        // Apply damage scalar
+        let actual_damage = damage * self.damage_scalar
+
+        self.current_health = self.current_health - actual_damage
+
+        if self.current_health < 0.0 {
+            self.current_health = 0.0
+        }
+
+        self.last_damage_frame = current_frame
+        self.last_attacker_id = attacker_id
+
+        self.update_damage_state()
+    }
+
+    fn attempt_healing(self, heal_amount: Float, current_frame: Int) {
+        self.previous_health = self.current_health
+
+        self.current_health = self.current_health + heal_amount
+
+        if self.current_health > self.max_health {
+            self.current_health = self.max_health
+        }
+
+        self.last_healing_frame = current_frame
+
+        self.update_damage_state()
+    }
+
+    fn apply_subdual_damage(self, damage: Float) {
+        self.subdual_damage = self.subdual_damage + damage
+    }
+
+    fn has_any_subdual_damage(self) -> Bool {
+        return self.subdual_damage > 0.0
+    }
+
+    fn get_current_subdual_damage_amount(self) -> Float {
+        return self.subdual_damage
+    }
+
+    fn update_subdual_healing(self, current_frame: Int) {
+        if self.subdual_damage <= 0.0 {
+            return
+        }
+
+        let frames_since_heal = current_frame - self.last_subdual_heal_frame
+
+        if frames_since_heal >= self.subdual_damage_heal_rate {
+            self.subdual_damage = self.subdual_damage - self.subdual_damage_heal_amount
+
+            if self.subdual_damage < 0.0 {
+                self.subdual_damage = 0.0
+            }
+
+            self.last_subdual_heal_frame = current_frame
+        }
+    }
+
+    fn update_damage_state(self) {
+        let percent = self.get_health_percentage()
+
+        if percent >= 100.0 {
+            self.damage_state = BodyDamageType::PRISTINE
+        } else if percent >= 75.0 {
+            self.damage_state = BodyDamageType::DAMAGED
+        } else if percent >= 25.0 {
+            self.damage_state = BodyDamageType::REALLYDAMAGED
+        } else if percent > 0.0 {
+            self.damage_state = BodyDamageType::RUBBLE
+        } else {
+            self.damage_state = BodyDamageType::DESTROYED
+        }
+    }
+
+    fn get_damage_state(self) -> BodyDamageType {
+        return self.damage_state
+    }
+
+    fn set_damage_state(self, state: BodyDamageType) {
+        self.damage_state = state
+    }
+
+    fn is_destroyed(self) -> Bool {
+        return self.damage_state == BodyDamageType::DESTROYED
+    }
+
+    fn is_damaged(self) -> Bool {
+        return self.damage_state != BodyDamageType::PRISTINE
+    }
+
+    fn is_badly_damaged(self) -> Bool {
+        return self.damage_state == BodyDamageType::REALLYDAMAGED ||
+               self.damage_state == BodyDamageType::RUBBLE ||
+               self.damage_state == BodyDamageType::DESTROYED
+    }
+
+    fn set_aflame(self, aflame: Bool) {
+        self.is_aflame = aflame
+    }
+
+    fn get_aflame(self) -> Bool {
+        return self.is_aflame
+    }
+
+    fn set_armor_set_flag(self, armor_set: ArmorSetType) {
+        let bit = 1 << (armor_set as Int)
+        self.armor_set_flags = self.armor_set_flags | bit
+    }
+
+    fn clear_armor_set_flag(self, armor_set: ArmorSetType) {
+        let bit = 1 << (armor_set as Int)
+        self.armor_set_flags = self.armor_set_flags & (~bit)
+    }
+
+    fn test_armor_set_flag(self, armor_set: ArmorSetType) -> Bool {
+        let bit = 1 << (armor_set as Int)
+        return (self.armor_set_flags & bit) != 0
+    }
+
+    fn clear_last_attacker(self) {
+        self.last_attacker_id = -1
+    }
+
+    fn get_clearable_last_attacker(self) -> Int {
+        return self.last_attacker_id
+    }
+
+    fn set_front_crushed(self, crushed: Bool) {
+        self.front_crushed = crushed
+    }
+
+    fn set_back_crushed(self, crushed: Bool) {
+        self.back_crushed = crushed
+    }
+
+    fn get_front_crushed(self) -> Bool {
+        return self.front_crushed
+    }
+
+    fn get_back_crushed(self) -> Bool {
+        return self.back_crushed
+    }
+
+    fn apply_damage_scalar(self, scalar: Float) {
+        self.damage_scalar = scalar
+    }
+
+    fn get_damage_scalar(self) -> Float {
+        return self.damage_scalar
+    }
+
+    fn internal_change_health(self, delta: Float) {
+        self.previous_health = self.current_health
+        self.current_health = self.current_health + delta
+
+        if self.current_health < 0.0 {
+            self.current_health = 0.0
+        }
+        if self.current_health > self.max_health {
+            self.current_health = self.max_health
+        }
+
+        self.update_damage_state()
+    }
+
+    fn set_indestructible(self, indestructible: Bool) {
+        self.is_indestructible = indestructible
+    }
+
+    fn is_indestructible(self) -> Bool {
+        return self.is_indestructible
+    }
+
+    fn on_veterancy_level_changed(self, old_level: Int, new_level: Int) {
+        // Veterancy can increase max health
+        if new_level > old_level {
+            // Typically +25% health per level
+            let health_bonus = 1.0 + (new_level as Float * 0.25)
+            let new_max = self.initial_health * health_bonus
+            self.set_max_health(new_max, MaxHealthChangeType::PRESERVE_RATIO)
+        }
+    }
+
+    fn update(self, current_frame: Int) {
+        self.update_subdual_healing(current_frame)
+    }
+}
+
+// Repairable interface - For units/buildings that can be repaired
+struct Repairable {
+    body: Body,
+    repair_rate: Float,           // Health per second
+    auto_repair: Bool,
+    auto_repair_delay_frames: Int,  // Delay after damage
+    last_repair_frame: Int,
+
+    fn init(body: Body, repair_rate: Float) -> Repairable {
+        return Repairable {
+            body: body,
+            repair_rate: repair_rate,
+            auto_repair: false,
+            auto_repair_delay_frames: 300,  // 5 seconds at 60fps
+            last_repair_frame: 0,
+        }
+    }
+
+    fn can_auto_repair(self, current_frame: Int) -> Bool {
+        if !self.auto_repair {
+            return false
+        }
+
+        if self.body.is_destroyed() {
+            return false
+        }
+
+        if self.body.get_health_percentage() >= 100.0 {
+            return false
+        }
+
+        // Check delay since last damage
+        let frames_since_damage = current_frame - self.body.last_damage_frame
+        return frames_since_damage >= self.auto_repair_delay_frames
+    }
+
+    fn do_auto_repair(self, current_frame: Int, delta_time: Float) {
+        if !self.can_auto_repair(current_frame) {
+            return
+        }
+
+        let heal_amount = self.repair_rate * delta_time
+        self.body.attempt_healing(heal_amount, current_frame)
+        self.last_repair_frame = current_frame
+    }
+
+    fn repair(self, amount: Float, current_frame: Int) {
+        self.body.attempt_healing(amount, current_frame)
+        self.last_repair_frame = current_frame
+    }
+}
+
+// Tests
+test "Body: init and health" {
+    let body = Body::init(1000.0)
+    assert body.get_health() == 1000.0
+    assert body.get_max_health() == 1000.0
+    assert body.get_health_percentage() == 100.0
+    assert body.get_damage_state() == BodyDamageType::PRISTINE
+}
+
+test "Body: take damage" {
+    let body = Body::init(1000.0)
+
+    body.attempt_damage(250.0, 100, 0)
+    assert body.get_health() == 750.0
+    assert body.get_health_percentage() == 75.0
+    assert body.get_damage_state() == BodyDamageType::DAMAGED
+}
+
+test "Body: damage states" {
+    let body = Body::init(1000.0)
+
+    // PRISTINE (100%)
+    assert body.get_damage_state() == BodyDamageType::PRISTINE
+
+    // DAMAGED (75-99%)
+    body.attempt_damage(100.0, 100, 0)
+    assert body.get_damage_state() == BodyDamageType::DAMAGED
+
+    // REALLYDAMAGED (25-74%)
+    body.attempt_damage(400.0, 100, 0)
+    assert body.get_damage_state() == BodyDamageType::REALLYDAMAGED
+
+    // RUBBLE (1-24%)
+    body.attempt_damage(350.0, 100, 0)
+    assert body.get_damage_state() == BodyDamageType::RUBBLE
+
+    // DESTROYED (0%)
+    body.attempt_damage(150.0, 100, 0)
+    assert body.get_damage_state() == BodyDamageType::DESTROYED
+    assert body.is_destroyed()
+}
+
+test "Body: healing" {
+    let body = Body::init(1000.0)
+
+    body.attempt_damage(500.0, 100, 0)
+    assert body.get_health() == 500.0
+
+    body.attempt_healing(250.0, 60)
+    assert body.get_health() == 750.0
+    assert body.get_damage_state() == BodyDamageType::DAMAGED
+}
+
+test "Body: max health overflow" {
+    let body = Body::init(1000.0)
+
+    body.attempt_damage(200.0, 100, 0)
+    body.attempt_healing(500.0, 60)  // Heal more than needed
+
+    assert body.get_health() == 1000.0  // Capped at max
+}
+
+test "Body: indestructible" {
+    let body = Body::init(1000.0)
+    body.set_indestructible(true)
+
+    body.attempt_damage(9999.0, 100, 0)
+    assert body.get_health() == 1000.0  // No damage taken
+}
+
+test "Body: subdual damage" {
+    let body = Body::init(1000.0)
+
+    body.apply_subdual_damage(100.0)
+    assert body.has_any_subdual_damage()
+    assert body.get_current_subdual_damage_amount() == 100.0
+
+    // Simulate healing over time
+    body.update_subdual_healing(60)  // After 1 second
+    assert body.get_current_subdual_damage_amount() == 99.0  // Healed 1.0
+}
+
+test "Body: armor sets" {
+    let body = Body::init(1000.0)
+
+    assert !body.test_armor_set_flag(ArmorSetType::PLAYER_UPGRADE)
+
+    body.set_armor_set_flag(ArmorSetType::PLAYER_UPGRADE)
+    assert body.test_armor_set_flag(ArmorSetType::PLAYER_UPGRADE)
+
+    body.clear_armor_set_flag(ArmorSetType::PLAYER_UPGRADE)
+    assert !body.test_armor_set_flag(ArmorSetType::PLAYER_UPGRADE)
+}
+
+test "Body: damage scalar" {
+    let body = Body::init(1000.0)
+
+    body.apply_damage_scalar(0.5)  // Take half damage
+
+    body.attempt_damage(200.0, 100, 0)
+    assert body.get_health() == 900.0  // Only 100 damage taken
+}
+
+test "Body: max health change types" {
+    let body = Body::init(1000.0)
+    body.attempt_damage(500.0, 100, 0)  // 50% health
+
+    // SAME_CURRENTHEALTH
+    body.set_max_health(2000.0, MaxHealthChangeType::SAME_CURRENTHEALTH)
+    assert body.get_health() == 500.0
+    assert body.get_max_health() == 2000.0
+    assert body.get_health_percentage() == 25.0
+
+    // Reset
+    body.current_health = 500.0
+    body.max_health = 1000.0
+
+    // PRESERVE_RATIO
+    body.set_max_health(2000.0, MaxHealthChangeType::PRESERVE_RATIO)
+    assert body.get_health() == 1000.0  // Still 50%
+    assert body.get_health_percentage() == 50.0
+
+    // Reset
+    body.current_health = 500.0
+    body.max_health = 1000.0
+
+    // ADD_CURRENT_HEALTH_TOO
+    body.set_max_health(1500.0, MaxHealthChangeType::ADD_CURRENT_HEALTH_TOO)
+    assert body.get_health() == 1000.0  // 500 + 500 delta
+}
+
+test "Repairable: auto repair" {
+    let body = Body::init(1000.0)
+    let repairable = Repairable::init(body, 10.0)  // 10 health/sec
+
+    repairable.auto_repair = true
+
+    body.attempt_damage(500.0, 100, 0)
+    assert body.get_health() == 500.0
+
+    // Can't repair yet (within delay)
+    assert !repairable.can_auto_repair(100)
+
+    // After delay
+    assert repairable.can_auto_repair(400)
+
+    // Repair for 1 second
+    repairable.do_auto_repair(400, 1.0)
+    assert body.get_health() == 510.0
+}
+
+test "Body: veterancy health bonus" {
+    let body = Body::init(1000.0)
+
+    // Level 1 -> Level 2 (25% bonus)
+    body.on_veterancy_level_changed(1, 2)
+    assert body.get_max_health() == 1250.0
+
+    // Level 2 -> Level 3 (50% bonus total)
+    body.on_veterancy_level_changed(2, 3)
+    assert body.get_max_health() == 1500.0
+}

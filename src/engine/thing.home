@@ -1,0 +1,471 @@
+// Thing system for C&C Generals Zero Hour
+// Based on Thyme's thing.h - Base class for all game objects
+// Written in Home language
+
+import kindof
+
+// Thing is the base class for all objects in the game world
+// Everything that exists in 3D space (objects, drawables, etc.) derives from Thing
+
+// Vec3 for positions/vectors
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn zero() -> Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn length(self) -> Float {
+        return sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+    }
+
+    fn normalize(self) -> Vec3 {
+        let len = self.length()
+        if len > 0.0 {
+            return Vec3 {
+                x: self.x / len,
+                y: self.y / len,
+                z: self.z / len,
+            }
+        }
+        return Vec3::zero()
+    }
+
+    fn dot(self, other: Vec3) -> Float {
+        return self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn distance(self, other: Vec3) -> Float {
+        let dx = other.x - self.x
+        let dy = other.y - self.y
+        let dz = other.z - self.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+}
+
+// 4x4 transformation matrix
+struct Matrix4 {
+    m: Array<Float, 16>,  // Row-major 4x4 matrix
+
+    fn identity() -> Matrix4 {
+        let mat = Matrix4 {
+            m: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        }
+        return mat
+    }
+
+    fn translation(pos: Vec3) -> Matrix4 {
+        let mat = Matrix4::identity()
+        mat.m[12] = pos.x
+        mat.m[13] = pos.y
+        mat.m[14] = pos.z
+        return mat
+    }
+
+    fn rotation_z(angle: Float) -> Matrix4 {
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let mat = Matrix4 {
+            m: [
+                cos_a, -sin_a, 0.0, 0.0,
+                sin_a, cos_a, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        }
+        return mat
+    }
+
+    fn get_position(self) -> Vec3 {
+        return Vec3 {
+            x: self.m[12],
+            y: self.m[13],
+            z: self.m[14],
+        }
+    }
+
+    fn transform_point(self, point: Vec3) -> Vec3 {
+        return Vec3 {
+            x: point.x * self.m[0] + point.y * self.m[4] + point.z * self.m[8] + self.m[12],
+            y: point.x * self.m[1] + point.y * self.m[5] + point.z * self.m[9] + self.m[13],
+            z: point.x * self.m[2] + point.y * self.m[6] + point.z * self.m[10] + self.m[14],
+        }
+    }
+}
+
+// ThingTemplate - Static data for a thing type
+struct ThingTemplate {
+    name: String,
+    kindof_mask: kindof::KindOfMask,
+    geometry_name: String,
+    geometry_major_radius: Float,
+    geometry_minor_radius: Float,
+    geometry_height: Float,
+    geometry_is_small: Bool,
+    shadow: String,
+}
+
+// Thing - Base class for all game objects
+struct Thing {
+    template: ThingTemplate,
+    transform: Matrix4,
+    cached_pos: Vec3,
+    cached_angle: Float,
+    cached_dir_vector: Vec3,
+    cached_altitude_above_terrain: Float,
+    cached_altitude_above_terrain_or_water: Float,
+    cache_flags: Int,
+
+    // Cache flags
+    VALID_DIRVECTOR: Int = 1,
+    VALID_ALTITUDE_TERRAIN: Int = 2,
+    VALID_ALTITUDE_SEALEVEL: Int = 4,
+
+    fn init(template: ThingTemplate) -> Thing {
+        return Thing {
+            template: template,
+            transform: Matrix4::identity(),
+            cached_pos: Vec3::zero(),
+            cached_angle: 0.0,
+            cached_dir_vector: Vec3::zero(),
+            cached_altitude_above_terrain: 0.0,
+            cached_altitude_above_terrain_or_water: 0.0,
+            cache_flags: 0,
+        }
+    }
+
+    fn get_template(self) -> ThingTemplate {
+        return self.template
+    }
+
+    fn get_position(self) -> Vec3 {
+        return self.cached_pos
+    }
+
+    fn get_orientation(self) -> Float {
+        return self.cached_angle
+    }
+
+    fn get_transform_matrix(self) -> Matrix4 {
+        return self.transform
+    }
+
+    fn set_position(self, pos: Vec3) {
+        self.cached_pos = pos
+        self.transform.m[12] = pos.x
+        self.transform.m[13] = pos.y
+        self.transform.m[14] = pos.z
+        self.invalidate_caches()
+    }
+
+    fn set_position_z(self, z: Float) {
+        self.cached_pos.z = z
+        self.transform.m[14] = z
+        self.invalidate_caches()
+    }
+
+    fn set_orientation(self, angle: Float) {
+        self.cached_angle = angle
+        self.transform = Matrix4::rotation_z(angle)
+        self.transform.m[12] = self.cached_pos.x
+        self.transform.m[13] = self.cached_pos.y
+        self.transform.m[14] = self.cached_pos.z
+        self.invalidate_caches()
+    }
+
+    fn set_transform_matrix(self, matrix: Matrix4) {
+        self.transform = matrix
+        self.cached_pos = matrix.get_position()
+        // Extract angle from rotation matrix
+        self.cached_angle = atan2(matrix.m[1], matrix.m[0])
+        self.invalidate_caches()
+    }
+
+    fn invalidate_caches(self) {
+        self.cache_flags = 0
+    }
+
+    fn get_unit_dir_vector_2d(self) -> Vec3 {
+        if (self.cache_flags & Thing::VALID_DIRVECTOR) == 0 {
+            // Recompute direction vector from angle
+            self.cached_dir_vector = Vec3 {
+                x: cos(self.cached_angle),
+                y: sin(self.cached_angle),
+                z: 0.0,
+            }
+            self.cache_flags = self.cache_flags | Thing::VALID_DIRVECTOR
+        }
+        return self.cached_dir_vector
+    }
+
+    fn get_unit_dir_vector_3d(self) -> Vec3 {
+        // For 3D, just use 2D direction (most units face forward in XY)
+        return self.get_unit_dir_vector_2d()
+    }
+
+    fn transform_point(self, point: Vec3) -> Vec3 {
+        return self.transform.transform_point(point)
+    }
+
+    fn is_kindof(self, kind: kindof::KindOf) -> Bool {
+        return self.template.kindof_mask.test(kind)
+    }
+
+    fn is_any_kindof(self, mask: kindof::KindOfMask) -> Bool {
+        return self.template.kindof_mask.test_any(mask)
+    }
+
+    fn is_all_kindof(self, mask: kindof::KindOfMask) -> Bool {
+        return self.template.kindof_mask.test_all(mask)
+    }
+
+    fn get_height_above_terrain(self) -> Float {
+        if (self.cache_flags & Thing::VALID_ALTITUDE_TERRAIN) == 0 {
+            // TODO: Query terrain system for height at position
+            // For now, just use cached position Z
+            self.cached_altitude_above_terrain = self.cached_pos.z
+            self.cache_flags = self.cache_flags | Thing::VALID_ALTITUDE_TERRAIN
+        }
+        return self.cached_altitude_above_terrain
+    }
+
+    fn get_height_above_terrain_or_water(self) -> Float {
+        if (self.cache_flags & Thing::VALID_ALTITUDE_SEALEVEL) == 0 {
+            // TODO: Check water height vs terrain height
+            // For now, same as terrain height
+            self.cached_altitude_above_terrain_or_water = self.get_height_above_terrain()
+            self.cache_flags = self.cache_flags | Thing::VALID_ALTITUDE_SEALEVEL
+        }
+        return self.cached_altitude_above_terrain_or_water
+    }
+
+    fn is_above_terrain(self) -> Bool {
+        return self.get_height_above_terrain() > 0.0
+    }
+
+    fn is_above_terrain_or_water(self) -> Bool {
+        return self.get_height_above_terrain_or_water() > 0.0
+    }
+
+    fn is_significantly_above_terrain(self) -> Bool {
+        // "Significant" threshold is 10 units
+        return self.get_height_above_terrain() > 10.0
+    }
+
+    fn calculate_height_above_terrain(self) -> Float {
+        // Virtual function - should be overridden by derived classes
+        return self.get_height_above_terrain()
+    }
+
+    fn convert_bone_pos_to_world_pos(self, bone_pos: Vec3, bone_transform: Matrix4) -> Vec3 {
+        // Transform bone position by bone transform, then by thing transform
+        let local_pos = bone_transform.transform_point(bone_pos)
+        return self.transform.transform_point(local_pos)
+    }
+}
+
+// ThingFactory - Creates things from templates
+struct ThingFactory {
+    templates: Collection<ThingTemplate>,
+
+    fn init() -> ThingFactory {
+        return ThingFactory {
+            templates: Collection::new(),
+        }
+    }
+
+    fn add_template(self, template: ThingTemplate) {
+        self.templates.add(template)
+    }
+
+    fn find_template(self, name: String) -> ThingTemplate? {
+        for template in self.templates {
+            if template.name == name {
+                return template
+            }
+        }
+        return null
+    }
+
+    fn create_thing(self, template_name: String) -> Thing? {
+        let template = self.find_template(template_name)?
+        return Thing::init(template)
+    }
+}
+
+// Helper function to create a basic thing template
+fn create_basic_template(
+    name: String,
+    kindof_mask: kindof::KindOfMask,
+    radius: Float,
+    height: Float
+) -> ThingTemplate {
+    return ThingTemplate {
+        name: name,
+        kindof_mask: kindof_mask,
+        geometry_name: "",
+        geometry_major_radius: radius,
+        geometry_minor_radius: radius,
+        geometry_height: height,
+        geometry_is_small: radius < 10.0,
+        shadow: "",
+    }
+}
+
+// Tests
+test "Thing: create and position" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_infantry(),
+        5.0,
+        10.0
+    )
+    let thing = Thing::init(template)
+
+    assert thing.get_position().x == 0.0
+    assert thing.get_position().y == 0.0
+    assert thing.get_position().z == 0.0
+
+    thing.set_position(Vec3::init(100.0, 200.0, 30.0))
+    assert thing.get_position().x == 100.0
+    assert thing.get_position().y == 200.0
+    assert thing.get_position().z == 30.0
+}
+
+test "Thing: orientation" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_vehicle(),
+        10.0,
+        15.0
+    )
+    let thing = Thing::init(template)
+
+    assert thing.get_orientation() == 0.0
+
+    thing.set_orientation(1.57)  // ~90 degrees
+    assert thing.get_orientation() == 1.57
+}
+
+test "Thing: direction vector" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_vehicle(),
+        10.0,
+        15.0
+    )
+    let thing = Thing::init(template)
+
+    thing.set_orientation(0.0)
+    let dir = thing.get_unit_dir_vector_2d()
+    assert dir.x > 0.99  // cos(0) = 1
+    assert abs(dir.y) < 0.01  // sin(0) = 0
+}
+
+test "Thing: kindof checks" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_infantry(),
+        5.0,
+        10.0
+    )
+    let thing = Thing::init(template)
+
+    assert thing.is_kindof(kindof::KindOf::INFANTRY)
+    assert !thing.is_kindof(kindof::KindOf::VEHICLE)
+    assert thing.is_kindof(kindof::KindOf::SELECTABLE)
+}
+
+test "Thing: transform point" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_vehicle(),
+        10.0,
+        15.0
+    )
+    let thing = Thing::init(template)
+
+    thing.set_position(Vec3::init(100.0, 200.0, 0.0))
+
+    let local_point = Vec3::init(10.0, 0.0, 0.0)
+    let world_point = thing.transform_point(local_point)
+
+    assert world_point.x == 110.0  // 100 + 10
+    assert world_point.y == 200.0
+}
+
+test "Thing: height above terrain" {
+    let template = create_basic_template(
+        "TestThing",
+        kindof::kindof_mask_aircraft(),
+        10.0,
+        15.0
+    )
+    let thing = Thing::init(template)
+
+    thing.set_position(Vec3::init(0.0, 0.0, 100.0))
+
+    assert thing.is_above_terrain()
+    assert thing.is_significantly_above_terrain()
+}
+
+test "ThingFactory: create from template" {
+    let factory = ThingFactory::init()
+
+    let template = create_basic_template(
+        "Ranger",
+        kindof::kindof_mask_infantry(),
+        5.0,
+        10.0
+    )
+    factory.add_template(template)
+
+    let thing = factory.create_thing("Ranger")?
+    assert thing.template.name == "Ranger"
+    assert thing.is_kindof(kindof::KindOf::INFANTRY)
+}
+
+test "ThingFactory: template not found" {
+    let factory = ThingFactory::init()
+    let thing = factory.create_thing("NonExistent")
+    assert thing == null
+}
+
+test "Matrix4: identity" {
+    let mat = Matrix4::identity()
+    let point = Vec3::init(10.0, 20.0, 30.0)
+    let transformed = mat.transform_point(point)
+
+    assert transformed.x == point.x
+    assert transformed.y == point.y
+    assert transformed.z == point.z
+}
+
+test "Matrix4: translation" {
+    let mat = Matrix4::translation(Vec3::init(100.0, 200.0, 300.0))
+    let point = Vec3::init(10.0, 20.0, 30.0)
+    let transformed = mat.transform_point(point)
+
+    assert transformed.x == 110.0
+    assert transformed.y == 220.0
+    assert transformed.z == 330.0
+}
+
+test "Vec3: normalize" {
+    let v = Vec3::init(3.0, 4.0, 0.0)
+    let normalized = v.normalize()
+
+    let len = normalized.length()
+    assert abs(len - 1.0) < 0.01  // Should be unit length
+}

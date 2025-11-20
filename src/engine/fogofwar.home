@@ -1,0 +1,596 @@
+// Fog of War system for C&C Generals Zero Hour
+// Visibility tracking, shroud, explored areas
+// Written in Home language
+
+// Visibility state for tiles
+enum VisibilityState {
+    UNEXPLORED = 0,  // Never seen (black)
+    EXPLORED = 1,    // Seen before (dark gray)
+    VISIBLE = 2,     // Currently visible
+}
+
+// Fog of war tile
+struct FogTile {
+    visibility: VisibilityState,
+    last_update_frame: Int,
+
+    fn init() -> FogTile {
+        return FogTile {
+            visibility: VisibilityState::UNEXPLORED,
+            last_update_frame: 0,
+        }
+    }
+
+    fn reveal(self, frame: Int) {
+        self.visibility = VisibilityState::VISIBLE
+        self.last_update_frame = frame
+    }
+
+    fn hide(self, frame: Int) {
+        if self.visibility == VisibilityState::VISIBLE {
+            self.visibility = VisibilityState::EXPLORED
+            self.last_update_frame = frame
+        }
+    }
+
+    fn is_visible(self) -> Bool {
+        return self.visibility == VisibilityState::VISIBLE
+    }
+
+    fn is_explored(self) -> Bool {
+        return self.visibility != VisibilityState::UNEXPLORED
+    }
+}
+
+// Vision provider (unit/building)
+struct VisionProvider {
+    id: Int,
+    position_x: Float,
+    position_y: Float,
+    vision_range: Float,
+    is_active: Bool,
+    owner_player_id: Int,
+
+    fn init(id: Int, x: Float, y: Float, range: Float, owner: Int) -> VisionProvider {
+        return VisionProvider {
+            id: id,
+            position_x: x,
+            position_y: y,
+            vision_range: range,
+            is_active: true,
+            owner_player_id: owner,
+        }
+    }
+
+    fn update_position(self, x: Float, y: Float) {
+        self.position_x = x
+        self.position_y = y
+    }
+
+    fn set_active(self, active: Bool) {
+        self.is_active = active
+    }
+}
+
+// Fog of war grid
+struct FogOfWarGrid {
+    width: Int,
+    height: Int,
+    tile_size: Float,
+    tiles: Collection<Collection<FogTile>>,
+    current_frame: Int,
+
+    fn init(width: Int, height: Int, tile_size: Float) -> FogOfWarGrid {
+        let grid = FogOfWarGrid {
+            width: width,
+            height: height,
+            tile_size: tile_size,
+            tiles: Collection::new(),
+            current_frame: 0,
+        }
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(FogTile::init())
+            }
+            grid.tiles.add(row)
+        }
+
+        return grid
+    }
+
+    fn get_tile(self, x: Int, y: Int) -> FogTile? {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.tiles.get(y)
+            return row.get(x)
+        }
+        return null
+    }
+
+    fn reveal_tile(self, x: Int, y: Int) {
+        if let Some(tile) = self.get_tile(x, y) {
+            tile.reveal(self.current_frame)
+        }
+    }
+
+    fn hide_tile(self, x: Int, y: Int) {
+        if let Some(tile) = self.get_tile(x, y) {
+            tile.hide(self.current_frame)
+        }
+    }
+
+    fn is_visible(self, x: Int, y: Int) -> Bool {
+        if let Some(tile) = self.get_tile(x, y) {
+            return tile.is_visible()
+        }
+        return false
+    }
+
+    fn is_explored(self, x: Int, y: Int) -> Bool {
+        if let Some(tile) = self.get_tile(x, y) {
+            return tile.is_explored()
+        }
+        return false
+    }
+
+    fn world_to_tile(self, world_x: Float, world_y: Float) -> (Int, Int) {
+        return (
+            (world_x / self.tile_size) as Int,
+            (world_y / self.tile_size) as Int
+        )
+    }
+
+    fn reveal_circle(self, center_x: Float, center_y: Float, radius: Float) {
+        let (tile_x, tile_y) = self.world_to_tile(center_x, center_y)
+        let tile_radius = (radius / self.tile_size) as Int
+
+        for dy in -tile_radius..(tile_radius + 1) {
+            for dx in -tile_radius..(tile_radius + 1) {
+                let tx = tile_x + dx
+                let ty = tile_y + dy
+
+                let distance = sqrt((dx * dx + dy * dy) as Float)
+                if distance <= tile_radius as Float {
+                    self.reveal_tile(tx, ty)
+                }
+            }
+        }
+    }
+
+    fn hide_all(self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.hide_tile(x, y)
+            }
+        }
+    }
+
+    fn reveal_all(self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.reveal_tile(x, y)
+            }
+        }
+    }
+
+    fn advance_frame(self) {
+        self.current_frame = self.current_frame + 1
+    }
+
+    fn get_visibility_percentage(self) -> Float {
+        let explored_count = 0
+        let total_count = self.width * self.height
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if let Some(tile) = self.get_tile(x, y) {
+                    if tile.is_explored() {
+                        explored_count = explored_count + 1
+                    }
+                }
+            }
+        }
+
+        return (explored_count as Float / total_count as Float) * 100.0
+    }
+}
+
+// Fog of war manager per player
+struct FogOfWarManager {
+    grids: Collection<FogOfWarGrid>,
+    vision_providers: Collection<VisionProvider>,
+    player_id: Int,
+    update_interval: Float,
+    time_since_update: Float,
+
+    fn init(player_id: Int, map_width: Int, map_height: Int, tile_size: Float) -> FogOfWarManager {
+        let manager = FogOfWarManager {
+            grids: Collection::new(),
+            vision_providers: Collection::new(),
+            player_id: player_id,
+            update_interval: 0.5,
+            time_since_update: 0.0,
+        }
+
+        let grid = FogOfWarGrid::init(map_width, map_height, tile_size)
+        manager.grids.add(grid)
+
+        return manager
+    }
+
+    fn add_vision_provider(self, provider: VisionProvider) {
+        self.vision_providers.add(provider)
+    }
+
+    fn remove_vision_provider(self, provider_id: Int) {
+        for i in 0..self.vision_providers.count() {
+            let provider = self.vision_providers.get(i)
+            if provider.id == provider_id {
+                self.vision_providers.remove(i)
+                return
+            }
+        }
+    }
+
+    fn update_provider_position(self, provider_id: Int, x: Float, y: Float) {
+        for provider in self.vision_providers {
+            if provider.id == provider_id {
+                provider.update_position(x, y)
+                return
+            }
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.time_since_update = self.time_since_update + delta_time
+
+        if self.time_since_update >= self.update_interval {
+            self.time_since_update = 0.0
+            self.recalculate_visibility()
+        }
+    }
+
+    fn recalculate_visibility(self) {
+        let grid = self.grids.get(0)
+
+        // Hide all tiles
+        grid.hide_all()
+
+        // Reveal based on vision providers
+        for provider in self.vision_providers {
+            if provider.is_active && provider.owner_player_id == self.player_id {
+                grid.reveal_circle(
+                    provider.position_x,
+                    provider.position_y,
+                    provider.vision_range
+                )
+            }
+        }
+
+        grid.advance_frame()
+    }
+
+    fn is_position_visible(self, x: Float, y: Float) -> Bool {
+        let grid = self.grids.get(0)
+        let (tile_x, tile_y) = grid.world_to_tile(x, y)
+        return grid.is_visible(tile_x, tile_y)
+    }
+
+    fn is_position_explored(self, x: Float, y: Float) -> Bool {
+        let grid = self.grids.get(0)
+        let (tile_x, tile_y) = grid.world_to_tile(x, y)
+        return grid.is_explored(tile_x, tile_y)
+    }
+
+    fn reveal_all(self) {
+        for grid in self.grids {
+            grid.reveal_all()
+        }
+    }
+
+    fn get_explored_percentage(self) -> Float {
+        let grid = self.grids.get(0)
+        return grid.get_visibility_percentage()
+    }
+
+    fn get_provider_count(self) -> Int {
+        return self.vision_providers.count()
+    }
+}
+
+// Shared vision between team members
+struct TeamVision {
+    team_id: Int,
+    managers: Collection<FogOfWarManager>,
+    shared_vision_enabled: Bool,
+
+    fn init(team_id: Int) -> TeamVision {
+        return TeamVision {
+            team_id: team_id,
+            managers: Collection::new(),
+            shared_vision_enabled: true,
+        }
+    }
+
+    fn add_manager(self, manager: FogOfWarManager) {
+        self.managers.add(manager)
+    }
+
+    fn is_position_visible_to_team(self, x: Float, y: Float) -> Bool {
+        if !self.shared_vision_enabled {
+            return false
+        }
+
+        for manager in self.managers {
+            if manager.is_position_visible(x, y) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn enable_shared_vision(self) {
+        self.shared_vision_enabled = true
+    }
+
+    fn disable_shared_vision(self) {
+        self.shared_vision_enabled = false
+    }
+}
+
+// Helper function
+fn sqrt(x: Float) -> Float {
+    return x ** 0.5
+}
+
+// Tests
+test "FogTile: init" {
+    let tile = FogTile::init()
+
+    assert tile.visibility == VisibilityState::UNEXPLORED
+    assert !tile.is_visible()
+    assert !tile.is_explored()
+}
+
+test "FogTile: reveal and hide" {
+    let tile = FogTile::init()
+
+    tile.reveal(1)
+    assert tile.is_visible()
+    assert tile.is_explored()
+
+    tile.hide(2)
+    assert !tile.is_visible()
+    assert tile.is_explored()
+}
+
+test "VisionProvider: init" {
+    let provider = VisionProvider::init(0, 100.0, 100.0, 50.0, 1)
+
+    assert provider.id == 0
+    assert provider.vision_range == 50.0
+    assert provider.is_active
+}
+
+test "VisionProvider: update position" {
+    let provider = VisionProvider::init(0, 0.0, 0.0, 50.0, 1)
+
+    provider.update_position(100.0, 100.0)
+    assert provider.position_x == 100.0
+    assert provider.position_y == 100.0
+}
+
+test "VisionProvider: set active" {
+    let provider = VisionProvider::init(0, 0.0, 0.0, 50.0, 1)
+
+    provider.set_active(false)
+    assert !provider.is_active
+}
+
+test "FogOfWarGrid: init" {
+    let grid = FogOfWarGrid::init(100, 100, 10.0)
+
+    assert grid.width == 100
+    assert grid.height == 100
+    assert grid.tile_size == 10.0
+}
+
+test "FogOfWarGrid: get tile" {
+    let grid = FogOfWarGrid::init(10, 10, 10.0)
+
+    let tile = grid.get_tile(5, 5)?
+    assert !tile.is_visible()
+
+    let invalid = grid.get_tile(100, 100)
+    assert invalid == null
+}
+
+test "FogOfWarGrid: reveal and hide tile" {
+    let grid = FogOfWarGrid::init(10, 10, 10.0)
+
+    grid.reveal_tile(5, 5)
+    assert grid.is_visible(5, 5)
+
+    grid.hide_tile(5, 5)
+    assert !grid.is_visible(5, 5)
+    assert grid.is_explored(5, 5)
+}
+
+test "FogOfWarGrid: world to tile" {
+    let grid = FogOfWarGrid::init(100, 100, 10.0)
+
+    let (tx, ty) = grid.world_to_tile(25.0, 35.0)
+    assert tx == 2
+    assert ty == 3
+}
+
+test "FogOfWarGrid: reveal circle" {
+    let grid = FogOfWarGrid::init(20, 20, 10.0)
+
+    grid.reveal_circle(100.0, 100.0, 30.0)
+
+    assert grid.is_visible(10, 10)  // Center
+    assert grid.is_visible(11, 10)  // Adjacent
+    assert grid.is_visible(9, 10)   // Adjacent
+}
+
+test "FogOfWarGrid: reveal all" {
+    let grid = FogOfWarGrid::init(5, 5, 10.0)
+
+    grid.reveal_all()
+
+    assert grid.is_visible(0, 0)
+    assert grid.is_visible(4, 4)
+    assert grid.get_visibility_percentage() == 100.0
+}
+
+test "FogOfWarGrid: hide all" {
+    let grid = FogOfWarGrid::init(5, 5, 10.0)
+
+    grid.reveal_all()
+    grid.hide_all()
+
+    assert !grid.is_visible(2, 2)
+    assert grid.is_explored(2, 2)
+}
+
+test "FogOfWarGrid: advance frame" {
+    let grid = FogOfWarGrid::init(10, 10, 10.0)
+
+    assert grid.current_frame == 0
+
+    grid.advance_frame()
+    assert grid.current_frame == 1
+}
+
+test "FogOfWarGrid: visibility percentage" {
+    let grid = FogOfWarGrid::init(10, 10, 10.0)
+
+    assert grid.get_visibility_percentage() == 0.0
+
+    grid.reveal_all()
+    assert grid.get_visibility_percentage() == 100.0
+}
+
+test "FogOfWarManager: init" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+
+    assert manager.player_id == 0
+    assert manager.get_provider_count() == 0
+}
+
+test "FogOfWarManager: add and remove providers" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+
+    let provider = VisionProvider::init(100, 50.0, 50.0, 30.0, 0)
+    manager.add_vision_provider(provider)
+
+    assert manager.get_provider_count() == 1
+
+    manager.remove_vision_provider(100)
+    assert manager.get_provider_count() == 0
+}
+
+test "FogOfWarManager: update provider position" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+
+    let provider = VisionProvider::init(100, 0.0, 0.0, 30.0, 0)
+    manager.add_vision_provider(provider)
+
+    manager.update_provider_position(100, 100.0, 100.0)
+
+    for p in manager.vision_providers {
+        if p.id == 100 {
+            assert p.position_x == 100.0
+        }
+    }
+}
+
+test "FogOfWarManager: recalculate visibility" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+
+    let provider = VisionProvider::init(100, 50.0, 50.0, 30.0, 0)
+    manager.add_vision_provider(provider)
+
+    manager.recalculate_visibility()
+
+    assert manager.is_position_visible(50.0, 50.0)
+}
+
+test "FogOfWarManager: is position visible" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+
+    let provider = VisionProvider::init(100, 50.0, 50.0, 30.0, 0)
+    manager.add_vision_provider(provider)
+
+    manager.recalculate_visibility()
+
+    assert manager.is_position_visible(50.0, 50.0)
+    assert !manager.is_position_visible(500.0, 500.0)
+}
+
+test "FogOfWarManager: reveal all" {
+    let manager = FogOfWarManager::init(0, 10, 10, 10.0)
+
+    manager.reveal_all()
+
+    assert manager.is_position_visible(50.0, 50.0)
+    assert manager.get_explored_percentage() == 100.0
+}
+
+test "FogOfWarManager: update with interval" {
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+    manager.update_interval = 1.0
+
+    manager.update(0.5)
+    assert manager.time_since_update == 0.5
+
+    manager.update(0.6)
+    assert manager.time_since_update < 0.5  // Reset after recalculation
+}
+
+test "TeamVision: init" {
+    let team = TeamVision::init(1)
+
+    assert team.team_id == 1
+    assert team.shared_vision_enabled
+}
+
+test "TeamVision: add managers" {
+    let team = TeamVision::init(1)
+
+    let manager1 = FogOfWarManager::init(0, 100, 100, 10.0)
+    let manager2 = FogOfWarManager::init(1, 100, 100, 10.0)
+
+    team.add_manager(manager1)
+    team.add_manager(manager2)
+
+    assert team.managers.count() == 2
+}
+
+test "TeamVision: shared visibility" {
+    let team = TeamVision::init(1)
+
+    let manager1 = FogOfWarManager::init(0, 100, 100, 10.0)
+    let provider = VisionProvider::init(100, 50.0, 50.0, 30.0, 0)
+    manager1.add_vision_provider(provider)
+    manager1.recalculate_visibility()
+
+    team.add_manager(manager1)
+
+    assert team.is_position_visible_to_team(50.0, 50.0)
+}
+
+test "TeamVision: disable shared vision" {
+    let team = TeamVision::init(1)
+
+    team.disable_shared_vision()
+    assert !team.shared_vision_enabled
+
+    let manager = FogOfWarManager::init(0, 100, 100, 10.0)
+    team.add_manager(manager)
+
+    assert !team.is_position_visible_to_team(50.0, 50.0)
+}

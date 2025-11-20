@@ -1,0 +1,448 @@
+// Production queue system for C&C Generals Zero Hour
+// Based on Thyme's production system
+// Written in Home language
+
+import player
+
+// Production item types
+enum ProductionType {
+    UNIT = 0,
+    BUILDING = 1,
+    UPGRADE = 2,
+}
+
+// Production status
+enum ProductionStatus {
+    QUEUED = 0,
+    IN_PROGRESS = 1,
+    PAUSED = 2,
+    COMPLETED = 3,
+    CANCELLED = 4,
+}
+
+// Production item
+struct ProductionItem {
+    item_type: ProductionType,
+    template_name: String,
+    cost: Float,
+    build_time: Float,
+    progress: Float,
+    status: ProductionStatus,
+    rally_point: Vec3?,
+
+    fn init(item_type: ProductionType, template_name: String, cost: Float, build_time: Float) -> ProductionItem {
+        return ProductionItem {
+            item_type: item_type,
+            template_name: template_name,
+            cost: cost,
+            build_time: build_time,
+            progress: 0.0,
+            status: ProductionStatus::QUEUED,
+            rally_point: null,
+        }
+    }
+
+    fn get_progress_percentage(self) -> Float {
+        return (self.progress / self.build_time) * 100.0
+    }
+
+    fn is_complete(self) -> Bool {
+        return self.progress >= self.build_time
+    }
+}
+
+// Production queue for a factory/building
+struct ProductionQueue {
+    max_queue_size: Int,
+    items: Collection<ProductionItem>,
+    current_item_index: Int,
+    is_on_hold: Bool,
+
+    fn init(max_queue_size: Int) -> ProductionQueue {
+        return ProductionQueue {
+            max_queue_size: max_queue_size,
+            items: Collection::new(),
+            current_item_index: -1,
+            is_on_hold: false,
+        }
+    }
+
+    fn can_queue(self) -> Bool {
+        return self.items.count() < self.max_queue_size
+    }
+
+    fn add_item(self, item: ProductionItem) -> Bool {
+        if !self.can_queue() {
+            return false
+        }
+
+        self.items.add(item)
+
+        if self.current_item_index == -1 && !self.is_on_hold {
+            self.current_item_index = 0
+            self.start_current_item()
+        }
+
+        return true
+    }
+
+    fn start_current_item(self) {
+        if self.current_item_index >= 0 && self.current_item_index < self.items.count() {
+            let item = self.items.get(self.current_item_index)
+            item.status = ProductionStatus::IN_PROGRESS
+        }
+    }
+
+    fn cancel_item(self, index: Int) -> Bool {
+        if index < 0 || index >= self.items.count() {
+            return false
+        }
+
+        let item = self.items.get(index)
+        item.status = ProductionStatus::CANCELLED
+
+        // Remove from queue
+        let new_items = Collection::new()
+        for i in 0..self.items.count() {
+            if i != index {
+                new_items.add(self.items.get(i))
+            }
+        }
+        self.items = new_items
+
+        // Adjust current index
+        if index == self.current_item_index {
+            if self.items.count() > 0 {
+                self.current_item_index = 0
+                self.start_current_item()
+            } else {
+                self.current_item_index = -1
+            }
+        } else if index < self.current_item_index {
+            self.current_item_index = self.current_item_index - 1
+        }
+
+        return true
+    }
+
+    fn pause(self) {
+        self.is_on_hold = true
+        if self.current_item_index >= 0 && self.current_item_index < self.items.count() {
+            let item = self.items.get(self.current_item_index)
+            item.status = ProductionStatus::PAUSED
+        }
+    }
+
+    fn resume(self) {
+        self.is_on_hold = false
+        if self.current_item_index >= 0 && self.current_item_index < self.items.count() {
+            let item = self.items.get(self.current_item_index)
+            item.status = ProductionStatus::IN_PROGRESS
+        }
+    }
+
+    fn update(self, delta_time: Float, build_speed_multiplier: Float) -> ProductionItem? {
+        if self.is_on_hold {
+            return null
+        }
+
+        if self.current_item_index < 0 || self.current_item_index >= self.items.count() {
+            return null
+        }
+
+        let item = self.items.get(self.current_item_index)
+
+        if item.status != ProductionStatus::IN_PROGRESS {
+            return null
+        }
+
+        item.progress = item.progress + (delta_time * build_speed_multiplier)
+
+        if item.is_complete() {
+            item.status = ProductionStatus::COMPLETED
+
+            // Remove completed item
+            let completed = item
+            let new_items = Collection::new()
+            for i in 0..self.items.count() {
+                if i != self.current_item_index {
+                    new_items.add(self.items.get(i))
+                }
+            }
+            self.items = new_items
+
+            // Start next item
+            if self.items.count() > 0 {
+                self.current_item_index = 0
+                self.start_current_item()
+            } else {
+                self.current_item_index = -1
+            }
+
+            return completed
+        }
+
+        return null
+    }
+
+    fn get_queue_size(self) -> Int {
+        return self.items.count()
+    }
+
+    fn get_current_item(self) -> ProductionItem? {
+        if self.current_item_index >= 0 && self.current_item_index < self.items.count() {
+            return self.items.get(self.current_item_index)
+        }
+        return null
+    }
+
+    fn clear(self) {
+        self.items = Collection::new()
+        self.current_item_index = -1
+    }
+}
+
+// Production manager - global production tracking
+struct ProductionManager {
+    queues: Collection<ProductionQueue>,
+    next_queue_id: Int,
+
+    fn init() -> ProductionManager {
+        return ProductionManager {
+            queues: Collection::new(),
+            next_queue_id: 0,
+        }
+    }
+
+    fn create_queue(self, max_size: Int) -> Int {
+        let queue_id = self.next_queue_id
+        self.next_queue_id = self.next_queue_id + 1
+
+        let queue = ProductionQueue::init(max_size)
+        self.queues.add(queue)
+
+        return queue_id
+    }
+
+    fn get_queue(self, queue_id: Int) -> ProductionQueue? {
+        if queue_id >= 0 && queue_id < self.queues.count() {
+            return self.queues.get(queue_id)
+        }
+        return null
+    }
+
+    fn update_all(self, delta_time: Float, build_speed: Float) -> Collection<ProductionItem> {
+        let completed_items = Collection::new()
+
+        for queue in self.queues {
+            if let Some(completed) = queue.update(delta_time, build_speed) {
+                completed_items.add(completed)
+            }
+        }
+
+        return completed_items
+    }
+}
+
+// Vec3 for rally points
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+// Tests
+test "ProductionItem: init and progress" {
+    let item = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+
+    assert item.template_name == "Ranger"
+    assert item.cost == 200.0
+    assert item.build_time == 10.0
+    assert item.progress == 0.0
+    assert item.get_progress_percentage() == 0.0
+    assert !item.is_complete()
+}
+
+test "ProductionItem: completion" {
+    let item = ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 15.0)
+
+    item.progress = 15.0
+    assert item.is_complete()
+    assert item.get_progress_percentage() == 100.0
+}
+
+test "ProductionQueue: add items" {
+    let queue = ProductionQueue::init(5)
+
+    let item1 = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    let item2 = ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 15.0)
+
+    assert queue.can_queue()
+    assert queue.add_item(item1)
+    assert queue.add_item(item2)
+    assert queue.get_queue_size() == 2
+}
+
+test "ProductionQueue: max size limit" {
+    let queue = ProductionQueue::init(2)
+
+    let item1 = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    let item2 = ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 15.0)
+    let item3 = ProductionItem::init(ProductionType::UNIT, "Humvee", 600.0, 12.0)
+
+    assert queue.add_item(item1)
+    assert queue.add_item(item2)
+    assert !queue.can_queue()
+    assert !queue.add_item(item3)
+    assert queue.get_queue_size() == 2
+}
+
+test "ProductionQueue: update and completion" {
+    let queue = ProductionQueue::init(5)
+
+    let item = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    queue.add_item(item)
+
+    // Build for 5 seconds (50% complete)
+    let completed1 = queue.update(5.0, 1.0)
+    assert completed1 == null
+
+    let current = queue.get_current_item()?
+    assert current.get_progress_percentage() == 50.0
+
+    // Build for another 5 seconds (100% complete)
+    let completed2 = queue.update(5.0, 1.0)
+    assert completed2 != null
+    assert queue.get_queue_size() == 0
+}
+
+test "ProductionQueue: cancel item" {
+    let queue = ProductionQueue::init(5)
+
+    let item1 = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    let item2 = ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 15.0)
+
+    queue.add_item(item1)
+    queue.add_item(item2)
+
+    assert queue.cancel_item(0)
+    assert queue.get_queue_size() == 1
+
+    let current = queue.get_current_item()?
+    assert current.template_name == "Tank"
+}
+
+test "ProductionQueue: pause and resume" {
+    let queue = ProductionQueue::init(5)
+
+    let item = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    queue.add_item(item)
+
+    queue.pause()
+    assert queue.is_on_hold
+
+    let completed1 = queue.update(5.0, 1.0)
+    assert completed1 == null
+
+    let current = queue.get_current_item()?
+    assert current.progress == 0.0  // No progress while paused
+
+    queue.resume()
+    assert !queue.is_on_hold
+
+    let completed2 = queue.update(10.0, 1.0)
+    assert completed2 != null
+}
+
+test "ProductionQueue: build speed multiplier" {
+    let queue = ProductionQueue::init(5)
+
+    let item = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0)
+    queue.add_item(item)
+
+    // 2x build speed
+    let completed = queue.update(5.0, 2.0)
+    assert completed != null  // Completes in 5 seconds instead of 10
+}
+
+test "ProductionQueue: multiple items in sequence" {
+    let queue = ProductionQueue::init(5)
+
+    let item1 = ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 5.0)
+    let item2 = ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 5.0)
+    let item3 = ProductionItem::init(ProductionType::UNIT, "Humvee", 600.0, 5.0)
+
+    queue.add_item(item1)
+    queue.add_item(item2)
+    queue.add_item(item3)
+
+    assert queue.get_queue_size() == 3
+
+    // Complete first item
+    let completed1 = queue.update(5.0, 1.0)
+    assert completed1 != null
+    assert completed1?.template_name == "Ranger"
+    assert queue.get_queue_size() == 2
+
+    // Complete second item
+    let completed2 = queue.update(5.0, 1.0)
+    assert completed2 != null
+    assert completed2?.template_name == "Tank"
+    assert queue.get_queue_size() == 1
+
+    // Complete third item
+    let completed3 = queue.update(5.0, 1.0)
+    assert completed3 != null
+    assert completed3?.template_name == "Humvee"
+    assert queue.get_queue_size() == 0
+}
+
+test "ProductionQueue: clear all" {
+    let queue = ProductionQueue::init(5)
+
+    queue.add_item(ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 10.0))
+    queue.add_item(ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 15.0))
+
+    assert queue.get_queue_size() == 2
+
+    queue.clear()
+    assert queue.get_queue_size() == 0
+    assert queue.current_item_index == -1
+}
+
+test "ProductionManager: create and manage queues" {
+    let manager = ProductionManager::init()
+
+    let queue_id1 = manager.create_queue(5)
+    let queue_id2 = manager.create_queue(10)
+
+    assert queue_id1 == 0
+    assert queue_id2 == 1
+
+    let queue1 = manager.get_queue(queue_id1)?
+    assert queue1.max_queue_size == 5
+
+    let queue2 = manager.get_queue(queue_id2)?
+    assert queue2.max_queue_size == 10
+}
+
+test "ProductionManager: update all queues" {
+    let manager = ProductionManager::init()
+
+    let queue_id1 = manager.create_queue(5)
+    let queue_id2 = manager.create_queue(5)
+
+    let queue1 = manager.get_queue(queue_id1)?
+    let queue2 = manager.get_queue(queue_id2)?
+
+    queue1.add_item(ProductionItem::init(ProductionType::UNIT, "Ranger", 200.0, 5.0))
+    queue2.add_item(ProductionItem::init(ProductionType::UNIT, "Tank", 800.0, 10.0))
+
+    let completed = manager.update_all(5.0, 1.0)
+    assert completed.count() == 1  // Only Ranger completes
+    assert completed.get(0).template_name == "Ranger"
+}

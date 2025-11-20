@@ -82,21 +82,29 @@ pub const ResourceManager = struct {
         const weapon_path = try String.format(self.allocator, "{s}/Weapon.ini", .{ini_path});
         defer self.allocator.free(weapon_path);
 
-        const fileExists = @import("io").fileExists;
-        if (fileExists(weapon_path)) {
-            std.debug.print("  Loading: {s}\n", .{weapon_path});
-            self.weapons = try IniFile.parseFile(self.allocator, weapon_path);
+        // Check if file exists
+        std.fs.cwd().access(weapon_path, .{}) catch |err| {
+            if (err != error.FileNotFound) return err;
+            std.debug.print("  Weapon.ini not found, skipping\n", .{});
+        };
 
-            if (self.weapons) |weapons| {
-                std.debug.print("    Loaded {} weapon definitions\n", .{weapons.sections.size()});
-            }
+        std.debug.print("  Loading: {s}\n", .{weapon_path});
+        self.weapons = IniFile.parseFile(self.allocator, weapon_path) catch null;
+
+        if (self.weapons) |weapons| {
+            std.debug.print("    Loaded {} weapon definitions\n", .{weapons.sections.count});
         }
 
         // Load CommandButton.ini
         const command_button_path = try String.format(self.allocator, "{s}/CommandButton.ini", .{ini_path});
         defer self.allocator.free(command_button_path);
 
-        if (fileExists(command_button_path)) {
+        std.fs.cwd().access(command_button_path, .{}) catch |err| {
+            if (err != error.FileNotFound) return err;
+            std.debug.print("  CommandButton.ini not found, skipping\n", .{});
+        };
+
+        if (true) {
             std.debug.print("  Loading: {s}\n", .{command_button_path});
             self.command_buttons = try IniFile.parseFile(self.allocator, command_button_path);
 

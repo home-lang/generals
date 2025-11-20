@@ -173,6 +173,8 @@ pub fn build(b: *std.Build) void {
     });
 
     test_w3d.root_module.addImport("math", math_mod);
+    test_w3d.root_module.addImport("io", io_mod);
+    test_w3d.root_module.addImport("collections", collections_mod);
 
     b.installArtifact(test_w3d);
 

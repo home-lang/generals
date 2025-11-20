@@ -1,0 +1,973 @@
+// Campaign Cinematics for C&C Generals Zero Hour
+// Cinematic sequences, camera paths, dialogue, subtitles, cutscene scripting
+// Written in Home language
+
+// Cinematic event types
+enum CinematicEventType {
+    CAMERA_MOVE = 0,
+    DIALOGUE = 1,
+    SUBTITLE = 2,
+    SOUND_EFFECT = 3,
+    MUSIC = 4,
+    FADE = 5,
+    UNIT_SPAWN = 6,
+    UNIT_MOVE = 7,
+    UNIT_ACTION = 8,
+    PAUSE = 9,
+}
+
+// Camera path types
+enum CameraPathType {
+    LINEAR = 0,
+    BEZIER = 1,
+    SPLINE = 2,
+}
+
+// Fade types
+enum FadeType {
+    FADE_IN = 0,
+    FADE_OUT = 1,
+    FADE_TO_BLACK = 2,
+    FADE_FROM_BLACK = 3,
+}
+
+// Camera keyframe
+struct CameraKeyframe {
+    time: Float,
+    position: Vec3,
+    look_at: Vec3,
+    field_of_view: Float,
+
+    fn init(time: Float, x: Float, y: Float, z: Float, look_x: Float, look_y: Float, look_z: Float) -> CameraKeyframe {
+        return CameraKeyframe {
+            time: time,
+            position: Vec3::init(x, y, z),
+            look_at: Vec3::init(look_x, look_y, look_z),
+            field_of_view: 60.0,
+        }
+    }
+
+    fn set_fov(self, fov: Float) {
+        self.field_of_view = fov
+    }
+}
+
+// Camera path
+struct CameraPath {
+    keyframes: Collection<CameraKeyframe>,
+    path_type: CameraPathType,
+    duration: Float,
+    loop_path: Bool,
+
+    fn init(path_type: CameraPathType) -> CameraPath {
+        return CameraPath {
+            keyframes: Collection::new(),
+            path_type: path_type,
+            duration: 0.0,
+            loop_path: false,
+        }
+    }
+
+    fn add_keyframe(self, keyframe: CameraKeyframe) {
+        self.keyframes.add(keyframe)
+        self.update_duration()
+    }
+
+    fn update_duration(self) {
+        if self.keyframes.count() > 0 {
+            let last = self.keyframes.get(self.keyframes.count() - 1)
+            self.duration = last.time
+        }
+    }
+
+    fn evaluate(self, time: Float) -> CameraTransform {
+        if self.keyframes.count() == 0 {
+            return CameraTransform::init()
+        }
+
+        if self.keyframes.count() == 1 {
+            let kf = self.keyframes.get(0)
+            return CameraTransform::from_keyframe(kf)
+        }
+
+        // Find surrounding keyframes
+        let prev_idx = -1
+        let next_idx = -1
+
+        for i in 0..self.keyframes.count() {
+            let kf = self.keyframes.get(i)
+            if kf.time <= time {
+                prev_idx = i
+            }
+            if kf.time >= time && next_idx == -1 {
+                next_idx = i
+            }
+        }
+
+        // Handle edge cases
+        if prev_idx == -1 {
+            let kf = self.keyframes.get(0)
+            return CameraTransform::from_keyframe(kf)
+        }
+
+        if next_idx == -1 || prev_idx == next_idx {
+            let kf = self.keyframes.get(prev_idx)
+            return CameraTransform::from_keyframe(kf)
+        }
+
+        // Interpolate
+        let prev = self.keyframes.get(prev_idx)
+        let next = self.keyframes.get(next_idx)
+
+        let t = (time - prev.time) / (next.time - prev.time)
+
+        return self.interpolate(prev, next, t)
+    }
+
+    fn interpolate(self, prev: CameraKeyframe, next: CameraKeyframe, t: Float) -> CameraTransform {
+        match self.path_type {
+            CameraPathType::LINEAR => return self.linear_interpolate(prev, next, t),
+            CameraPathType::BEZIER => return self.bezier_interpolate(prev, next, t),
+            CameraPathType::SPLINE => return self.spline_interpolate(prev, next, t),
+            _ => return self.linear_interpolate(prev, next, t),
+        }
+    }
+
+    fn linear_interpolate(self, prev: CameraKeyframe, next: CameraKeyframe, t: Float) -> CameraTransform {
+        let pos_x = prev.position.x + (next.position.x - prev.position.x) * t
+        let pos_y = prev.position.y + (next.position.y - prev.position.y) * t
+        let pos_z = prev.position.z + (next.position.z - prev.position.z) * t
+
+        let look_x = prev.look_at.x + (next.look_at.x - prev.look_at.x) * t
+        let look_y = prev.look_at.y + (next.look_at.y - prev.look_at.y) * t
+        let look_z = prev.look_at.z + (next.look_at.z - prev.look_at.z) * t
+
+        let fov = prev.field_of_view + (next.field_of_view - prev.field_of_view) * t
+
+        return CameraTransform {
+            position: Vec3::init(pos_x, pos_y, pos_z),
+            look_at: Vec3::init(look_x, look_y, look_z),
+            field_of_view: fov,
+        }
+    }
+
+    fn bezier_interpolate(self, prev: CameraKeyframe, next: CameraKeyframe, t: Float) -> CameraTransform {
+        // Smooth interpolation using cubic bezier
+        let t_smooth = t * t * (3.0 - 2.0 * t)
+        return self.linear_interpolate(prev, next, t_smooth)
+    }
+
+    fn spline_interpolate(self, prev: CameraKeyframe, next: CameraKeyframe, t: Float) -> CameraTransform {
+        // Catmull-Rom spline approximation
+        let t2 = t * t
+        let t3 = t2 * t
+        let factor = 2.0 * t3 - 3.0 * t2 + 1.0
+        return self.linear_interpolate(prev, next, factor)
+    }
+
+    fn enable_loop(self) {
+        self.loop_path = true
+    }
+
+    fn disable_loop(self) {
+        self.loop_path = false
+    }
+
+    fn get_keyframe_count(self) -> Int {
+        return self.keyframes.count()
+    }
+}
+
+// Dialogue line
+struct DialogueLine {
+    speaker: String,
+    text: String,
+    audio_file: String,
+    duration: Float,
+    subtitle_enabled: Bool,
+
+    fn init(speaker: String, text: String, audio_file: String, duration: Float) -> DialogueLine {
+        return DialogueLine {
+            speaker: speaker,
+            text: text,
+            audio_file: audio_file,
+            duration: duration,
+            subtitle_enabled: true,
+        }
+    }
+
+    fn disable_subtitle(self) {
+        self.subtitle_enabled = false
+    }
+
+    fn enable_subtitle(self) {
+        self.subtitle_enabled = true
+    }
+}
+
+// Subtitle
+struct Subtitle {
+    text: String,
+    start_time: Float,
+    duration: Float,
+    position: SubtitlePosition,
+
+    fn init(text: String, start_time: Float, duration: Float) -> Subtitle {
+        return Subtitle {
+            text: text,
+            start_time: start_time,
+            duration: duration,
+            position: SubtitlePosition::BOTTOM,
+        }
+    }
+
+    fn set_position(self, position: SubtitlePosition) {
+        self.position = position
+    }
+
+    fn is_active(self, current_time: Float) -> Bool {
+        return current_time >= self.start_time && current_time < (self.start_time + self.duration)
+    }
+}
+
+// Cinematic event
+struct CinematicEvent {
+    event_type: CinematicEventType,
+    start_time: Float,
+    duration: Float,
+    data: String,
+
+    fn init(event_type: CinematicEventType, start_time: Float, duration: Float) -> CinematicEvent {
+        return CinematicEvent {
+            event_type: event_type,
+            start_time: start_time,
+            duration: duration,
+            data: "",
+        }
+    }
+
+    fn set_data(self, data: String) {
+        self.data = data
+    }
+
+    fn is_active(self, current_time: Float) -> Bool {
+        return current_time >= self.start_time && current_time < (self.start_time + self.duration)
+    }
+
+    fn is_triggered(self, current_time: Float, last_time: Float) -> Bool {
+        return last_time < self.start_time && current_time >= self.start_time
+    }
+}
+
+// Cinematic sequence
+struct CinematicSequence {
+    id: Int,
+    name: String,
+    camera_path: CameraPath?,
+    dialogue_lines: Collection<DialogueLine>,
+    subtitles: Collection<Subtitle>,
+    events: Collection<CinematicEvent>,
+    duration: Float,
+    skippable: Bool,
+
+    fn init(id: Int, name: String) -> CinematicSequence {
+        return CinematicSequence {
+            id: id,
+            name: name,
+            camera_path: null,
+            dialogue_lines: Collection::new(),
+            subtitles: Collection::new(),
+            events: Collection::new(),
+            duration: 0.0,
+            skippable: true,
+        }
+    }
+
+    fn set_camera_path(self, path: CameraPath) {
+        self.camera_path = path
+        self.update_duration()
+    }
+
+    fn add_dialogue(self, dialogue: DialogueLine) {
+        self.dialogue_lines.add(dialogue)
+    }
+
+    fn add_subtitle(self, subtitle: Subtitle) {
+        self.subtitles.add(subtitle)
+    }
+
+    fn add_event(self, event: CinematicEvent) {
+        self.events.add(event)
+        self.update_duration()
+    }
+
+    fn update_duration(self) {
+        let max_time = 0.0
+
+        if let Some(path) = self.camera_path {
+            if path.duration > max_time {
+                max_time = path.duration
+            }
+        }
+
+        for i in 0..self.events.count() {
+            let event = self.events.get(i)
+            let event_end = event.start_time + event.duration
+            if event_end > max_time {
+                max_time = event_end
+            }
+        }
+
+        self.duration = max_time
+    }
+
+    fn get_active_subtitle(self, time: Float) -> Subtitle? {
+        for i in 0..self.subtitles.count() {
+            let subtitle = self.subtitles.get(i)
+            if subtitle.is_active(time) {
+                return subtitle
+            }
+        }
+        return null
+    }
+
+    fn get_triggered_events(self, current_time: Float, last_time: Float) -> Collection<CinematicEvent> {
+        let triggered = Collection::new()
+
+        for i in 0..self.events.count() {
+            let event = self.events.get(i)
+            if event.is_triggered(current_time, last_time) {
+                triggered.add(event)
+            }
+        }
+
+        return triggered
+    }
+
+    fn make_unskippable(self) {
+        self.skippable = false
+    }
+
+    fn make_skippable(self) {
+        self.skippable = true
+    }
+}
+
+// Cinematic player
+struct CinematicPlayer {
+    current_sequence: CinematicSequence?,
+    playback_time: Float,
+    last_time: Float,
+    is_playing: Bool,
+    is_paused: Bool,
+    playback_speed: Float,
+
+    fn init() -> CinematicPlayer {
+        return CinematicPlayer {
+            current_sequence: null,
+            playback_time: 0.0,
+            last_time: 0.0,
+            is_playing: false,
+            is_paused: false,
+            playback_speed: 1.0,
+        }
+    }
+
+    fn play(self, sequence: CinematicSequence) {
+        self.current_sequence = sequence
+        self.playback_time = 0.0
+        self.last_time = 0.0
+        self.is_playing = true
+        self.is_paused = false
+    }
+
+    fn stop(self) {
+        self.current_sequence = null
+        self.playback_time = 0.0
+        self.is_playing = false
+        self.is_paused = false
+    }
+
+    fn pause(self) {
+        self.is_paused = true
+    }
+
+    fn resume(self) {
+        self.is_paused = false
+    }
+
+    fn skip(self) {
+        if let Some(seq) = self.current_sequence {
+            if seq.skippable {
+                self.stop()
+            }
+        }
+    }
+
+    fn update(self, delta_time: Float) -> CinematicState {
+        if !self.is_playing || self.is_paused {
+            return CinematicState::init()
+        }
+
+        if let Some(seq) = self.current_sequence {
+            self.last_time = self.playback_time
+            self.playback_time = self.playback_time + delta_time * self.playback_speed
+
+            // Check if finished
+            if self.playback_time >= seq.duration {
+                self.stop()
+                return CinematicState::finished()
+            }
+
+            // Get current state
+            let state = CinematicState::init()
+            state.is_active = true
+            state.current_time = self.playback_time
+
+            // Get camera transform
+            if let Some(path) = seq.camera_path {
+                state.camera_transform = path.evaluate(self.playback_time)
+            }
+
+            // Get active subtitle
+            state.subtitle = seq.get_active_subtitle(self.playback_time)
+
+            // Get triggered events
+            state.triggered_events = seq.get_triggered_events(self.playback_time, self.last_time)
+
+            return state
+        }
+
+        return CinematicState::init()
+    }
+
+    fn set_playback_speed(self, speed: Float) {
+        self.playback_speed = speed
+    }
+
+    fn is_active(self) -> Bool {
+        return self.is_playing
+    }
+
+    fn get_progress(self) -> Float {
+        if let Some(seq) = self.current_sequence {
+            if seq.duration > 0.0 {
+                return (self.playback_time / seq.duration) * 100.0
+            }
+        }
+        return 0.0
+    }
+}
+
+// Cinematic manager
+struct CinematicManager {
+    sequences: Collection<CinematicSequence>,
+    player: CinematicPlayer,
+    queue: Collection<Int>,
+
+    fn init() -> CinematicManager {
+        return CinematicManager {
+            sequences: Collection::new(),
+            player: CinematicPlayer::init(),
+            queue: Collection::new(),
+        }
+    }
+
+    fn register_sequence(self, sequence: CinematicSequence) {
+        self.sequences.add(sequence)
+    }
+
+    fn play_sequence(self, sequence_id: Int) {
+        for i in 0..self.sequences.count() {
+            let seq = self.sequences.get(i)
+            if seq.id == sequence_id {
+                self.player.play(seq)
+                return
+            }
+        }
+    }
+
+    fn queue_sequence(self, sequence_id: Int) {
+        self.queue.add(sequence_id)
+    }
+
+    fn stop_current(self) {
+        self.player.stop()
+    }
+
+    fn skip_current(self) {
+        self.player.skip()
+    }
+
+    fn update(self, delta_time: Float) -> CinematicState {
+        let state = self.player.update(delta_time)
+
+        // If finished and queue has more, play next
+        if !self.player.is_active() && self.queue.count() > 0 {
+            let next_id = self.queue.get(0)
+            self.queue.remove_at(0)
+            self.play_sequence(next_id)
+            return self.player.update(0.0)
+        }
+
+        return state
+    }
+
+    fn is_playing(self) -> Bool {
+        return self.player.is_active()
+    }
+
+    fn get_sequence_count(self) -> Int {
+        return self.sequences.count()
+    }
+
+    fn get_queue_length(self) -> Int {
+        return self.queue.count()
+    }
+}
+
+// Helper structs
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+struct CameraTransform {
+    position: Vec3,
+    look_at: Vec3,
+    field_of_view: Float,
+
+    fn init() -> CameraTransform {
+        return CameraTransform {
+            position: Vec3::init(0.0, 0.0, 0.0),
+            look_at: Vec3::init(0.0, 0.0, 1.0),
+            field_of_view: 60.0,
+        }
+    }
+
+    fn from_keyframe(kf: CameraKeyframe) -> CameraTransform {
+        return CameraTransform {
+            position: kf.position,
+            look_at: kf.look_at,
+            field_of_view: kf.field_of_view,
+        }
+    }
+}
+
+struct CinematicState {
+    is_active: Bool,
+    is_finished: Bool,
+    current_time: Float,
+    camera_transform: CameraTransform,
+    subtitle: Subtitle?,
+    triggered_events: Collection<CinematicEvent>,
+
+    fn init() -> CinematicState {
+        return CinematicState {
+            is_active: false,
+            is_finished: false,
+            current_time: 0.0,
+            camera_transform: CameraTransform::init(),
+            subtitle: null,
+            triggered_events: Collection::new(),
+        }
+    }
+
+    fn finished() -> CinematicState {
+        let state = CinematicState::init()
+        state.is_finished = true
+        return state
+    }
+}
+
+enum SubtitlePosition {
+    TOP = 0,
+    MIDDLE = 1,
+    BOTTOM = 2,
+}
+
+// Tests
+test "CameraKeyframe: init" {
+    let kf = CameraKeyframe::init(0.0, 10.0, 20.0, 5.0, 0.0, 0.0, 0.0)
+
+    assert kf.time == 0.0
+    assert kf.position.x == 10.0
+    assert kf.field_of_view == 60.0
+}
+
+test "CameraKeyframe: set fov" {
+    let kf = CameraKeyframe::init(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    kf.set_fov(90.0)
+
+    assert kf.field_of_view == 90.0
+}
+
+test "CameraPath: init" {
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    assert path.path_type == CameraPathType::LINEAR
+    assert path.get_keyframe_count() == 0
+}
+
+test "CameraPath: add keyframe" {
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    let kf1 = CameraKeyframe::init(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    let kf2 = CameraKeyframe::init(5.0, 10.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+    path.add_keyframe(kf1)
+    path.add_keyframe(kf2)
+
+    assert path.get_keyframe_count() == 2
+    assert path.duration == 5.0
+}
+
+test "CameraPath: evaluate single keyframe" {
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    let kf = CameraKeyframe::init(0.0, 10.0, 20.0, 5.0, 0.0, 0.0, 1.0)
+    path.add_keyframe(kf)
+
+    let transform = path.evaluate(0.0)
+
+    assert transform.position.x == 10.0
+}
+
+test "CameraPath: interpolate between keyframes" {
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    let kf1 = CameraKeyframe::init(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    let kf2 = CameraKeyframe::init(10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+    path.add_keyframe(kf1)
+    path.add_keyframe(kf2)
+
+    let transform = path.evaluate(5.0)
+
+    assert transform.position.x == 5.0
+}
+
+test "CameraPath: enable loop" {
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    path.enable_loop()
+
+    assert path.loop_path
+}
+
+test "DialogueLine: init" {
+    let dialogue = DialogueLine::init("Colonel Burton", "Mission accomplished.", "voice_01.wav", 3.0)
+
+    assert dialogue.speaker == "Colonel Burton"
+    assert dialogue.text == "Mission accomplished."
+    assert dialogue.subtitle_enabled
+}
+
+test "DialogueLine: disable subtitle" {
+    let dialogue = DialogueLine::init("Speaker", "Text", "audio.wav", 2.0)
+
+    dialogue.disable_subtitle()
+
+    assert !dialogue.subtitle_enabled
+}
+
+test "Subtitle: init" {
+    let subtitle = Subtitle::init("Hello, Commander.", 0.0, 3.0)
+
+    assert subtitle.text == "Hello, Commander."
+    assert subtitle.duration == 3.0
+}
+
+test "Subtitle: is active" {
+    let subtitle = Subtitle::init("Text", 1.0, 2.0)
+
+    assert !subtitle.is_active(0.5)
+    assert subtitle.is_active(1.5)
+    assert subtitle.is_active(2.5)
+    assert !subtitle.is_active(3.5)
+}
+
+test "Subtitle: set position" {
+    let subtitle = Subtitle::init("Text", 0.0, 1.0)
+
+    subtitle.set_position(SubtitlePosition::TOP)
+
+    assert subtitle.position == SubtitlePosition::TOP
+}
+
+test "CinematicEvent: init" {
+    let event = CinematicEvent::init(CinematicEventType::DIALOGUE, 0.0, 3.0)
+
+    assert event.event_type == CinematicEventType::DIALOGUE
+    assert event.start_time == 0.0
+}
+
+test "CinematicEvent: is active" {
+    let event = CinematicEvent::init(CinematicEventType::PAUSE, 1.0, 2.0)
+
+    assert !event.is_active(0.5)
+    assert event.is_active(1.5)
+    assert !event.is_active(3.5)
+}
+
+test "CinematicEvent: is triggered" {
+    let event = CinematicEvent::init(CinematicEventType::SOUND_EFFECT, 2.0, 1.0)
+
+    assert !event.is_triggered(1.5, 1.0)
+    assert event.is_triggered(2.5, 1.5)
+    assert !event.is_triggered(3.0, 2.5)
+}
+
+test "CinematicSequence: init" {
+    let seq = CinematicSequence::init(0, "Intro")
+
+    assert seq.id == 0
+    assert seq.name == "Intro"
+    assert seq.skippable
+}
+
+test "CinematicSequence: set camera path" {
+    let seq = CinematicSequence::init(0, "Test")
+    let path = CameraPath::init(CameraPathType::LINEAR)
+
+    let kf = CameraKeyframe::init(5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    path.add_keyframe(kf)
+
+    seq.set_camera_path(path)
+
+    assert seq.camera_path != null
+    assert seq.duration == 5.0
+}
+
+test "CinematicSequence: add dialogue" {
+    let seq = CinematicSequence::init(0, "Test")
+    let dialogue = DialogueLine::init("Speaker", "Text", "audio.wav", 2.0)
+
+    seq.add_dialogue(dialogue)
+
+    assert seq.dialogue_lines.count() == 1
+}
+
+test "CinematicSequence: add subtitle" {
+    let seq = CinematicSequence::init(0, "Test")
+    let subtitle = Subtitle::init("Text", 0.0, 2.0)
+
+    seq.add_subtitle(subtitle)
+
+    assert seq.subtitles.count() == 1
+}
+
+test "CinematicSequence: add event" {
+    let seq = CinematicSequence::init(0, "Test")
+    let event = CinematicEvent::init(CinematicEventType::FADE, 0.0, 1.0)
+
+    seq.add_event(event)
+
+    assert seq.events.count() == 1
+}
+
+test "CinematicSequence: get active subtitle" {
+    let seq = CinematicSequence::init(0, "Test")
+
+    let sub1 = Subtitle::init("First", 0.0, 2.0)
+    let sub2 = Subtitle::init("Second", 3.0, 2.0)
+
+    seq.add_subtitle(sub1)
+    seq.add_subtitle(sub2)
+
+    let active = seq.get_active_subtitle(1.0)
+
+    assert active != null
+}
+
+test "CinematicSequence: make unskippable" {
+    let seq = CinematicSequence::init(0, "Test")
+
+    seq.make_unskippable()
+
+    assert !seq.skippable
+}
+
+test "CinematicPlayer: init" {
+    let player = CinematicPlayer::init()
+
+    assert !player.is_playing
+    assert !player.is_paused
+    assert player.playback_speed == 1.0
+}
+
+test "CinematicPlayer: play sequence" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    player.play(seq)
+
+    assert player.is_active()
+    assert player.playback_time == 0.0
+}
+
+test "CinematicPlayer: stop" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    player.play(seq)
+    player.stop()
+
+    assert !player.is_active()
+}
+
+test "CinematicPlayer: pause and resume" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    player.play(seq)
+    player.pause()
+
+    assert player.is_paused
+
+    player.resume()
+
+    assert !player.is_paused
+}
+
+test "CinematicPlayer: skip" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    player.play(seq)
+    player.skip()
+
+    assert !player.is_active()
+}
+
+test "CinematicPlayer: set playback speed" {
+    let player = CinematicPlayer::init()
+
+    player.set_playback_speed(2.0)
+
+    assert player.playback_speed == 2.0
+}
+
+test "CinematicPlayer: get progress" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    let path = CameraPath::init(CameraPathType::LINEAR)
+    let kf = CameraKeyframe::init(10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    path.add_keyframe(kf)
+    seq.set_camera_path(path)
+
+    player.play(seq)
+    player.playback_time = 5.0
+
+    let progress = player.get_progress()
+
+    assert progress == 50.0
+}
+
+test "CinematicPlayer: update advances time" {
+    let player = CinematicPlayer::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    let path = CameraPath::init(CameraPathType::LINEAR)
+    let kf = CameraKeyframe::init(10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    path.add_keyframe(kf)
+    seq.set_camera_path(path)
+
+    player.play(seq)
+    player.update(1.0)
+
+    assert player.playback_time == 1.0
+}
+
+test "CinematicManager: init" {
+    let manager = CinematicManager::init()
+
+    assert manager.get_sequence_count() == 0
+    assert !manager.is_playing()
+}
+
+test "CinematicManager: register sequence" {
+    let manager = CinematicManager::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    manager.register_sequence(seq)
+
+    assert manager.get_sequence_count() == 1
+}
+
+test "CinematicManager: play sequence" {
+    let manager = CinematicManager::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    manager.register_sequence(seq)
+    manager.play_sequence(0)
+
+    assert manager.is_playing()
+}
+
+test "CinematicManager: queue sequence" {
+    let manager = CinematicManager::init()
+
+    manager.queue_sequence(1)
+    manager.queue_sequence(2)
+
+    assert manager.get_queue_length() == 2
+}
+
+test "CinematicManager: stop current" {
+    let manager = CinematicManager::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    manager.register_sequence(seq)
+    manager.play_sequence(0)
+    manager.stop_current()
+
+    assert !manager.is_playing()
+}
+
+test "CinematicManager: skip current" {
+    let manager = CinematicManager::init()
+    let seq = CinematicSequence::init(0, "Test")
+
+    manager.register_sequence(seq)
+    manager.play_sequence(0)
+    manager.skip_current()
+
+    assert !manager.is_playing()
+}
+
+test "CameraTransform: init" {
+    let transform = CameraTransform::init()
+
+    assert transform.position.x == 0.0
+    assert transform.field_of_view == 60.0
+}
+
+test "CameraTransform: from keyframe" {
+    let kf = CameraKeyframe::init(0.0, 10.0, 20.0, 5.0, 0.0, 0.0, 1.0)
+
+    let transform = CameraTransform::from_keyframe(kf)
+
+    assert transform.position.x == 10.0
+    assert transform.position.y == 20.0
+}
+
+test "CinematicState: init" {
+    let state = CinematicState::init()
+
+    assert !state.is_active
+    assert !state.is_finished
+}
+
+test "CinematicState: finished" {
+    let state = CinematicState::finished()
+
+    assert state.is_finished
+}

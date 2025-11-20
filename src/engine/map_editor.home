@@ -1,0 +1,1362 @@
+// Map Editor for C&C Generals Zero Hour
+// Terrain editing, texture painting, object placement, trigger editor, lighting
+// Written in Home language
+
+// Editor modes
+enum EditorMode {
+    TERRAIN = 0,
+    TEXTURE = 1,
+    OBJECTS = 2,
+    TRIGGERS = 3,
+    LIGHTING = 4,
+    PLAYTEST = 5,
+}
+
+// Terrain edit modes
+enum TerrainEditMode {
+    RAISE = 0,
+    LOWER = 1,
+    FLATTEN = 2,
+    SMOOTH = 3,
+    RAMP = 4,
+}
+
+// Brush shapes
+enum BrushShape {
+    CIRCLE = 0,
+    SQUARE = 1,
+    CUSTOM = 2,
+}
+
+// Terrain brush
+struct TerrainBrush {
+    shape: BrushShape,
+    radius: Float,
+    strength: Float,
+    falloff: Float,
+    edit_mode: TerrainEditMode,
+
+    fn init() -> TerrainBrush {
+        return TerrainBrush {
+            shape: BrushShape::CIRCLE,
+            radius: 5.0,
+            strength: 1.0,
+            falloff: 0.5,
+            edit_mode: TerrainEditMode::RAISE,
+        }
+    }
+
+    fn apply(self, heightmap: HeightMap, x: Int, y: Int, delta_time: Float) {
+        let affected_cells = self.get_affected_cells(x, y, heightmap.width, heightmap.height)
+
+        for i in 0..affected_cells.count() {
+            let cell = affected_cells.get(i)
+            let distance = self.distance_to_center(cell.x, cell.y, x, y)
+            let influence = self.calculate_influence(distance)
+
+            if influence > 0.0 {
+                self.apply_to_cell(heightmap, cell.x, cell.y, influence, delta_time)
+            }
+        }
+    }
+
+    fn get_affected_cells(self, center_x: Int, center_y: Int, map_width: Int, map_height: Int) -> Collection<GridCell> {
+        let cells = Collection::new()
+        let radius_int = self.radius as Int
+
+        match self.shape {
+            BrushShape::CIRCLE => {
+                let start_x = max(0, center_x - radius_int)
+                let end_x = min(map_width - 1, center_x + radius_int)
+                let start_y = max(0, center_y - radius_int)
+                let end_y = min(map_height - 1, center_y + radius_int)
+
+                for y in start_y..end_y {
+                    for x in start_x..end_x {
+                        let dist = self.distance_to_center(x, y, center_x, center_y)
+                        if dist <= self.radius {
+                            cells.add(GridCell::init(x, y))
+                        }
+                    }
+                }
+            },
+            BrushShape::SQUARE => {
+                let start_x = max(0, center_x - radius_int)
+                let end_x = min(map_width - 1, center_x + radius_int)
+                let start_y = max(0, center_y - radius_int)
+                let end_y = min(map_height - 1, center_y + radius_int)
+
+                for y in start_y..end_y {
+                    for x in start_x..end_x {
+                        cells.add(GridCell::init(x, y))
+                    }
+                }
+            },
+            _ => {},
+        }
+
+        return cells
+    }
+
+    fn distance_to_center(self, x: Int, y: Int, center_x: Int, center_y: Int) -> Float {
+        let dx = (x - center_x) as Float
+        let dy = (y - center_y) as Float
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    fn calculate_influence(self, distance: Float) -> Float {
+        if distance > self.radius {
+            return 0.0
+        }
+
+        let normalized_dist = distance / self.radius
+        let influence = 1.0 - normalized_dist
+
+        // Apply falloff curve
+        return pow(influence, self.falloff)
+    }
+
+    fn apply_to_cell(self, heightmap: HeightMap, x: Int, y: Int, influence: Float, delta_time: Float) {
+        let current_height = heightmap.get_height(x, y)
+        let change = self.strength * influence * delta_time
+
+        match self.edit_mode {
+            TerrainEditMode::RAISE => heightmap.set_height(x, y, current_height + change),
+            TerrainEditMode::LOWER => heightmap.set_height(x, y, current_height - change),
+            TerrainEditMode::FLATTEN => {
+                let target_height = heightmap.get_height(x, y)
+                heightmap.set_height(x, y, target_height)
+            },
+            TerrainEditMode::SMOOTH => {
+                let avg = heightmap.get_average_height_around(x, y)
+                let new_height = current_height + (avg - current_height) * influence * delta_time
+                heightmap.set_height(x, y, new_height)
+            },
+            _ => {},
+        }
+    }
+
+    fn set_radius(self, radius: Float) {
+        self.radius = radius
+    }
+
+    fn set_strength(self, strength: Float) {
+        self.strength = strength
+    }
+
+    fn set_edit_mode(self, mode: TerrainEditMode) {
+        self.edit_mode = mode
+    }
+}
+
+// Texture painter
+struct TexturePainter {
+    current_texture: Int,
+    brush_size: Float,
+    brush_strength: Float,
+    blend_mode: TextureBlendMode,
+
+    fn init() -> TexturePainter {
+        return TexturePainter {
+            current_texture: 0,
+            brush_size: 5.0,
+            brush_strength: 1.0,
+            blend_mode: TextureBlendMode::REPLACE,
+        }
+    }
+
+    fn paint(self, texture_map: TextureMap, x: Int, y: Int) {
+        let radius = self.brush_size as Int
+
+        for dy in -radius..radius {
+            for dx in -radius..radius {
+                let tx = x + dx
+                let ty = y + dy
+
+                if tx >= 0 && tx < texture_map.width && ty >= 0 && ty < texture_map.height {
+                    let dist = sqrt((dx * dx + dy * dy) as Float)
+                    if dist <= self.brush_size {
+                        let influence = self.calculate_influence(dist)
+                        self.apply_texture(texture_map, tx, ty, influence)
+                    }
+                }
+            }
+        }
+    }
+
+    fn calculate_influence(self, distance: Float) -> Float {
+        if distance > self.brush_size {
+            return 0.0
+        }
+        return 1.0 - (distance / self.brush_size)
+    }
+
+    fn apply_texture(self, texture_map: TextureMap, x: Int, y: Int, influence: Float) {
+        match self.blend_mode {
+            TextureBlendMode::REPLACE => {
+                texture_map.set_texture(x, y, self.current_texture, influence * self.brush_strength)
+            },
+            TextureBlendMode::ADD => {
+                let current = texture_map.get_texture_weight(x, y, self.current_texture)
+                texture_map.set_texture(x, y, self.current_texture, current + influence * self.brush_strength)
+            },
+            TextureBlendMode::SUBTRACT => {
+                let current = texture_map.get_texture_weight(x, y, self.current_texture)
+                texture_map.set_texture(x, y, self.current_texture, current - influence * self.brush_strength)
+            },
+            _ => {},
+        }
+    }
+
+    fn select_texture(self, texture_id: Int) {
+        self.current_texture = texture_id
+    }
+
+    fn set_brush_size(self, size: Float) {
+        self.brush_size = size
+    }
+
+    fn set_blend_mode(self, mode: TextureBlendMode) {
+        self.blend_mode = mode
+    }
+}
+
+// Object placement tool
+struct ObjectPlacementTool {
+    current_template: String,
+    snap_to_grid: Bool,
+    grid_size: Float,
+    rotation: Float,
+    preview_object: PlacedObject?,
+
+    fn init() -> ObjectPlacementTool {
+        return ObjectPlacementTool {
+            current_template: "",
+            snap_to_grid: true,
+            grid_size: 1.0,
+            rotation: 0.0,
+            preview_object: null,
+        }
+    }
+
+    fn place_object(self, objects: Collection<PlacedObject>, x: Float, y: Float) -> PlacedObject {
+        let final_x = x
+        let final_y = y
+
+        if self.snap_to_grid {
+            final_x = self.snap_to_grid_coord(x)
+            final_y = self.snap_to_grid_coord(y)
+        }
+
+        let obj = PlacedObject::init(self.current_template, final_x, final_y, self.rotation)
+        objects.add(obj)
+
+        return obj
+    }
+
+    fn snap_to_grid_coord(self, coord: Float) -> Float {
+        return (coord / self.grid_size).floor() * self.grid_size
+    }
+
+    fn rotate_object(self, angle: Float) {
+        self.rotation = self.rotation + angle
+        if self.rotation >= 360.0 {
+            self.rotation = self.rotation - 360.0
+        } else if self.rotation < 0.0 {
+            self.rotation = self.rotation + 360.0
+        }
+    }
+
+    fn select_template(self, template: String) {
+        self.current_template = template
+    }
+
+    fn toggle_grid_snap(self) {
+        self.snap_to_grid = !self.snap_to_grid
+    }
+
+    fn set_grid_size(self, size: Float) {
+        self.grid_size = size
+    }
+
+    fn update_preview(self, x: Float, y: Float) {
+        let final_x = x
+        let final_y = y
+
+        if self.snap_to_grid {
+            final_x = self.snap_to_grid_coord(x)
+            final_y = self.snap_to_grid_coord(y)
+        }
+
+        self.preview_object = PlacedObject::init(self.current_template, final_x, final_y, self.rotation)
+    }
+
+    fn clear_preview(self) {
+        self.preview_object = null
+    }
+}
+
+// Trigger editor
+struct TriggerEditor {
+    triggers: Collection<EditorTrigger>,
+    selected_trigger: Int,
+
+    fn init() -> TriggerEditor {
+        return TriggerEditor {
+            triggers: Collection::new(),
+            selected_trigger: -1,
+        }
+    }
+
+    fn create_trigger(self, name: String) -> Int {
+        let trigger = EditorTrigger::init(self.triggers.count(), name)
+        self.triggers.add(trigger)
+        return self.triggers.count() - 1
+    }
+
+    fn delete_trigger(self, id: Int) {
+        for i in 0..self.triggers.count() {
+            let trigger = self.triggers.get(i)
+            if trigger.id == id {
+                self.triggers.remove_at(i)
+                return
+            }
+        }
+    }
+
+    fn add_condition(self, trigger_id: Int, condition_type: String, params: String) {
+        for i in 0..self.triggers.count() {
+            let trigger = self.triggers.get(i)
+            if trigger.id == trigger_id {
+                trigger.add_condition(condition_type, params)
+                return
+            }
+        }
+    }
+
+    fn add_action(self, trigger_id: Int, action_type: String, params: String) {
+        for i in 0..self.triggers.count() {
+            let trigger = self.triggers.get(i)
+            if trigger.id == trigger_id {
+                trigger.add_action(action_type, params)
+                return
+            }
+        }
+    }
+
+    fn select_trigger(self, id: Int) {
+        self.selected_trigger = id
+    }
+
+    fn get_selected_trigger(self) -> EditorTrigger? {
+        for i in 0..self.triggers.count() {
+            let trigger = self.triggers.get(i)
+            if trigger.id == self.selected_trigger {
+                return trigger
+            }
+        }
+        return null
+    }
+
+    fn get_trigger_count(self) -> Int {
+        return self.triggers.count()
+    }
+
+    fn export_triggers(self) -> String {
+        let result = ""
+        for i in 0..self.triggers.count() {
+            let trigger = self.triggers.get(i)
+            result = result + trigger.to_string()
+        }
+        return result
+    }
+}
+
+// Lighting editor
+struct LightingEditor {
+    lights: Collection<EditorLight>,
+    ambient_light: Color,
+    sun_direction: Vec3,
+    sun_color: Color,
+    sun_intensity: Float,
+
+    fn init() -> LightingEditor {
+        return LightingEditor {
+            lights: Collection::new(),
+            ambient_light: Color::init(0.2, 0.2, 0.2, 1.0),
+            sun_direction: Vec3::init(0.5, -1.0, 0.5),
+            sun_color: Color::init(1.0, 0.95, 0.9, 1.0),
+            sun_intensity: 1.0,
+        }
+    }
+
+    fn add_point_light(self, x: Float, y: Float, z: Float, color: Color, radius: Float) -> Int {
+        let light = EditorLight::init_point(self.lights.count(), x, y, z, color, radius)
+        self.lights.add(light)
+        return self.lights.count() - 1
+    }
+
+    fn add_spot_light(self, x: Float, y: Float, z: Float, dir_x: Float, dir_y: Float, dir_z: Float, color: Color, angle: Float) -> Int {
+        let light = EditorLight::init_spot(self.lights.count(), x, y, z, dir_x, dir_y, dir_z, color, angle)
+        self.lights.add(light)
+        return self.lights.count() - 1
+    }
+
+    fn remove_light(self, id: Int) {
+        for i in 0..self.lights.count() {
+            let light = self.lights.get(i)
+            if light.id == id {
+                self.lights.remove_at(i)
+                return
+            }
+        }
+    }
+
+    fn set_ambient_light(self, r: Float, g: Float, b: Float) {
+        self.ambient_light = Color::init(r, g, b, 1.0)
+    }
+
+    fn set_sun_direction(self, x: Float, y: Float, z: Float) {
+        self.sun_direction = Vec3::init(x, y, z)
+    }
+
+    fn set_sun_color(self, r: Float, g: Float, b: Float) {
+        self.sun_color = Color::init(r, g, b, 1.0)
+    }
+
+    fn set_sun_intensity(self, intensity: Float) {
+        self.sun_intensity = intensity
+    }
+
+    fn get_light_count(self) -> Int {
+        return self.lights.count()
+    }
+}
+
+// Map validator
+struct MapValidator {
+    errors: Collection<ValidationError>,
+    warnings: Collection<ValidationWarning>,
+
+    fn init() -> MapValidator {
+        return MapValidator {
+            errors: Collection::new(),
+            warnings: Collection::new(),
+        }
+    }
+
+    fn validate(self, map: EditorMap) -> Bool {
+        self.errors.clear()
+        self.warnings.clear()
+
+        self.check_spawn_points(map)
+        self.check_terrain(map)
+        self.check_objects(map)
+        self.check_triggers(map)
+
+        return self.errors.count() == 0
+    }
+
+    fn check_spawn_points(self, map: EditorMap) {
+        let spawn_count = 0
+
+        for i in 0..map.objects.count() {
+            let obj = map.objects.get(i)
+            if obj.template == "SpawnPoint" {
+                spawn_count = spawn_count + 1
+            }
+        }
+
+        if spawn_count < 2 {
+            self.errors.add(ValidationError::init("Not enough spawn points (minimum 2)"))
+        }
+
+        if spawn_count > 8 {
+            self.warnings.add(ValidationWarning::init("Many spawn points (maximum recommended: 8)"))
+        }
+    }
+
+    fn check_terrain(self, map: EditorMap) {
+        // Check for terrain anomalies
+        if map.heightmap.width < 64 || map.heightmap.height < 64 {
+            self.errors.add(ValidationError::init("Map too small (minimum 64x64)"))
+        }
+    }
+
+    fn check_objects(self, map: EditorMap) {
+        // Check for overlapping objects
+        let overlap_count = 0
+
+        for i in 0..map.objects.count() {
+            let obj1 = map.objects.get(i)
+            for j in (i + 1)..map.objects.count() {
+                let obj2 = map.objects.get(j)
+                if self.objects_overlap(obj1, obj2) {
+                    overlap_count = overlap_count + 1
+                }
+            }
+        }
+
+        if overlap_count > 0 {
+            self.warnings.add(ValidationWarning::init("Objects overlapping: " + overlap_count.to_string()))
+        }
+    }
+
+    fn check_triggers(self, map: EditorMap) {
+        // Validate trigger logic
+        for i in 0..map.triggers.count() {
+            let trigger = map.triggers.get(i)
+            if trigger.conditions.count() == 0 {
+                self.warnings.add(ValidationWarning::init("Trigger '" + trigger.name + "' has no conditions"))
+            }
+            if trigger.actions.count() == 0 {
+                self.warnings.add(ValidationWarning::init("Trigger '" + trigger.name + "' has no actions"))
+            }
+        }
+    }
+
+    fn objects_overlap(self, obj1: PlacedObject, obj2: PlacedObject) -> Bool {
+        let dist = sqrt((obj1.x - obj2.x) * (obj1.x - obj2.x) + (obj1.y - obj2.y) * (obj1.y - obj2.y))
+        return dist < 2.0
+    }
+
+    fn has_errors(self) -> Bool {
+        return self.errors.count() > 0
+    }
+
+    fn get_error_count(self) -> Int {
+        return self.errors.count()
+    }
+
+    fn get_warning_count(self) -> Int {
+        return self.warnings.count()
+    }
+}
+
+// Map editor main
+struct MapEditor {
+    mode: EditorMode,
+    map: EditorMap,
+    terrain_brush: TerrainBrush,
+    texture_painter: TexturePainter,
+    object_tool: ObjectPlacementTool,
+    trigger_editor: TriggerEditor,
+    lighting_editor: LightingEditor,
+    validator: MapValidator,
+    is_playtest_mode: Bool,
+
+    fn init(map_width: Int, map_height: Int) -> MapEditor {
+        return MapEditor {
+            mode: EditorMode::TERRAIN,
+            map: EditorMap::init(map_width, map_height),
+            terrain_brush: TerrainBrush::init(),
+            texture_painter: TexturePainter::init(),
+            object_tool: ObjectPlacementTool::init(),
+            trigger_editor: TriggerEditor::init(),
+            lighting_editor: LightingEditor::init(),
+            validator: MapValidator::init(),
+            is_playtest_mode: false,
+        }
+    }
+
+    fn set_mode(self, mode: EditorMode) {
+        self.mode = mode
+
+        if mode == EditorMode::PLAYTEST {
+            self.enter_playtest_mode()
+        } else if self.is_playtest_mode {
+            self.exit_playtest_mode()
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        if self.is_playtest_mode {
+            // Update game simulation
+            return
+        }
+
+        match self.mode {
+            EditorMode::TERRAIN => {},
+            EditorMode::TEXTURE => {},
+            EditorMode::OBJECTS => {},
+            EditorMode::TRIGGERS => {},
+            EditorMode::LIGHTING => {},
+            _ => {},
+        }
+    }
+
+    fn handle_mouse_click(self, x: Float, y: Float, button: Int) {
+        match self.mode {
+            EditorMode::TERRAIN => {
+                if button == 0 {
+                    let grid_x = x as Int
+                    let grid_y = y as Int
+                    self.terrain_brush.apply(self.map.heightmap, grid_x, grid_y, 0.016)
+                }
+            },
+            EditorMode::TEXTURE => {
+                if button == 0 {
+                    let grid_x = x as Int
+                    let grid_y = y as Int
+                    self.texture_painter.paint(self.map.texture_map, grid_x, grid_y)
+                }
+            },
+            EditorMode::OBJECTS => {
+                if button == 0 {
+                    self.object_tool.place_object(self.map.objects, x, y)
+                }
+            },
+            _ => {},
+        }
+    }
+
+    fn save_map(self, filename: String) -> Bool {
+        // Validate before saving
+        if !self.validator.validate(self.map) {
+            return false
+        }
+
+        // TODO: Implement actual file saving
+        return true
+    }
+
+    fn load_map(self, filename: String) -> Bool {
+        // TODO: Implement actual file loading
+        return false
+    }
+
+    fn validate_map(self) -> Bool {
+        return self.validator.validate(self.map)
+    }
+
+    fn enter_playtest_mode(self) {
+        self.is_playtest_mode = true
+        // Initialize game state from editor state
+    }
+
+    fn exit_playtest_mode(self) {
+        self.is_playtest_mode = false
+        // Restore editor state
+    }
+
+    fn get_error_count(self) -> Int {
+        return self.validator.get_error_count()
+    }
+
+    fn get_warning_count(self) -> Int {
+        return self.validator.get_warning_count()
+    }
+}
+
+// Helper structs
+struct HeightMap {
+    width: Int,
+    height: Int,
+    heights: Collection<Collection<Float>>,
+
+    fn init(width: Int, height: Int) -> HeightMap {
+        let heights = Collection::new()
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(0.0)
+            }
+            heights.add(row)
+        }
+
+        return HeightMap {
+            width: width,
+            height: height,
+            heights: heights,
+        }
+    }
+
+    fn get_height(self, x: Int, y: Int) -> Float {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.heights.get(y)
+            return row.get(x)
+        }
+        return 0.0
+    }
+
+    fn set_height(self, x: Int, y: Int, height: Float) {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.heights.get(y)
+            row.set(x, height)
+        }
+    }
+
+    fn get_average_height_around(self, x: Int, y: Int) -> Float {
+        let sum = 0.0
+        let count = 0
+
+        for dy in -1..1 {
+            for dx in -1..1 {
+                let nx = x + dx
+                let ny = y + dy
+                if nx >= 0 && nx < self.width && ny >= 0 && ny < self.height {
+                    sum = sum + self.get_height(nx, ny)
+                    count = count + 1
+                }
+            }
+        }
+
+        if count > 0 {
+            return sum / count as Float
+        }
+        return 0.0
+    }
+}
+
+struct TextureMap {
+    width: Int,
+    height: Int,
+    texture_layers: Collection<TextureLayer>,
+
+    fn init(width: Int, height: Int) -> TextureMap {
+        return TextureMap {
+            width: width,
+            height: height,
+            texture_layers: Collection::new(),
+        }
+    }
+
+    fn set_texture(self, x: Int, y: Int, texture_id: Int, weight: Float) {
+        // Find or create layer
+        let layer = self.get_or_create_layer(texture_id)
+        layer.set_weight(x, y, weight)
+    }
+
+    fn get_texture_weight(self, x: Int, y: Int, texture_id: Int) -> Float {
+        for i in 0..self.texture_layers.count() {
+            let layer = self.texture_layers.get(i)
+            if layer.texture_id == texture_id {
+                return layer.get_weight(x, y)
+            }
+        }
+        return 0.0
+    }
+
+    fn get_or_create_layer(self, texture_id: Int) -> TextureLayer {
+        for i in 0..self.texture_layers.count() {
+            let layer = self.texture_layers.get(i)
+            if layer.texture_id == texture_id {
+                return layer
+            }
+        }
+
+        let new_layer = TextureLayer::init(texture_id, self.width, self.height)
+        self.texture_layers.add(new_layer)
+        return new_layer
+    }
+}
+
+struct TextureLayer {
+    texture_id: Int,
+    weights: Collection<Collection<Float>>,
+
+    fn init(texture_id: Int, width: Int, height: Int) -> TextureLayer {
+        let weights = Collection::new()
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(0.0)
+            }
+            weights.add(row)
+        }
+
+        return TextureLayer {
+            texture_id: texture_id,
+            weights: weights,
+        }
+    }
+
+    fn set_weight(self, x: Int, y: Int, weight: Float) {
+        let row = self.weights.get(y)
+        row.set(x, weight)
+    }
+
+    fn get_weight(self, x: Int, y: Int) -> Float {
+        let row = self.weights.get(y)
+        return row.get(x)
+    }
+}
+
+struct PlacedObject {
+    template: String,
+    x: Float,
+    y: Float,
+    rotation: Float,
+
+    fn init(template: String, x: Float, y: Float, rotation: Float) -> PlacedObject {
+        return PlacedObject {
+            template: template,
+            x: x,
+            y: y,
+            rotation: rotation,
+        }
+    }
+}
+
+struct EditorTrigger {
+    id: Int,
+    name: String,
+    conditions: Collection<String>,
+    actions: Collection<String>,
+
+    fn init(id: Int, name: String) -> EditorTrigger {
+        return EditorTrigger {
+            id: id,
+            name: name,
+            conditions: Collection::new(),
+            actions: Collection::new(),
+        }
+    }
+
+    fn add_condition(self, condition_type: String, params: String) {
+        self.conditions.add(condition_type + ":" + params)
+    }
+
+    fn add_action(self, action_type: String, params: String) {
+        self.actions.add(action_type + ":" + params)
+    }
+
+    fn to_string(self) -> String {
+        return "Trigger: " + self.name
+    }
+}
+
+enum LightType {
+    POINT = 0,
+    SPOT = 1,
+    DIRECTIONAL = 2,
+}
+
+struct EditorLight {
+    id: Int,
+    light_type: LightType,
+    position: Vec3,
+    direction: Vec3,
+    color: Color,
+    radius: Float,
+    angle: Float,
+
+    fn init_point(id: Int, x: Float, y: Float, z: Float, color: Color, radius: Float) -> EditorLight {
+        return EditorLight {
+            id: id,
+            light_type: LightType::POINT,
+            position: Vec3::init(x, y, z),
+            direction: Vec3::init(0.0, 0.0, 0.0),
+            color: color,
+            radius: radius,
+            angle: 0.0,
+        }
+    }
+
+    fn init_spot(id: Int, x: Float, y: Float, z: Float, dir_x: Float, dir_y: Float, dir_z: Float, color: Color, angle: Float) -> EditorLight {
+        return EditorLight {
+            id: id,
+            light_type: LightType::SPOT,
+            position: Vec3::init(x, y, z),
+            direction: Vec3::init(dir_x, dir_y, dir_z),
+            color: color,
+            radius: 0.0,
+            angle: angle,
+        }
+    }
+}
+
+struct EditorMap {
+    width: Int,
+    height: Int,
+    heightmap: HeightMap,
+    texture_map: TextureMap,
+    objects: Collection<PlacedObject>,
+    triggers: Collection<EditorTrigger>,
+
+    fn init(width: Int, height: Int) -> EditorMap {
+        return EditorMap {
+            width: width,
+            height: height,
+            heightmap: HeightMap::init(width, height),
+            texture_map: TextureMap::init(width, height),
+            objects: Collection::new(),
+            triggers: Collection::new(),
+        }
+    }
+}
+
+struct ValidationError {
+    message: String,
+
+    fn init(message: String) -> ValidationError {
+        return ValidationError { message: message }
+    }
+}
+
+struct ValidationWarning {
+    message: String,
+
+    fn init(message: String) -> ValidationWarning {
+        return ValidationWarning { message: message }
+    }
+}
+
+struct GridCell {
+    x: Int,
+    y: Int,
+
+    fn init(x: Int, y: Int) -> GridCell {
+        return GridCell { x: x, y: y }
+    }
+}
+
+struct Color {
+    r: Float,
+    g: Float,
+    b: Float,
+    a: Float,
+
+    fn init(r: Float, g: Float, b: Float, a: Float) -> Color {
+        return Color { r: r, g: g, b: b, a: a }
+    }
+}
+
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+enum TextureBlendMode {
+    REPLACE = 0,
+    ADD = 1,
+    SUBTRACT = 2,
+}
+
+// Helper functions
+fn max(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn min(a: Int, b: Int) -> Int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let guess = x / 2.0
+    let epsilon = 0.01
+    let max_iter = 10
+    let iter = 0
+    while iter < max_iter {
+        let next = (guess + x / guess) / 2.0
+        if abs(next - guess) < epsilon {
+            return next
+        }
+        guess = next
+        iter = iter + 1
+    }
+    return guess
+}
+
+fn abs(x: Float) -> Float {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+fn pow(base: Float, exp: Float) -> Float {
+    // Simple approximation for positive exponents
+    if exp == 0.0 {
+        return 1.0
+    }
+    let result = base
+    let count = exp as Int
+    for i in 1..count {
+        result = result * base
+    }
+    return result
+}
+
+// Tests
+test "TerrainBrush: init" {
+    let brush = TerrainBrush::init()
+
+    assert brush.shape == BrushShape::CIRCLE
+    assert brush.radius == 5.0
+    assert brush.strength == 1.0
+}
+
+test "TerrainBrush: set radius" {
+    let brush = TerrainBrush::init()
+
+    brush.set_radius(10.0)
+
+    assert brush.radius == 10.0
+}
+
+test "TerrainBrush: set strength" {
+    let brush = TerrainBrush::init()
+
+    brush.set_strength(2.0)
+
+    assert brush.strength == 2.0
+}
+
+test "TerrainBrush: set edit mode" {
+    let brush = TerrainBrush::init()
+
+    brush.set_edit_mode(TerrainEditMode::LOWER)
+
+    assert brush.edit_mode == TerrainEditMode::LOWER
+}
+
+test "TerrainBrush: distance calculation" {
+    let brush = TerrainBrush::init()
+
+    let dist = brush.distance_to_center(3, 4, 0, 0)
+
+    assert dist == 5.0
+}
+
+test "TerrainBrush: calculate influence" {
+    let brush = TerrainBrush::init()
+    brush.radius = 10.0
+
+    let influence_close = brush.calculate_influence(2.0)
+    let influence_far = brush.calculate_influence(9.0)
+
+    assert influence_close > influence_far
+}
+
+test "TexturePainter: init" {
+    let painter = TexturePainter::init()
+
+    assert painter.current_texture == 0
+    assert painter.brush_size == 5.0
+}
+
+test "TexturePainter: select texture" {
+    let painter = TexturePainter::init()
+
+    painter.select_texture(3)
+
+    assert painter.current_texture == 3
+}
+
+test "TexturePainter: set brush size" {
+    let painter = TexturePainter::init()
+
+    painter.set_brush_size(10.0)
+
+    assert painter.brush_size == 10.0
+}
+
+test "TexturePainter: set blend mode" {
+    let painter = TexturePainter::init()
+
+    painter.set_blend_mode(TextureBlendMode::ADD)
+
+    assert painter.blend_mode == TextureBlendMode::ADD
+}
+
+test "ObjectPlacementTool: init" {
+    let tool = ObjectPlacementTool::init()
+
+    assert tool.snap_to_grid
+    assert tool.grid_size == 1.0
+    assert tool.rotation == 0.0
+}
+
+test "ObjectPlacementTool: select template" {
+    let tool = ObjectPlacementTool::init()
+
+    tool.select_template("Tank")
+
+    assert tool.current_template == "Tank"
+}
+
+test "ObjectPlacementTool: rotate object" {
+    let tool = ObjectPlacementTool::init()
+
+    tool.rotate_object(45.0)
+
+    assert tool.rotation == 45.0
+}
+
+test "ObjectPlacementTool: toggle grid snap" {
+    let tool = ObjectPlacementTool::init()
+
+    tool.toggle_grid_snap()
+
+    assert !tool.snap_to_grid
+}
+
+test "ObjectPlacementTool: snap to grid" {
+    let tool = ObjectPlacementTool::init()
+    tool.grid_size = 5.0
+
+    let snapped = tool.snap_to_grid_coord(12.7)
+
+    assert snapped == 10.0
+}
+
+test "ObjectPlacementTool: place object" {
+    let tool = ObjectPlacementTool::init()
+    tool.select_template("Tank")
+
+    let objects = Collection::new()
+    let obj = tool.place_object(objects, 10.5, 20.3)
+
+    assert objects.count() == 1
+    assert obj.template == "Tank"
+}
+
+test "TriggerEditor: init" {
+    let editor = TriggerEditor::init()
+
+    assert editor.get_trigger_count() == 0
+    assert editor.selected_trigger == -1
+}
+
+test "TriggerEditor: create trigger" {
+    let editor = TriggerEditor::init()
+
+    let id = editor.create_trigger("Test Trigger")
+
+    assert editor.get_trigger_count() == 1
+    assert id == 0
+}
+
+test "TriggerEditor: delete trigger" {
+    let editor = TriggerEditor::init()
+
+    let id = editor.create_trigger("Test")
+    editor.delete_trigger(id)
+
+    assert editor.get_trigger_count() == 0
+}
+
+test "TriggerEditor: add condition" {
+    let editor = TriggerEditor::init()
+
+    let id = editor.create_trigger("Test")
+    editor.add_condition(id, "UnitEntersArea", "area1")
+
+    let trigger = editor.triggers.get(0)
+    assert trigger.conditions.count() == 1
+}
+
+test "TriggerEditor: add action" {
+    let editor = TriggerEditor::init()
+
+    let id = editor.create_trigger("Test")
+    editor.add_action(id, "SpawnUnit", "unit1")
+
+    let trigger = editor.triggers.get(0)
+    assert trigger.actions.count() == 1
+}
+
+test "TriggerEditor: select trigger" {
+    let editor = TriggerEditor::init()
+
+    let id = editor.create_trigger("Test")
+    editor.select_trigger(id)
+
+    assert editor.selected_trigger == id
+}
+
+test "LightingEditor: init" {
+    let editor = LightingEditor::init()
+
+    assert editor.get_light_count() == 0
+    assert editor.sun_intensity == 1.0
+}
+
+test "LightingEditor: add point light" {
+    let editor = LightingEditor::init()
+
+    let color = Color::init(1.0, 1.0, 1.0, 1.0)
+    let id = editor.add_point_light(10.0, 20.0, 5.0, color, 15.0)
+
+    assert editor.get_light_count() == 1
+    assert id == 0
+}
+
+test "LightingEditor: add spot light" {
+    let editor = LightingEditor::init()
+
+    let color = Color::init(1.0, 1.0, 1.0, 1.0)
+    let id = editor.add_spot_light(10.0, 20.0, 5.0, 0.0, -1.0, 0.0, color, 45.0)
+
+    assert editor.get_light_count() == 1
+}
+
+test "LightingEditor: remove light" {
+    let editor = LightingEditor::init()
+
+    let color = Color::init(1.0, 1.0, 1.0, 1.0)
+    let id = editor.add_point_light(10.0, 20.0, 5.0, color, 15.0)
+    editor.remove_light(id)
+
+    assert editor.get_light_count() == 0
+}
+
+test "LightingEditor: set ambient light" {
+    let editor = LightingEditor::init()
+
+    editor.set_ambient_light(0.5, 0.5, 0.5)
+
+    assert editor.ambient_light.r == 0.5
+}
+
+test "LightingEditor: set sun direction" {
+    let editor = LightingEditor::init()
+
+    editor.set_sun_direction(1.0, -1.0, 0.0)
+
+    assert editor.sun_direction.x == 1.0
+}
+
+test "MapValidator: init" {
+    let validator = MapValidator::init()
+
+    assert !validator.has_errors()
+    assert validator.get_error_count() == 0
+}
+
+test "MapValidator: validate empty map" {
+    let validator = MapValidator::init()
+    let map = EditorMap::init(128, 128)
+
+    let is_valid = validator.validate(map)
+
+    assert !is_valid  // Should fail - no spawn points
+    assert validator.has_errors()
+}
+
+test "MapValidator: check spawn points" {
+    let validator = MapValidator::init()
+    let map = EditorMap::init(128, 128)
+
+    // Add spawn points
+    map.objects.add(PlacedObject::init("SpawnPoint", 10.0, 10.0, 0.0))
+    map.objects.add(PlacedObject::init("SpawnPoint", 100.0, 100.0, 0.0))
+
+    validator.validate(map)
+
+    assert !validator.has_errors()  // Should pass with 2 spawn points
+}
+
+test "MapValidator: check terrain size" {
+    let validator = MapValidator::init()
+    let map = EditorMap::init(32, 32)  // Too small
+
+    validator.validate(map)
+
+    assert validator.has_errors()
+}
+
+test "HeightMap: init" {
+    let heightmap = HeightMap::init(10, 10)
+
+    assert heightmap.width == 10
+    assert heightmap.height == 10
+}
+
+test "HeightMap: get and set height" {
+    let heightmap = HeightMap::init(10, 10)
+
+    heightmap.set_height(5, 5, 10.0)
+    let height = heightmap.get_height(5, 5)
+
+    assert height == 10.0
+}
+
+test "HeightMap: get average height" {
+    let heightmap = HeightMap::init(10, 10)
+
+    heightmap.set_height(5, 5, 10.0)
+    heightmap.set_height(5, 6, 20.0)
+    heightmap.set_height(6, 5, 30.0)
+
+    let avg = heightmap.get_average_height_around(5, 5)
+
+    assert avg > 0.0
+}
+
+test "TextureMap: init" {
+    let tex_map = TextureMap::init(10, 10)
+
+    assert tex_map.width == 10
+    assert tex_map.height == 10
+}
+
+test "TextureMap: set and get texture weight" {
+    let tex_map = TextureMap::init(10, 10)
+
+    tex_map.set_texture(5, 5, 1, 0.8)
+    let weight = tex_map.get_texture_weight(5, 5, 1)
+
+    assert weight == 0.8
+}
+
+test "MapEditor: init" {
+    let editor = MapEditor::init(128, 128)
+
+    assert editor.mode == EditorMode::TERRAIN
+    assert !editor.is_playtest_mode
+}
+
+test "MapEditor: set mode" {
+    let editor = MapEditor::init(128, 128)
+
+    editor.set_mode(EditorMode::TEXTURE)
+
+    assert editor.mode == EditorMode::TEXTURE
+}
+
+test "MapEditor: validate map" {
+    let editor = MapEditor::init(128, 128)
+
+    // Add minimum required elements
+    editor.map.objects.add(PlacedObject::init("SpawnPoint", 10.0, 10.0, 0.0))
+    editor.map.objects.add(PlacedObject::init("SpawnPoint", 100.0, 100.0, 0.0))
+
+    let is_valid = editor.validate_map()
+
+    assert is_valid
+}
+
+test "MapEditor: enter playtest mode" {
+    let editor = MapEditor::init(128, 128)
+
+    editor.set_mode(EditorMode::PLAYTEST)
+
+    assert editor.is_playtest_mode
+}
+
+test "MapEditor: exit playtest mode" {
+    let editor = MapEditor::init(128, 128)
+
+    editor.set_mode(EditorMode::PLAYTEST)
+    editor.set_mode(EditorMode::TERRAIN)
+
+    assert !editor.is_playtest_mode
+}

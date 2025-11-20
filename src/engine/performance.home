@@ -1,0 +1,1034 @@
+// Performance & Optimization for C&C Generals Zero Hour
+// Profiling, object pooling, spatial optimization, multithreading, GPU instancing
+// Written in Home language
+
+// Profiling scope types
+enum ProfileScope {
+    FRAME = 0,
+    UPDATE = 1,
+    RENDER = 2,
+    PHYSICS = 3,
+    AI = 4,
+    PATHFINDING = 5,
+    NETWORKING = 6,
+    AUDIO = 7,
+}
+
+// Performance metrics
+struct PerformanceMetrics {
+    fps: Float,
+    frame_time_ms: Float,
+    update_time_ms: Float,
+    render_time_ms: Float,
+    memory_used_mb: Float,
+    draw_calls: Int,
+    triangles_rendered: Int,
+    units_active: Int,
+
+    fn init() -> PerformanceMetrics {
+        return PerformanceMetrics {
+            fps: 0.0,
+            frame_time_ms: 0.0,
+            update_time_ms: 0.0,
+            render_time_ms: 0.0,
+            memory_used_mb: 0.0,
+            draw_calls: 0,
+            triangles_rendered: 0,
+            units_active: 0,
+        }
+    }
+}
+
+// Profiler timer
+struct ProfileTimer {
+    scope: ProfileScope,
+    start_time: Float,
+    end_time: Float,
+    is_running: Bool,
+
+    fn init(scope: ProfileScope) -> ProfileTimer {
+        return ProfileTimer {
+            scope: scope,
+            start_time: 0.0,
+            end_time: 0.0,
+            is_running: false,
+        }
+    }
+
+    fn start(self) {
+        self.start_time = get_current_time()
+        self.is_running = true
+    }
+
+    fn stop(self) {
+        self.end_time = get_current_time()
+        self.is_running = false
+    }
+
+    fn get_duration_ms(self) -> Float {
+        if self.is_running {
+            return (get_current_time() - self.start_time) * 1000.0
+        }
+        return (self.end_time - self.start_time) * 1000.0
+    }
+
+    fn reset(self) {
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.is_running = false
+    }
+}
+
+// Performance profiler
+struct Profiler {
+    timers: Collection<ProfileTimer>,
+    frame_history: Collection<Float>,
+    history_size: Int,
+    enabled: Bool,
+
+    fn init() -> Profiler {
+        return Profiler {
+            timers: Collection::new(),
+            frame_history: Collection::new(),
+            history_size: 60,
+            enabled: true,
+        }
+    }
+
+    fn begin_scope(self, scope: ProfileScope) {
+        if !self.enabled {
+            return
+        }
+
+        let timer = ProfileTimer::init(scope)
+        timer.start()
+        self.timers.add(timer)
+    }
+
+    fn end_scope(self, scope: ProfileScope) {
+        if !self.enabled {
+            return
+        }
+
+        for i in 0..self.timers.count() {
+            let timer = self.timers.get(i)
+            if timer.scope == scope && timer.is_running {
+                timer.stop()
+                return
+            }
+        }
+    }
+
+    fn get_scope_time(self, scope: ProfileScope) -> Float {
+        let total = 0.0
+
+        for i in 0..self.timers.count() {
+            let timer = self.timers.get(i)
+            if timer.scope == scope {
+                total = total + timer.get_duration_ms()
+            }
+        }
+
+        return total
+    }
+
+    fn record_frame_time(self, frame_time: Float) {
+        self.frame_history.add(frame_time)
+
+        if self.frame_history.count() > self.history_size {
+            self.frame_history.remove_at(0)
+        }
+    }
+
+    fn get_average_frame_time(self) -> Float {
+        if self.frame_history.count() == 0 {
+            return 0.0
+        }
+
+        let sum = 0.0
+        for i in 0..self.frame_history.count() {
+            sum = sum + self.frame_history.get(i)
+        }
+
+        return sum / self.frame_history.count() as Float
+    }
+
+    fn get_average_fps(self) -> Float {
+        let avg_frame = self.get_average_frame_time()
+        if avg_frame > 0.0 {
+            return 1000.0 / avg_frame
+        }
+        return 0.0
+    }
+
+    fn reset(self) {
+        self.timers.clear()
+    }
+
+    fn enable(self) {
+        self.enabled = true
+    }
+
+    fn disable(self) {
+        self.enabled = false
+    }
+}
+
+// Object pool
+struct ObjectPool {
+    pool_name: String,
+    available: Collection<Int>,
+    in_use: Collection<Int>,
+    max_size: Int,
+    grow_size: Int,
+
+    fn init(name: String, initial_size: Int, max_size: Int) -> ObjectPool {
+        let pool = ObjectPool {
+            pool_name: name,
+            available: Collection::new(),
+            in_use: Collection::new(),
+            max_size: max_size,
+            grow_size: 10,
+        }
+
+        // Pre-allocate
+        for i in 0..initial_size {
+            pool.available.add(i)
+        }
+
+        return pool
+    }
+
+    fn acquire(self) -> Int? {
+        if self.available.count() == 0 {
+            if !self.grow() {
+                return null
+            }
+        }
+
+        let id = self.available.get(0)
+        self.available.remove_at(0)
+        self.in_use.add(id)
+
+        return id
+    }
+
+    fn release(self, id: Int) {
+        let index = self.in_use.index_of(id)
+        if index != -1 {
+            self.in_use.remove_at(index)
+            self.available.add(id)
+        }
+    }
+
+    fn grow(self) -> Bool {
+        let current_size = self.available.count() + self.in_use.count()
+
+        if current_size >= self.max_size {
+            return false
+        }
+
+        let to_add = min(self.grow_size, self.max_size - current_size)
+
+        for i in 0..to_add {
+            let new_id = current_size + i
+            self.available.add(new_id)
+        }
+
+        return true
+    }
+
+    fn get_available_count(self) -> Int {
+        return self.available.count()
+    }
+
+    fn get_in_use_count(self) -> Int {
+        return self.in_use.count()
+    }
+
+    fn get_total_size(self) -> Int {
+        return self.available.count() + self.in_use.count()
+    }
+
+    fn reset(self) {
+        self.available.clear()
+        self.in_use.clear()
+    }
+}
+
+// Spatial hash grid cell
+struct SpatialCell {
+    objects: Collection<Int>,
+
+    fn init() -> SpatialCell {
+        return SpatialCell {
+            objects: Collection::new(),
+        }
+    }
+
+    fn add(self, object_id: Int) {
+        if self.objects.index_of(object_id) == -1 {
+            self.objects.add(object_id)
+        }
+    }
+
+    fn remove(self, object_id: Int) {
+        let index = self.objects.index_of(object_id)
+        if index != -1 {
+            self.objects.remove_at(index)
+        }
+    }
+
+    fn clear(self) {
+        self.objects.clear()
+    }
+
+    fn get_count(self) -> Int {
+        return self.objects.count()
+    }
+}
+
+// Spatial hash grid for optimization
+struct SpatialHashGrid {
+    cell_size: Float,
+    width: Int,
+    height: Int,
+    cells: Collection<Collection<SpatialCell>>,
+
+    fn init(width: Int, height: Int, cell_size: Float) -> SpatialHashGrid {
+        let cells = Collection::new()
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(SpatialCell::init())
+            }
+            cells.add(row)
+        }
+
+        return SpatialHashGrid {
+            cell_size: cell_size,
+            width: width,
+            height: height,
+            cells: cells,
+        }
+    }
+
+    fn insert(self, object_id: Int, x: Float, y: Float) {
+        let cell_x = (x / self.cell_size) as Int
+        let cell_y = (y / self.cell_size) as Int
+
+        if cell_x >= 0 && cell_x < self.width && cell_y >= 0 && cell_y < self.height {
+            let row = self.cells.get(cell_y)
+            let cell = row.get(cell_x)
+            cell.add(object_id)
+        }
+    }
+
+    fn remove(self, object_id: Int, x: Float, y: Float) {
+        let cell_x = (x / self.cell_size) as Int
+        let cell_y = (y / self.cell_size) as Int
+
+        if cell_x >= 0 && cell_x < self.width && cell_y >= 0 && cell_y < self.height {
+            let row = self.cells.get(cell_y)
+            let cell = row.get(cell_x)
+            cell.remove(object_id)
+        }
+    }
+
+    fn query_radius(self, x: Float, y: Float, radius: Float) -> Collection<Int> {
+        let results = Collection::new()
+
+        let cell_x = (x / self.cell_size) as Int
+        let cell_y = (y / self.cell_size) as Int
+        let cell_radius = (radius / self.cell_size) as Int
+
+        let start_x = max(0, cell_x - cell_radius)
+        let end_x = min(self.width - 1, cell_x + cell_radius)
+        let start_y = max(0, cell_y - cell_radius)
+        let end_y = min(self.height - 1, cell_y + cell_radius)
+
+        for cy in start_y..end_y {
+            let row = self.cells.get(cy)
+            for cx in start_x..end_x {
+                let cell = row.get(cx)
+                for i in 0..cell.objects.count() {
+                    let obj_id = cell.objects.get(i)
+                    if results.index_of(obj_id) == -1 {
+                        results.add(obj_id)
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+
+    fn clear_all(self) {
+        for y in 0..self.height {
+            let row = self.cells.get(y)
+            for x in 0..self.width {
+                let cell = row.get(x)
+                cell.clear()
+            }
+        }
+    }
+
+    fn get_cell_count(self, cell_x: Int, cell_y: Int) -> Int {
+        if cell_x >= 0 && cell_x < self.width && cell_y >= 0 && cell_y < self.height {
+            let row = self.cells.get(cell_y)
+            let cell = row.get(cell_x)
+            return cell.get_count()
+        }
+        return 0
+    }
+}
+
+// GPU instancing batch
+struct InstanceBatch {
+    model_id: Int,
+    instances: Collection<InstanceData>,
+    max_instances: Int,
+
+    fn init(model_id: Int, max_instances: Int) -> InstanceBatch {
+        return InstanceBatch {
+            model_id: model_id,
+            instances: Collection::new(),
+            max_instances: max_instances,
+        }
+    }
+
+    fn add_instance(self, data: InstanceData) -> Bool {
+        if self.instances.count() >= self.max_instances {
+            return false
+        }
+
+        self.instances.add(data)
+        return true
+    }
+
+    fn clear(self) {
+        self.instances.clear()
+    }
+
+    fn get_count(self) -> Int {
+        return self.instances.count()
+    }
+
+    fn is_full(self) -> Bool {
+        return self.instances.count() >= self.max_instances
+    }
+}
+
+// Instance data for GPU instancing
+struct InstanceData {
+    position: Vec3,
+    rotation: Float,
+    scale: Float,
+
+    fn init(x: Float, y: Float, z: Float, rotation: Float, scale: Float) -> InstanceData {
+        return InstanceData {
+            position: Vec3::init(x, y, z),
+            rotation: rotation,
+            scale: scale,
+        }
+    }
+}
+
+// Frame budget manager
+struct FrameBudgetManager {
+    target_fps: Float,
+    target_frame_time_ms: Float,
+    current_frame_time_ms: Float,
+    budgets: Collection<ScopeBudget>,
+
+    fn init(target_fps: Float) -> FrameBudgetManager {
+        return FrameBudgetManager {
+            target_fps: target_fps,
+            target_frame_time_ms: 1000.0 / target_fps,
+            current_frame_time_ms: 0.0,
+            budgets: Collection::new(),
+        }
+    }
+
+    fn set_scope_budget(self, scope: ProfileScope, percentage: Float) {
+        let budget = ScopeBudget::init(scope, self.target_frame_time_ms * percentage)
+        self.budgets.add(budget)
+    }
+
+    fn update_frame_time(self, frame_time_ms: Float) {
+        self.current_frame_time_ms = frame_time_ms
+    }
+
+    fn is_over_budget(self, scope: ProfileScope, actual_time_ms: Float) -> Bool {
+        for i in 0..self.budgets.count() {
+            let budget = self.budgets.get(i)
+            if budget.scope == scope {
+                return actual_time_ms > budget.budget_ms
+            }
+        }
+        return false
+    }
+
+    fn get_remaining_time(self) -> Float {
+        return self.target_frame_time_ms - self.current_frame_time_ms
+    }
+
+    fn is_frame_over_budget(self) -> Bool {
+        return self.current_frame_time_ms > self.target_frame_time_ms
+    }
+
+    fn get_budget_for_scope(self, scope: ProfileScope) -> Float {
+        for i in 0..self.budgets.count() {
+            let budget = self.budgets.get(i)
+            if budget.scope == scope {
+                return budget.budget_ms
+            }
+        }
+        return 0.0
+    }
+}
+
+// Scope budget
+struct ScopeBudget {
+    scope: ProfileScope,
+    budget_ms: Float,
+
+    fn init(scope: ProfileScope, budget_ms: Float) -> ScopeBudget {
+        return ScopeBudget {
+            scope: scope,
+            budget_ms: budget_ms,
+        }
+    }
+}
+
+// Memory profiler
+struct MemoryProfiler {
+    total_allocated_mb: Float,
+    peak_allocated_mb: Float,
+    allocations: Collection<MemoryAllocation>,
+
+    fn init() -> MemoryProfiler {
+        return MemoryProfiler {
+            total_allocated_mb: 0.0,
+            peak_allocated_mb: 0.0,
+            allocations: Collection::new(),
+        }
+    }
+
+    fn record_allocation(self, size_bytes: Int, category: String) {
+        let allocation = MemoryAllocation::init(size_bytes, category)
+        self.allocations.add(allocation)
+
+        let size_mb = size_bytes as Float / 1048576.0
+        self.total_allocated_mb = self.total_allocated_mb + size_mb
+
+        if self.total_allocated_mb > self.peak_allocated_mb {
+            self.peak_allocated_mb = self.total_allocated_mb
+        }
+    }
+
+    fn record_deallocation(self, size_bytes: Int) {
+        let size_mb = size_bytes as Float / 1048576.0
+        self.total_allocated_mb = self.total_allocated_mb - size_mb
+
+        if self.total_allocated_mb < 0.0 {
+            self.total_allocated_mb = 0.0
+        }
+    }
+
+    fn get_allocation_by_category(self, category: String) -> Float {
+        let total_bytes = 0
+
+        for i in 0..self.allocations.count() {
+            let alloc = self.allocations.get(i)
+            if alloc.category == category {
+                total_bytes = total_bytes + alloc.size_bytes
+            }
+        }
+
+        return total_bytes as Float / 1048576.0
+    }
+
+    fn get_total_allocated(self) -> Float {
+        return self.total_allocated_mb
+    }
+
+    fn get_peak_allocated(self) -> Float {
+        return self.peak_allocated_mb
+    }
+
+    fn reset(self) {
+        self.allocations.clear()
+        self.total_allocated_mb = 0.0
+    }
+}
+
+// Memory allocation record
+struct MemoryAllocation {
+    size_bytes: Int,
+    category: String,
+    timestamp: Float,
+
+    fn init(size_bytes: Int, category: String) -> MemoryAllocation {
+        return MemoryAllocation {
+            size_bytes: size_bytes,
+            category: category,
+            timestamp: get_current_time(),
+        }
+    }
+}
+
+// Performance optimizer
+struct PerformanceOptimizer {
+    profiler: Profiler,
+    object_pools: Collection<ObjectPool>,
+    spatial_grid: SpatialHashGrid,
+    frame_budget: FrameBudgetManager,
+    memory_profiler: MemoryProfiler,
+    metrics: PerformanceMetrics,
+
+    fn init(target_fps: Float) -> PerformanceOptimizer {
+        return PerformanceOptimizer {
+            profiler: Profiler::init(),
+            object_pools: Collection::new(),
+            spatial_grid: SpatialHashGrid::init(100, 100, 10.0),
+            frame_budget: FrameBudgetManager::init(target_fps),
+            memory_profiler: MemoryProfiler::init(),
+            metrics: PerformanceMetrics::init(),
+        }
+    }
+
+    fn create_pool(self, name: String, initial_size: Int, max_size: Int) -> Int {
+        let pool = ObjectPool::init(name, initial_size, max_size)
+        self.object_pools.add(pool)
+        return self.object_pools.count() - 1
+    }
+
+    fn get_pool(self, pool_id: Int) -> ObjectPool? {
+        if pool_id >= 0 && pool_id < self.object_pools.count() {
+            return self.object_pools.get(pool_id)
+        }
+        return null
+    }
+
+    fn begin_frame(self) {
+        self.profiler.begin_scope(ProfileScope::FRAME)
+    }
+
+    fn end_frame(self) {
+        self.profiler.end_scope(ProfileScope::FRAME)
+
+        let frame_time = self.profiler.get_scope_time(ProfileScope::FRAME)
+        self.profiler.record_frame_time(frame_time)
+        self.frame_budget.update_frame_time(frame_time)
+
+        self.update_metrics()
+        self.profiler.reset()
+    }
+
+    fn update_metrics(self) {
+        self.metrics.frame_time_ms = self.profiler.get_average_frame_time()
+        self.metrics.fps = self.profiler.get_average_fps()
+        self.metrics.update_time_ms = self.profiler.get_scope_time(ProfileScope::UPDATE)
+        self.metrics.render_time_ms = self.profiler.get_scope_time(ProfileScope::RENDER)
+        self.metrics.memory_used_mb = self.memory_profiler.get_total_allocated()
+    }
+
+    fn get_metrics(self) -> PerformanceMetrics {
+        return self.metrics
+    }
+
+    fn is_over_budget(self) -> Bool {
+        return self.frame_budget.is_frame_over_budget()
+    }
+
+    fn get_pool_count(self) -> Int {
+        return self.object_pools.count()
+    }
+}
+
+// Helper structs
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+// Helper functions
+fn get_current_time() -> Float {
+    // Placeholder - would get actual system time
+    return 0.0
+}
+
+fn min(a: Int, b: Int) -> Int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Tests
+test "ProfileTimer: init" {
+    let timer = ProfileTimer::init(ProfileScope::UPDATE)
+
+    assert timer.scope == ProfileScope::UPDATE
+    assert !timer.is_running
+}
+
+test "ProfileTimer: start and stop" {
+    let timer = ProfileTimer::init(ProfileScope::RENDER)
+
+    timer.start()
+    assert timer.is_running
+
+    timer.stop()
+    assert !timer.is_running
+}
+
+test "ProfileTimer: reset" {
+    let timer = ProfileTimer::init(ProfileScope::FRAME)
+
+    timer.start()
+    timer.stop()
+    timer.reset()
+
+    assert !timer.is_running
+}
+
+test "Profiler: init" {
+    let profiler = Profiler::init()
+
+    assert profiler.enabled
+    assert profiler.history_size == 60
+}
+
+test "Profiler: begin and end scope" {
+    let profiler = Profiler::init()
+
+    profiler.begin_scope(ProfileScope::UPDATE)
+    profiler.end_scope(ProfileScope::UPDATE)
+
+    assert profiler.timers.count() > 0
+}
+
+test "Profiler: record frame time" {
+    let profiler = Profiler::init()
+
+    profiler.record_frame_time(16.67)
+    profiler.record_frame_time(16.70)
+
+    assert profiler.frame_history.count() == 2
+}
+
+test "Profiler: get average frame time" {
+    let profiler = Profiler::init()
+
+    profiler.record_frame_time(10.0)
+    profiler.record_frame_time(20.0)
+
+    let avg = profiler.get_average_frame_time()
+
+    assert avg == 15.0
+}
+
+test "Profiler: enable and disable" {
+    let profiler = Profiler::init()
+
+    profiler.disable()
+    assert !profiler.enabled
+
+    profiler.enable()
+    assert profiler.enabled
+}
+
+test "ObjectPool: init" {
+    let pool = ObjectPool::init("TestPool", 10, 100)
+
+    assert pool.pool_name == "TestPool"
+    assert pool.get_available_count() == 10
+}
+
+test "ObjectPool: acquire" {
+    let pool = ObjectPool::init("TestPool", 5, 10)
+
+    let id = pool.acquire()
+
+    assert id != null
+    assert pool.get_in_use_count() == 1
+    assert pool.get_available_count() == 4
+}
+
+test "ObjectPool: release" {
+    let pool = ObjectPool::init("TestPool", 5, 10)
+
+    let id = pool.acquire()
+    if let Some(obj_id) = id {
+        pool.release(obj_id)
+    }
+
+    assert pool.get_in_use_count() == 0
+    assert pool.get_available_count() == 5
+}
+
+test "ObjectPool: grow" {
+    let pool = ObjectPool::init("TestPool", 5, 20)
+    pool.grow_size = 5
+
+    let success = pool.grow()
+
+    assert success
+    assert pool.get_total_size() == 10
+}
+
+test "ObjectPool: max size limit" {
+    let pool = ObjectPool::init("TestPool", 5, 5)
+
+    // Acquire all
+    for i in 0..5 {
+        pool.acquire()
+    }
+
+    let id = pool.acquire()
+
+    assert id == null
+}
+
+test "ObjectPool: reset" {
+    let pool = ObjectPool::init("TestPool", 5, 10)
+
+    pool.acquire()
+    pool.reset()
+
+    assert pool.get_in_use_count() == 0
+    assert pool.get_available_count() == 0
+}
+
+test "SpatialHashGrid: init" {
+    let grid = SpatialHashGrid::init(10, 10, 5.0)
+
+    assert grid.width == 10
+    assert grid.height == 10
+    assert grid.cell_size == 5.0
+}
+
+test "SpatialHashGrid: insert" {
+    let grid = SpatialHashGrid::init(10, 10, 10.0)
+
+    grid.insert(1, 15.0, 25.0)
+
+    let count = grid.get_cell_count(1, 2)
+    assert count == 1
+}
+
+test "SpatialHashGrid: remove" {
+    let grid = SpatialHashGrid::init(10, 10, 10.0)
+
+    grid.insert(1, 15.0, 25.0)
+    grid.remove(1, 15.0, 25.0)
+
+    let count = grid.get_cell_count(1, 2)
+    assert count == 0
+}
+
+test "SpatialHashGrid: query radius" {
+    let grid = SpatialHashGrid::init(10, 10, 10.0)
+
+    grid.insert(1, 15.0, 15.0)
+    grid.insert(2, 25.0, 25.0)
+
+    let results = grid.query_radius(20.0, 20.0, 20.0)
+
+    assert results.count() > 0
+}
+
+test "SpatialHashGrid: clear all" {
+    let grid = SpatialHashGrid::init(10, 10, 10.0)
+
+    grid.insert(1, 15.0, 15.0)
+    grid.clear_all()
+
+    let count = grid.get_cell_count(1, 1)
+    assert count == 0
+}
+
+test "InstanceBatch: init" {
+    let batch = InstanceBatch::init(0, 100)
+
+    assert batch.model_id == 0
+    assert batch.max_instances == 100
+}
+
+test "InstanceBatch: add instance" {
+    let batch = InstanceBatch::init(0, 100)
+    let data = InstanceData::init(10.0, 0.0, 0.0, 0.0, 1.0)
+
+    let success = batch.add_instance(data)
+
+    assert success
+    assert batch.get_count() == 1
+}
+
+test "InstanceBatch: is full" {
+    let batch = InstanceBatch::init(0, 2)
+
+    let data1 = InstanceData::init(10.0, 0.0, 0.0, 0.0, 1.0)
+    let data2 = InstanceData::init(20.0, 0.0, 0.0, 0.0, 1.0)
+
+    batch.add_instance(data1)
+    batch.add_instance(data2)
+
+    assert batch.is_full()
+}
+
+test "InstanceBatch: clear" {
+    let batch = InstanceBatch::init(0, 100)
+    let data = InstanceData::init(10.0, 0.0, 0.0, 0.0, 1.0)
+
+    batch.add_instance(data)
+    batch.clear()
+
+    assert batch.get_count() == 0
+}
+
+test "FrameBudgetManager: init" {
+    let manager = FrameBudgetManager::init(60.0)
+
+    assert manager.target_fps == 60.0
+    assert manager.target_frame_time_ms > 16.0 && manager.target_frame_time_ms < 17.0
+}
+
+test "FrameBudgetManager: set scope budget" {
+    let manager = FrameBudgetManager::init(60.0)
+
+    manager.set_scope_budget(ProfileScope::UPDATE, 0.5)
+
+    assert manager.budgets.count() == 1
+}
+
+test "FrameBudgetManager: is over budget" {
+    let manager = FrameBudgetManager::init(60.0)
+
+    manager.set_scope_budget(ProfileScope::UPDATE, 0.5)
+
+    assert !manager.is_over_budget(ProfileScope::UPDATE, 5.0)
+    assert manager.is_over_budget(ProfileScope::UPDATE, 20.0)
+}
+
+test "FrameBudgetManager: get remaining time" {
+    let manager = FrameBudgetManager::init(60.0)
+
+    manager.update_frame_time(10.0)
+
+    let remaining = manager.get_remaining_time()
+
+    assert remaining > 0.0
+}
+
+test "FrameBudgetManager: is frame over budget" {
+    let manager = FrameBudgetManager::init(60.0)
+
+    manager.update_frame_time(20.0)
+
+    assert !manager.is_frame_over_budget()
+
+    manager.update_frame_time(100.0)
+
+    assert manager.is_frame_over_budget()
+}
+
+test "MemoryProfiler: init" {
+    let profiler = MemoryProfiler::init()
+
+    assert profiler.total_allocated_mb == 0.0
+    assert profiler.peak_allocated_mb == 0.0
+}
+
+test "MemoryProfiler: record allocation" {
+    let profiler = MemoryProfiler::init()
+
+    profiler.record_allocation(1048576, "textures")
+
+    assert profiler.get_total_allocated() == 1.0
+}
+
+test "MemoryProfiler: record deallocation" {
+    let profiler = MemoryProfiler::init()
+
+    profiler.record_allocation(2097152, "models")
+    profiler.record_deallocation(1048576)
+
+    assert profiler.get_total_allocated() == 1.0
+}
+
+test "MemoryProfiler: get allocation by category" {
+    let profiler = MemoryProfiler::init()
+
+    profiler.record_allocation(1048576, "textures")
+    profiler.record_allocation(1048576, "models")
+
+    let textures_mb = profiler.get_allocation_by_category("textures")
+
+    assert textures_mb == 1.0
+}
+
+test "MemoryProfiler: peak allocated" {
+    let profiler = MemoryProfiler::init()
+
+    profiler.record_allocation(2097152, "test")
+    profiler.record_deallocation(1048576)
+
+    assert profiler.get_peak_allocated() == 2.0
+}
+
+test "PerformanceOptimizer: init" {
+    let optimizer = PerformanceOptimizer::init(60.0)
+
+    assert optimizer.get_pool_count() == 0
+}
+
+test "PerformanceOptimizer: create pool" {
+    let optimizer = PerformanceOptimizer::init(60.0)
+
+    let pool_id = optimizer.create_pool("UnitPool", 50, 500)
+
+    assert pool_id == 0
+    assert optimizer.get_pool_count() == 1
+}
+
+test "PerformanceOptimizer: get pool" {
+    let optimizer = PerformanceOptimizer::init(60.0)
+
+    let pool_id = optimizer.create_pool("UnitPool", 50, 500)
+    let pool = optimizer.get_pool(pool_id)
+
+    assert pool != null
+}
+
+test "PerformanceOptimizer: begin and end frame" {
+    let optimizer = PerformanceOptimizer::init(60.0)
+
+    optimizer.begin_frame()
+    optimizer.end_frame()
+
+    let metrics = optimizer.get_metrics()
+    assert metrics.frame_time_ms >= 0.0
+}
+
+test "PerformanceMetrics: init" {
+    let metrics = PerformanceMetrics::init()
+
+    assert metrics.fps == 0.0
+    assert metrics.draw_calls == 0
+}

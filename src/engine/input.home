@@ -1,0 +1,815 @@
+// Input system for C&C Generals Zero Hour
+// Keyboard, mouse, hotkeys, camera controls
+// Written in Home language
+
+// Key codes
+enum KeyCode {
+    // Letters
+    A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7,
+    I = 8, J = 9, K = 10, L = 11, M = 12, N = 13, O = 14, P = 15,
+    Q = 16, R = 17, S = 18, T = 19, U = 20, V = 21, W = 22, X = 23,
+    Y = 24, Z = 25,
+
+    // Numbers
+    NUM0 = 26, NUM1 = 27, NUM2 = 28, NUM3 = 29, NUM4 = 30,
+    NUM5 = 31, NUM6 = 32, NUM7 = 33, NUM8 = 34, NUM9 = 35,
+
+    // Special
+    SPACE = 36,
+    ENTER = 37,
+    ESCAPE = 38,
+    SHIFT = 39,
+    CONTROL = 40,
+    ALT = 41,
+    TAB = 42,
+    BACKSPACE = 43,
+    DELETE = 44,
+
+    // Function keys
+    F1 = 45, F2 = 46, F3 = 47, F4 = 48,
+    F5 = 49, F6 = 50, F7 = 51, F8 = 52,
+    F9 = 53, F10 = 54, F11 = 55, F12 = 56,
+
+    // Arrow keys
+    UP = 57,
+    DOWN = 58,
+    LEFT = 59,
+    RIGHT = 60,
+}
+
+// Mouse buttons
+enum MouseButton {
+    LEFT = 0,
+    RIGHT = 1,
+    MIDDLE = 2,
+}
+
+// Mouse state
+struct MouseState {
+    position: Vec2,
+    delta: Vec2,
+    scroll_delta: Float,
+    left_button_down: Bool,
+    right_button_down: Bool,
+    middle_button_down: Bool,
+
+    fn init() -> MouseState {
+        return MouseState {
+            position: Vec2::init(0.0, 0.0),
+            delta: Vec2::init(0.0, 0.0),
+            scroll_delta: 0.0,
+            left_button_down: false,
+            right_button_down: false,
+            middle_button_down: false,
+        }
+    }
+
+    fn update_position(self, x: Float, y: Float) {
+        self.delta.x = x - self.position.x
+        self.delta.y = y - self.position.y
+        self.position.x = x
+        self.position.y = y
+    }
+
+    fn set_button(self, button: MouseButton, pressed: Bool) {
+        match button {
+            MouseButton::LEFT => self.left_button_down = pressed,
+            MouseButton::RIGHT => self.right_button_down = pressed,
+            MouseButton::MIDDLE => self.middle_button_down = pressed,
+        }
+    }
+
+    fn is_button_down(self, button: MouseButton) -> Bool {
+        return match button {
+            MouseButton::LEFT => self.left_button_down,
+            MouseButton::RIGHT => self.right_button_down,
+            MouseButton::MIDDLE => self.middle_button_down,
+        }
+    }
+
+    fn reset_delta(self) {
+        self.delta = Vec2::init(0.0, 0.0)
+        self.scroll_delta = 0.0
+    }
+}
+
+// Keyboard state
+struct KeyboardState {
+    keys_down: Collection<KeyCode>,
+    keys_pressed_this_frame: Collection<KeyCode>,
+    keys_released_this_frame: Collection<KeyCode>,
+    shift_down: Bool,
+    control_down: Bool,
+    alt_down: Bool,
+
+    fn init() -> KeyboardState {
+        return KeyboardState {
+            keys_down: Collection::new(),
+            keys_pressed_this_frame: Collection::new(),
+            keys_released_this_frame: Collection::new(),
+            shift_down: false,
+            control_down: false,
+            alt_down: false,
+        }
+    }
+
+    fn press_key(self, key: KeyCode) {
+        if !self.is_key_down(key) {
+            self.keys_down.add(key)
+            self.keys_pressed_this_frame.add(key)
+        }
+
+        self.update_modifiers(key, true)
+    }
+
+    fn release_key(self, key: KeyCode) {
+        for i in 0..self.keys_down.count() {
+            if self.keys_down.get(i) == key {
+                self.keys_down.remove(i)
+                self.keys_released_this_frame.add(key)
+                break
+            }
+        }
+
+        self.update_modifiers(key, false)
+    }
+
+    fn update_modifiers(self, key: KeyCode, pressed: Bool) {
+        match key {
+            KeyCode::SHIFT => self.shift_down = pressed,
+            KeyCode::CONTROL => self.control_down = pressed,
+            KeyCode::ALT => self.alt_down = pressed,
+            _ => {},
+        }
+    }
+
+    fn is_key_down(self, key: KeyCode) -> Bool {
+        for k in self.keys_down {
+            if k == key {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn was_key_pressed(self, key: KeyCode) -> Bool {
+        for k in self.keys_pressed_this_frame {
+            if k == key {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn was_key_released(self, key: KeyCode) -> Bool {
+        for k in self.keys_released_this_frame {
+            if k == key {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn clear_frame_state(self) {
+        self.keys_pressed_this_frame.clear()
+        self.keys_released_this_frame.clear()
+    }
+}
+
+// Hotkey binding
+struct Hotkey {
+    key: KeyCode,
+    requires_shift: Bool,
+    requires_control: Bool,
+    requires_alt: Bool,
+    action: String,
+
+    fn init(key: KeyCode, action: String) -> Hotkey {
+        return Hotkey {
+            key: key,
+            requires_shift: false,
+            requires_control: false,
+            requires_alt: false,
+            action: action,
+        }
+    }
+
+    fn set_modifiers(self, shift: Bool, control: Bool, alt: Bool) {
+        self.requires_shift = shift
+        self.requires_control = control
+        self.requires_alt = alt
+    }
+
+    fn matches(self, keyboard: KeyboardState) -> Bool {
+        if !keyboard.is_key_down(self.key) {
+            return false
+        }
+
+        if self.requires_shift != keyboard.shift_down {
+            return false
+        }
+
+        if self.requires_control != keyboard.control_down {
+            return false
+        }
+
+        if self.requires_alt != keyboard.alt_down {
+            return false
+        }
+
+        return true
+    }
+}
+
+// Camera controller
+struct CameraController {
+    move_speed: Float,
+    rotate_speed: Float,
+    zoom_speed: Float,
+    edge_scroll_margin: Float,
+    is_edge_scroll_enabled: Bool,
+
+    fn init() -> CameraController {
+        return CameraController {
+            move_speed: 500.0,
+            rotate_speed: 90.0,
+            zoom_speed: 100.0,
+            edge_scroll_margin: 20.0,
+            is_edge_scroll_enabled: true,
+        }
+    }
+
+    fn update(self, keyboard: KeyboardState, mouse: MouseState, delta_time: Float, screen_width: Float, screen_height: Float) -> CameraMovement {
+        let movement = CameraMovement::init()
+
+        // Keyboard movement (WASD)
+        if keyboard.is_key_down(KeyCode::W) || keyboard.is_key_down(KeyCode::UP) {
+            movement.forward = self.move_speed * delta_time
+        }
+
+        if keyboard.is_key_down(KeyCode::S) || keyboard.is_key_down(KeyCode::DOWN) {
+            movement.backward = self.move_speed * delta_time
+        }
+
+        if keyboard.is_key_down(KeyCode::A) || keyboard.is_key_down(KeyCode::LEFT) {
+            movement.left = self.move_speed * delta_time
+        }
+
+        if keyboard.is_key_down(KeyCode::D) || keyboard.is_key_down(KeyCode::RIGHT) {
+            movement.right = self.move_speed * delta_time
+        }
+
+        // Edge scrolling
+        if self.is_edge_scroll_enabled {
+            if mouse.position.x < self.edge_scroll_margin {
+                movement.left = movement.left + (self.move_speed * delta_time)
+            }
+
+            if mouse.position.x > screen_width - self.edge_scroll_margin {
+                movement.right = movement.right + (self.move_speed * delta_time)
+            }
+
+            if mouse.position.y < self.edge_scroll_margin {
+                movement.forward = movement.forward + (self.move_speed * delta_time)
+            }
+
+            if mouse.position.y > screen_height - self.edge_scroll_margin {
+                movement.backward = movement.backward + (self.move_speed * delta_time)
+            }
+        }
+
+        // Rotation (Q/E keys)
+        if keyboard.is_key_down(KeyCode::Q) {
+            movement.rotate_left = self.rotate_speed * delta_time
+        }
+
+        if keyboard.is_key_down(KeyCode::E) {
+            movement.rotate_right = self.rotate_speed * delta_time
+        }
+
+        // Zoom (mouse wheel)
+        if mouse.scroll_delta != 0.0 {
+            movement.zoom = mouse.scroll_delta * self.zoom_speed
+        }
+
+        return movement
+    }
+}
+
+struct CameraMovement {
+    forward: Float,
+    backward: Float,
+    left: Float,
+    right: Float,
+    rotate_left: Float,
+    rotate_right: Float,
+    zoom: Float,
+
+    fn init() -> CameraMovement {
+        return CameraMovement {
+            forward: 0.0,
+            backward: 0.0,
+            left: 0.0,
+            right: 0.0,
+            rotate_left: 0.0,
+            rotate_right: 0.0,
+            zoom: 0.0,
+        }
+    }
+
+    fn has_movement(self) -> Bool {
+        return self.forward != 0.0 || self.backward != 0.0 ||
+               self.left != 0.0 || self.right != 0.0 ||
+               self.rotate_left != 0.0 || self.rotate_right != 0.0 ||
+               self.zoom != 0.0
+    }
+}
+
+// Selection rectangle
+struct SelectionBox {
+    start_position: Vec2,
+    end_position: Vec2,
+    is_active: Bool,
+
+    fn init() -> SelectionBox {
+        return SelectionBox {
+            start_position: Vec2::init(0.0, 0.0),
+            end_position: Vec2::init(0.0, 0.0),
+            is_active: false,
+        }
+    }
+
+    fn start(self, position: Vec2) {
+        self.start_position = position
+        self.end_position = position
+        self.is_active = true
+    }
+
+    fn update(self, position: Vec2) {
+        self.end_position = position
+    }
+
+    fn end(self) {
+        self.is_active = false
+    }
+
+    fn get_min_x(self) -> Float {
+        return min_float(self.start_position.x, self.end_position.x)
+    }
+
+    fn get_min_y(self) -> Float {
+        return min_float(self.start_position.y, self.end_position.y)
+    }
+
+    fn get_max_x(self) -> Float {
+        return max_float(self.start_position.x, self.end_position.x)
+    }
+
+    fn get_max_y(self) -> Float {
+        return max_float(self.start_position.y, self.end_position.y)
+    }
+
+    fn get_width(self) -> Float {
+        return abs(self.end_position.x - self.start_position.x)
+    }
+
+    fn get_height(self) -> Float {
+        return abs(self.end_position.y - self.start_position.y)
+    }
+
+    fn contains_point(self, x: Float, y: Float) -> Bool {
+        return x >= self.get_min_x() && x <= self.get_max_x() &&
+               y >= self.get_min_y() && y <= self.get_max_y()
+    }
+}
+
+// Input manager
+struct InputManager {
+    keyboard: KeyboardState,
+    mouse: MouseState,
+    camera_controller: CameraController,
+    hotkeys: Collection<Hotkey>,
+    selection_box: SelectionBox,
+    screen_width: Float,
+    screen_height: Float,
+
+    fn init(screen_width: Float, screen_height: Float) -> InputManager {
+        return InputManager {
+            keyboard: KeyboardState::init(),
+            mouse: MouseState::init(),
+            camera_controller: CameraController::init(),
+            hotkeys: Collection::new(),
+            selection_box: SelectionBox::init(),
+            screen_width: screen_width,
+            screen_height: screen_height,
+        }
+    }
+
+    fn register_hotkey(self, hotkey: Hotkey) {
+        self.hotkeys.add(hotkey)
+    }
+
+    fn on_key_down(self, key: KeyCode) {
+        self.keyboard.press_key(key)
+    }
+
+    fn on_key_up(self, key: KeyCode) {
+        self.keyboard.release_key(key)
+    }
+
+    fn on_mouse_move(self, x: Float, y: Float) {
+        self.mouse.update_position(x, y)
+
+        if self.selection_box.is_active {
+            self.selection_box.update(Vec2::init(x, y))
+        }
+    }
+
+    fn on_mouse_button_down(self, button: MouseButton) {
+        self.mouse.set_button(button, true)
+
+        if button == MouseButton::LEFT {
+            self.selection_box.start(self.mouse.position)
+        }
+    }
+
+    fn on_mouse_button_up(self, button: MouseButton) {
+        self.mouse.set_button(button, false)
+
+        if button == MouseButton::LEFT && self.selection_box.is_active {
+            self.selection_box.end()
+        }
+    }
+
+    fn on_mouse_scroll(self, delta: Float) {
+        self.mouse.scroll_delta = delta
+    }
+
+    fn update(self, delta_time: Float) -> InputState {
+        let state = InputState::init()
+
+        // Check hotkeys
+        for hotkey in self.hotkeys {
+            if hotkey.matches(self.keyboard) {
+                state.triggered_actions.add(hotkey.action)
+            }
+        }
+
+        // Update camera
+        state.camera_movement = self.camera_controller.update(
+            self.keyboard,
+            self.mouse,
+            delta_time,
+            self.screen_width,
+            self.screen_height
+        )
+
+        // Check for clicks
+        if self.mouse.left_button_down {
+            state.left_click_position = self.mouse.position
+        }
+
+        if self.mouse.right_button_down {
+            state.right_click_position = self.mouse.position
+        }
+
+        return state
+    }
+
+    fn end_frame(self) {
+        self.keyboard.clear_frame_state()
+        self.mouse.reset_delta()
+    }
+
+    fn is_selection_active(self) -> Bool {
+        return self.selection_box.is_active
+    }
+
+    fn get_selection_box(self) -> SelectionBox {
+        return self.selection_box
+    }
+}
+
+// Input state for this frame
+struct InputState {
+    triggered_actions: Collection<String>,
+    camera_movement: CameraMovement,
+    left_click_position: Vec2?,
+    right_click_position: Vec2?,
+
+    fn init() -> InputState {
+        return InputState {
+            triggered_actions: Collection::new(),
+            camera_movement: CameraMovement::init(),
+            left_click_position: null,
+            right_click_position: null,
+        }
+    }
+
+    fn has_action(self, action: String) -> Bool {
+        for a in self.triggered_actions {
+            if a == action {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Helper structs
+struct Vec2 {
+    x: Float,
+    y: Float,
+
+    fn init(x: Float, y: Float) -> Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+}
+
+// Helper functions
+fn min_float(a: Float, b: Float) -> Float {
+    if a < b { return a } else { return b }
+}
+
+fn max_float(a: Float, b: Float) -> Float {
+    if a > b { return a } else { return b }
+}
+
+fn abs(x: Float) -> Float {
+    if x < 0.0 { return -x } else { return x }
+}
+
+// Tests
+test "MouseState: init" {
+    let mouse = MouseState::init()
+
+    assert mouse.position.x == 0.0
+    assert !mouse.left_button_down
+    assert mouse.scroll_delta == 0.0
+}
+
+test "MouseState: position update" {
+    let mouse = MouseState::init()
+
+    mouse.update_position(100.0, 200.0)
+    assert mouse.position.x == 100.0
+    assert mouse.position.y == 200.0
+    assert mouse.delta.x == 100.0
+
+    mouse.update_position(150.0, 250.0)
+    assert mouse.delta.x == 50.0
+    assert mouse.delta.y == 50.0
+}
+
+test "MouseState: button states" {
+    let mouse = MouseState::init()
+
+    mouse.set_button(MouseButton::LEFT, true)
+    assert mouse.is_button_down(MouseButton::LEFT)
+    assert !mouse.is_button_down(MouseButton::RIGHT)
+
+    mouse.set_button(MouseButton::LEFT, false)
+    assert !mouse.is_button_down(MouseButton::LEFT)
+}
+
+test "KeyboardState: press and release" {
+    let keyboard = KeyboardState::init()
+
+    keyboard.press_key(KeyCode::A)
+    assert keyboard.is_key_down(KeyCode::A)
+    assert keyboard.was_key_pressed(KeyCode::A)
+
+    keyboard.release_key(KeyCode::A)
+    assert !keyboard.is_key_down(KeyCode::A)
+    assert keyboard.was_key_released(KeyCode::A)
+}
+
+test "KeyboardState: modifiers" {
+    let keyboard = KeyboardState::init()
+
+    keyboard.press_key(KeyCode::SHIFT)
+    assert keyboard.shift_down
+
+    keyboard.press_key(KeyCode::CONTROL)
+    assert keyboard.control_down
+
+    keyboard.release_key(KeyCode::SHIFT)
+    assert !keyboard.shift_down
+}
+
+test "KeyboardState: clear frame state" {
+    let keyboard = KeyboardState::init()
+
+    keyboard.press_key(KeyCode::W)
+    assert keyboard.was_key_pressed(KeyCode::W)
+
+    keyboard.clear_frame_state()
+    assert !keyboard.was_key_pressed(KeyCode::W)
+    assert keyboard.is_key_down(KeyCode::W)  // Still down
+}
+
+test "Hotkey: init and match" {
+    let hotkey = Hotkey::init(KeyCode::B, "build_barracks")
+
+    assert hotkey.action == "build_barracks"
+    assert hotkey.key == KeyCode::B
+}
+
+test "Hotkey: match with modifiers" {
+    let hotkey = Hotkey::init(KeyCode::S, "save_game")
+    hotkey.set_modifiers(false, true, false)  // Ctrl+S
+
+    let keyboard = KeyboardState::init()
+    keyboard.press_key(KeyCode::CONTROL)
+    keyboard.press_key(KeyCode::S)
+
+    assert hotkey.matches(keyboard)
+}
+
+test "Hotkey: no match without modifiers" {
+    let hotkey = Hotkey::init(KeyCode::S, "save_game")
+    hotkey.set_modifiers(false, true, false)  // Requires Ctrl
+
+    let keyboard = KeyboardState::init()
+    keyboard.press_key(KeyCode::S)  // Just S, no Ctrl
+
+    assert !hotkey.matches(keyboard)
+}
+
+test "CameraController: init" {
+    let controller = CameraController::init()
+
+    assert controller.move_speed == 500.0
+    assert controller.is_edge_scroll_enabled
+}
+
+test "CameraController: keyboard movement" {
+    let controller = CameraController::init()
+    let keyboard = KeyboardState::init()
+    let mouse = MouseState::init()
+
+    keyboard.press_key(KeyCode::W)
+
+    let movement = controller.update(keyboard, mouse, 0.1, 1920.0, 1080.0)
+
+    assert movement.forward > 0.0
+    assert movement.has_movement()
+}
+
+test "CameraController: rotation" {
+    let controller = CameraController::init()
+    let keyboard = KeyboardState::init()
+    let mouse = MouseState::init()
+
+    keyboard.press_key(KeyCode::Q)
+
+    let movement = controller.update(keyboard, mouse, 0.1, 1920.0, 1080.0)
+
+    assert movement.rotate_left > 0.0
+}
+
+test "SelectionBox: init" {
+    let box = SelectionBox::init()
+
+    assert !box.is_active
+}
+
+test "SelectionBox: start and update" {
+    let box = SelectionBox::init()
+
+    box.start(Vec2::init(100.0, 100.0))
+    assert box.is_active
+    assert box.start_position.x == 100.0
+
+    box.update(Vec2::init(200.0, 200.0))
+    assert box.end_position.x == 200.0
+
+    box.end()
+    assert !box.is_active
+}
+
+test "SelectionBox: dimensions" {
+    let box = SelectionBox::init()
+
+    box.start(Vec2::init(100.0, 100.0))
+    box.update(Vec2::init(200.0, 250.0))
+
+    assert box.get_width() == 100.0
+    assert box.get_height() == 150.0
+    assert box.get_min_x() == 100.0
+    assert box.get_max_x() == 200.0
+}
+
+test "SelectionBox: contains point" {
+    let box = SelectionBox::init()
+
+    box.start(Vec2::init(100.0, 100.0))
+    box.update(Vec2::init(200.0, 200.0))
+
+    assert box.contains_point(150.0, 150.0)
+    assert !box.contains_point(50.0, 50.0)
+    assert !box.contains_point(250.0, 150.0)
+}
+
+test "InputManager: init" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    assert manager.screen_width == 1920.0
+    assert manager.hotkeys.count() == 0
+}
+
+test "InputManager: register hotkey" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    let hotkey = Hotkey::init(KeyCode::B, "build")
+    manager.register_hotkey(hotkey)
+
+    assert manager.hotkeys.count() == 1
+}
+
+test "InputManager: key events" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    manager.on_key_down(KeyCode::W)
+    assert manager.keyboard.is_key_down(KeyCode::W)
+
+    manager.on_key_up(KeyCode::W)
+    assert !manager.keyboard.is_key_down(KeyCode::W)
+}
+
+test "InputManager: mouse events" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    manager.on_mouse_move(100.0, 200.0)
+    assert manager.mouse.position.x == 100.0
+
+    manager.on_mouse_button_down(MouseButton::LEFT)
+    assert manager.mouse.left_button_down
+
+    manager.on_mouse_button_up(MouseButton::LEFT)
+    assert !manager.mouse.left_button_down
+}
+
+test "InputManager: selection box" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    manager.on_mouse_move(100.0, 100.0)
+    manager.on_mouse_button_down(MouseButton::LEFT)
+
+    assert manager.is_selection_active()
+
+    manager.on_mouse_move(200.0, 200.0)
+    manager.on_mouse_button_up(MouseButton::LEFT)
+
+    assert !manager.is_selection_active()
+}
+
+test "InputManager: update and actions" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    let hotkey = Hotkey::init(KeyCode::A, "attack_move")
+    manager.register_hotkey(hotkey)
+
+    manager.on_key_down(KeyCode::A)
+
+    let state = manager.update(0.016)
+    assert state.has_action("attack_move")
+}
+
+test "InputManager: end frame" {
+    let manager = InputManager::init(1920.0, 1080.0)
+
+    manager.on_key_down(KeyCode::W)
+    manager.keyboard.clear_frame_state()
+
+    manager.end_frame()
+
+    assert manager.mouse.delta.x == 0.0
+    assert manager.mouse.scroll_delta == 0.0
+}
+
+test "InputState: init" {
+    let state = InputState::init()
+
+    assert state.triggered_actions.count() == 0
+    assert !state.camera_movement.has_movement()
+}
+
+test "InputState: has action" {
+    let state = InputState::init()
+
+    state.triggered_actions.add("build")
+    state.triggered_actions.add("attack")
+
+    assert state.has_action("build")
+    assert !state.has_action("defend")
+}
+
+test "CameraMovement: has movement" {
+    let movement = CameraMovement::init()
+
+    assert !movement.has_movement()
+
+    movement.forward = 10.0
+    assert movement.has_movement()
+}

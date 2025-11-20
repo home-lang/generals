@@ -259,7 +259,7 @@ pub const EntityManager = struct {
     pub fn init(allocator: Allocator) !EntityManager {
         return .{
             .allocator = allocator,
-            .entities = try std.ArrayList(Entity).initCapacity(allocator, 0),
+            .entities = std.ArrayList(Entity){},
             .next_id = 1,
         };
     }

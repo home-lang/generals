@@ -1,0 +1,745 @@
+// Effects system for C&C Generals Zero Hour
+// Visual effects, decals, projectile trails, explosions
+// Written in Home language
+
+// Effect types
+enum EffectType {
+    EXPLOSION = 0,
+    SMOKE = 1,
+    FIRE = 2,
+    PROJECTILE_TRAIL = 3,
+    MUZZLE_FLASH = 4,
+    IMPACT = 5,
+    DEBRIS = 6,
+    WEATHER = 7,
+    BEAM = 8,
+    SHOCKWAVE = 9,
+}
+
+// Effect lifecycle
+enum EffectLifecycle {
+    SPAWNING = 0,
+    ACTIVE = 1,
+    FADING = 2,
+    DEAD = 3,
+}
+
+// Single effect instance
+struct Effect {
+    id: Int,
+    effect_type: EffectType,
+    lifecycle: EffectLifecycle,
+    position: Vec3,
+    velocity: Vec3,
+    scale: Float,
+    rotation: Float,
+    age: Float,
+    lifetime: Float,
+    alpha: Float,
+
+    fn init(id: Int, effect_type: EffectType, position: Vec3) -> Effect {
+        return Effect {
+            id: id,
+            effect_type: effect_type,
+            lifecycle: EffectLifecycle::SPAWNING,
+            position: position,
+            velocity: Vec3::init(0.0, 0.0, 0.0),
+            scale: 1.0,
+            rotation: 0.0,
+            age: 0.0,
+            lifetime: 1.0,
+            alpha: 1.0,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.age = self.age + delta_time
+
+        // Update position
+        self.position.x = self.position.x + (self.velocity.x * delta_time)
+        self.position.y = self.position.y + (self.velocity.y * delta_time)
+        self.position.z = self.position.z + (self.velocity.z * delta_time)
+
+        // Update lifecycle
+        if self.age >= self.lifetime {
+            self.lifecycle = EffectLifecycle::DEAD
+        } else if self.age >= self.lifetime * 0.8 {
+            self.lifecycle = EffectLifecycle::FADING
+            self.alpha = 1.0 - ((self.age - (self.lifetime * 0.8)) / (self.lifetime * 0.2))
+        } else if self.age >= self.lifetime * 0.1 {
+            self.lifecycle = EffectLifecycle::ACTIVE
+        }
+    }
+
+    fn is_dead(self) -> Bool {
+        return self.lifecycle == EffectLifecycle::DEAD
+    }
+
+    fn get_life_percentage(self) -> Float {
+        if self.lifetime == 0.0 {
+            return 0.0
+        }
+        return (self.age / self.lifetime) * 100.0
+    }
+}
+
+// Decal for ground marks
+struct Decal {
+    id: Int,
+    position: Vec3,
+    size: Float,
+    rotation: Float,
+    alpha: Float,
+    texture_name: String,
+    age: Float,
+    lifetime: Float,
+
+    fn init(id: Int, position: Vec3, texture_name: String) -> Decal {
+        return Decal {
+            id: id,
+            position: position,
+            size: 2.0,
+            rotation: 0.0,
+            alpha: 1.0,
+            texture_name: texture_name,
+            age: 0.0,
+            lifetime: 30.0,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.age = self.age + delta_time
+
+        // Fade out over lifetime
+        if self.age >= self.lifetime * 0.7 {
+            let fade_duration = self.lifetime * 0.3
+            let fade_age = self.age - (self.lifetime * 0.7)
+            self.alpha = 1.0 - (fade_age / fade_duration)
+        }
+    }
+
+    fn is_expired(self) -> Bool {
+        return self.age >= self.lifetime
+    }
+}
+
+// Projectile trail
+struct ProjectileTrail {
+    segments: Collection<TrailSegment>,
+    max_segments: Int,
+    segment_lifetime: Float,
+    color: Color,
+
+    fn init(max_segments: Int) -> ProjectileTrail {
+        return ProjectileTrail {
+            segments: Collection::new(),
+            max_segments: max_segments,
+            segment_lifetime: 0.5,
+            color: Color::init(1.0, 1.0, 1.0, 1.0),
+        }
+    }
+
+    fn add_segment(self, position: Vec3) {
+        let segment = TrailSegment::init(position)
+        self.segments.add(segment)
+
+        // Remove oldest if over limit
+        if self.segments.count() > self.max_segments {
+            self.segments.remove(0)
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        // Update all segments
+        for segment in self.segments {
+            segment.update(delta_time)
+        }
+
+        // Remove dead segments
+        let mut i = 0
+        while i < self.segments.count() {
+            let segment = self.segments.get(i)
+            if segment.age >= self.segment_lifetime {
+                self.segments.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    fn get_segment_count(self) -> Int {
+        return self.segments.count()
+    }
+
+    fn clear(self) {
+        self.segments.clear()
+    }
+}
+
+struct TrailSegment {
+    position: Vec3,
+    age: Float,
+
+    fn init(position: Vec3) -> TrailSegment {
+        return TrailSegment {
+            position: position,
+            age: 0.0,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.age = self.age + delta_time
+    }
+}
+
+// Beam effect (for laser weapons)
+struct BeamEffect {
+    id: Int,
+    start_position: Vec3,
+    end_position: Vec3,
+    width: Float,
+    color: Color,
+    intensity: Float,
+    age: Float,
+    lifetime: Float,
+
+    fn init(id: Int, start_pos: Vec3, end_pos: Vec3) -> BeamEffect {
+        return BeamEffect {
+            id: id,
+            start_position: start_pos,
+            end_position: end_pos,
+            width: 0.5,
+            color: Color::init(1.0, 0.0, 0.0, 1.0),
+            intensity: 1.0,
+            age: 0.0,
+            lifetime: 0.2,
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        self.age = self.age + delta_time
+
+        // Fade intensity
+        self.intensity = 1.0 - (self.age / self.lifetime)
+    }
+
+    fn is_expired(self) -> Bool {
+        return self.age >= self.lifetime
+    }
+
+    fn get_length(self) -> Float {
+        return Vec3::distance(self.start_position, self.end_position)
+    }
+}
+
+// Explosion template
+struct ExplosionTemplate {
+    name: String,
+    effect_type: EffectType,
+    lifetime: Float,
+    max_scale: Float,
+    damage_radius: Float,
+    particle_count: Int,
+    light_intensity: Float,
+    sound_name: String,
+
+    fn init(name: String) -> ExplosionTemplate {
+        return ExplosionTemplate {
+            name: name,
+            effect_type: EffectType::EXPLOSION,
+            lifetime: 1.0,
+            max_scale: 5.0,
+            damage_radius: 10.0,
+            particle_count: 50,
+            light_intensity: 1.0,
+            sound_name: "explosion_medium.wav",
+        }
+    }
+
+    fn create_effect(self, id: Int, position: Vec3) -> Effect {
+        let effect = Effect::init(id, self.effect_type, position)
+        effect.lifetime = self.lifetime
+        effect.scale = self.max_scale
+        return effect
+    }
+}
+
+// Effects manager
+struct EffectsManager {
+    effects: Collection<Effect>,
+    decals: Collection<Decal>,
+    beams: Collection<BeamEffect>,
+    trails: Collection<ProjectileTrail>,
+    explosion_templates: Collection<ExplosionTemplate>,
+    next_effect_id: Int,
+    next_decal_id: Int,
+    max_effects: Int,
+    max_decals: Int,
+
+    fn init() -> EffectsManager {
+        return EffectsManager {
+            effects: Collection::new(),
+            decals: Collection::new(),
+            beams: Collection::new(),
+            trails: Collection::new(),
+            explosion_templates: Collection::new(),
+            next_effect_id: 0,
+            next_decal_id: 0,
+            max_effects: 500,
+            max_decals: 100,
+        }
+    }
+
+    fn register_explosion_template(self, template: ExplosionTemplate) {
+        self.explosion_templates.add(template)
+    }
+
+    fn spawn_effect(self, effect_type: EffectType, position: Vec3) -> Int {
+        let effect = Effect::init(self.next_effect_id, effect_type, position)
+        self.next_effect_id = self.next_effect_id + 1
+
+        self.effects.add(effect)
+        self.limit_effects()
+
+        return effect.id
+    }
+
+    fn spawn_explosion(self, template_name: String, position: Vec3) -> Int {
+        for template in self.explosion_templates {
+            if template.name == template_name {
+                let effect = template.create_effect(self.next_effect_id, position)
+                self.next_effect_id = self.next_effect_id + 1
+
+                self.effects.add(effect)
+                return effect.id
+            }
+        }
+
+        // Fallback to basic explosion
+        return self.spawn_effect(EffectType::EXPLOSION, position)
+    }
+
+    fn spawn_decal(self, position: Vec3, texture_name: String) -> Int {
+        let decal = Decal::init(self.next_decal_id, position, texture_name)
+        self.next_decal_id = self.next_decal_id + 1
+
+        self.decals.add(decal)
+        self.limit_decals()
+
+        return decal.id
+    }
+
+    fn spawn_beam(self, start_pos: Vec3, end_pos: Vec3) -> Int {
+        let beam = BeamEffect::init(self.beams.count(), start_pos, end_pos)
+        self.beams.add(beam)
+        return beam.id
+    }
+
+    fn create_trail(self, max_segments: Int) -> Int {
+        let trail = ProjectileTrail::init(max_segments)
+        self.trails.add(trail)
+        return self.trails.count() - 1
+    }
+
+    fn update_trail(self, trail_id: Int, position: Vec3) {
+        if trail_id >= 0 && trail_id < self.trails.count() {
+            let trail = self.trails.get(trail_id)
+            trail.add_segment(position)
+        }
+    }
+
+    fn remove_trail(self, trail_id: Int) {
+        if trail_id >= 0 && trail_id < self.trails.count() {
+            self.trails.remove(trail_id)
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        // Update effects
+        let mut i = 0
+        while i < self.effects.count() {
+            let effect = self.effects.get(i)
+            effect.update(delta_time)
+
+            if effect.is_dead() {
+                self.effects.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+
+        // Update decals
+        i = 0
+        while i < self.decals.count() {
+            let decal = self.decals.get(i)
+            decal.update(delta_time)
+
+            if decal.is_expired() {
+                self.decals.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+
+        // Update beams
+        i = 0
+        while i < self.beams.count() {
+            let beam = self.beams.get(i)
+            beam.update(delta_time)
+
+            if beam.is_expired() {
+                self.beams.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+
+        // Update trails
+        for trail in self.trails {
+            trail.update(delta_time)
+        }
+    }
+
+    fn limit_effects(self) {
+        while self.effects.count() > self.max_effects {
+            self.effects.remove(0)
+        }
+    }
+
+    fn limit_decals(self) {
+        while self.decals.count() > self.max_decals {
+            self.decals.remove(0)
+        }
+    }
+
+    fn get_effect_count(self) -> Int {
+        return self.effects.count()
+    }
+
+    fn get_decal_count(self) -> Int {
+        return self.decals.count()
+    }
+
+    fn get_beam_count(self) -> Int {
+        return self.beams.count()
+    }
+
+    fn clear_all(self) {
+        self.effects.clear()
+        self.decals.clear()
+        self.beams.clear()
+        self.trails.clear()
+    }
+}
+
+// Helper structs
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn distance(a: Vec3, b: Vec3) -> Float {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dz = b.z - a.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+}
+
+struct Color {
+    r: Float,
+    g: Float,
+    b: Float,
+    a: Float,
+
+    fn init(r: Float, g: Float, b: Float, a: Float) -> Color {
+        return Color { r: r, g: g, b: b, a: a }
+    }
+}
+
+fn sqrt(x: Float) -> Float {
+    return x ** 0.5
+}
+
+// Tests
+test "Effect: init" {
+    let pos = Vec3::init(100.0, 0.0, 100.0)
+    let effect = Effect::init(0, EffectType::EXPLOSION, pos)
+
+    assert effect.id == 0
+    assert effect.effect_type == EffectType::EXPLOSION
+    assert effect.lifecycle == EffectLifecycle::SPAWNING
+    assert effect.position.x == 100.0
+}
+
+test "Effect: lifecycle" {
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let effect = Effect::init(0, EffectType::SMOKE, pos)
+    effect.lifetime = 1.0
+
+    assert effect.lifecycle == EffectLifecycle::SPAWNING
+
+    effect.update(0.2)
+    assert effect.lifecycle == EffectLifecycle::ACTIVE
+
+    effect.update(0.7)
+    assert effect.lifecycle == EffectLifecycle::FADING
+
+    effect.update(0.2)
+    assert effect.is_dead()
+}
+
+test "Effect: position update with velocity" {
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let effect = Effect::init(0, EffectType::DEBRIS, pos)
+    effect.velocity = Vec3::init(10.0, 5.0, 0.0)
+
+    effect.update(1.0)
+
+    assert effect.position.x == 10.0
+    assert effect.position.y == 5.0
+}
+
+test "Effect: get life percentage" {
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let effect = Effect::init(0, EffectType::FIRE, pos)
+    effect.lifetime = 2.0
+
+    effect.update(1.0)
+    assert effect.get_life_percentage() == 50.0
+}
+
+test "Decal: init" {
+    let pos = Vec3::init(50.0, 0.0, 50.0)
+    let decal = Decal::init(0, pos, "scorch_mark.tga")
+
+    assert decal.texture_name == "scorch_mark.tga"
+    assert decal.alpha == 1.0
+    assert !decal.is_expired()
+}
+
+test "Decal: fading" {
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let decal = Decal::init(0, pos, "crater.tga")
+    decal.lifetime = 10.0
+
+    decal.update(7.0)
+    assert decal.alpha == 1.0
+
+    decal.update(2.0)
+    assert decal.alpha < 1.0
+}
+
+test "Decal: expiration" {
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let decal = Decal::init(0, pos, "test.tga")
+    decal.lifetime = 1.0
+
+    decal.update(1.5)
+    assert decal.is_expired()
+}
+
+test "ProjectileTrail: init" {
+    let trail = ProjectileTrail::init(10)
+
+    assert trail.max_segments == 10
+    assert trail.get_segment_count() == 0
+}
+
+test "ProjectileTrail: add segments" {
+    let trail = ProjectileTrail::init(5)
+
+    trail.add_segment(Vec3::init(0.0, 0.0, 0.0))
+    trail.add_segment(Vec3::init(1.0, 0.0, 0.0))
+    trail.add_segment(Vec3::init(2.0, 0.0, 0.0))
+
+    assert trail.get_segment_count() == 3
+}
+
+test "ProjectileTrail: max segments limit" {
+    let trail = ProjectileTrail::init(3)
+
+    for i in 0..5 {
+        trail.add_segment(Vec3::init(i as Float, 0.0, 0.0))
+    }
+
+    assert trail.get_segment_count() == 3  // Limited
+}
+
+test "ProjectileTrail: segment expiration" {
+    let trail = ProjectileTrail::init(10)
+    trail.segment_lifetime = 0.5
+
+    trail.add_segment(Vec3::init(0.0, 0.0, 0.0))
+
+    trail.update(0.6)
+    assert trail.get_segment_count() == 0  // Expired
+}
+
+test "ProjectileTrail: clear" {
+    let trail = ProjectileTrail::init(10)
+
+    trail.add_segment(Vec3::init(0.0, 0.0, 0.0))
+    trail.add_segment(Vec3::init(1.0, 0.0, 0.0))
+
+    trail.clear()
+    assert trail.get_segment_count() == 0
+}
+
+test "BeamEffect: init" {
+    let start = Vec3::init(0.0, 0.0, 0.0)
+    let end = Vec3::init(10.0, 0.0, 0.0)
+    let beam = BeamEffect::init(0, start, end)
+
+    assert beam.intensity == 1.0
+    assert !beam.is_expired()
+}
+
+test "BeamEffect: length calculation" {
+    let start = Vec3::init(0.0, 0.0, 0.0)
+    let end = Vec3::init(10.0, 0.0, 0.0)
+    let beam = BeamEffect::init(0, start, end)
+
+    assert beam.get_length() == 10.0
+}
+
+test "BeamEffect: intensity fade" {
+    let start = Vec3::init(0.0, 0.0, 0.0)
+    let end = Vec3::init(10.0, 0.0, 0.0)
+    let beam = BeamEffect::init(0, start, end)
+    beam.lifetime = 1.0
+
+    beam.update(0.5)
+    assert beam.intensity == 0.5
+
+    beam.update(0.6)
+    assert beam.is_expired()
+}
+
+test "ExplosionTemplate: init" {
+    let template = ExplosionTemplate::init("SmallExplosion")
+
+    assert template.name == "SmallExplosion"
+    assert template.effect_type == EffectType::EXPLOSION
+    assert template.lifetime > 0.0
+}
+
+test "ExplosionTemplate: create effect" {
+    let template = ExplosionTemplate::init("BigExplosion")
+    template.lifetime = 2.0
+    template.max_scale = 10.0
+
+    let pos = Vec3::init(100.0, 0.0, 100.0)
+    let effect = template.create_effect(5, pos)
+
+    assert effect.id == 5
+    assert effect.lifetime == 2.0
+    assert effect.scale == 10.0
+}
+
+test "EffectsManager: init" {
+    let manager = EffectsManager::init()
+
+    assert manager.get_effect_count() == 0
+    assert manager.get_decal_count() == 0
+    assert manager.max_effects == 500
+}
+
+test "EffectsManager: spawn effect" {
+    let manager = EffectsManager::init()
+
+    let pos = Vec3::init(50.0, 0.0, 50.0)
+    let id = manager.spawn_effect(EffectType::EXPLOSION, pos)
+
+    assert id == 0
+    assert manager.get_effect_count() == 1
+}
+
+test "EffectsManager: spawn decal" {
+    let manager = EffectsManager::init()
+
+    let pos = Vec3::init(100.0, 0.0, 100.0)
+    let id = manager.spawn_decal(pos, "scorch.tga")
+
+    assert id == 0
+    assert manager.get_decal_count() == 1
+}
+
+test "EffectsManager: spawn beam" {
+    let manager = EffectsManager::init()
+
+    let start = Vec3::init(0.0, 0.0, 0.0)
+    let end = Vec3::init(10.0, 0.0, 0.0)
+    let id = manager.spawn_beam(start, end)
+
+    assert id >= 0
+    assert manager.get_beam_count() == 1
+}
+
+test "EffectsManager: create trail" {
+    let manager = EffectsManager::init()
+
+    let trail_id = manager.create_trail(10)
+
+    assert trail_id == 0
+
+    manager.update_trail(trail_id, Vec3::init(0.0, 0.0, 0.0))
+    manager.update_trail(trail_id, Vec3::init(1.0, 0.0, 0.0))
+}
+
+test "EffectsManager: update removes dead effects" {
+    let manager = EffectsManager::init()
+
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    manager.spawn_effect(EffectType::MUZZLE_FLASH, pos)
+
+    assert manager.get_effect_count() == 1
+
+    manager.update(2.0)  // Enough time to die
+    assert manager.get_effect_count() == 0
+}
+
+test "EffectsManager: register and use template" {
+    let manager = EffectsManager::init()
+
+    let template = ExplosionTemplate::init("TestExplosion")
+    template.lifetime = 5.0
+    manager.register_explosion_template(template)
+
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    let id = manager.spawn_explosion("TestExplosion", pos)
+
+    assert id >= 0
+    assert manager.get_effect_count() == 1
+}
+
+test "EffectsManager: limit effects" {
+    let manager = EffectsManager::init()
+    manager.max_effects = 3
+
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    for i in 0..5 {
+        manager.spawn_effect(EffectType::SMOKE, pos)
+    }
+
+    assert manager.get_effect_count() == 3  // Limited
+}
+
+test "EffectsManager: clear all" {
+    let manager = EffectsManager::init()
+
+    let pos = Vec3::init(0.0, 0.0, 0.0)
+    manager.spawn_effect(EffectType::EXPLOSION, pos)
+    manager.spawn_decal(pos, "test.tga")
+    manager.spawn_beam(pos, Vec3::init(10.0, 0.0, 0.0))
+
+    manager.clear_all()
+
+    assert manager.get_effect_count() == 0
+    assert manager.get_decal_count() == 0
+    assert manager.get_beam_count() == 0
+}

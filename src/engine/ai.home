@@ -1,0 +1,525 @@
+// AI decision making system for C&C Generals Zero Hour
+// Based on Thyme's AI system
+// Written in Home language
+
+import player
+import object
+
+// AI personality types
+enum AIPersonality {
+    AGGRESSIVE = 0,
+    DEFENSIVE = 1,
+    BALANCED = 2,
+    RUSH = 3,
+    TURTLE = 4,
+    ECONOMIC = 5,
+}
+
+// AI difficulty levels
+enum AIDifficulty {
+    EASY = 0,
+    MEDIUM = 1,
+    HARD = 2,
+    BRUTAL = 3,
+}
+
+// AI states
+enum AIState {
+    STARTING = 0,
+    BUILDING_BASE = 1,
+    EXPANDING = 2,
+    ATTACKING = 3,
+    DEFENDING = 4,
+    RETREATING = 5,
+}
+
+// Build order item
+struct BuildOrderItem {
+    building_type: String,
+    priority: Int,
+    min_money: Float,
+    min_power: Int,
+
+    fn init(building_type: String, priority: Int, min_money: Float, min_power: Int) -> BuildOrderItem {
+        return BuildOrderItem {
+            building_type: building_type,
+            priority: priority,
+            min_money: min_money,
+            min_power: min_power,
+        }
+    }
+}
+
+// Attack squad
+struct AttackSquad {
+    unit_ids: Collection<Int>,
+    target_position: Vec3?,
+    is_active: Bool,
+    strength: Float,
+
+    fn init() -> AttackSquad {
+        return AttackSquad {
+            unit_ids: Collection::new(),
+            target_position: null,
+            is_active: false,
+            strength: 0.0,
+        }
+    }
+
+    fn add_unit(self, unit_id: Int, unit_strength: Float) {
+        self.unit_ids.add(unit_id)
+        self.strength = self.strength + unit_strength
+    }
+
+    fn remove_unit(self, unit_id: Int, unit_strength: Float) {
+        let new_units = Collection::new()
+        for id in self.unit_ids {
+            if id != unit_id {
+                new_units.add(id)
+            }
+        }
+        self.unit_ids = new_units
+        self.strength = self.strength - unit_strength
+    }
+
+    fn get_size(self) -> Int {
+        return self.unit_ids.count()
+    }
+
+    fn is_strong_enough(self, min_strength: Float) -> Bool {
+        return self.strength >= min_strength
+    }
+}
+
+// AI player brain
+struct AIBrain {
+    player_id: Int,
+    personality: AIPersonality,
+    difficulty: AIDifficulty,
+    current_state: AIState,
+
+    // Build orders
+    build_queue: Collection<BuildOrderItem>,
+    next_build_index: Int,
+
+    // Military
+    attack_squads: Collection<AttackSquad>,
+    defense_squad: AttackSquad,
+    min_attack_strength: Float,
+
+    // Economy
+    target_harvester_count: Int,
+    current_harvester_count: Int,
+    target_money_reserve: Float,
+
+    // Base management
+    base_position: Vec3?,
+    expansion_positions: Collection<Vec3>,
+
+    // Timing
+    last_attack_time: Float,
+    last_expansion_time: Float,
+    last_build_time: Float,
+
+    // Decision making
+    update_interval: Float,
+    time_since_update: Float,
+
+    fn init(player_id: Int, personality: AIPersonality, difficulty: AIDifficulty) -> AIBrain {
+        return AIBrain {
+            player_id: player_id,
+            personality: personality,
+            difficulty: difficulty,
+            current_state: AIState::STARTING,
+            build_queue: Collection::new(),
+            next_build_index: 0,
+            attack_squads: Collection::new(),
+            defense_squad: AttackSquad::init(),
+            min_attack_strength: 1000.0,
+            target_harvester_count: 3,
+            current_harvester_count: 0,
+            target_money_reserve: 5000.0,
+            base_position: null,
+            expansion_positions: Collection::new(),
+            last_attack_time: 0.0,
+            last_expansion_time: 0.0,
+            last_build_time: 0.0,
+            update_interval: 1.0,
+            time_since_update: 0.0,
+        }
+    }
+
+    fn set_base_position(self, pos: Vec3) {
+        self.base_position = pos
+    }
+
+    fn add_build_order(self, item: BuildOrderItem) {
+        self.build_queue.add(item)
+    }
+
+    fn update(self, game_state: GameState, delta_time: Float) {
+        self.time_since_update = self.time_since_update + delta_time
+
+        if self.time_since_update < self.update_interval {
+            return
+        }
+
+        self.time_since_update = 0.0
+
+        // Update state based on situation
+        self.evaluate_state(game_state)
+
+        // Make decisions based on state
+        match self.current_state {
+            AIState::STARTING => self.handle_starting(game_state),
+            AIState::BUILDING_BASE => self.handle_building_base(game_state),
+            AIState::EXPANDING => self.handle_expanding(game_state),
+            AIState::ATTACKING => self.handle_attacking(game_state),
+            AIState::DEFENDING => self.handle_defending(game_state),
+            AIState::RETREATING => self.handle_retreating(game_state),
+        }
+
+        // Always check economy
+        self.manage_economy(game_state)
+    }
+
+    fn evaluate_state(self, game_state: GameState) {
+        let player = game_state.get_player(self.player_id)?
+
+        // Check if under attack
+        if self.is_under_attack(game_state) {
+            self.current_state = AIState::DEFENDING
+            return
+        }
+
+        // Check if should attack
+        if self.should_attack(game_state) {
+            self.current_state = AIState::ATTACKING
+            return
+        }
+
+        // Check if should expand
+        if self.should_expand(game_state, player) {
+            self.current_state = AIState::EXPANDING
+            return
+        }
+
+        // Default to building
+        self.current_state = AIState::BUILDING_BASE
+    }
+
+    fn is_under_attack(self, game_state: GameState) -> Bool {
+        // TODO: Check if base is being attacked
+        return false
+    }
+
+    fn should_attack(self, game_state: GameState) -> Bool {
+        match self.personality {
+            AIPersonality::AGGRESSIVE => {
+                // Attack if have any units
+                for squad in self.attack_squads {
+                    if squad.get_size() > 0 {
+                        return true
+                    }
+                }
+                return false
+            },
+            AIPersonality::DEFENSIVE => {
+                // Only attack if very strong
+                for squad in self.attack_squads {
+                    if squad.is_strong_enough(self.min_attack_strength * 2.0) {
+                        return true
+                    }
+                }
+                return false
+            },
+            AIPersonality::BALANCED => {
+                // Attack if strong enough
+                for squad in self.attack_squads {
+                    if squad.is_strong_enough(self.min_attack_strength) {
+                        return true
+                    }
+                }
+                return false
+            },
+            AIPersonality::RUSH => {
+                // Always attack if have units
+                for squad in self.attack_squads {
+                    if squad.get_size() >= 3 {
+                        return true
+                    }
+                }
+                return false
+            },
+            _ => return false,
+        }
+    }
+
+    fn should_expand(self, game_state: GameState, player: player::Player) -> Bool {
+        // Expand if have enough money and not expanding recently
+        let time_since_expansion = game_state.get_game_time() - self.last_expansion_time
+
+        if time_since_expansion < 120.0 {
+            return false  // Don't expand too frequently
+        }
+
+        return player.get_money() > 10000.0
+    }
+
+    fn handle_starting(self, game_state: GameState) {
+        // Build initial base
+        if self.base_position == null {
+            // Find starting position
+            // TODO: Get actual starting location
+            self.set_base_position(Vec3::init(1000.0, 1000.0, 0.0))
+        }
+
+        self.current_state = AIState::BUILDING_BASE
+    }
+
+    fn handle_building_base(self, game_state: GameState) {
+        let player = game_state.get_player(self.player_id)?
+
+        // Execute build orders
+        if self.next_build_index < self.build_queue.count() {
+            let build_item = self.build_queue.get(self.next_build_index)
+
+            if player.get_money() >= build_item.min_money {
+                // TODO: Issue build command
+                self.next_build_index = self.next_build_index + 1
+            }
+        }
+    }
+
+    fn handle_expanding(self, game_state: GameState) {
+        let player = game_state.get_player(self.player_id)?
+
+        // TODO: Build expansion base
+        self.last_expansion_time = game_state.get_game_time()
+        self.current_state = AIState::BUILDING_BASE
+    }
+
+    fn handle_attacking(self, game_state: GameState) {
+        // Move attack squads to enemy base
+        for squad in self.attack_squads {
+            if !squad.is_active {
+                continue
+            }
+
+            // TODO: Issue attack commands to squad units
+        }
+
+        self.last_attack_time = game_state.get_game_time()
+    }
+
+    fn handle_defending(self, game_state: GameState) {
+        // Move units to base for defense
+        // TODO: Issue defend commands
+    }
+
+    fn handle_retreating(self, game_state: GameState) {
+        // Pull back units
+        self.current_state = AIState::DEFENDING
+    }
+
+    fn manage_economy(self, game_state: GameState) {
+        let player = game_state.get_player(self.player_id)?
+
+        // Build more harvesters if needed
+        if self.current_harvester_count < self.target_harvester_count {
+            if player.get_money() > 1400.0 {
+                // TODO: Build harvester
+            }
+        }
+    }
+
+    fn create_attack_squad(self) -> Int {
+        let squad = AttackSquad::init()
+        self.attack_squads.add(squad)
+        return self.attack_squads.count() - 1
+    }
+
+    fn get_difficulty_modifier(self) -> Float {
+        return match self.difficulty {
+            AIDifficulty::EASY => 0.5,
+            AIDifficulty::MEDIUM => 1.0,
+            AIDifficulty::HARD => 1.5,
+            AIDifficulty::BRUTAL => 2.0,
+        }
+    }
+}
+
+// Standard build orders
+fn create_usa_build_order() -> Collection<BuildOrderItem> {
+    let orders = Collection::new()
+
+    orders.add(BuildOrderItem::init("Dozer", 100, 0.0, 0))
+    orders.add(BuildOrderItem::init("PowerPlant", 90, 500.0, 0))
+    orders.add(BuildOrderItem::init("SupplyCenter", 80, 1000.0, 0))
+    orders.add(BuildOrderItem::init("Barracks", 70, 500.0, 0))
+    orders.add(BuildOrderItem::init("PowerPlant", 60, 1000.0, 0))
+    orders.add(BuildOrderItem::init("WarFactory", 50, 2000.0, 0))
+    orders.add(BuildOrderItem::init("Airfield", 40, 2000.0, 0))
+
+    return orders
+}
+
+fn create_china_build_order() -> Collection<BuildOrderItem> {
+    let orders = Collection::new()
+
+    orders.add(BuildOrderItem::init("Dozer", 100, 0.0, 0))
+    orders.add(BuildOrderItem::init("PowerPlant", 90, 500.0, 0))
+    orders.add(BuildOrderItem::init("SupplyCenter", 80, 1000.0, 0))
+    orders.add(BuildOrderItem::init("Barracks", 70, 500.0, 0))
+    orders.add(BuildOrderItem::init("WarFactory", 60, 2000.0, 0))
+    orders.add(BuildOrderItem::init("Airfield", 50, 2000.0, 0))
+
+    return orders
+}
+
+fn create_gla_build_order() -> Collection<BuildOrderItem> {
+    let orders = Collection::new()
+
+    orders.add(BuildOrderItem::init("Worker", 100, 0.0, 0))
+    orders.add(BuildOrderItem::init("SupplyStash", 90, 800.0, 0))
+    orders.add(BuildOrderItem::init("Barracks", 80, 500.0, 0))
+    orders.add(BuildOrderItem::init("SupplyStash", 70, 1000.0, 0))
+    orders.add(BuildOrderItem::init("ArmsDealer", 60, 1500.0, 0))
+    orders.add(BuildOrderItem::init("BlackMarket", 50, 2500.0, 0))
+
+    return orders
+}
+
+// Vec3 for positions
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+}
+
+// Stub for GameState
+struct GameState {
+    fn get_player(self, player_id: Int) -> player::Player? {
+        return null
+    }
+
+    fn get_game_time(self) -> Float {
+        return 0.0
+    }
+}
+
+// Tests
+test "AIBrain: init" {
+    let brain = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::MEDIUM)
+
+    assert brain.player_id == 0
+    assert brain.personality == AIPersonality::BALANCED
+    assert brain.difficulty == AIDifficulty::MEDIUM
+    assert brain.current_state == AIState::STARTING
+}
+
+test "AIBrain: difficulty modifier" {
+    let easy = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::EASY)
+    let hard = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::HARD)
+    let brutal = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::BRUTAL)
+
+    assert easy.get_difficulty_modifier() == 0.5
+    assert hard.get_difficulty_modifier() == 1.5
+    assert brutal.get_difficulty_modifier() == 2.0
+}
+
+test "AIBrain: build orders" {
+    let brain = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::MEDIUM)
+
+    let item1 = BuildOrderItem::init("Barracks", 100, 500.0, 0)
+    let item2 = BuildOrderItem::init("WarFactory", 90, 2000.0, 0)
+
+    brain.add_build_order(item1)
+    brain.add_build_order(item2)
+
+    assert brain.build_queue.count() == 2
+}
+
+test "AttackSquad: manage units" {
+    let squad = AttackSquad::init()
+
+    assert squad.get_size() == 0
+    assert squad.strength == 0.0
+
+    squad.add_unit(100, 50.0)
+    squad.add_unit(101, 75.0)
+
+    assert squad.get_size() == 2
+    assert squad.strength == 125.0
+
+    squad.remove_unit(100, 50.0)
+    assert squad.get_size() == 1
+    assert squad.strength == 75.0
+}
+
+test "AttackSquad: strength check" {
+    let squad = AttackSquad::init()
+
+    squad.add_unit(100, 500.0)
+    squad.add_unit(101, 600.0)
+
+    assert squad.is_strong_enough(1000.0)
+    assert !squad.is_strong_enough(1200.0)
+}
+
+test "AIBrain: create attack squad" {
+    let brain = AIBrain::init(0, AIPersonality::AGGRESSIVE, AIDifficulty::HARD)
+
+    let squad_id = brain.create_attack_squad()
+    assert squad_id == 0
+
+    let squad_id2 = brain.create_attack_squad()
+    assert squad_id2 == 1
+}
+
+test "BuildOrderItem: init" {
+    let item = BuildOrderItem::init("Barracks", 100, 500.0, 0)
+
+    assert item.building_type == "Barracks"
+    assert item.priority == 100
+    assert item.min_money == 500.0
+    assert item.min_power == 0
+}
+
+test "Standard build orders: USA" {
+    let orders = create_usa_build_order()
+
+    assert orders.count() == 7
+    assert orders.get(0).building_type == "Dozer"
+    assert orders.get(1).building_type == "PowerPlant"
+}
+
+test "Standard build orders: China" {
+    let orders = create_china_build_order()
+
+    assert orders.count() == 6
+    assert orders.get(0).building_type == "Dozer"
+}
+
+test "Standard build orders: GLA" {
+    let orders = create_gla_build_order()
+
+    assert orders.count() == 6
+    assert orders.get(0).building_type == "Worker"
+}
+
+test "AIBrain: base position" {
+    let brain = AIBrain::init(0, AIPersonality::BALANCED, AIDifficulty::MEDIUM)
+
+    assert brain.base_position == null
+
+    brain.set_base_position(Vec3::init(1000.0, 1000.0, 0.0))
+    assert brain.base_position != null
+
+    let pos = brain.base_position?
+    assert pos.x == 1000.0
+}

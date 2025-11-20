@@ -1,0 +1,657 @@
+// Formation movement for C&C Generals Zero Hour
+// Coordinated unit movement in formations
+// Written in Home language
+
+// Formation types
+enum FormationType {
+    LINE = 0,
+    COLUMN = 1,
+    WEDGE = 2,
+    BOX = 3,
+    SPREAD = 4,
+    CUSTOM = 5,
+}
+
+// Formation slot
+struct FormationSlot {
+    offset_x: Float,
+    offset_y: Float,
+    assigned_unit_id: Int,
+    is_filled: Bool,
+
+    fn init(offset_x: Float, offset_y: Float) -> FormationSlot {
+        return FormationSlot {
+            offset_x: offset_x,
+            offset_y: offset_y,
+            assigned_unit_id: -1,
+            is_filled: false,
+        }
+    }
+
+    fn assign_unit(self, unit_id: Int) {
+        self.assigned_unit_id = unit_id
+        self.is_filled = true
+    }
+
+    fn clear(self) {
+        self.assigned_unit_id = -1
+        self.is_filled = false
+    }
+
+    fn get_world_position(self, center: Vec2, rotation: Float) -> Vec2 {
+        let cos_r = cos(rotation)
+        let sin_r = sin(rotation)
+
+        let rotated_x = self.offset_x * cos_r - self.offset_y * sin_r
+        let rotated_y = self.offset_x * sin_r + self.offset_y * cos_r
+
+        return Vec2::init(center.x + rotated_x, center.y + rotated_y)
+    }
+}
+
+// Formation definition
+struct Formation {
+    formation_type: FormationType,
+    slots: Collection<FormationSlot>,
+    center_position: Vec2,
+    rotation: Float,
+    spacing: Float,
+    width: Float,
+    depth: Float,
+
+    fn init(formation_type: FormationType, spacing: Float) -> Formation {
+        return Formation {
+            formation_type: formation_type,
+            slots: Collection::new(),
+            center_position: Vec2::init(0.0, 0.0),
+            rotation: 0.0,
+            spacing: spacing,
+            width: 0.0,
+            depth: 0.0,
+        }
+    }
+
+    fn generate_slots(self, unit_count: Int) {
+        self.slots.clear()
+
+        match self.formation_type {
+            FormationType::LINE => self.generate_line(unit_count),
+            FormationType::COLUMN => self.generate_column(unit_count),
+            FormationType::WEDGE => self.generate_wedge(unit_count),
+            FormationType::BOX => self.generate_box(unit_count),
+            FormationType::SPREAD => self.generate_spread(unit_count),
+            _ => {},
+        }
+    }
+
+    fn generate_line(self, unit_count: Int) {
+        let half_width = ((unit_count - 1) as Float * self.spacing) / 2.0
+
+        for i in 0..unit_count {
+            let x = (i as Float * self.spacing) - half_width
+            let slot = FormationSlot::init(x, 0.0)
+            self.slots.add(slot)
+        }
+
+        self.width = (unit_count - 1) as Float * self.spacing
+        self.depth = 0.0
+    }
+
+    fn generate_column(self, unit_count: Int) {
+        for i in 0..unit_count {
+            let y = i as Float * self.spacing
+            let slot = FormationSlot::init(0.0, y)
+            self.slots.add(slot)
+        }
+
+        self.width = 0.0
+        self.depth = (unit_count - 1) as Float * self.spacing
+    }
+
+    fn generate_wedge(self, unit_count: Int) {
+        let mut row = 0
+        let mut units_placed = 0
+
+        while units_placed < unit_count {
+            let units_in_row = (row * 2) + 1
+            let start_x = -(row as Float * self.spacing)
+
+            for i in 0..min_int(units_in_row, unit_count - units_placed) {
+                let x = start_x + (i as Float * self.spacing)
+                let y = row as Float * self.spacing
+                let slot = FormationSlot::init(x, y)
+                self.slots.add(slot)
+                units_placed = units_placed + 1
+            }
+
+            row = row + 1
+        }
+    }
+
+    fn generate_box(self, unit_count: Int) {
+        let side = sqrt(unit_count as Float) as Int
+        let rows = (unit_count + side - 1) / side
+
+        for row in 0..rows {
+            let units_in_row = min_int(side, unit_count - (row * side))
+            let half_width = ((units_in_row - 1) as Float * self.spacing) / 2.0
+
+            for col in 0..units_in_row {
+                let x = (col as Float * self.spacing) - half_width
+                let y = row as Float * self.spacing
+                let slot = FormationSlot::init(x, y)
+                self.slots.add(slot)
+            }
+        }
+    }
+
+    fn generate_spread(self, unit_count: Int) {
+        let radius = sqrt(unit_count as Float) * self.spacing
+
+        for i in 0..unit_count {
+            let angle = (i as Float / unit_count as Float) * 2.0 * 3.14159
+            let distance = radius * sqrt((i as Float + 1.0) / unit_count as Float)
+
+            let x = cos(angle) * distance
+            let y = sin(angle) * distance
+            let slot = FormationSlot::init(x, y)
+            self.slots.add(slot)
+        }
+    }
+
+    fn assign_units(self, unit_ids: Collection<Int>) {
+        let slot_count = min_int(self.slots.count(), unit_ids.count())
+
+        for i in 0..slot_count {
+            let slot = self.slots.get(i)
+            let unit_id = unit_ids.get(i)
+            slot.assign_unit(unit_id)
+        }
+    }
+
+    fn get_slot_for_unit(self, unit_id: Int) -> FormationSlot? {
+        for slot in self.slots {
+            if slot.assigned_unit_id == unit_id {
+                return slot
+            }
+        }
+        return null
+    }
+
+    fn get_target_position(self, unit_id: Int) -> Vec2? {
+        if let Some(slot) = self.get_slot_for_unit(unit_id) {
+            return slot.get_world_position(self.center_position, self.rotation)
+        }
+        return null
+    }
+
+    fn set_center(self, position: Vec2) {
+        self.center_position = position
+    }
+
+    fn set_rotation(self, rotation: Float) {
+        self.rotation = rotation
+    }
+
+    fn get_slot_count(self) -> Int {
+        return self.slots.count()
+    }
+
+    fn is_unit_in_formation(self, unit_id: Int) -> Bool {
+        for slot in self.slots {
+            if slot.assigned_unit_id == unit_id {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Formation controller
+struct FormationController {
+    formations: Collection<Formation>,
+    active_formation_id: Int,
+    move_threshold: Float,
+    rotation_threshold: Float,
+
+    fn init() -> FormationController {
+        return FormationController {
+            formations: Collection::new(),
+            active_formation_id: -1,
+            move_threshold: 5.0,
+            rotation_threshold: 0.1,
+        }
+    }
+
+    fn create_formation(self, formation_type: FormationType, spacing: Float, unit_ids: Collection<Int>) -> Int {
+        let formation = Formation::init(formation_type, spacing)
+        formation.generate_slots(unit_ids.count())
+        formation.assign_units(unit_ids)
+
+        let formation_id = self.formations.count()
+        self.formations.add(formation)
+
+        return formation_id
+    }
+
+    fn get_formation(self, formation_id: Int) -> Formation? {
+        if formation_id >= 0 && formation_id < self.formations.count() {
+            return self.formations.get(formation_id)
+        }
+        return null
+    }
+
+    fn set_formation_destination(self, formation_id: Int, destination: Vec2, facing: Float) {
+        if let Some(formation) = self.get_formation(formation_id) {
+            formation.set_center(destination)
+            formation.set_rotation(facing)
+        }
+    }
+
+    fn get_unit_target(self, formation_id: Int, unit_id: Int) -> Vec2? {
+        if let Some(formation) = self.get_formation(formation_id) {
+            return formation.get_target_position(unit_id)
+        }
+        return null
+    }
+
+    fn is_formation_in_position(self, formation_id: Int, unit_positions: Collection<(Int, Vec2)>) -> Bool {
+        if let Some(formation) = self.get_formation(formation_id) {
+            for (unit_id, pos) in unit_positions {
+                if let Some(target) = formation.get_target_position(unit_id) {
+                    let distance = Vec2::distance(pos, target)
+                    if distance > self.move_threshold {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    fn remove_formation(self, formation_id: Int) {
+        if formation_id >= 0 && formation_id < self.formations.count() {
+            self.formations.remove(formation_id)
+        }
+    }
+
+    fn get_formation_count(self) -> Int {
+        return self.formations.count()
+    }
+}
+
+// Group movement coordinator
+struct GroupMovement {
+    formation_controller: FormationController,
+    unit_assignments: Collection<(Int, Int)>,  // (unit_id, formation_id)
+    waiting_units: Collection<Int>,
+
+    fn init() -> GroupMovement {
+        return GroupMovement {
+            formation_controller: FormationController::init(),
+            unit_assignments: Collection::new(),
+            waiting_units: Collection::new(),
+        }
+    }
+
+    fn move_group(self, unit_ids: Collection<Int>, destination: Vec2, formation_type: FormationType) -> Int {
+        let spacing = 5.0
+        let formation_id = self.formation_controller.create_formation(formation_type, spacing, unit_ids)
+
+        let facing = 0.0
+        self.formation_controller.set_formation_destination(formation_id, destination, facing)
+
+        // Track assignments
+        for unit_id in unit_ids {
+            self.unit_assignments.add((unit_id, formation_id))
+        }
+
+        return formation_id
+    }
+
+    fn get_unit_destination(self, unit_id: Int) -> Vec2? {
+        for (uid, fid) in self.unit_assignments {
+            if uid == unit_id {
+                return self.formation_controller.get_unit_target(fid, unit_id)
+            }
+        }
+        return null
+    }
+
+    fn is_group_in_position(self, formation_id: Int, unit_positions: Collection<(Int, Vec2)>) -> Bool {
+        return self.formation_controller.is_formation_in_position(formation_id, unit_positions)
+    }
+
+    fn add_waiting_unit(self, unit_id: Int) {
+        self.waiting_units.add(unit_id)
+    }
+
+    fn remove_waiting_unit(self, unit_id: Int) {
+        for i in 0..self.waiting_units.count() {
+            if self.waiting_units.get(i) == unit_id {
+                self.waiting_units.remove(i)
+                return
+            }
+        }
+    }
+
+    fn get_waiting_count(self) -> Int {
+        return self.waiting_units.count()
+    }
+
+    fn clear_formation(self, formation_id: Int) {
+        self.formation_controller.remove_formation(formation_id)
+
+        // Remove assignments
+        let mut i = 0
+        while i < self.unit_assignments.count() {
+            let (_, fid) = self.unit_assignments.get(i)
+            if fid == formation_id {
+                self.unit_assignments.remove(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+}
+
+// Helper structs
+struct Vec2 {
+    x: Float,
+    y: Float,
+
+    fn init(x: Float, y: Float) -> Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn distance(a: Vec2, b: Vec2) -> Float {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        return sqrt(dx * dx + dy * dy)
+    }
+}
+
+// Helper functions
+fn cos(angle: Float) -> Float {
+    return 1.0 - (angle * angle) / 2.0
+}
+
+fn sin(angle: Float) -> Float {
+    return angle - (angle * angle * angle) / 6.0
+}
+
+fn sqrt(x: Float) -> Float {
+    return x ** 0.5
+}
+
+fn min_int(a: Int, b: Int) -> Int {
+    if a < b { return a } else { return b }
+}
+
+// Tests
+test "FormationSlot: init" {
+    let slot = FormationSlot::init(10.0, 5.0)
+
+    assert slot.offset_x == 10.0
+    assert slot.offset_y == 5.0
+    assert !slot.is_filled
+}
+
+test "FormationSlot: assign and clear" {
+    let slot = FormationSlot::init(0.0, 0.0)
+
+    slot.assign_unit(42)
+    assert slot.is_filled
+    assert slot.assigned_unit_id == 42
+
+    slot.clear()
+    assert !slot.is_filled
+}
+
+test "FormationSlot: get world position" {
+    let slot = FormationSlot::init(10.0, 0.0)
+    let center = Vec2::init(100.0, 100.0)
+
+    let pos = slot.get_world_position(center, 0.0)
+    assert pos.x == 110.0
+    assert pos.y == 100.0
+}
+
+test "Formation: init" {
+    let formation = Formation::init(FormationType::LINE, 5.0)
+
+    assert formation.formation_type == FormationType::LINE
+    assert formation.spacing == 5.0
+}
+
+test "Formation: generate line" {
+    let formation = Formation::init(FormationType::LINE, 5.0)
+    formation.generate_slots(5)
+
+    assert formation.get_slot_count() == 5
+
+    let first = formation.slots.get(0)
+    let last = formation.slots.get(4)
+
+    assert first.offset_x < 0.0
+    assert last.offset_x > 0.0
+}
+
+test "Formation: generate column" {
+    let formation = Formation::init(FormationType::COLUMN, 5.0)
+    formation.generate_slots(4)
+
+    assert formation.get_slot_count() == 4
+
+    for i in 0..4 {
+        let slot = formation.slots.get(i)
+        assert slot.offset_x == 0.0
+        assert slot.offset_y == (i as Float * 5.0)
+    }
+}
+
+test "Formation: generate wedge" {
+    let formation = Formation::init(FormationType::WEDGE, 5.0)
+    formation.generate_slots(6)
+
+    assert formation.get_slot_count() == 6
+}
+
+test "Formation: generate box" {
+    let formation = Formation::init(FormationType::BOX, 5.0)
+    formation.generate_slots(9)
+
+    assert formation.get_slot_count() == 9
+}
+
+test "Formation: generate spread" {
+    let formation = Formation::init(FormationType::SPREAD, 5.0)
+    formation.generate_slots(8)
+
+    assert formation.get_slot_count() == 8
+}
+
+test "Formation: assign units" {
+    let formation = Formation::init(FormationType::LINE, 5.0)
+    formation.generate_slots(3)
+
+    let units = Collection::new()
+    units.add(100)
+    units.add(101)
+    units.add(102)
+
+    formation.assign_units(units)
+
+    assert formation.is_unit_in_formation(100)
+    assert formation.is_unit_in_formation(101)
+    assert !formation.is_unit_in_formation(999)
+}
+
+test "Formation: get target position" {
+    let formation = Formation::init(FormationType::LINE, 5.0)
+    formation.generate_slots(3)
+
+    let units = Collection::new()
+    units.add(100)
+    units.add(101)
+    units.add(102)
+    formation.assign_units(units)
+
+    formation.set_center(Vec2::init(50.0, 50.0))
+    formation.set_rotation(0.0)
+
+    let target = formation.get_target_position(101)?
+    assert target.x != 50.0 || target.y != 50.0
+}
+
+test "Formation: set center and rotation" {
+    let formation = Formation::init(FormationType::LINE, 5.0)
+
+    formation.set_center(Vec2::init(100.0, 200.0))
+    assert formation.center_position.x == 100.0
+
+    formation.set_rotation(1.57)
+    assert formation.rotation == 1.57
+}
+
+test "FormationController: init" {
+    let controller = FormationController::init()
+
+    assert controller.get_formation_count() == 0
+}
+
+test "FormationController: create formation" {
+    let controller = FormationController::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+    units.add(3)
+
+    let fid = controller.create_formation(FormationType::LINE, 5.0, units)
+
+    assert fid == 0
+    assert controller.get_formation_count() == 1
+}
+
+test "FormationController: get formation" {
+    let controller = FormationController::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+
+    let fid = controller.create_formation(FormationType::COLUMN, 5.0, units)
+    let formation = controller.get_formation(fid)?
+
+    assert formation.formation_type == FormationType::COLUMN
+}
+
+test "FormationController: set destination" {
+    let controller = FormationController::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+
+    let fid = controller.create_formation(FormationType::LINE, 5.0, units)
+    controller.set_formation_destination(fid, Vec2::init(100.0, 100.0), 0.0)
+
+    let formation = controller.get_formation(fid)?
+    assert formation.center_position.x == 100.0
+}
+
+test "FormationController: get unit target" {
+    let controller = FormationController::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+
+    let fid = controller.create_formation(FormationType::LINE, 5.0, units)
+    controller.set_formation_destination(fid, Vec2::init(100.0, 100.0), 0.0)
+
+    let target = controller.get_unit_target(fid, 1)?
+    assert target.x != 0.0 || target.y != 0.0
+}
+
+test "FormationController: remove formation" {
+    let controller = FormationController::init()
+
+    let units = Collection::new()
+    units.add(1)
+
+    let fid = controller.create_formation(FormationType::LINE, 5.0, units)
+    assert controller.get_formation_count() == 1
+
+    controller.remove_formation(fid)
+    assert controller.get_formation_count() == 0
+}
+
+test "GroupMovement: init" {
+    let group = GroupMovement::init()
+
+    assert group.formation_controller.get_formation_count() == 0
+}
+
+test "GroupMovement: move group" {
+    let group = GroupMovement::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+    units.add(3)
+
+    let fid = group.move_group(units, Vec2::init(100.0, 100.0), FormationType::LINE)
+
+    assert fid >= 0
+    assert group.formation_controller.get_formation_count() == 1
+}
+
+test "GroupMovement: get unit destination" {
+    let group = GroupMovement::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+
+    group.move_group(units, Vec2::init(100.0, 100.0), FormationType::LINE)
+
+    let dest = group.get_unit_destination(1)?
+    assert dest.x != 0.0 || dest.y != 0.0
+}
+
+test "GroupMovement: waiting units" {
+    let group = GroupMovement::init()
+
+    assert group.get_waiting_count() == 0
+
+    group.add_waiting_unit(5)
+    group.add_waiting_unit(6)
+
+    assert group.get_waiting_count() == 2
+
+    group.remove_waiting_unit(5)
+    assert group.get_waiting_count() == 1
+}
+
+test "GroupMovement: clear formation" {
+    let group = GroupMovement::init()
+
+    let units = Collection::new()
+    units.add(1)
+    units.add(2)
+
+    let fid = group.move_group(units, Vec2::init(100.0, 100.0), FormationType::LINE)
+
+    group.clear_formation(fid)
+    assert group.formation_controller.get_formation_count() == 0
+}
+
+test "Vec2: distance" {
+    let a = Vec2::init(0.0, 0.0)
+    let b = Vec2::init(3.0, 4.0)
+
+    assert Vec2::distance(a, b) == 5.0
+}

@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const io = @import("io");
+const BinaryReader = io.BinaryReader;
 
 // ============================================================================
 // W3D Chunk Types
@@ -305,22 +307,22 @@ pub const VertexMaterial = extern struct {
     pub fn read(reader: anytype) !VertexMaterial {
         var mat: VertexMaterial = undefined;
         mat.attributes = try reader.readInt(u32, .little);
-        mat.ambient.r = try reader.readByte();
-        mat.ambient.g = try reader.readByte();
-        mat.ambient.b = try reader.readByte();
-        mat.ambient.pad = try reader.readByte();
-        mat.diffuse.r = try reader.readByte();
-        mat.diffuse.g = try reader.readByte();
-        mat.diffuse.b = try reader.readByte();
-        mat.diffuse.pad = try reader.readByte();
-        mat.specular.r = try reader.readByte();
-        mat.specular.g = try reader.readByte();
-        mat.specular.b = try reader.readByte();
-        mat.specular.pad = try reader.readByte();
-        mat.emissive.r = try reader.readByte();
-        mat.emissive.g = try reader.readByte();
-        mat.emissive.b = try reader.readByte();
-        mat.emissive.pad = try reader.readByte();
+        mat.ambient.r = try reader.readU8();
+        mat.ambient.g = try reader.readU8();
+        mat.ambient.b = try reader.readU8();
+        mat.ambient.pad = try reader.readU8();
+        mat.diffuse.r = try reader.readU8();
+        mat.diffuse.g = try reader.readU8();
+        mat.diffuse.b = try reader.readU8();
+        mat.diffuse.pad = try reader.readU8();
+        mat.specular.r = try reader.readU8();
+        mat.specular.g = try reader.readU8();
+        mat.specular.b = try reader.readU8();
+        mat.specular.pad = try reader.readU8();
+        mat.emissive.r = try reader.readU8();
+        mat.emissive.g = try reader.readU8();
+        mat.emissive.b = try reader.readU8();
+        mat.emissive.pad = try reader.readU8();
         mat.shininess = @bitCast(try reader.readInt(u32, .little));
         mat.opacity = @bitCast(try reader.readInt(u32, .little));
         mat.translucency = @bitCast(try reader.readInt(u32, .little));
@@ -407,18 +409,12 @@ pub const W3DModel = struct {
     }
 
     pub fn loadFromBytes(allocator: Allocator, data: []const u8) !W3DModel {
-        // BLOCKED: Zig 0.16-dev completely changed the std.Io.Reader API to use VTable
-        // The old std.io.fixedBufferStream() function is gone
-        // The new std.Io.Reader uses a complex VTable-based approach
-        // This needs to be reimplemented when Zig 0.16 API stabilizes
-        //
-        // For now, return an error until this can be properly fixed
-        _ = allocator;
-        _ = data;
-        return error.Zig016IoApiNotYetSupported;
+        // Use Home's BinaryReader for parsing W3D binary format
+        var reader = BinaryReader.init(data);
+        return try loadFromReader(allocator, &reader);
     }
 
-    fn loadFromReader(allocator: Allocator, reader: anytype) !W3DModel {
+    fn loadFromReader(allocator: Allocator, reader: *BinaryReader) !W3DModel {
         var model = W3DModel{
             .allocator = allocator,
             .header = undefined,
@@ -442,10 +438,10 @@ pub const W3DModel = struct {
             return error.InvalidW3DFile;
         }
 
-        const end_pos = try reader.context.getPos() + root_header.chunk_size - 8;
+        const end_pos = reader.getPos() + root_header.chunk_size - 8;
 
         // Parse mesh chunks
-        while ((try reader.context.getPos()) < end_pos) {
+        while (reader.getPos() < end_pos) {
             const chunk_header = try ChunkHeader.read(reader);
             const chunk_type: ChunkType = @enumFromInt(chunk_header.chunk_type);
             const data_size = chunk_header.chunk_size - 8;
@@ -509,23 +505,23 @@ pub const W3DModel = struct {
 
                 .Textures => {
                     // This is a wrapper chunk, contains nested Texture chunks
-                    const textures_end = try reader.context.getPos() + data_size;
-                    var texture_list = std.ArrayList(W3DTexture).init(allocator);
+                    const textures_end = reader.getPos() + data_size;
+                    var texture_list = std.ArrayList(W3DTexture){};
 
-                    while ((try reader.context.getPos()) < textures_end) {
+                    while (reader.getPos() < textures_end) {
                         const tex_header = try ChunkHeader.read(reader);
                         const tex_type: ChunkType = @enumFromInt(tex_header.chunk_type);
                         const tex_data_size = tex_header.chunk_size - 8;
 
                         if (tex_type == .Texture) {
                             // Parse individual texture
-                            const tex_end = try reader.context.getPos() + tex_data_size;
+                            const tex_end = reader.getPos() + tex_data_size;
                             var texture = W3DTexture{
                                 .name = &.{},
                                 .info = null,
                             };
 
-                            while ((try reader.context.getPos()) < tex_end) {
+                            while (reader.getPos() < tex_end) {
                                 const tex_sub_header = try ChunkHeader.read(reader);
                                 const tex_sub_type: ChunkType = @enumFromInt(tex_sub_header.chunk_type);
                                 const tex_sub_size = tex_sub_header.chunk_size - 8;
@@ -541,18 +537,18 @@ pub const W3DModel = struct {
                                         texture.info = try TextureInfo.read(reader);
                                     },
                                     else => {
-                                        try reader.context.seekBy(@intCast(tex_sub_size));
+                                        try reader.seekBy(@intCast(tex_sub_size));
                                     },
                                 }
                             }
 
-                            try texture_list.append(texture);
+                            try texture_list.append(allocator, texture);
                         } else {
-                            try reader.context.seekBy(@intCast(tex_data_size));
+                            try reader.seekBy(@intCast(tex_data_size));
                         }
                     }
 
-                    model.textures = try texture_list.toOwnedSlice();
+                    model.textures = try texture_list.toOwnedSlice(allocator);
                 },
 
                 .VertexMapperArgs0, .StageTexCoords => {
@@ -571,16 +567,16 @@ pub const W3DModel = struct {
                     model.vertex_colors = try allocator.alloc(RGBA, num_colors);
 
                     for (model.vertex_colors) |*color| {
-                        color.r = try reader.readByte();
-                        color.g = try reader.readByte();
-                        color.b = try reader.readByte();
-                        color.a = try reader.readByte();
+                        color.r = try reader.readU8();
+                        color.g = try reader.readU8();
+                        color.b = try reader.readU8();
+                        color.a = try reader.readU8();
                     }
                 },
 
                 else => {
                     // Skip unknown chunks (there are many we don't need yet)
-                    try reader.context.seekBy(@intCast(data_size));
+                    try reader.seekBy(@intCast(data_size));
                 },
             }
         }

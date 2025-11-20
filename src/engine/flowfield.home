@@ -1,0 +1,555 @@
+// Flow field pathfinding for C&C Generals Zero Hour
+// Efficient pathfinding for large groups of units
+// Written in Home language
+
+// Flow field cell
+struct FlowCell {
+    cost: Int,            // Cost to reach this cell
+    best_direction: Vec2, // Direction to move
+    is_blocked: Bool,
+
+    fn init() -> FlowCell {
+        return FlowCell {
+            cost: 9999,
+            best_direction: Vec2::init(0.0, 0.0),
+            is_blocked: false,
+        }
+    }
+
+    fn set_direction(self, dx: Float, dy: Float) {
+        self.best_direction = Vec2::init(dx, dy)
+    }
+}
+
+// Integration field for calculating flow
+struct IntegrationField {
+    width: Int,
+    height: Int,
+    cells: Collection<Collection<Int>>,
+    goal_x: Int,
+    goal_y: Int,
+
+    fn init(width: Int, height: Int) -> IntegrationField {
+        let field = IntegrationField {
+            width: width,
+            height: height,
+            cells: Collection::new(),
+            goal_x: 0,
+            goal_y: 0,
+        }
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(9999)
+            }
+            field.cells.add(row)
+        }
+
+        return field
+    }
+
+    fn set_goal(self, x: Int, y: Int) {
+        self.goal_x = x
+        self.goal_y = y
+        self.set_cost(x, y, 0)
+    }
+
+    fn set_cost(self, x: Int, y: Int, cost: Int) {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.cells.get(y)
+            row.set(x, cost)
+        }
+    }
+
+    fn get_cost(self, x: Int, y: Int) -> Int {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.cells.get(y)
+            return row.get(x)
+        }
+        return 9999
+    }
+
+    fn set_blocked(self, x: Int, y: Int) {
+        self.set_cost(x, y, 255)
+    }
+
+    fn is_blocked(self, x: Int, y: Int) -> Bool {
+        return self.get_cost(x, y) == 255
+    }
+
+    fn calculate_from_goal(self) {
+        // Dijkstra's algorithm to fill integration field
+        let open = Collection::new()
+        open.add((self.goal_x, self.goal_y))
+
+        while open.count() > 0 {
+            let current = open.get(0)
+            open.remove(0)
+
+            let (cx, cy) = current
+            let current_cost = self.get_cost(cx, cy)
+
+            // Check neighbors
+            let neighbors = self.get_neighbors(cx, cy)
+            for neighbor in neighbors {
+                let (nx, ny) = neighbor
+
+                if self.is_blocked(nx, ny) {
+                    continue
+                }
+
+                let new_cost = current_cost + 1
+                let existing_cost = self.get_cost(nx, ny)
+
+                if new_cost < existing_cost {
+                    self.set_cost(nx, ny, new_cost)
+                    open.add((nx, ny))
+                }
+            }
+        }
+    }
+
+    fn get_neighbors(self, x: Int, y: Int) -> Collection<(Int, Int)> {
+        let neighbors = Collection::new()
+
+        // Cardinal directions
+        if x > 0 { neighbors.add((x - 1, y)) }
+        if x < self.width - 1 { neighbors.add((x + 1, y)) }
+        if y > 0 { neighbors.add((x, y - 1)) }
+        if y < self.height - 1 { neighbors.add((x, y + 1)) }
+
+        // Diagonals
+        if x > 0 && y > 0 { neighbors.add((x - 1, y - 1)) }
+        if x < self.width - 1 && y > 0 { neighbors.add((x + 1, y - 1)) }
+        if x > 0 && y < self.height - 1 { neighbors.add((x - 1, y + 1)) }
+        if x < self.width - 1 && y < self.height - 1 { neighbors.add((x + 1, y + 1)) }
+
+        return neighbors
+    }
+}
+
+// Flow field
+struct FlowField {
+    width: Int,
+    height: Int,
+    cells: Collection<Collection<FlowCell>>,
+
+    fn init(width: Int, height: Int) -> FlowField {
+        let field = FlowField {
+            width: width,
+            height: height,
+            cells: Collection::new(),
+        }
+
+        for y in 0..height {
+            let row = Collection::new()
+            for x in 0..width {
+                row.add(FlowCell::init())
+            }
+            field.cells.add(row)
+        }
+
+        return field
+    }
+
+    fn get_cell(self, x: Int, y: Int) -> FlowCell? {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let row = self.cells.get(y)
+            return row.get(x)
+        }
+        return null
+    }
+
+    fn set_blocked(self, x: Int, y: Int, blocked: Bool) {
+        if let Some(cell) = self.get_cell(x, y) {
+            cell.is_blocked = blocked
+        }
+    }
+
+    fn calculate_from_integration(self, integration: IntegrationField) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if let Some(cell) = self.get_cell(x, y) {
+                    if cell.is_blocked {
+                        continue
+                    }
+
+                    cell.cost = integration.get_cost(x, y)
+
+                    // Find lowest cost neighbor
+                    let best_direction = self.find_best_direction(x, y, integration)
+                    cell.best_direction = best_direction
+                }
+            }
+        }
+    }
+
+    fn find_best_direction(self, x: Int, y: Int, integration: IntegrationField) -> Vec2 {
+        let current_cost = integration.get_cost(x, y)
+        let mut best_x = x
+        let mut best_y = y
+        let mut best_cost = current_cost
+
+        // Check all neighbors
+        for dy in -1..2 {
+            for dx in -1..2 {
+                if dx == 0 && dy == 0 {
+                    continue
+                }
+
+                let nx = x + dx
+                let ny = y + dy
+
+                let cost = integration.get_cost(nx, ny)
+                if cost < best_cost {
+                    best_cost = cost
+                    best_x = nx
+                    best_y = ny
+                }
+            }
+        }
+
+        // Calculate direction vector
+        let dir_x = (best_x - x) as Float
+        let dir_y = (best_y - y) as Float
+
+        // Normalize
+        let length = sqrt(dir_x * dir_x + dir_y * dir_y)
+        if length > 0.0 {
+            return Vec2::init(dir_x / length, dir_y / length)
+        }
+
+        return Vec2::init(0.0, 0.0)
+    }
+
+    fn get_direction(self, x: Int, y: Int) -> Vec2? {
+        if let Some(cell) = self.get_cell(x, y) {
+            return cell.best_direction
+        }
+        return null
+    }
+
+    fn is_at_goal(self, x: Int, y: Int) -> Bool {
+        if let Some(cell) = self.get_cell(x, y) {
+            return cell.cost == 0
+        }
+        return false
+    }
+}
+
+// Flow field manager
+struct FlowFieldManager {
+    flow_fields: Collection<FlowField>,
+    integration_fields: Collection<IntegrationField>,
+    map_width: Int,
+    map_height: Int,
+    cell_size: Float,
+
+    fn init(map_width: Int, map_height: Int, cell_size: Float) -> FlowFieldManager {
+        return FlowFieldManager {
+            flow_fields: Collection::new(),
+            integration_fields: Collection::new(),
+            map_width: map_width,
+            map_height: map_height,
+            cell_size: cell_size,
+        }
+    }
+
+    fn create_flow_field(self, goal_x: Int, goal_y: Int, obstacles: Collection<(Int, Int)>) -> Int {
+        // Create integration field
+        let integration = IntegrationField::init(self.map_width, self.map_height)
+
+        // Set blocked cells
+        for obstacle in obstacles {
+            let (ox, oy) = obstacle
+            integration.set_blocked(ox, oy)
+        }
+
+        // Set goal and calculate
+        integration.set_goal(goal_x, goal_y)
+        integration.calculate_from_goal()
+
+        // Create flow field
+        let flow = FlowField::init(self.map_width, self.map_height)
+
+        // Set blocked cells
+        for obstacle in obstacles {
+            let (ox, oy) = obstacle
+            flow.set_blocked(ox, oy, true)
+        }
+
+        // Calculate flow from integration
+        flow.calculate_from_integration(integration)
+
+        let field_id = self.flow_fields.count()
+        self.flow_fields.add(flow)
+        self.integration_fields.add(integration)
+
+        return field_id
+    }
+
+    fn get_flow_direction(self, field_id: Int, x: Int, y: Int) -> Vec2? {
+        if field_id >= 0 && field_id < self.flow_fields.count() {
+            let field = self.flow_fields.get(field_id)
+            return field.get_direction(x, y)
+        }
+        return null
+    }
+
+    fn world_to_grid(self, world_x: Float, world_y: Float) -> (Int, Int) {
+        let grid_x = (world_x / self.cell_size) as Int
+        let grid_y = (world_y / self.cell_size) as Int
+        return (grid_x, grid_y)
+    }
+
+    fn clear_field(self, field_id: Int) {
+        if field_id >= 0 && field_id < self.flow_fields.count() {
+            self.flow_fields.remove(field_id)
+            self.integration_fields.remove(field_id)
+        }
+    }
+
+    fn clear_all_fields(self) {
+        self.flow_fields.clear()
+        self.integration_fields.clear()
+    }
+
+    fn get_field_count(self) -> Int {
+        return self.flow_fields.count()
+    }
+}
+
+// Helper structs
+struct Vec2 {
+    x: Float,
+    y: Float,
+
+    fn init(x: Float, y: Float) -> Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn length(self) -> Float {
+        return sqrt(self.x * self.x + self.y * self.y)
+    }
+}
+
+fn sqrt(x: Float) -> Float {
+    return x ** 0.5
+}
+
+// Tests
+test "FlowCell: init" {
+    let cell = FlowCell::init()
+
+    assert cell.cost == 9999
+    assert !cell.is_blocked
+}
+
+test "FlowCell: set direction" {
+    let cell = FlowCell::init()
+
+    cell.set_direction(1.0, 0.0)
+    assert cell.best_direction.x == 1.0
+    assert cell.best_direction.y == 0.0
+}
+
+test "IntegrationField: init" {
+    let field = IntegrationField::init(10, 10)
+
+    assert field.width == 10
+    assert field.height == 10
+}
+
+test "IntegrationField: set and get cost" {
+    let field = IntegrationField::init(10, 10)
+
+    field.set_cost(5, 5, 100)
+    assert field.get_cost(5, 5) == 100
+}
+
+test "IntegrationField: set goal" {
+    let field = IntegrationField::init(10, 10)
+
+    field.set_goal(5, 5)
+    assert field.goal_x == 5
+    assert field.goal_y == 5
+    assert field.get_cost(5, 5) == 0
+}
+
+test "IntegrationField: set blocked" {
+    let field = IntegrationField::init(10, 10)
+
+    field.set_blocked(3, 3)
+    assert field.is_blocked(3, 3)
+}
+
+test "IntegrationField: get neighbors" {
+    let field = IntegrationField::init(10, 10)
+
+    let neighbors = field.get_neighbors(5, 5)
+    assert neighbors.count() == 8  // All 8 directions
+
+    let corner_neighbors = field.get_neighbors(0, 0)
+    assert corner_neighbors.count() == 3  // Corner has 3 neighbors
+}
+
+test "IntegrationField: calculate from goal" {
+    let field = IntegrationField::init(10, 10)
+
+    field.set_goal(5, 5)
+    field.calculate_from_goal()
+
+    // Adjacent cells should have cost 1
+    assert field.get_cost(4, 5) == 1
+    assert field.get_cost(6, 5) == 1
+    assert field.get_cost(5, 4) == 1
+    assert field.get_cost(5, 6) == 1
+
+    // Corner cell should have cost 1 (diagonal)
+    assert field.get_cost(4, 4) == 1
+}
+
+test "IntegrationField: blocked cells" {
+    let field = IntegrationField::init(10, 10)
+
+    field.set_blocked(5, 5)
+    field.set_goal(4, 5)
+    field.calculate_from_goal()
+
+    // Blocked cell should remain 255
+    assert field.is_blocked(5, 5)
+}
+
+test "FlowField: init" {
+    let field = FlowField::init(10, 10)
+
+    assert field.width == 10
+    assert field.height == 10
+}
+
+test "FlowField: get cell" {
+    let field = FlowField::init(10, 10)
+
+    let cell = field.get_cell(5, 5)?
+    assert cell.cost == 9999
+
+    let invalid = field.get_cell(100, 100)
+    assert invalid == null
+}
+
+test "FlowField: set blocked" {
+    let field = FlowField::init(10, 10)
+
+    field.set_blocked(5, 5, true)
+
+    let cell = field.get_cell(5, 5)?
+    assert cell.is_blocked
+}
+
+test "FlowField: calculate from integration" {
+    let integration = IntegrationField::init(5, 5)
+    integration.set_goal(2, 2)
+    integration.calculate_from_goal()
+
+    let flow = FlowField::init(5, 5)
+    flow.calculate_from_integration(integration)
+
+    let cell = flow.get_cell(2, 2)?
+    assert cell.cost == 0
+
+    let neighbor = flow.get_cell(1, 2)?
+    assert neighbor.cost == 1
+}
+
+test "FlowField: get direction" {
+    let integration = IntegrationField::init(5, 5)
+    integration.set_goal(2, 2)
+    integration.calculate_from_goal()
+
+    let flow = FlowField::init(5, 5)
+    flow.calculate_from_integration(integration)
+
+    let direction = flow.get_direction(0, 2)?
+    assert direction.x > 0.0  // Should point right
+}
+
+test "FlowField: is at goal" {
+    let integration = IntegrationField::init(5, 5)
+    integration.set_goal(2, 2)
+    integration.calculate_from_goal()
+
+    let flow = FlowField::init(5, 5)
+    flow.calculate_from_integration(integration)
+
+    assert flow.is_at_goal(2, 2)
+    assert !flow.is_at_goal(0, 0)
+}
+
+test "FlowFieldManager: init" {
+    let manager = FlowFieldManager::init(50, 50, 10.0)
+
+    assert manager.map_width == 50
+    assert manager.map_height == 50
+    assert manager.cell_size == 10.0
+}
+
+test "FlowFieldManager: create flow field" {
+    let manager = FlowFieldManager::init(10, 10, 1.0)
+
+    let obstacles = Collection::new()
+    obstacles.add((5, 5))
+
+    let field_id = manager.create_flow_field(7, 7, obstacles)
+
+    assert field_id == 0
+    assert manager.get_field_count() == 1
+}
+
+test "FlowFieldManager: get flow direction" {
+    let manager = FlowFieldManager::init(10, 10, 1.0)
+
+    let obstacles = Collection::new()
+    let field_id = manager.create_flow_field(5, 5, obstacles)
+
+    let direction = manager.get_flow_direction(field_id, 3, 5)?
+    assert direction.x > 0.0  // Should point toward goal
+}
+
+test "FlowFieldManager: world to grid" {
+    let manager = FlowFieldManager::init(100, 100, 10.0)
+
+    let (gx, gy) = manager.world_to_grid(25.0, 35.0)
+    assert gx == 2
+    assert gy == 3
+}
+
+test "FlowFieldManager: clear field" {
+    let manager = FlowFieldManager::init(10, 10, 1.0)
+
+    let obstacles = Collection::new()
+    manager.create_flow_field(5, 5, obstacles)
+
+    assert manager.get_field_count() == 1
+
+    manager.clear_field(0)
+    assert manager.get_field_count() == 0
+}
+
+test "FlowFieldManager: clear all fields" {
+    let manager = FlowFieldManager::init(10, 10, 1.0)
+
+    let obstacles = Collection::new()
+    manager.create_flow_field(5, 5, obstacles)
+    manager.create_flow_field(7, 7, obstacles)
+
+    assert manager.get_field_count() == 2
+
+    manager.clear_all_fields()
+    assert manager.get_field_count() == 0
+}
+
+test "Vec2: length" {
+    let vec = Vec2::init(3.0, 4.0)
+    assert vec.length() == 5.0
+}

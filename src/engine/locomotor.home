@@ -1,0 +1,619 @@
+// Locomotor system for C&C Generals Zero Hour
+// Based on Thyme's locomotor.h/cpp - Movement and physics for units
+// Written in Home language
+
+// Z-axis behavior modes
+enum LocomotorBehaviorZ {
+    NO_Z_MOTIVE_FORCE,                      // No vertical movement
+    SEA_LEVEL,                              // Boats on water surface
+    SURFACE_RELATIVE_HEIGHT,                // Hover at height above terrain
+    ABSOLUTE_HEIGHT,                        // Fixed altitude
+    FIXED_SURFACE_RELATIVE_HEIGHT,          // Fixed height above ground
+    FIXED_ABSOLUTE_HEIGHT,                  // Fixed world height
+    FIXED_RELATIVE_TO_GROUND_AND_BUILDINGS, // Height relative to highest surface
+    RELATIVE_TO_HIGHEST_LAYER,              // Height relative to bridges/etc
+}
+
+// Visual movement appearance
+enum LocomotorAppearance {
+    LEGS_TWO,      // Infantry (2 legs)
+    WHEELS_FOUR,   // Wheeled vehicles
+    TREADS,        // Tanks with treads
+    HOVER,         // Hovering units
+    THRUST,        // Jet thrust
+    WINGS,         // Aircraft
+    CLIMBER,       // Wall climbers
+    OTHER,         // Generic
+    MOTORCYCLE,    // Motorcycles
+}
+
+// Group movement priority
+enum LocomotorGroupMovementPriority {
+    MOVES_BACK,   // Slower units in back
+    MOVES_MIDDLE, // Medium speed units
+    MOVES_FRONT,  // Fastest units in front
+}
+
+// Surface types that locomotor can traverse
+enum LocomotorSurface {
+    GROUND = 1,
+    WATER = 2,
+    CLIFF = 4,
+    AIR = 8,
+    RUBBLE = 16,
+}
+
+// Locomotor template (loaded from INI)
+struct LocomotorTemplate {
+    name: String,
+
+    // Movement capabilities
+    surfaces: Int,                 // Bitfield of LocomotorSurface
+    max_speed: Float,              // Maximum speed (world units/sec)
+    max_speed_damaged: Float,      // Speed when damaged
+    min_speed: Float,              // Minimum speed
+    max_turn_rate: Float,          // Degrees per second
+    max_turn_rate_damaged: Float,  // Turn rate when damaged
+    acceleration: Float,           // Acceleration rate
+    acceleration_damaged: Float,   // Acceleration when damaged
+    lift: Float,                   // Vertical lift force
+    lift_damaged: Float,           // Lift when damaged
+    braking: Float,                // Braking force
+    min_turn_speed: Float,         // Minimum speed for turning
+
+    // Height behavior
+    preferred_height: Float,        // Preferred altitude
+    preferred_height_damping: Float,// Height correction damping
+    behavior_z: LocomotorBehaviorZ, // Z-axis behavior mode
+
+    // Aircraft/hover specific
+    circling_radius: Float,         // Radius when circling
+    speed_limit_z: Float,           // Vertical speed limit
+    extra_2d_friction: Float,       // Extra ground friction
+    max_thrust_angle: Float,        // Max angle for thrust
+
+    // Visual appearance
+    appearance: LocomotorAppearance,
+    group_movement_priority: LocomotorGroupMovementPriority,
+
+    // Physics tuning
+    accel_pitch_limit: Float,       // Pitch when accelerating
+    decel_pitch_limit: Float,       // Pitch when braking
+    bounce_kick: Float,             // Bounce intensity
+    pitch_stiffness: Float,         // Pitch spring stiffness
+    roll_stiffness: Float,          // Roll spring stiffness
+    pitch_damping: Float,           // Pitch damping
+    roll_damping: Float,            // Roll damping
+    pitch_in_direction_of_z_vel_factor: Float,
+
+    // Thrust/aircraft
+    thrust_roll: Float,
+    thrust_wobble_rate: Float,
+    thrust_min_wobble: Float,
+    thrust_max_wobble: Float,
+
+    // Velocity coefficients
+    forward_vel_coef: Float,
+    lateral_vel_coef: Float,
+    forward_accel_coef: Float,
+    lateral_accel_coef: Float,
+    uniform_axial_damping: Float,
+    turn_pivot_offset: Float,
+
+    // Targeting
+    airborne_targeting_height: Int,
+    close_enough_dist: Float,
+    close_enough_dist_3d: Bool,
+    slide_into_place_time: Float,
+
+    // Behavior flags
+    locomotor_works_when_dead: Bool,
+    allow_motive_force_while_airborne: Bool,
+    apply_2d_friction_when_airborne: Bool,
+    downhill_only: Bool,
+    stick_to_ground: Bool,
+    can_move_backwards: Bool,
+
+    // Wheels/suspension
+    has_suspension: Bool,
+    maximum_wheel_extension: Float,
+    maximum_wheel_compression: Float,
+    wheel_turn_angle: Float,
+
+    // Wandering behavior
+    wander_width_factor: Float,
+    wander_length_factor: Float,
+    wander_about_point_radius: Float,
+
+    // Correction factors
+    rudder_correction_degree: Float,
+    rudder_correction_rate: Float,
+    elevator_correction_degree: Float,
+    elevator_correction_rate: Float,
+}
+
+// Instance of a locomotor (per-unit)
+struct Locomotor {
+    template: LocomotorTemplate,
+
+    // Current state
+    current_speed: Float,
+    current_turn_rate: Float,
+    is_braking: Bool,
+    is_moving_backwards: Bool,
+    is_turning_around: Bool,
+    is_climbing: Bool,
+    over_water: Bool,
+
+    // Position maintenance
+    allow_invalid_position: Bool,
+    maintain_pos_is_valid: Bool,
+    precise_z_pos: Bool,
+    ultra_accurate: Bool,
+
+    // Distance tracking
+    no_slow_down_as_approaching_dest: Bool,
+    close_enough_dist_3d: Bool,
+
+    // Wandering
+    wander_direction: Bool,
+    wander_target_x: Float,
+    wander_target_y: Float,
+
+    // Physics integration
+    preferred_height_damping: Float,
+
+    fn init(template: LocomotorTemplate) -> Locomotor {
+        return Locomotor {
+            template: template,
+            current_speed: 0.0,
+            current_turn_rate: 0.0,
+            is_braking: false,
+            is_moving_backwards: false,
+            is_turning_around: false,
+            is_climbing: false,
+            over_water: false,
+            allow_invalid_position: false,
+            maintain_pos_is_valid: false,
+            precise_z_pos: false,
+            ultra_accurate: false,
+            no_slow_down_as_approaching_dest: false,
+            close_enough_dist_3d: template.close_enough_dist_3d,
+            wander_direction: false,
+            wander_target_x: 0.0,
+            wander_target_y: 0.0,
+            preferred_height_damping: template.preferred_height_damping,
+        }
+    }
+
+    fn get_max_speed(self, is_damaged: Bool) -> Float {
+        if is_damaged {
+            return self.template.max_speed_damaged
+        }
+        return self.template.max_speed
+    }
+
+    fn get_max_turn_rate(self, is_damaged: Bool) -> Float {
+        if is_damaged {
+            return self.template.max_turn_rate_damaged
+        }
+        return self.template.max_turn_rate
+    }
+
+    fn get_max_acceleration(self, is_damaged: Bool) -> Float {
+        if is_damaged {
+            return self.template.acceleration_damaged
+        }
+        return self.template.acceleration
+    }
+
+    fn get_max_lift(self, is_damaged: Bool) -> Float {
+        if is_damaged {
+            return self.template.lift_damaged
+        }
+        return self.template.lift
+    }
+
+    fn can_traverse_surface(self, surface: LocomotorSurface) -> Bool {
+        let surface_bit = surface as Int
+        return (self.template.surfaces & surface_bit) != 0
+    }
+
+    fn is_airborne(self) -> Bool {
+        return self.can_traverse_surface(LocomotorSurface::AIR)
+    }
+
+    fn is_naval(self) -> Bool {
+        return self.can_traverse_surface(LocomotorSurface::WATER) &&
+               !self.can_traverse_surface(LocomotorSurface::GROUND)
+    }
+
+    fn calc_min_turn_radius(self, is_damaged: Bool) -> Float {
+        let max_speed = self.get_max_speed(is_damaged)
+        let max_turn_rate = self.get_max_turn_rate(is_damaged)
+
+        if max_turn_rate <= 0.0 {
+            return 999999.0  // Can't turn
+        }
+
+        // Convert turn rate from degrees/sec to radians/sec
+        let turn_rate_rad = max_turn_rate * 0.0174532925  // PI / 180
+
+        // Radius = speed / angular_velocity
+        return max_speed / turn_rate_rad
+    }
+}
+
+// Locomotor template manager
+struct LocomotorManager {
+    templates: Collection<LocomotorTemplate>,
+
+    fn init() -> LocomotorManager {
+        return LocomotorManager {
+            templates: Collection::new(),
+        }
+    }
+
+    fn add_template(self, template: LocomotorTemplate) {
+        self.templates.add(template)
+    }
+
+    fn find_template(self, name: String) -> LocomotorTemplate? {
+        for template in self.templates {
+            if template.name == name {
+                return template
+            }
+        }
+        return null
+    }
+
+    fn create_locomotor(self, template_name: String) -> Locomotor? {
+        let template = self.find_template(template_name)?
+        return Locomotor::init(template)
+    }
+}
+
+// Predefined locomotor templates for C&C Generals
+fn create_default_locomotor_templates() -> LocomotorManager {
+    let manager = LocomotorManager::init()
+
+    // Infantry locomotor
+    let infantry = LocomotorTemplate {
+        name: "Infantry",
+        surfaces: LocomotorSurface::GROUND as Int,
+        max_speed: 30.0,
+        max_speed_damaged: 20.0,
+        min_speed: 0.0,
+        max_turn_rate: 360.0,
+        max_turn_rate_damaged: 180.0,
+        acceleration: 50.0,
+        acceleration_damaged: 30.0,
+        lift: 0.0,
+        lift_damaged: 0.0,
+        braking: 50.0,
+        min_turn_speed: 0.0,
+        preferred_height: 0.0,
+        preferred_height_damping: 1.0,
+        behavior_z: LocomotorBehaviorZ::NO_Z_MOTIVE_FORCE,
+        circling_radius: 0.0,
+        speed_limit_z: 0.0,
+        extra_2d_friction: 0.0,
+        max_thrust_angle: 0.0,
+        appearance: LocomotorAppearance::LEGS_TWO,
+        group_movement_priority: LocomotorGroupMovementPriority::MOVES_MIDDLE,
+        accel_pitch_limit: 0.0,
+        decel_pitch_limit: 0.0,
+        bounce_kick: 0.0,
+        pitch_stiffness: 0.0,
+        roll_stiffness: 0.0,
+        pitch_damping: 0.0,
+        roll_damping: 0.0,
+        pitch_in_direction_of_z_vel_factor: 0.0,
+        thrust_roll: 0.0,
+        thrust_wobble_rate: 0.0,
+        thrust_min_wobble: 0.0,
+        thrust_max_wobble: 0.0,
+        forward_vel_coef: 1.0,
+        lateral_vel_coef: 0.2,
+        forward_accel_coef: 1.0,
+        lateral_accel_coef: 0.2,
+        uniform_axial_damping: 0.0,
+        turn_pivot_offset: 0.0,
+        airborne_targeting_height: 0,
+        close_enough_dist: 5.0,
+        close_enough_dist_3d: false,
+        slide_into_place_time: 0.0,
+        locomotor_works_when_dead: false,
+        allow_motive_force_while_airborne: false,
+        apply_2d_friction_when_airborne: false,
+        downhill_only: false,
+        stick_to_ground: true,
+        can_move_backwards: true,
+        has_suspension: false,
+        maximum_wheel_extension: 0.0,
+        maximum_wheel_compression: 0.0,
+        wheel_turn_angle: 0.0,
+        wander_width_factor: 0.0,
+        wander_length_factor: 0.0,
+        wander_about_point_radius: 0.0,
+        rudder_correction_degree: 0.0,
+        rudder_correction_rate: 0.0,
+        elevator_correction_degree: 0.0,
+        elevator_correction_rate: 0.0,
+    }
+    manager.add_template(infantry)
+
+    // Tank locomotor (treads)
+    let tank = LocomotorTemplate {
+        name: "Tank",
+        surfaces: LocomotorSurface::GROUND as Int,
+        max_speed: 40.0,
+        max_speed_damaged: 25.0,
+        min_speed: 0.0,
+        max_turn_rate: 120.0,
+        max_turn_rate_damaged: 60.0,
+        acceleration: 30.0,
+        acceleration_damaged: 15.0,
+        lift: 0.0,
+        lift_damaged: 0.0,
+        braking: 40.0,
+        min_turn_speed: 10.0,
+        preferred_height: 0.0,
+        preferred_height_damping: 1.0,
+        behavior_z: LocomotorBehaviorZ::NO_Z_MOTIVE_FORCE,
+        circling_radius: 0.0,
+        speed_limit_z: 0.0,
+        extra_2d_friction: 0.0,
+        max_thrust_angle: 0.0,
+        appearance: LocomotorAppearance::TREADS,
+        group_movement_priority: LocomotorGroupMovementPriority::MOVES_FRONT,
+        accel_pitch_limit: 5.0,
+        decel_pitch_limit: -5.0,
+        bounce_kick: 0.0,
+        pitch_stiffness: 0.5,
+        roll_stiffness: 0.5,
+        pitch_damping: 0.9,
+        roll_damping: 0.9,
+        pitch_in_direction_of_z_vel_factor: 0.0,
+        thrust_roll: 0.0,
+        thrust_wobble_rate: 0.0,
+        thrust_min_wobble: 0.0,
+        thrust_max_wobble: 0.0,
+        forward_vel_coef: 1.0,
+        lateral_vel_coef: 0.1,
+        forward_accel_coef: 1.0,
+        lateral_accel_coef: 0.1,
+        uniform_axial_damping: 0.0,
+        turn_pivot_offset: 0.0,
+        airborne_targeting_height: 0,
+        close_enough_dist: 10.0,
+        close_enough_dist_3d: false,
+        slide_into_place_time: 0.0,
+        locomotor_works_when_dead: false,
+        allow_motive_force_while_airborne: false,
+        apply_2d_friction_when_airborne: false,
+        downhill_only: false,
+        stick_to_ground: true,
+        can_move_backwards: true,
+        has_suspension: true,
+        maximum_wheel_extension: 1.0,
+        maximum_wheel_compression: 0.5,
+        wheel_turn_angle: 0.0,
+        wander_width_factor: 0.0,
+        wander_length_factor: 0.0,
+        wander_about_point_radius: 0.0,
+        rudder_correction_degree: 0.0,
+        rudder_correction_rate: 0.0,
+        elevator_correction_degree: 0.0,
+        elevator_correction_rate: 0.0,
+    }
+    manager.add_template(tank)
+
+    // Aircraft locomotor (jet fighter)
+    let aircraft = LocomotorTemplate {
+        name: "JetAircraft",
+        surfaces: LocomotorSurface::AIR as Int,
+        max_speed: 120.0,
+        max_speed_damaged: 80.0,
+        min_speed: 40.0,
+        max_turn_rate: 60.0,
+        max_turn_rate_damaged: 30.0,
+        acceleration: 40.0,
+        acceleration_damaged: 20.0,
+        lift: 100.0,
+        lift_damaged: 50.0,
+        braking: 30.0,
+        min_turn_speed: 40.0,
+        preferred_height: 200.0,
+        preferred_height_damping: 0.8,
+        behavior_z: LocomotorBehaviorZ::SURFACE_RELATIVE_HEIGHT,
+        circling_radius: 100.0,
+        speed_limit_z: 50.0,
+        extra_2d_friction: 0.0,
+        max_thrust_angle: 0.5,
+        appearance: LocomotorAppearance::WINGS,
+        group_movement_priority: LocomotorGroupMovementPriority::MOVES_FRONT,
+        accel_pitch_limit: 15.0,
+        decel_pitch_limit: -15.0,
+        bounce_kick: 0.0,
+        pitch_stiffness: 0.3,
+        roll_stiffness: 0.3,
+        pitch_damping: 0.7,
+        roll_damping: 0.7,
+        pitch_in_direction_of_z_vel_factor: 0.5,
+        thrust_roll: 0.2,
+        thrust_wobble_rate: 2.0,
+        thrust_min_wobble: 0.0,
+        thrust_max_wobble: 1.0,
+        forward_vel_coef: 1.0,
+        lateral_vel_coef: 0.05,
+        forward_accel_coef: 1.0,
+        lateral_accel_coef: 0.05,
+        uniform_axial_damping: 0.0,
+        turn_pivot_offset: 0.0,
+        airborne_targeting_height: 200,
+        close_enough_dist: 50.0,
+        close_enough_dist_3d: true,
+        slide_into_place_time: 0.0,
+        locomotor_works_when_dead: false,
+        allow_motive_force_while_airborne: true,
+        apply_2d_friction_when_airborne: false,
+        downhill_only: false,
+        stick_to_ground: false,
+        can_move_backwards: false,
+        has_suspension: false,
+        maximum_wheel_extension: 0.0,
+        maximum_wheel_compression: 0.0,
+        wheel_turn_angle: 0.0,
+        wander_width_factor: 0.0,
+        wander_length_factor: 0.0,
+        wander_about_point_radius: 0.0,
+        rudder_correction_degree: 10.0,
+        rudder_correction_rate: 0.5,
+        elevator_correction_degree: 10.0,
+        elevator_correction_rate: 0.5,
+    }
+    manager.add_template(aircraft)
+
+    // Helicopter locomotor
+    let helicopter = LocomotorTemplate {
+        name: "Helicopter",
+        surfaces: LocomotorSurface::AIR as Int,
+        max_speed: 60.0,
+        max_speed_damaged: 40.0,
+        min_speed: 0.0,
+        max_turn_rate: 180.0,
+        max_turn_rate_damaged: 90.0,
+        acceleration: 35.0,
+        acceleration_damaged: 20.0,
+        lift: 80.0,
+        lift_damaged: 40.0,
+        braking: 40.0,
+        min_turn_speed: 0.0,
+        preferred_height: 100.0,
+        preferred_height_damping: 0.5,
+        behavior_z: LocomotorBehaviorZ::SURFACE_RELATIVE_HEIGHT,
+        circling_radius: 50.0,
+        speed_limit_z: 40.0,
+        extra_2d_friction: 0.0,
+        max_thrust_angle: 0.3,
+        appearance: LocomotorAppearance::THRUST,
+        group_movement_priority: LocomotorGroupMovementPriority::MOVES_FRONT,
+        accel_pitch_limit: 20.0,
+        decel_pitch_limit: -20.0,
+        bounce_kick: 0.0,
+        pitch_stiffness: 0.2,
+        roll_stiffness: 0.2,
+        pitch_damping: 0.8,
+        roll_damping: 0.8,
+        pitch_in_direction_of_z_vel_factor: 0.3,
+        thrust_roll: 0.15,
+        thrust_wobble_rate: 3.0,
+        thrust_min_wobble: 0.5,
+        thrust_max_wobble: 2.0,
+        forward_vel_coef: 1.0,
+        lateral_vel_coef: 0.8,
+        forward_accel_coef: 1.0,
+        lateral_accel_coef: 0.8,
+        uniform_axial_damping: 0.0,
+        turn_pivot_offset: 0.0,
+        airborne_targeting_height: 100,
+        close_enough_dist: 30.0,
+        close_enough_dist_3d: true,
+        slide_into_place_time: 0.0,
+        locomotor_works_when_dead: false,
+        allow_motive_force_while_airborne: true,
+        apply_2d_friction_when_airborne: false,
+        downhill_only: false,
+        stick_to_ground: false,
+        can_move_backwards: true,
+        has_suspension: false,
+        maximum_wheel_extension: 0.0,
+        maximum_wheel_compression: 0.0,
+        wheel_turn_angle: 0.0,
+        wander_width_factor: 0.0,
+        wander_length_factor: 0.0,
+        wander_about_point_radius: 0.0,
+        rudder_correction_degree: 15.0,
+        rudder_correction_rate: 1.0,
+        elevator_correction_degree: 15.0,
+        elevator_correction_rate: 1.0,
+    }
+    manager.add_template(helicopter)
+
+    return manager
+}
+
+// Tests
+test "Locomotor: create infantry" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("Infantry")?
+
+    assert loco.template.name == "Infantry"
+    assert loco.template.max_speed == 30.0
+    assert loco.template.appearance == LocomotorAppearance::LEGS_TWO
+    assert loco.can_traverse_surface(LocomotorSurface::GROUND)
+    assert !loco.is_airborne()
+}
+
+test "Locomotor: create tank" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("Tank")?
+
+    assert loco.template.name == "Tank"
+    assert loco.template.max_speed == 40.0
+    assert loco.template.appearance == LocomotorAppearance::TREADS
+    assert loco.template.has_suspension
+}
+
+test "Locomotor: create aircraft" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("JetAircraft")?
+
+    assert loco.template.name == "JetAircraft"
+    assert loco.template.max_speed == 120.0
+    assert loco.template.min_speed == 40.0  // Jets can't hover
+    assert loco.is_airborne()
+    assert !loco.is_naval()
+}
+
+test "Locomotor: create helicopter" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("Helicopter")?
+
+    assert loco.template.name == "Helicopter"
+    assert loco.template.min_speed == 0.0  // Can hover
+    assert loco.is_airborne()
+    assert loco.template.can_move_backwards
+}
+
+test "Locomotor: damaged stats" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("Tank")?
+
+    let normal_speed = loco.get_max_speed(false)
+    let damaged_speed = loco.get_max_speed(true)
+
+    assert damaged_speed < normal_speed
+    assert damaged_speed == 25.0
+}
+
+test "Locomotor: turn radius calculation" {
+    let manager = create_default_locomotor_templates()
+    let loco = manager.create_locomotor("Tank")?
+
+    let radius = loco.calc_min_turn_radius(false)
+    assert radius > 0.0
+}
+
+test "Locomotor: surface traversal" {
+    let manager = create_default_locomotor_templates()
+    let infantry = manager.create_locomotor("Infantry")?
+    let aircraft = manager.create_locomotor("JetAircraft")?
+
+    assert infantry.can_traverse_surface(LocomotorSurface::GROUND)
+    assert !infantry.can_traverse_surface(LocomotorSurface::AIR)
+
+    assert !aircraft.can_traverse_surface(LocomotorSurface::GROUND)
+    assert aircraft.can_traverse_surface(LocomotorSurface::AIR)
+}

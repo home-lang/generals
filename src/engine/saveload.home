@@ -1,0 +1,630 @@
+// Save/Load system for C&C Generals Zero Hour
+// Game state serialization and persistence
+// Written in Home language
+
+import world
+import player
+import object
+
+// Save data version for compatibility
+const SAVE_VERSION: Int = 1
+
+// Save file header
+struct SaveHeader {
+    version: Int,
+    game_name: String,
+    map_name: String,
+    timestamp: Float,
+    play_time: Float,
+    player_count: Int,
+
+    fn init(game_name: String, map_name: String, play_time: Float, player_count: Int) -> SaveHeader {
+        return SaveHeader {
+            version: SAVE_VERSION,
+            game_name: game_name,
+            map_name: map_name,
+            timestamp: 0.0,
+            play_time: play_time,
+            player_count: player_count,
+        }
+    }
+
+    fn is_compatible(self) -> Bool {
+        return self.version == SAVE_VERSION
+    }
+}
+
+// Saved game state
+struct SavedGameState {
+    header: SaveHeader,
+    current_frame: Int,
+    game_time: Float,
+    is_paused: Bool,
+    victory_conditions_met: Bool,
+    winning_player: Int,
+
+    fn init(header: SaveHeader) -> SavedGameState {
+        return SavedGameState {
+            header: header,
+            current_frame: 0,
+            game_time: 0.0,
+            is_paused: false,
+            victory_conditions_met: false,
+            winning_player: -1,
+        }
+    }
+}
+
+// Saved player data
+struct SavedPlayer {
+    player_id: Int,
+    name: String,
+    faction: String,
+    team: Int,
+    money: Float,
+    power_available: Int,
+    power_consumed: Int,
+    is_defeated: Bool,
+    upgrades_completed: Int,
+    generals_points: Int,
+
+    fn init(player_id: Int, name: String) -> SavedPlayer {
+        return SavedPlayer {
+            player_id: player_id,
+            name: name,
+            faction: "",
+            team: 0,
+            money: 0.0,
+            power_available: 0,
+            power_consumed: 0,
+            is_defeated: false,
+            upgrades_completed: 0,
+            generals_points: 0,
+        }
+    }
+}
+
+// Saved object data
+struct SavedObject {
+    object_id: Int,
+    template_name: String,
+    owner_id: Int,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    rotation: Float,
+    health: Float,
+    max_health: Float,
+    is_selected: Bool,
+    is_under_construction: Bool,
+    construction_progress: Float,
+    veteran_level: Int,
+
+    fn init(object_id: Int, template_name: String, owner_id: Int) -> SavedObject {
+        return SavedObject {
+            object_id: object_id,
+            template_name: template_name,
+            owner_id: owner_id,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+            rotation: 0.0,
+            health: 100.0,
+            max_health: 100.0,
+            is_selected: false,
+            is_under_construction: false,
+            construction_progress: 0.0,
+            veteran_level: 0,
+        }
+    }
+}
+
+// Complete save data
+struct SaveData {
+    game_state: SavedGameState,
+    players: Collection<SavedPlayer>,
+    objects: Collection<SavedObject>,
+    script_flags: Collection<(String, Bool)>,
+    script_counters: Collection<(String, Int)>,
+
+    fn init(header: SaveHeader) -> SaveData {
+        return SaveData {
+            game_state: SavedGameState::init(header),
+            players: Collection::new(),
+            objects: Collection::new(),
+            script_flags: Collection::new(),
+            script_counters: Collection::new(),
+        }
+    }
+
+    fn add_player(self, player: SavedPlayer) {
+        self.players.add(player)
+    }
+
+    fn add_object(self, obj: SavedObject) {
+        self.objects.add(obj)
+    }
+
+    fn add_script_flag(self, name: String, value: Bool) {
+        self.script_flags.add((name, value))
+    }
+
+    fn add_script_counter(self, name: String, value: Int) {
+        self.script_counters.add((name, value))
+    }
+
+    fn get_player_count(self) -> Int {
+        return self.players.count()
+    }
+
+    fn get_object_count(self) -> Int {
+        return self.objects.count()
+    }
+}
+
+// Save/Load manager
+struct SaveLoadManager {
+    current_save: SaveData?,
+    auto_save_interval: Float,
+    time_since_auto_save: Float,
+    auto_save_enabled: Bool,
+    max_auto_saves: Int,
+    save_directory: String,
+
+    fn init() -> SaveLoadManager {
+        return SaveLoadManager {
+            current_save: null,
+            auto_save_interval: 300.0,  // 5 minutes
+            time_since_auto_save: 0.0,
+            auto_save_enabled: true,
+            max_auto_saves: 5,
+            save_directory: "saves/",
+        }
+    }
+
+    fn create_save(self, game_name: String, map_name: String, play_time: Float, player_count: Int) -> SaveData {
+        let header = SaveHeader::init(game_name, map_name, play_time, player_count)
+        let save = SaveData::init(header)
+        self.current_save = save
+        return save
+    }
+
+    fn save_game(self, save_data: SaveData, filename: String) -> Bool {
+        // TODO: Actually write to file
+        self.current_save = save_data
+        return true
+    }
+
+    fn load_game(self, filename: String) -> SaveData? {
+        // TODO: Actually read from file
+        return self.current_save
+    }
+
+    fn quick_save(self, save_data: SaveData) -> Bool {
+        return self.save_game(save_data, "quicksave.sav")
+    }
+
+    fn quick_load(self) -> SaveData? {
+        return self.load_game("quicksave.sav")
+    }
+
+    fn auto_save(self, save_data: SaveData) -> Bool {
+        if !self.auto_save_enabled {
+            return false
+        }
+
+        let filename = "autosave_" + self.get_timestamp() + ".sav"
+        return self.save_game(save_data, filename)
+    }
+
+    fn update(self, delta_time: Float) {
+        if !self.auto_save_enabled {
+            return
+        }
+
+        self.time_since_auto_save = self.time_since_auto_save + delta_time
+
+        if self.time_since_auto_save >= self.auto_save_interval {
+            self.time_since_auto_save = 0.0
+            // Trigger auto-save
+        }
+    }
+
+    fn enable_auto_save(self) {
+        self.auto_save_enabled = true
+    }
+
+    fn disable_auto_save(self) {
+        self.auto_save_enabled = false
+    }
+
+    fn set_auto_save_interval(self, seconds: Float) {
+        self.auto_save_interval = seconds
+    }
+
+    fn get_timestamp(self) -> String {
+        // TODO: Get actual timestamp
+        return "1234567890"
+    }
+
+    fn list_saves(self) -> Collection<String> {
+        // TODO: List actual save files
+        let saves = Collection::new()
+        saves.add("quicksave.sav")
+        saves.add("autosave_1.sav")
+        return saves
+    }
+
+    fn delete_save(self, filename: String) -> Bool {
+        // TODO: Actually delete file
+        return true
+    }
+
+    fn has_quick_save(self) -> Bool {
+        let saves = self.list_saves()
+        for save in saves {
+            if save == "quicksave.sav" {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Save file info for UI
+struct SaveFileInfo {
+    filename: String,
+    display_name: String,
+    map_name: String,
+    timestamp: Float,
+    play_time: Float,
+    is_auto_save: Bool,
+
+    fn init(filename: String) -> SaveFileInfo {
+        return SaveFileInfo {
+            filename: filename,
+            display_name: filename,
+            map_name: "",
+            timestamp: 0.0,
+            play_time: 0.0,
+            is_auto_save: false,
+        }
+    }
+
+    fn from_header(filename: String, header: SaveHeader) -> SaveFileInfo {
+        let mut info = SaveFileInfo::init(filename)
+        info.display_name = header.game_name
+        info.map_name = header.map_name
+        info.timestamp = header.timestamp
+        info.play_time = header.play_time
+        info.is_auto_save = filename.starts_with("autosave_")
+        return info
+    }
+}
+
+// Serialization helpers
+struct Serializer {
+    data: Collection<String>,
+
+    fn init() -> Serializer {
+        return Serializer {
+            data: Collection::new(),
+        }
+    }
+
+    fn write_int(self, value: Int) {
+        self.data.add("i:" + value)
+    }
+
+    fn write_float(self, value: Float) {
+        self.data.add("f:" + value)
+    }
+
+    fn write_bool(self, value: Bool) {
+        if value {
+            self.data.add("b:1")
+        } else {
+            self.data.add("b:0")
+        }
+    }
+
+    fn write_string(self, value: String) {
+        self.data.add("s:" + value)
+    }
+
+    fn get_data(self) -> Collection<String> {
+        return self.data
+    }
+
+    fn get_size(self) -> Int {
+        return self.data.count()
+    }
+}
+
+struct Deserializer {
+    data: Collection<String>,
+    read_index: Int,
+
+    fn init(data: Collection<String>) -> Deserializer {
+        return Deserializer {
+            data: data,
+            read_index: 0,
+        }
+    }
+
+    fn read_int(self) -> Int {
+        if self.read_index < self.data.count() {
+            let value = self.data.get(self.read_index)
+            self.read_index = self.read_index + 1
+            // TODO: Parse int from string
+            return 0
+        }
+        return 0
+    }
+
+    fn read_float(self) -> Float {
+        if self.read_index < self.data.count() {
+            let value = self.data.get(self.read_index)
+            self.read_index = self.read_index + 1
+            // TODO: Parse float from string
+            return 0.0
+        }
+        return 0.0
+    }
+
+    fn read_bool(self) -> Bool {
+        if self.read_index < self.data.count() {
+            let value = self.data.get(self.read_index)
+            self.read_index = self.read_index + 1
+            return value == "b:1"
+        }
+        return false
+    }
+
+    fn read_string(self) -> String {
+        if self.read_index < self.data.count() {
+            let value = self.data.get(self.read_index)
+            self.read_index = self.read_index + 1
+            // TODO: Extract string after "s:"
+            return value
+        }
+        return ""
+    }
+
+    fn has_more(self) -> Bool {
+        return self.read_index < self.data.count()
+    }
+}
+
+// Tests
+test "SaveHeader: init" {
+    let header = SaveHeader::init("Campaign Mission 1", "map_usa01", 3600.0, 2)
+
+    assert header.version == SAVE_VERSION
+    assert header.game_name == "Campaign Mission 1"
+    assert header.map_name == "map_usa01"
+    assert header.is_compatible()
+}
+
+test "SavedGameState: init" {
+    let header = SaveHeader::init("Test", "test_map", 0.0, 1)
+    let state = SavedGameState::init(header)
+
+    assert state.current_frame == 0
+    assert !state.is_paused
+    assert state.winning_player == -1
+}
+
+test "SavedPlayer: init" {
+    let player = SavedPlayer::init(0, "Player1")
+
+    assert player.player_id == 0
+    assert player.name == "Player1"
+    assert player.money == 0.0
+    assert !player.is_defeated
+}
+
+test "SavedObject: init" {
+    let obj = SavedObject::init(100, "avCrusader", 0)
+
+    assert obj.object_id == 100
+    assert obj.template_name == "avCrusader"
+    assert obj.owner_id == 0
+    assert obj.health == 100.0
+}
+
+test "SaveData: init" {
+    let header = SaveHeader::init("Test", "map", 0.0, 1)
+    let save = SaveData::init(header)
+
+    assert save.get_player_count() == 0
+    assert save.get_object_count() == 0
+}
+
+test "SaveData: add player" {
+    let header = SaveHeader::init("Test", "map", 0.0, 2)
+    let save = SaveData::init(header)
+
+    let player1 = SavedPlayer::init(0, "Player1")
+    let player2 = SavedPlayer::init(1, "Player2")
+
+    save.add_player(player1)
+    save.add_player(player2)
+
+    assert save.get_player_count() == 2
+}
+
+test "SaveData: add object" {
+    let header = SaveHeader::init("Test", "map", 0.0, 1)
+    let save = SaveData::init(header)
+
+    let obj = SavedObject::init(1, "avHumvee", 0)
+    save.add_object(obj)
+
+    assert save.get_object_count() == 1
+}
+
+test "SaveData: script data" {
+    let header = SaveHeader::init("Test", "map", 0.0, 1)
+    let save = SaveData::init(header)
+
+    save.add_script_flag("mission_started", true)
+    save.add_script_counter("enemies_killed", 10)
+
+    assert save.script_flags.count() == 1
+    assert save.script_counters.count() == 1
+}
+
+test "SaveLoadManager: init" {
+    let manager = SaveLoadManager::init()
+
+    assert manager.auto_save_enabled
+    assert manager.auto_save_interval == 300.0
+}
+
+test "SaveLoadManager: create save" {
+    let manager = SaveLoadManager::init()
+
+    let save = manager.create_save("Test Game", "test_map", 1000.0, 2)
+
+    assert save.game_state.header.game_name == "Test Game"
+    assert save.game_state.header.player_count == 2
+}
+
+test "SaveLoadManager: save and load" {
+    let manager = SaveLoadManager::init()
+
+    let save = manager.create_save("Test", "map", 0.0, 1)
+    let player = SavedPlayer::init(0, "TestPlayer")
+    save.add_player(player)
+
+    let saved = manager.save_game(save, "test.sav")
+    assert saved
+
+    let loaded = manager.load_game("test.sav")?
+    assert loaded.get_player_count() == 1
+}
+
+test "SaveLoadManager: quick save and load" {
+    let manager = SaveLoadManager::init()
+
+    let save = manager.create_save("Quick", "map", 0.0, 1)
+    let saved = manager.quick_save(save)
+    assert saved
+
+    let loaded = manager.quick_load()?
+    assert loaded.game_state.header.game_name == "Quick"
+}
+
+test "SaveLoadManager: auto save" {
+    let manager = SaveLoadManager::init()
+
+    let save = manager.create_save("Auto", "map", 0.0, 1)
+    let saved = manager.auto_save(save)
+    assert saved
+}
+
+test "SaveLoadManager: auto save disabled" {
+    let manager = SaveLoadManager::init()
+    manager.disable_auto_save()
+
+    let save = manager.create_save("Test", "map", 0.0, 1)
+    let saved = manager.auto_save(save)
+    assert !saved
+}
+
+test "SaveLoadManager: auto save interval" {
+    let manager = SaveLoadManager::init()
+
+    manager.set_auto_save_interval(600.0)
+    assert manager.auto_save_interval == 600.0
+}
+
+test "SaveLoadManager: update triggers auto save" {
+    let manager = SaveLoadManager::init()
+    manager.set_auto_save_interval(1.0)
+
+    manager.update(0.5)
+    assert manager.time_since_auto_save == 0.5
+
+    manager.update(0.6)
+    assert manager.time_since_auto_save < 0.5  // Reset after trigger
+}
+
+test "SaveLoadManager: list saves" {
+    let manager = SaveLoadManager::init()
+
+    let saves = manager.list_saves()
+    assert saves.count() > 0
+}
+
+test "SaveLoadManager: has quick save" {
+    let manager = SaveLoadManager::init()
+
+    let save = manager.create_save("Test", "map", 0.0, 1)
+    manager.quick_save(save)
+
+    assert manager.has_quick_save()
+}
+
+test "SaveFileInfo: init" {
+    let info = SaveFileInfo::init("save1.sav")
+
+    assert info.filename == "save1.sav"
+    assert !info.is_auto_save
+}
+
+test "SaveFileInfo: from header" {
+    let header = SaveHeader::init("Mission 1", "map_usa01", 1800.0, 2)
+    let info = SaveFileInfo::from_header("save1.sav", header)
+
+    assert info.display_name == "Mission 1"
+    assert info.map_name == "map_usa01"
+    assert info.play_time == 1800.0
+}
+
+test "SaveFileInfo: auto save detection" {
+    let header = SaveHeader::init("Auto", "map", 0.0, 1)
+    let info = SaveFileInfo::from_header("autosave_123.sav", header)
+
+    assert info.is_auto_save
+}
+
+test "Serializer: write primitives" {
+    let serializer = Serializer::init()
+
+    serializer.write_int(42)
+    serializer.write_float(3.14)
+    serializer.write_bool(true)
+    serializer.write_string("test")
+
+    assert serializer.get_size() == 4
+}
+
+test "Deserializer: read primitives" {
+    let data = Collection::new()
+    data.add("i:42")
+    data.add("f:3.14")
+    data.add("b:1")
+    data.add("s:test")
+
+    let deserializer = Deserializer::init(data)
+
+    assert deserializer.has_more()
+    deserializer.read_int()
+    deserializer.read_float()
+    deserializer.read_bool()
+    deserializer.read_string()
+    assert !deserializer.has_more()
+}
+
+test "Deserializer: read bool" {
+    let data = Collection::new()
+    data.add("b:1")
+    data.add("b:0")
+
+    let deserializer = Deserializer::init(data)
+
+    assert deserializer.read_bool()
+    assert !deserializer.read_bool()
+}

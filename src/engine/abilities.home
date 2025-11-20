@@ -1,0 +1,1027 @@
+// Special Powers and Abilities System
+// Implements all general powers, unit abilities, and faction mechanics
+
+enum AbilityType {
+    ACTIVE,      // Manually triggered
+    PASSIVE,     // Always on
+    TOGGLED,     // Can be turned on/off
+    TRIGGERED,   // Auto-triggers on condition
+}
+
+enum AbilityTarget {
+    SELF,
+    SINGLE_UNIT,
+    AREA,
+    BUILDING,
+    GROUND,
+    NONE,
+}
+
+enum PowerCategory {
+    OFFENSIVE,
+    DEFENSIVE,
+    SUPPORT,
+    ECONOMY,
+    SPECIAL,
+}
+
+struct AbilityDefinition {
+    id: String,
+    name: String,
+    description: String,
+    ability_type: AbilityType,
+    target_type: AbilityTarget,
+    category: PowerCategory,
+
+    // Cost and requirements
+    cost: Int,
+    energy_cost: Int,
+    cooldown: Float,
+    requires_power: Bool,
+    requires_general_rank: Int,
+
+    // Effect parameters
+    damage: Float,
+    radius: Float,
+    duration: Float,
+    heal_amount: Float,
+    modifier_value: Float,
+
+    // Targeting
+    min_range: Float,
+    max_range: Float,
+    los_required: Bool,
+
+    // Effects
+    creates_object: String,
+    applies_buff: String,
+    applies_debuff: String,
+
+    fn init(id: String, name: String, desc: String) -> AbilityDefinition {
+        let ability = AbilityDefinition {
+            id: id,
+            name: name,
+            description: desc,
+            ability_type: AbilityType::ACTIVE,
+            target_type: AbilityTarget::NONE,
+            category: PowerCategory::SPECIAL,
+            cost: 0,
+            energy_cost: 0,
+            cooldown: 0.0,
+            requires_power: false,
+            requires_general_rank: 0,
+            damage: 0.0,
+            radius: 0.0,
+            duration: 0.0,
+            heal_amount: 0.0,
+            modifier_value: 0.0,
+            min_range: 0.0,
+            max_range: 1000.0,
+            los_required: true,
+            creates_object: "",
+            applies_buff: "",
+            applies_debuff: "",
+        }
+        return ability
+    }
+}
+
+struct AbilityInstance {
+    definition: AbilityDefinition,
+    owner_id: Int,
+    is_active: Bool,
+    current_cooldown: Float,
+    available_uses: Int,
+
+    fn init(def: AbilityDefinition, owner: Int) -> AbilityInstance {
+        let instance = AbilityInstance {
+            definition: def,
+            owner_id: owner,
+            is_active: false,
+            current_cooldown: 0.0,
+            available_uses: -1,  // -1 = infinite
+        }
+        return instance
+    }
+
+    fn can_use(self) -> Bool {
+        if self.current_cooldown > 0.0 {
+            return false
+        }
+
+        if self.available_uses == 0 {
+            return false
+        }
+
+        return true
+    }
+
+    fn use_ability(self) {
+        self.current_cooldown = self.definition.cooldown
+
+        if self.available_uses > 0 {
+            self.available_uses = self.available_uses - 1
+        }
+    }
+
+    fn update(self, dt: Float) {
+        if self.current_cooldown > 0.0 {
+            self.current_cooldown = self.current_cooldown - dt
+            if self.current_cooldown < 0.0 {
+                self.current_cooldown = 0.0
+            }
+        }
+    }
+}
+
+// USA General Powers
+fn create_a10_strike() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "a10_strike",
+        "A-10 Strike",
+        "Call in an A-10 Thunderbolt strafing run"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 800
+    ability.cooldown = 120.0
+    ability.damage = 500.0
+    ability.radius = 50.0
+    ability.requires_general_rank = 1
+    ability.creates_object = "a10_strafe"
+    return ability
+}
+
+fn create_carpet_bomb() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "carpet_bomb",
+        "Carpet Bomb",
+        "B-52 bomber drops a line of explosives"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1500
+    ability.cooldown = 180.0
+    ability.damage = 800.0
+    ability.radius = 75.0
+    ability.requires_general_rank = 3
+    ability.creates_object = "b52_bomber"
+    return ability
+}
+
+fn create_fuel_air_bomb() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "fuel_air_bomb",
+        "Fuel Air Bomb",
+        "Massive thermobaric explosion"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::GROUND
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 2500
+    ability.cooldown = 240.0
+    ability.damage = 1200.0
+    ability.radius = 100.0
+    ability.requires_general_rank = 5
+    ability.creates_object = "moab"
+    return ability
+}
+
+fn create_pathfinder() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "pathfinder",
+        "Pathfinder",
+        "Elite special forces unit with stealth detection"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::GROUND
+    ability.category = PowerCategory::SUPPORT
+    ability.cost = 600
+    ability.cooldown = 90.0
+    ability.requires_general_rank = 1
+    ability.creates_object = "pathfinder_unit"
+    return ability
+}
+
+fn create_spectre_gunship() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "spectre_gunship",
+        "Spectre Gunship",
+        "AC-130 gunship provides fire support"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1200
+    ability.cooldown = 150.0
+    ability.duration = 30.0
+    ability.requires_general_rank = 3
+    ability.creates_object = "ac130"
+    return ability
+}
+
+fn create_emergency_repair() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "emergency_repair",
+        "Emergency Repair",
+        "Instantly repairs all vehicles in area"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::SUPPORT
+    ability.cost = 1000
+    ability.cooldown = 120.0
+    ability.heal_amount = 300.0
+    ability.radius = 75.0
+    ability.requires_general_rank = 1
+    return ability
+}
+
+// China General Powers
+fn create_artillery_barrage() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "artillery_barrage",
+        "Artillery Barrage",
+        "Heavy artillery bombardment"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1000
+    ability.cooldown = 120.0
+    ability.damage = 600.0
+    ability.radius = 60.0
+    ability.duration = 10.0
+    ability.requires_general_rank = 1
+    return ability
+}
+
+fn create_carpet_bomb_mig() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "carpet_bomb_mig",
+        "Carpet Bomb (MiG)",
+        "MiG fighter drops carpet bombs"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1500
+    ability.cooldown = 180.0
+    ability.damage = 800.0
+    ability.radius = 70.0
+    ability.requires_general_rank = 3
+    ability.creates_object = "mig_bomber"
+    return ability
+}
+
+fn create_nuclear_missile() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "nuclear_missile",
+        "Nuclear Missile",
+        "Devastating nuclear warhead"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::GROUND
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 5000
+    ability.cooldown = 360.0
+    ability.damage = 2000.0
+    ability.radius = 150.0
+    ability.requires_general_rank = 5
+    ability.requires_power = true
+    ability.creates_object = "icbm"
+    ability.applies_debuff = "radiation"
+    return ability
+}
+
+fn create_napalm_strike() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "napalm_strike",
+        "Napalm Strike",
+        "MiG drops napalm bombs"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1200
+    ability.cooldown = 150.0
+    ability.damage = 400.0
+    ability.radius = 50.0
+    ability.duration = 15.0
+    ability.requires_general_rank = 3
+    ability.applies_debuff = "burning"
+    return ability
+}
+
+fn create_cluster_mines() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "cluster_mines",
+        "Cluster Mines",
+        "Deploy cluster mines in area"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::DEFENSIVE
+    ability.cost = 800
+    ability.cooldown = 90.0
+    ability.damage = 300.0
+    ability.radius = 40.0
+    ability.requires_general_rank = 1
+    ability.creates_object = "cluster_mine"
+    return ability
+}
+
+fn create_emp_pulse() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "emp_pulse",
+        "EMP Pulse",
+        "Disables all vehicles and electronics"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1500
+    ability.cooldown = 180.0
+    ability.radius = 100.0
+    ability.duration = 20.0
+    ability.requires_general_rank = 3
+    ability.applies_debuff = "emp_disabled"
+    return ability
+}
+
+// GLA General Powers
+fn create_sneak_attack() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "sneak_attack",
+        "Sneak Attack",
+        "Deploy rebel ambush team"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::GROUND
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 400
+    ability.cooldown = 60.0
+    ability.requires_general_rank = 1
+    ability.creates_object = "rebel_ambush"
+    return ability
+}
+
+fn create_rebel_reinforcements() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "rebel_reinforcements",
+        "Rebel Reinforcements",
+        "Tunnel network delivers fighters"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::GROUND
+    ability.category = PowerCategory::SUPPORT
+    ability.cost = 600
+    ability.cooldown = 90.0
+    ability.requires_general_rank = 1
+    ability.creates_object = "tunnel_spawn"
+    return ability
+}
+
+fn create_anthrax_bomb() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "anthrax_bomb",
+        "Anthrax Bomb",
+        "Biological weapon cloud"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 1200
+    ability.cooldown = 150.0
+    ability.damage = 500.0
+    ability.radius = 70.0
+    ability.duration = 20.0
+    ability.requires_general_rank = 3
+    ability.applies_debuff = "anthrax_poisoning"
+    return ability
+}
+
+fn create_scud_storm() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "scud_storm",
+        "SCUD Storm",
+        "Multiple SCUD missiles rain down"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cost = 5000
+    ability.cooldown = 360.0
+    ability.damage = 1500.0
+    ability.radius = 120.0
+    ability.requires_general_rank = 5
+    ability.requires_power = true
+    ability.creates_object = "scud_launcher"
+    ability.applies_debuff = "anthrax_poisoning"
+    return ability
+}
+
+fn create_cash_bounty() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "cash_bounty",
+        "Cash Bounty",
+        "Gain cash for each kill"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::NONE
+    ability.category = PowerCategory::ECONOMY
+    ability.modifier_value = 25.0  // Bonus cash per kill
+    ability.requires_general_rank = 1
+    return ability
+}
+
+fn create_demolition_charge() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "demo_charge",
+        "Demolition Charge",
+        "Plant explosive on building"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::BUILDING
+    ability.category = PowerCategory::OFFENSIVE
+    ability.damage = 1000.0
+    ability.cooldown = 30.0
+    ability.max_range = 5.0
+    return ability
+}
+
+// Unit Abilities
+fn create_stealth() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "stealth",
+        "Stealth",
+        "Unit is invisible to enemies"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SPECIAL
+    return ability
+}
+
+fn create_stealth_detection() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "stealth_detection",
+        "Stealth Detection",
+        "Reveals stealth units"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SPECIAL
+    ability.radius = 150.0
+    return ability
+}
+
+fn create_remote_charges() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "remote_charges",
+        "Remote Charges",
+        "Plant C4 on buildings"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::BUILDING
+    ability.category = PowerCategory::OFFENSIVE
+    ability.damage = 800.0
+    ability.cooldown = 15.0
+    ability.max_range = 5.0
+    return ability
+}
+
+fn create_capture_building() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "capture_building",
+        "Capture Building",
+        "Hack and capture enemy building"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::BUILDING
+    ability.category = PowerCategory::SPECIAL
+    ability.duration = 5.0
+    ability.max_range = 5.0
+    return ability
+}
+
+fn create_cash_hack() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "cash_hack",
+        "Cash Hack",
+        "Steal enemy resources"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::BUILDING
+    ability.category = PowerCategory::ECONOMY
+    ability.duration = 3.0
+    ability.modifier_value = 500.0
+    ability.max_range = 5.0
+    return ability
+}
+
+fn create_disable_vehicle() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "disable_vehicle",
+        "Disable Vehicle",
+        "Shut down enemy vehicle systems"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::SINGLE_UNIT
+    ability.category = PowerCategory::OFFENSIVE
+    ability.duration = 10.0
+    ability.cooldown = 20.0
+    ability.max_range = 200.0
+    return ability
+}
+
+fn create_kill_driver() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "kill_driver",
+        "Snipe Driver",
+        "Kill vehicle driver with precision shot"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::SINGLE_UNIT
+    ability.category = PowerCategory::OFFENSIVE
+    ability.cooldown = 15.0
+    ability.max_range = 300.0
+    ability.los_required = true
+    return ability
+}
+
+fn create_suicide_attack() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "suicide_attack",
+        "Suicide Attack",
+        "Detonate explosives"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::OFFENSIVE
+    ability.damage = 600.0
+    ability.radius = 30.0
+    return ability
+}
+
+fn create_salvage() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "salvage",
+        "Salvage",
+        "Collect resources from wreckage"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::NONE
+    ability.category = PowerCategory::ECONOMY
+    ability.modifier_value = 25.0
+    ability.radius = 5.0
+    return ability
+}
+
+fn create_hijack_vehicle() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "hijack_vehicle",
+        "Hijack Vehicle",
+        "Steal enemy vehicle"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::SINGLE_UNIT
+    ability.category = PowerCategory::SPECIAL
+    ability.duration = 3.0
+    ability.max_range = 5.0
+    return ability
+}
+
+fn create_radar_scan() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "radar_scan",
+        "Radar Scan",
+        "Reveal area on map"
+    )
+    ability.ability_type = AbilityType::ACTIVE
+    ability.target_type = AbilityTarget::AREA
+    ability.category = PowerCategory::SUPPORT
+    ability.cost = 500
+    ability.cooldown = 60.0
+    ability.radius = 200.0
+    ability.duration = 10.0
+    return ability
+}
+
+fn create_radar_jam() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "radar_jam",
+        "Radar Jamming",
+        "Disable enemy radar"
+    )
+    ability.ability_type = AbilityType::TOGGLED
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SUPPORT
+    ability.radius = 150.0
+    return ability
+}
+
+fn create_point_defense_laser() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "point_defense_laser",
+        "Point Defense Laser",
+        "Shoots down incoming missiles"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::DEFENSIVE
+    ability.radius = 100.0
+    return ability
+}
+
+fn create_battle_drone() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "battle_drone",
+        "Battle Drone",
+        "Deploy combat drone"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SUPPORT
+    ability.creates_object = "drone"
+    return ability
+}
+
+fn create_overlord_speaker() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "propaganda_speaker",
+        "Propaganda Tower",
+        "Heals nearby infantry"
+    )
+    ability.ability_type = AbilityType::TOGGLED
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SUPPORT
+    ability.heal_amount = 5.0
+    ability.radius = 100.0
+    return ability
+}
+
+fn create_gattling_cannon() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "gattling_cannon",
+        "Gattling Cannon",
+        "Barrels spin up for increased damage"
+    )
+    ability.ability_type = AbilityType::TRIGGERED
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::OFFENSIVE
+    ability.modifier_value = 2.0  // Damage multiplier
+    ability.duration = 999.0  // While firing
+    return ability
+}
+
+fn create_booby_trap() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "booby_trap",
+        "Booby Trap",
+        "Building explodes when destroyed"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::DEFENSIVE
+    ability.damage = 400.0
+    ability.radius = 50.0
+    return ability
+}
+
+fn create_camouflage() -> AbilityDefinition {
+    let ability = AbilityDefinition::init(
+        "camouflage",
+        "Camouflage",
+        "Disguises as civilian vehicle"
+    )
+    ability.ability_type = AbilityType::PASSIVE
+    ability.target_type = AbilityTarget::SELF
+    ability.category = PowerCategory::SPECIAL
+    return ability
+}
+
+struct AbilityRegistry {
+    abilities: Collection<AbilityDefinition>,
+
+    fn init() -> AbilityRegistry {
+        let registry = AbilityRegistry {
+            abilities: Collection::init(),
+        }
+
+        // USA Powers
+        registry.abilities.add(create_a10_strike())
+        registry.abilities.add(create_carpet_bomb())
+        registry.abilities.add(create_fuel_air_bomb())
+        registry.abilities.add(create_pathfinder())
+        registry.abilities.add(create_spectre_gunship())
+        registry.abilities.add(create_emergency_repair())
+
+        // China Powers
+        registry.abilities.add(create_artillery_barrage())
+        registry.abilities.add(create_carpet_bomb_mig())
+        registry.abilities.add(create_nuclear_missile())
+        registry.abilities.add(create_napalm_strike())
+        registry.abilities.add(create_cluster_mines())
+        registry.abilities.add(create_emp_pulse())
+
+        // GLA Powers
+        registry.abilities.add(create_sneak_attack())
+        registry.abilities.add(create_rebel_reinforcements())
+        registry.abilities.add(create_anthrax_bomb())
+        registry.abilities.add(create_scud_storm())
+        registry.abilities.add(create_cash_bounty())
+        registry.abilities.add(create_demolition_charge())
+
+        // Unit Abilities
+        registry.abilities.add(create_stealth())
+        registry.abilities.add(create_stealth_detection())
+        registry.abilities.add(create_remote_charges())
+        registry.abilities.add(create_capture_building())
+        registry.abilities.add(create_cash_hack())
+        registry.abilities.add(create_disable_vehicle())
+        registry.abilities.add(create_kill_driver())
+        registry.abilities.add(create_suicide_attack())
+        registry.abilities.add(create_salvage())
+        registry.abilities.add(create_hijack_vehicle())
+        registry.abilities.add(create_radar_scan())
+        registry.abilities.add(create_radar_jam())
+        registry.abilities.add(create_point_defense_laser())
+        registry.abilities.add(create_battle_drone())
+        registry.abilities.add(create_overlord_speaker())
+        registry.abilities.add(create_gattling_cannon())
+        registry.abilities.add(create_booby_trap())
+        registry.abilities.add(create_camouflage())
+
+        return registry
+    }
+
+    fn get_ability(self, id: String) -> AbilityDefinition? {
+        for i in 0..self.abilities.len() {
+            let ability = self.abilities.get(i)
+            if ability.id == id {
+                return ability
+            }
+        }
+        return null
+    }
+
+    fn get_general_powers(self, faction: String) -> Collection<AbilityDefinition> {
+        let powers = Collection::init()
+
+        for i in 0..self.abilities.len() {
+            let ability = self.abilities.get(i)
+            if ability.requires_general_rank > 0 {
+                powers.add(ability)
+            }
+        }
+
+        return powers
+    }
+
+    fn get_powers_by_rank(self, rank: Int) -> Collection<AbilityDefinition> {
+        let powers = Collection::init()
+
+        for i in 0..self.abilities.len() {
+            let ability = self.abilities.get(i)
+            if ability.requires_general_rank == rank {
+                powers.add(ability)
+            }
+        }
+
+        return powers
+    }
+}
+
+struct AbilityManager {
+    registry: AbilityRegistry,
+    active_abilities: Collection<AbilityInstance>,
+
+    fn init() -> AbilityManager {
+        let manager = AbilityManager {
+            registry: AbilityRegistry::init(),
+            active_abilities: Collection::init(),
+        }
+        return manager
+    }
+
+    fn grant_ability(self, unit_id: Int, ability_id: String) -> Bool {
+        let def = self.registry.get_ability(ability_id)
+        if def == null {
+            return false
+        }
+
+        let instance = AbilityInstance::init(def, unit_id)
+        self.active_abilities.add(instance)
+        return true
+    }
+
+    fn activate_ability(self, unit_id: Int, ability_id: String, target_x: Float, target_y: Float) -> Bool {
+        // Find ability instance for this unit
+        for i in 0..self.active_abilities.len() {
+            let instance = self.active_abilities.get(i)
+            if instance.owner_id == unit_id && instance.definition.id == ability_id {
+                if !instance.can_use() {
+                    return false
+                }
+
+                instance.use_ability()
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn update(self, dt: Float) {
+        for i in 0..self.active_abilities.len() {
+            let instance = self.active_abilities.get(i)
+            instance.update(dt)
+        }
+    }
+
+    fn get_unit_abilities(self, unit_id: Int) -> Collection<AbilityInstance> {
+        let result = Collection::init()
+
+        for i in 0..self.active_abilities.len() {
+            let instance = self.active_abilities.get(i)
+            if instance.owner_id == unit_id {
+                result.add(instance)
+            }
+        }
+
+        return result
+    }
+
+    fn remove_unit_abilities(self, unit_id: Int) {
+        let new_list = Collection::init()
+
+        for i in 0..self.active_abilities.len() {
+            let instance = self.active_abilities.get(i)
+            if instance.owner_id != unit_id {
+                new_list.add(instance)
+            }
+        }
+
+        self.active_abilities = new_list
+    }
+}
+
+// Tests
+fn test_ability_creation() -> Bool {
+    let ability = create_a10_strike()
+    assert(ability.id == "a10_strike", "A10 strike ID")
+    assert(ability.cost == 800, "A10 strike cost")
+    assert(ability.requires_general_rank == 1, "A10 strike rank")
+    return true
+}
+
+fn test_ability_instance() -> Bool {
+    let def = create_carpet_bomb()
+    let instance = AbilityInstance::init(def, 1)
+
+    assert(instance.can_use(), "Initial can use")
+
+    instance.use_ability()
+    assert(!instance.can_use(), "Can't use while on cooldown")
+    assert(instance.current_cooldown == 180.0, "Cooldown set")
+
+    instance.update(90.0)
+    assert(!instance.can_use(), "Still on cooldown")
+
+    instance.update(100.0)
+    assert(instance.can_use(), "Cooldown finished")
+
+    return true
+}
+
+fn test_ability_registry() -> Bool {
+    let registry = AbilityRegistry::init()
+
+    assert(registry.abilities.len() > 30, "Registry has abilities")
+
+    let a10 = registry.get_ability("a10_strike")
+    assert(a10 != null, "Found A10 strike")
+    assert(a10.name == "A-10 Strike", "A10 name correct")
+
+    let rank1 = registry.get_powers_by_rank(1)
+    assert(rank1.len() > 0, "Has rank 1 powers")
+
+    return true
+}
+
+fn test_ability_manager() -> Bool {
+    let manager = AbilityManager::init()
+
+    let success = manager.grant_ability(1, "stealth")
+    assert(success, "Granted stealth ability")
+
+    let abilities = manager.get_unit_abilities(1)
+    assert(abilities.len() == 1, "Unit has 1 ability")
+
+    manager.remove_unit_abilities(1)
+    let after_remove = manager.get_unit_abilities(1)
+    assert(after_remove.len() == 0, "Abilities removed")
+
+    return true
+}
+
+fn test_general_powers() -> Bool {
+    let usa_a10 = create_a10_strike()
+    assert(usa_a10.category == PowerCategory::OFFENSIVE, "A10 is offensive")
+
+    let china_nuke = create_nuclear_missile()
+    assert(china_nuke.requires_power, "Nuke requires power")
+    assert(china_nuke.requires_general_rank == 5, "Nuke is rank 5")
+
+    let gla_sneak = create_sneak_attack()
+    assert(gla_sneak.cost == 400, "Sneak attack cost")
+
+    return true
+}
+
+fn test_unit_abilities() -> Bool {
+    let stealth = create_stealth()
+    assert(stealth.ability_type == AbilityType::PASSIVE, "Stealth is passive")
+
+    let remote = create_remote_charges()
+    assert(remote.ability_type == AbilityType::ACTIVE, "Remote charges active")
+    assert(remote.target_type == AbilityTarget::BUILDING, "Targets buildings")
+
+    let capture = create_capture_building()
+    assert(capture.duration == 5.0, "Capture duration")
+
+    return true
+}
+
+fn test_special_mechanics() -> Bool {
+    let salvage = create_salvage()
+    assert(salvage.modifier_value == 25.0, "Salvage bonus")
+
+    let cash_bounty = create_cash_bounty()
+    assert(cash_bounty.ability_type == AbilityType::PASSIVE, "Bounty is passive")
+
+    let hijack = create_hijack_vehicle()
+    assert(hijack.max_range == 5.0, "Hijack range")
+
+    return true
+}
+
+fn test_defensive_abilities() -> Bool {
+    let pdl = create_point_defense_laser()
+    assert(pdl.radius == 100.0, "PDL range")
+
+    let booby = create_booby_trap()
+    assert(booby.damage == 400.0, "Booby trap damage")
+
+    let cluster = create_cluster_mines()
+    assert(cluster.category == PowerCategory::DEFENSIVE, "Mines defensive")
+
+    return true
+}
+
+fn test_support_abilities() -> Bool {
+    let repair = create_emergency_repair()
+    assert(repair.heal_amount == 300.0, "Repair amount")
+    assert(repair.radius == 75.0, "Repair radius")
+
+    let speaker = create_overlord_speaker()
+    assert(speaker.ability_type == AbilityType::TOGGLED, "Speaker toggled")
+
+    let drone = create_battle_drone()
+    assert(drone.creates_object == "drone", "Drone creation")
+
+    return true
+}
+
+fn test_cooldown_system() -> Bool {
+    let def = create_spectre_gunship()
+    let instance = AbilityInstance::init(def, 1)
+
+    instance.use_ability()
+    assert(instance.current_cooldown == 150.0, "Initial cooldown")
+
+    instance.update(50.0)
+    assert(instance.current_cooldown == 100.0, "After 50s")
+
+    instance.update(100.0)
+    assert(instance.current_cooldown == 0.0, "Cooldown reset")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_ability_creation(), "Test 1: Ability creation")
+    assert(test_ability_instance(), "Test 2: Ability instance")
+    assert(test_ability_registry(), "Test 3: Ability registry")
+    assert(test_ability_manager(), "Test 4: Ability manager")
+    assert(test_general_powers(), "Test 5: General powers")
+    assert(test_unit_abilities(), "Test 6: Unit abilities")
+    assert(test_special_mechanics(), "Test 7: Special mechanics")
+    assert(test_defensive_abilities(), "Test 8: Defensive abilities")
+    assert(test_support_abilities(), "Test 9: Support abilities")
+    assert(test_cooldown_system(), "Test 10: Cooldown system")
+    return true
+}
