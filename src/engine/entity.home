@@ -1,0 +1,649 @@
+// Entity Component System for Generals RTS
+// Manages units, buildings, and other game entities
+// Pure Home implementation - converted from Zig
+
+// ============================================================================
+// Entity Types
+// ============================================================================
+
+enum EntityType {
+    UNIT,
+    BUILDING,
+    PROJECTILE,
+    EFFECT,
+}
+
+// ============================================================================
+// Transform Component
+// ============================================================================
+
+struct Transform {
+    position: Vector2,
+    rotation: Float,
+    scale: Float,
+
+    fn init(x: Float, y: Float) -> Transform {
+        let transform = Transform {
+            position: Vector2::init(x, y),
+            rotation: 0.0,
+            scale: 1.0,
+        }
+        return transform
+    }
+
+    fn init_full(x: Float, y: Float, rotation: Float, scale: Float) -> Transform {
+        let transform = Transform {
+            position: Vector2::init(x, y),
+            rotation: rotation,
+            scale: scale,
+        }
+        return transform
+    }
+}
+
+// ============================================================================
+// Sprite Component
+// ============================================================================
+
+struct Sprite {
+    texture_id: Int,
+    width: Float,
+    height: Float,
+    uv_min: Vector2,
+    uv_max: Vector2,
+
+    fn init(texture_id: Int, width: Float, height: Float) -> Sprite {
+        let sprite = Sprite {
+            texture_id: texture_id,
+            width: width,
+            height: height,
+            uv_min: Vector2::init(0.0, 0.0),
+            uv_max: Vector2::init(1.0, 1.0),
+        }
+        return sprite
+    }
+
+    fn init_atlas(texture_id: Int, width: Float, height: Float, uv_min: Vector2, uv_max: Vector2) -> Sprite {
+        let sprite = Sprite {
+            texture_id: texture_id,
+            width: width,
+            height: height,
+            uv_min: uv_min,
+            uv_max: uv_max,
+        }
+        return sprite
+    }
+}
+
+// ============================================================================
+// AI State
+// ============================================================================
+
+enum AIState {
+    IDLE,
+    ATTACKING,
+    CHASING,
+    FLEEING,
+    PLAYER_CONTROLLED,
+}
+
+// ============================================================================
+// Unit Component
+// ============================================================================
+
+struct UnitData {
+    unit_type: String,
+    health: Float,
+    max_health: Float,
+    speed: Float,
+    selected: Bool,
+
+    // Combat stats
+    attack_damage: Float,
+    attack_range: Float,
+    attack_cooldown: Float,
+    time_since_attack: Float,
+    target_id: Int,
+    has_target: Bool,
+
+    // AI
+    ai_state: AIState,
+    is_ai_controlled: Bool,
+
+    fn init(unit_type: String, max_health: Float, speed: Float) -> UnitData {
+        let unit = UnitData {
+            unit_type: unit_type,
+            health: max_health,
+            max_health: max_health,
+            speed: speed,
+            selected: false,
+            attack_damage: 10.0,
+            attack_range: 150.0,
+            attack_cooldown: 1.0,
+            time_since_attack: 0.0,
+            target_id: 0,
+            has_target: false,
+            ai_state: AIState::IDLE,
+            is_ai_controlled: true,
+        }
+        return unit
+    }
+
+    fn can_attack(self) -> Bool {
+        return self.time_since_attack >= self.attack_cooldown
+    }
+
+    fn reset_attack_timer(self) {
+        self.time_since_attack = 0.0
+    }
+}
+
+// ============================================================================
+// Building Component
+// ============================================================================
+
+struct BuildingData {
+    building_type: String,
+    health: Float,
+    max_health: Float,
+    construction_progress: Float,  // 0.0 to 1.0
+    has_production: Bool,
+
+    fn init(building_type: String, max_health: Float) -> BuildingData {
+        let building = BuildingData {
+            building_type: building_type,
+            health: max_health,
+            max_health: max_health,
+            construction_progress: 1.0,
+            has_production: false,
+        }
+        return building
+    }
+
+    fn init_with_production(building_type: String, max_health: Float) -> BuildingData {
+        let building = BuildingData::init(building_type, max_health)
+        building.has_production = true
+        return building
+    }
+}
+
+// ============================================================================
+// Movement Component
+// ============================================================================
+
+struct Movement {
+    path: Collection<Vector2>,
+    move_speed: Float,
+    is_moving: Bool,
+    current_waypoint: Int,
+
+    fn init(move_speed: Float) -> Movement {
+        let movement = Movement {
+            path: Collection::init(),
+            move_speed: move_speed,
+            is_moving: false,
+            current_waypoint: 0,
+        }
+        return movement
+    }
+
+    fn set_path(self, path: Collection<Vector2>) {
+        self.path = path
+        self.is_moving = path.len() > 0
+        self.current_waypoint = 0
+    }
+
+    fn stop_moving(self) {
+        self.path.clear()
+        self.is_moving = false
+        self.current_waypoint = 0
+    }
+
+    fn get_next_waypoint(self) -> Vector2? {
+        if self.current_waypoint < self.path.len() {
+            return self.path.get(self.current_waypoint)
+        }
+        return null
+    }
+
+    fn advance_waypoint(self) {
+        self.current_waypoint = self.current_waypoint + 1
+        if self.current_waypoint >= self.path.len() {
+            self.stop_moving()
+        }
+    }
+}
+
+// ============================================================================
+// Entity
+// ============================================================================
+
+struct Entity {
+    id: Int,
+    entity_type: EntityType,
+    team: Int,
+    transform: Transform,
+    sprite: Sprite?,
+    has_sprite: Bool,
+    unit_data: UnitData?,
+    has_unit_data: Bool,
+    building_data: BuildingData?,
+    has_building_data: Bool,
+    movement: Movement?,
+    has_movement: Bool,
+    active: Bool,
+
+    fn create_unit(id: Int, x: Float, y: Float, unit_type: String, sprite: Sprite, team: Int) -> Entity {
+        let entity = Entity {
+            id: id,
+            entity_type: EntityType::UNIT,
+            team: team,
+            transform: Transform::init(x, y),
+            sprite: sprite,
+            has_sprite: true,
+            unit_data: UnitData::init(unit_type, 100.0, 50.0),
+            has_unit_data: true,
+            building_data: null,
+            has_building_data: false,
+            movement: Movement::init(100.0),
+            has_movement: true,
+            active: true,
+        }
+        return entity
+    }
+
+    fn create_building(id: Int, x: Float, y: Float, building_type: String, sprite: Sprite, team: Int) -> Entity {
+        let entity = Entity {
+            id: id,
+            entity_type: EntityType::BUILDING,
+            team: team,
+            transform: Transform::init(x, y),
+            sprite: sprite,
+            has_sprite: true,
+            unit_data: null,
+            has_unit_data: false,
+            building_data: BuildingData::init(building_type, 500.0),
+            has_building_data: true,
+            movement: null,
+            has_movement: false,
+            active: true,
+        }
+        return entity
+    }
+}
+
+// ============================================================================
+// Entity Manager
+// ============================================================================
+
+struct EntityManager {
+    entities: Collection<Entity>,
+    next_id: Int,
+
+    fn init() -> EntityManager {
+        let manager = EntityManager {
+            entities: Collection::init(),
+            next_id: 1,
+        }
+        return manager
+    }
+
+    fn create_unit(self, x: Float, y: Float, unit_type: String, sprite: Sprite, team: Int) -> Int {
+        let id = self.next_id
+        self.next_id = self.next_id + 1
+
+        let entity = Entity::create_unit(id, x, y, unit_type, sprite, team)
+        self.entities.add(entity)
+
+        return id
+    }
+
+    fn create_building(self, x: Float, y: Float, building_type: String, sprite: Sprite, team: Int) -> Int {
+        let id = self.next_id
+        self.next_id = self.next_id + 1
+
+        let entity = Entity::create_building(id, x, y, building_type, sprite, team)
+        self.entities.add(entity)
+
+        return id
+    }
+
+    fn get_entity(self, id: Int) -> Entity? {
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+            if entity.id == id && entity.active {
+                return entity
+            }
+        }
+        return null
+    }
+
+    fn remove_entity(self, id: Int) {
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+            if entity.id == id {
+                entity.active = false
+                return
+            }
+        }
+    }
+
+    fn get_entity_count(self) -> Int {
+        let count = 0
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+            if entity.active {
+                count = count + 1
+            }
+        }
+        return count
+    }
+
+    fn select_unit_at(self, world_x: Float, world_y: Float, radius: Float) -> Int {
+        // Deselect all units first
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+            if entity.has_unit_data {
+                entity.unit_data.selected = false
+            }
+        }
+
+        // Find unit at position
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+
+            if !entity.active { continue }
+            if entity.entity_type != EntityType::UNIT { continue }
+
+            let dx = entity.transform.position.x - world_x
+            let dy = entity.transform.position.y - world_y
+            let dist_sq = dx * dx + dy * dy
+
+            if dist_sq <= radius * radius {
+                if entity.has_unit_data {
+                    entity.unit_data.selected = true
+                }
+                return entity.id
+            }
+        }
+
+        return -1
+    }
+
+    fn find_nearest_enemy(self, attacker_id: Int, attacker_team: Int, pos_x: Float, pos_y: Float, max_range: Float) -> Int {
+        let nearest_id = -1
+        let nearest_dist_sq = max_range * max_range
+
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+
+            if !entity.active { continue }
+            if entity.id == attacker_id { continue }
+            if entity.entity_type != EntityType::UNIT { continue }
+            if entity.team == attacker_team { continue }
+
+            let dx = entity.transform.position.x - pos_x
+            let dy = entity.transform.position.y - pos_y
+            let dist_sq = dx * dx + dy * dy
+
+            if dist_sq < nearest_dist_sq {
+                nearest_dist_sq = dist_sq
+                nearest_id = entity.id
+            }
+        }
+
+        return nearest_id
+    }
+
+    fn damage_entity(self, entity_id: Int, damage: Float) {
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+
+            if entity.id == entity_id && entity.active {
+                if entity.has_unit_data {
+                    entity.unit_data.health = entity.unit_data.health - damage
+
+                    if entity.unit_data.health <= 0.0 {
+                        entity.active = false
+                    }
+                }
+                return
+            }
+        }
+    }
+
+    fn update(self, dt: Float) {
+        // Update all entities
+        for i in 0..self.entities.len() {
+            let entity = self.entities.get(i)
+
+            if !entity.active { continue }
+
+            // Update AI and combat for units
+            if entity.has_unit_data {
+                let unit = entity.unit_data
+                unit.time_since_attack = unit.time_since_attack + dt
+
+                // AI behavior
+                if unit.is_ai_controlled {
+                    let health_pct = unit.health / unit.max_health
+
+                    let nearest_enemy = self.find_nearest_enemy(
+                        entity.id,
+                        entity.team,
+                        entity.transform.position.x,
+                        entity.transform.position.y,
+                        unit.attack_range * 2.0
+                    )
+
+                    // State machine
+                    if unit.ai_state == AIState::IDLE {
+                        if nearest_enemy >= 0 {
+                            unit.ai_state = AIState::CHASING
+                            unit.target_id = nearest_enemy
+                            unit.has_target = true
+                        }
+                    }
+
+                    if unit.ai_state == AIState::CHASING {
+                        if health_pct < 0.3 {
+                            unit.ai_state = AIState::FLEEING
+                            unit.has_target = false
+                        }
+                    }
+
+                    if unit.ai_state == AIState::ATTACKING {
+                        if health_pct < 0.3 {
+                            unit.ai_state = AIState::FLEEING
+                            unit.has_target = false
+                        }
+                    }
+
+                    if unit.ai_state == AIState::FLEEING {
+                        if health_pct > 0.5 {
+                            unit.ai_state = AIState::IDLE
+                        }
+                    }
+                }
+
+                // Find target if needed
+                if !unit.has_target && unit.ai_state != AIState::FLEEING {
+                    let target_id = self.find_nearest_enemy(
+                        entity.id,
+                        entity.team,
+                        entity.transform.position.x,
+                        entity.transform.position.y,
+                        unit.attack_range
+                    )
+
+                    if target_id >= 0 {
+                        unit.target_id = target_id
+                        unit.has_target = true
+                    }
+                }
+
+                // Attack target
+                if unit.has_target {
+                    let target = self.get_entity(unit.target_id)
+
+                    if target == null || !target.active {
+                        unit.has_target = false
+                    } else {
+                        let dx = target.transform.position.x - entity.transform.position.x
+                        let dy = target.transform.position.y - entity.transform.position.y
+                        let dist_sq = dx * dx + dy * dy
+                        let range_sq = unit.attack_range * unit.attack_range
+
+                        if dist_sq <= range_sq {
+                            unit.ai_state = AIState::ATTACKING
+
+                            if unit.can_attack() {
+                                self.damage_entity(unit.target_id, unit.attack_damage)
+                                unit.reset_attack_timer()
+                            }
+                        } else {
+                            unit.has_target = false
+                        }
+                    }
+                }
+            }
+
+            // Update movement
+            if entity.has_movement {
+                let movement = entity.movement
+
+                if movement.is_moving {
+                    let waypoint = movement.get_next_waypoint()
+
+                    if waypoint != null {
+                        let target_x = waypoint.x
+                        let target_y = waypoint.y
+
+                        let dx = target_x - entity.transform.position.x
+                        let dy = target_y - entity.transform.position.y
+                        let dist_sq = dx * dx + dy * dy
+
+                        let threshold = 5.0
+
+                        if dist_sq < threshold * threshold {
+                            movement.advance_waypoint()
+                        } else {
+                            let dist = sqrt(dist_sq)
+                            let move_amount = movement.move_speed * dt
+
+                            if move_amount >= dist {
+                                entity.transform.position.x = target_x
+                                entity.transform.position.y = target_y
+                            } else {
+                                let ratio = move_amount / dist
+                                entity.transform.position.x = entity.transform.position.x + dx * ratio
+                                entity.transform.position.y = entity.transform.position.y + dy * ratio
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_entity_manager_create() -> Bool {
+    let manager = EntityManager::init()
+    let sprite = Sprite::init(0, 64.0, 64.0)
+    let id = manager.create_unit(100.0, 200.0, "TestUnit", sprite, 0)
+
+    let entity = manager.get_entity(id)
+    assert(entity != null, "Entity created")
+    assert(entity.transform.position.x == 100.0, "X position")
+    assert(entity.transform.position.y == 200.0, "Y position")
+    assert(entity.entity_type == EntityType::UNIT, "Entity type")
+
+    return true
+}
+
+fn test_entity_manager_remove() -> Bool {
+    let manager = EntityManager::init()
+    let sprite = Sprite::init(0, 64.0, 64.0)
+    let id = manager.create_unit(100.0, 200.0, "TestUnit", sprite, 0)
+
+    manager.remove_entity(id)
+    let entity = manager.get_entity(id)
+    assert(entity == null, "Entity removed")
+
+    return true
+}
+
+fn test_entity_manager_count() -> Bool {
+    let manager = EntityManager::init()
+    let sprite = Sprite::init(0, 64.0, 64.0)
+
+    manager.create_unit(100.0, 200.0, "Unit1", sprite, 0)
+    manager.create_unit(150.0, 250.0, "Unit2", sprite, 0)
+    manager.create_building(300.0, 400.0, "Building1", sprite, 0)
+
+    assert(manager.get_entity_count() == 3, "Entity count")
+
+    return true
+}
+
+fn test_transform() -> Bool {
+    let t = Transform::init(10.0, 20.0)
+    assert(t.position.x == 10.0, "Transform X")
+    assert(t.position.y == 20.0, "Transform Y")
+    assert(t.rotation == 0.0, "Rotation")
+    assert(t.scale == 1.0, "Scale")
+
+    return true
+}
+
+fn test_sprite() -> Bool {
+    let s = Sprite::init(5, 32.0, 32.0)
+    assert(s.texture_id == 5, "Texture ID")
+    assert(s.width == 32.0, "Width")
+    assert(s.height == 32.0, "Height")
+
+    return true
+}
+
+fn test_unit_data() -> Bool {
+    let unit = UnitData::init("Tank", 100.0, 50.0)
+    assert(unit.health == 100.0, "Health")
+    assert(unit.max_health == 100.0, "Max health")
+    assert(unit.speed == 50.0, "Speed")
+    assert(unit.can_attack(), "Can attack initially")
+
+    return true
+}
+
+fn test_building_data() -> Bool {
+    let building = BuildingData::init("Barracks", 500.0)
+    assert(building.health == 500.0, "Health")
+    assert(building.max_health == 500.0, "Max health")
+    assert(building.construction_progress == 1.0, "Complete")
+
+    return true
+}
+
+fn test_movement() -> Bool {
+    let movement = Movement::init(100.0)
+    assert(!movement.is_moving, "Not moving initially")
+    assert(movement.move_speed == 100.0, "Move speed")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_entity_manager_create(), "Test 1: Entity manager create")
+    assert(test_entity_manager_remove(), "Test 2: Entity manager remove")
+    assert(test_entity_manager_count(), "Test 3: Entity manager count")
+    assert(test_transform(), "Test 4: Transform")
+    assert(test_sprite(), "Test 5: Sprite")
+    assert(test_unit_data(), "Test 6: Unit data")
+    assert(test_building_data(), "Test 7: Building data")
+    assert(test_movement(), "Test 8: Movement")
+    return true
+}

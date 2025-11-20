@@ -1,0 +1,549 @@
+// ============================================================================
+// Veterancy/Experience System - Complete Implementation
+// Based on Thyme's veterancy architecture
+// ============================================================================
+//
+// Veterancy provides unit progression through combat experience.
+// Units gain XP from kills and level up (Veteran → Elite → Heroic)
+// Each level grants bonuses: health, damage, speed, vision, healing
+//
+// References:
+// - Thyme/src/game/logic/object/experiencelevels.h
+// - Thyme/src/game/logic/object/armedunit.h (ExperienceScalar)
+// - Thyme/ini/Experience.ini
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// Phase 1: Experience Levels
+// ============================================================================
+
+enum ExperienceLevel {
+    ROOKIE,
+    VETERAN,
+    ELITE,
+    HEROIC,
+}
+
+/// Get XP required for each level (from C&C Generals)
+fn get_required_xp(level: ExperienceLevel) -> Int {
+    if level == ExperienceLevel::ROOKIE {
+        return 0
+    } else if level == ExperienceLevel::VETERAN {
+        return 100  // 100 XP to reach Veteran
+    } else if level == ExperienceLevel::ELITE {
+        return 300  // 300 XP total to reach Elite
+    } else if level == ExperienceLevel::HEROIC {
+        return 600  // 600 XP total to reach Heroic
+    }
+    return 600
+}
+
+/// Get display name for level
+fn get_level_name(level: ExperienceLevel) -> String {
+    if level == ExperienceLevel::ROOKIE {
+        return "Rookie"
+    } else if level == ExperienceLevel::VETERAN {
+        return "Veteran"
+    } else if level == ExperienceLevel::ELITE {
+        return "Elite"
+    } else if level == ExperienceLevel::HEROIC {
+        return "Heroic"
+    }
+    return "Unknown"
+}
+
+// ============================================================================
+// Phase 2: Experience Modifiers
+// ============================================================================
+
+/// Modifiers applied at each experience level
+struct ExperienceLevelModifiers {
+    health_bonus: Float,      // Multiplier (1.0 = no change, 1.5 = +50%)
+    damage_bonus: Float,
+    speed_bonus: Float,
+    vision_bonus: Float,
+    heal_per_second: Float,   // Passive healing
+    armor_bonus: Float,
+}
+
+fn create_modifiers() -> ExperienceLevelModifiers {
+    let mods = ExperienceLevelModifiers {}
+    mods.health_bonus = 1.0
+    mods.damage_bonus = 1.0
+    mods.speed_bonus = 1.0
+    mods.vision_bonus = 1.0
+    mods.heal_per_second = 0.0
+    mods.armor_bonus = 0.0
+    return mods
+}
+
+/// Get default modifiers for a level (from C&C Generals)
+fn modifiers_for_level(level: ExperienceLevel) -> ExperienceLevelModifiers {
+    if level == ExperienceLevel::ROOKIE {
+        let mods = create_modifiers()
+        return mods
+    } else if level == ExperienceLevel::VETERAN {
+        let mods = create_modifiers()
+        mods.health_bonus = 1.25     // +25% health
+        mods.damage_bonus = 1.25     // +25% damage
+        mods.vision_bonus = 1.1      // +10% vision
+        return mods
+    } else if level == ExperienceLevel::ELITE {
+        let mods = create_modifiers()
+        mods.health_bonus = 1.5      // +50% health
+        mods.damage_bonus = 1.5      // +50% damage
+        mods.speed_bonus = 1.1       // +10% speed
+        mods.vision_bonus = 1.2      // +20% vision
+        mods.heal_per_second = 2.0   // +2 HP/sec healing
+        mods.armor_bonus = 25.0
+        return mods
+    } else if level == ExperienceLevel::HEROIC {
+        let mods = create_modifiers()
+        mods.health_bonus = 2.0      // +100% health (double)
+        mods.damage_bonus = 2.0      // +100% damage
+        mods.speed_bonus = 1.2       // +20% speed
+        mods.vision_bonus = 1.5      // +50% vision
+        mods.heal_per_second = 5.0   // +5 HP/sec healing
+        mods.armor_bonus = 50.0
+        return mods
+    }
+    return create_modifiers()
+}
+
+// ============================================================================
+// Phase 3: Experience Tracker
+// ============================================================================
+
+struct ExperienceTracker {
+    current_xp: Int,
+    current_level: ExperienceLevel,
+    lifetime_kills: Int,
+    lifetime_damage_dealt: Float,
+    lifetime_damage_taken: Float,
+}
+
+fn create_experience_tracker() -> ExperienceTracker {
+    let tracker = ExperienceTracker {}
+    tracker.current_xp = 0
+    tracker.current_level = ExperienceLevel::ROOKIE
+    tracker.lifetime_kills = 0
+    tracker.lifetime_damage_dealt = 0.0
+    tracker.lifetime_damage_taken = 0.0
+    return tracker
+}
+
+/// Award XP and check for level up
+fn award_xp(tracker: ExperienceTracker, xp: Int) -> Bool {
+    tracker.current_xp = tracker.current_xp + xp
+    return check_level_up(tracker)
+}
+
+/// Check and apply level up if threshold reached
+fn check_level_up(tracker: ExperienceTracker) -> Bool {
+    let leveled_up = false
+    let done = false
+
+    while !done {
+        let next_level_value = get_level_int(tracker.current_level) + 1
+        if next_level_value >= 4 {
+            done = true
+            continue
+        }
+
+        let next_level = int_to_level(next_level_value)
+        let required = get_required_xp(next_level)
+
+        if tracker.current_xp >= required {
+            tracker.current_level = next_level
+            leveled_up = true
+        } else {
+            done = true
+        }
+    }
+
+    return leveled_up
+}
+
+fn get_level_int(level: ExperienceLevel) -> Int {
+    if level == ExperienceLevel::ROOKIE {
+        return 0
+    } else if level == ExperienceLevel::VETERAN {
+        return 1
+    } else if level == ExperienceLevel::ELITE {
+        return 2
+    } else if level == ExperienceLevel::HEROIC {
+        return 3
+    }
+    return 0
+}
+
+fn int_to_level(value: Int) -> ExperienceLevel {
+    if value == 0 {
+        return ExperienceLevel::ROOKIE
+    } else if value == 1 {
+        return ExperienceLevel::VETERAN
+    } else if value == 2 {
+        return ExperienceLevel::ELITE
+    } else if value == 3 {
+        return ExperienceLevel::HEROIC
+    }
+    return ExperienceLevel::ROOKIE
+}
+
+/// Calculate XP awarded for killing an enemy
+fn calculate_kill_xp(enemy_cost: Int, enemy_level: ExperienceLevel) -> Int {
+    // Base XP is 10% of enemy cost
+    let xp = enemy_cost / 10
+
+    // Bonus XP for higher level enemies
+    let level_bonus = 0
+    if enemy_level == ExperienceLevel::VETERAN {
+        level_bonus = 20
+    } else if enemy_level == ExperienceLevel::ELITE {
+        level_bonus = 50
+    } else if enemy_level == ExperienceLevel::HEROIC {
+        level_bonus = 100
+    }
+
+    let total_xp = xp + level_bonus
+    if total_xp < 1 {
+        return 1  // Minimum 1 XP
+    }
+    return total_xp
+}
+
+/// Record a kill and award XP
+fn record_kill(tracker: ExperienceTracker, enemy_cost: Int, enemy_level: ExperienceLevel) -> Bool {
+    tracker.lifetime_kills = tracker.lifetime_kills + 1
+    let xp = calculate_kill_xp(enemy_cost, enemy_level)
+    return award_xp(tracker, xp)
+}
+
+/// Record damage dealt (for partial XP)
+fn record_damage_dealt(tracker: ExperienceTracker, damage: Float, enemy_cost: Int) {
+    tracker.lifetime_damage_dealt = tracker.lifetime_damage_dealt + damage
+
+    // Award small amount of XP for damage (10% of kill XP per 100 damage)
+    let kill_xp = calculate_kill_xp(enemy_cost, ExperienceLevel::ROOKIE)
+    let damage_ratio = damage / 100.0
+    let damage_xp = ((kill_xp as Float) * damage_ratio * 0.1) as Int
+
+    if damage_xp > 0 {
+        award_xp(tracker, damage_xp)
+    }
+}
+
+/// Record damage taken
+fn record_damage_taken(tracker: ExperienceTracker, damage: Float) {
+    tracker.lifetime_damage_taken = tracker.lifetime_damage_taken + damage
+}
+
+/// Get current modifiers
+fn get_modifiers(tracker: ExperienceTracker) -> ExperienceLevelModifiers {
+    return modifiers_for_level(tracker.current_level)
+}
+
+/// Get progress to next level (0.0 to 1.0)
+fn get_progress_to_next_level(tracker: ExperienceTracker) -> Float {
+    let next_level_value = get_level_int(tracker.current_level) + 1
+    if next_level_value >= 4 {
+        return 1.0  // Max level
+    }
+
+    let next_level = int_to_level(next_level_value)
+    let current_threshold = get_required_xp(tracker.current_level)
+    let next_threshold = get_required_xp(next_level)
+
+    if next_threshold <= current_threshold {
+        return 1.0
+    }
+
+    let progress_xp = tracker.current_xp - current_threshold
+    let required_xp = next_threshold - current_threshold
+
+    return (progress_xp as Float) / (required_xp as Float)
+}
+
+/// Check if at max level
+fn is_max_level(tracker: ExperienceTracker) -> Bool {
+    return tracker.current_level == ExperienceLevel::HEROIC
+}
+
+/// Get XP needed for next level
+fn get_xp_for_next_level(tracker: ExperienceTracker) -> Int {
+    let next_level_value = get_level_int(tracker.current_level) + 1
+    if next_level_value >= 4 {
+        return 0  // Max level
+    }
+
+    let next_level = int_to_level(next_level_value)
+    let required = get_required_xp(next_level)
+
+    if tracker.current_xp >= required {
+        return 0
+    }
+    return required - tracker.current_xp
+}
+
+// ============================================================================
+// Phase 4: Experience Settings
+// ============================================================================
+
+struct ExperienceSettings {
+    xp_multiplier: Float,           // Global XP gain multiplier
+    enable_passive_healing: Bool,   // Enable healing at Elite+
+    veteran_health_bonus: Float,
+    veteran_damage_bonus: Float,
+    elite_health_bonus: Float,
+    elite_damage_bonus: Float,
+    heroic_health_bonus: Float,
+    heroic_damage_bonus: Float,
+}
+
+fn create_experience_settings() -> ExperienceSettings {
+    let settings = ExperienceSettings {}
+    settings.xp_multiplier = 1.0
+    settings.enable_passive_healing = true
+    settings.veteran_health_bonus = 1.25
+    settings.veteran_damage_bonus = 1.25
+    settings.elite_health_bonus = 1.5
+    settings.elite_damage_bonus = 1.5
+    settings.heroic_health_bonus = 2.0
+    settings.heroic_damage_bonus = 2.0
+    return settings
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_tracker_init() -> Bool {
+    let tracker = create_experience_tracker()
+
+    assert(tracker.current_level == ExperienceLevel::ROOKIE, "Should start as ROOKIE")
+    assert(tracker.current_xp == 0, "Should start with 0 XP")
+    assert(tracker.lifetime_kills == 0, "Should start with 0 kills")
+
+    return true
+}
+
+fn test_level_up_from_xp() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Award 100 XP → should reach Veteran
+    let leveled_up = award_xp(tracker, 100)
+    assert(leveled_up, "Should level up")
+    assert(tracker.current_level == ExperienceLevel::VETERAN, "Should be VETERAN")
+
+    // Award another 200 XP (total 300) → should reach Elite
+    let leveled_up2 = award_xp(tracker, 200)
+    assert(leveled_up2, "Should level up to Elite")
+    assert(tracker.current_level == ExperienceLevel::ELITE, "Should be ELITE")
+
+    // Award another 300 XP (total 600) → should reach Heroic
+    let leveled_up3 = award_xp(tracker, 300)
+    assert(leveled_up3, "Should level up to Heroic")
+    assert(tracker.current_level == ExperienceLevel::HEROIC, "Should be HEROIC")
+
+    // Check max level
+    assert(is_max_level(tracker), "Should be max level")
+
+    return true
+}
+
+fn test_kill_xp_calculation() -> Bool {
+    let xp1 = calculate_kill_xp(1000, ExperienceLevel::ROOKIE)
+    assert(xp1 == 100, "10% of 1000 = 100 XP")
+
+    let xp2 = calculate_kill_xp(1000, ExperienceLevel::VETERAN)
+    assert(xp2 == 120, "100 + 20 bonus = 120 XP")
+
+    let xp3 = calculate_kill_xp(1000, ExperienceLevel::HEROIC)
+    assert(xp3 == 200, "100 + 100 bonus = 200 XP")
+
+    return true
+}
+
+fn test_record_kill() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Kill cheap unit (100 cost) → 10 XP
+    let leveled_up = record_kill(tracker, 100, ExperienceLevel::ROOKIE)
+    assert(!leveled_up, "Should not level up")
+    assert(tracker.lifetime_kills == 1, "Should have 1 kill")
+    assert(tracker.current_xp == 10, "Should have 10 XP")
+
+    // Kill expensive unit (1000 cost) → 100 XP (total 110)
+    record_kill(tracker, 1000, ExperienceLevel::ROOKIE)
+    assert(tracker.lifetime_kills == 2, "Should have 2 kills")
+    assert(tracker.current_xp == 110, "Should have 110 XP")
+    assert(tracker.current_level == ExperienceLevel::VETERAN, "Should be VETERAN")
+
+    return true
+}
+
+fn test_progress_to_next_level() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // 0 XP → 0% progress to Veteran (needs 100)
+    assert(get_progress_to_next_level(tracker) == 0.0, "Should be 0% progress")
+
+    // 50 XP → 50% progress to Veteran
+    award_xp(tracker, 50)
+    let progress = get_progress_to_next_level(tracker)
+    assert(abs(progress - 0.5) < 0.01, "Should be ~50% progress")
+
+    // 100 XP → Veteran, 0% progress to Elite
+    award_xp(tracker, 50)
+    assert(get_progress_to_next_level(tracker) == 0.0, "Should be 0% at new level")
+
+    return true
+}
+
+fn test_xp_for_next_level() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Rookie → needs 100 for Veteran
+    assert(get_xp_for_next_level(tracker) == 100, "Need 100 XP for Veteran")
+
+    // Award 50 XP → needs 50 more
+    award_xp(tracker, 50)
+    assert(get_xp_for_next_level(tracker) == 50, "Need 50 more XP")
+
+    // Reach Veteran → needs 200 for Elite (300 - 100)
+    award_xp(tracker, 50)
+    assert(get_xp_for_next_level(tracker) == 200, "Need 200 XP for Elite")
+
+    // Reach max level → 0 needed
+    award_xp(tracker, 500)
+    assert(get_xp_for_next_level(tracker) == 0, "Max level needs 0 XP")
+
+    return true
+}
+
+fn test_level_modifiers() -> Bool {
+    let rookie_mods = modifiers_for_level(ExperienceLevel::ROOKIE)
+    assert(rookie_mods.health_bonus == 1.0, "Rookie health bonus = 1.0")
+    assert(rookie_mods.damage_bonus == 1.0, "Rookie damage bonus = 1.0")
+
+    let veteran_mods = modifiers_for_level(ExperienceLevel::VETERAN)
+    assert(veteran_mods.health_bonus == 1.25, "Veteran health bonus = 1.25")
+    assert(veteran_mods.damage_bonus == 1.25, "Veteran damage bonus = 1.25")
+
+    let elite_mods = modifiers_for_level(ExperienceLevel::ELITE)
+    assert(elite_mods.health_bonus == 1.5, "Elite health bonus = 1.5")
+    assert(elite_mods.heal_per_second == 2.0, "Elite healing = 2.0")
+
+    let heroic_mods = modifiers_for_level(ExperienceLevel::HEROIC)
+    assert(heroic_mods.health_bonus == 2.0, "Heroic health bonus = 2.0")
+    assert(heroic_mods.heal_per_second == 5.0, "Heroic healing = 5.0")
+
+    return true
+}
+
+fn test_get_current_modifiers() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Rookie has 1.0x bonuses
+    let mods1 = get_modifiers(tracker)
+    assert(mods1.damage_bonus == 1.0, "Rookie damage = 1.0")
+
+    // Level to Veteran
+    award_xp(tracker, 100)
+    let mods2 = get_modifiers(tracker)
+    assert(mods2.damage_bonus == 1.25, "Veteran damage = 1.25")
+
+    // Level to Heroic
+    award_xp(tracker, 500)
+    let mods3 = get_modifiers(tracker)
+    assert(mods3.damage_bonus == 2.0, "Heroic damage = 2.0")
+
+    return true
+}
+
+fn test_damage_dealt_xp() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Deal 50 damage to 1000-cost enemy
+    record_damage_dealt(tracker, 50.0, 1000)
+
+    assert(tracker.current_xp > 0, "Should have XP from damage")
+    assert(abs(tracker.lifetime_damage_dealt - 50.0) < 0.01, "Should track damage dealt")
+
+    return true
+}
+
+fn test_level_names() -> Bool {
+    assert(get_level_name(ExperienceLevel::ROOKIE) == "Rookie", "Rookie name")
+    assert(get_level_name(ExperienceLevel::VETERAN) == "Veteran", "Veteran name")
+    assert(get_level_name(ExperienceLevel::ELITE) == "Elite", "Elite name")
+    assert(get_level_name(ExperienceLevel::HEROIC) == "Heroic", "Heroic name")
+
+    return true
+}
+
+fn test_required_xp() -> Bool {
+    assert(get_required_xp(ExperienceLevel::ROOKIE) == 0, "Rookie needs 0")
+    assert(get_required_xp(ExperienceLevel::VETERAN) == 100, "Veteran needs 100")
+    assert(get_required_xp(ExperienceLevel::ELITE) == 300, "Elite needs 300")
+    assert(get_required_xp(ExperienceLevel::HEROIC) == 600, "Heroic needs 600")
+
+    return true
+}
+
+fn test_settings() -> Bool {
+    let settings = create_experience_settings()
+
+    assert(settings.xp_multiplier == 1.0, "Default XP multiplier = 1.0")
+    assert(settings.enable_passive_healing, "Passive healing enabled")
+    assert(settings.veteran_health_bonus == 1.25, "Veteran health = 1.25")
+
+    return true
+}
+
+fn test_damage_taken() -> Bool {
+    let tracker = create_experience_tracker()
+
+    record_damage_taken(tracker, 100.0)
+    assert(tracker.lifetime_damage_taken == 100.0, "Should track damage taken")
+
+    record_damage_taken(tracker, 50.0)
+    assert(tracker.lifetime_damage_taken == 150.0, "Should accumulate damage")
+
+    return true
+}
+
+fn test_multiple_kills() -> Bool {
+    let tracker = create_experience_tracker()
+
+    // Kill 10 units worth 100 cost each = 100 XP total
+    for i in 0..10 {
+        record_kill(tracker, 100, ExperienceLevel::ROOKIE)
+    }
+
+    assert(tracker.lifetime_kills == 10, "Should have 10 kills")
+    assert(tracker.current_xp == 100, "Should have 100 XP")
+    assert(tracker.current_level == ExperienceLevel::VETERAN, "Should be Veteran")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_tracker_init(), "Tracker init test failed")
+    assert(test_level_up_from_xp(), "Level up test failed")
+    assert(test_kill_xp_calculation(), "Kill XP calculation test failed")
+    assert(test_record_kill(), "Record kill test failed")
+    assert(test_progress_to_next_level(), "Progress test failed")
+    assert(test_xp_for_next_level(), "XP for next level test failed")
+    assert(test_level_modifiers(), "Level modifiers test failed")
+    assert(test_get_current_modifiers(), "Get modifiers test failed")
+    assert(test_damage_dealt_xp(), "Damage dealt XP test failed")
+    assert(test_level_names(), "Level names test failed")
+    assert(test_required_xp(), "Required XP test failed")
+    assert(test_settings(), "Settings test failed")
+    assert(test_damage_taken(), "Damage taken test failed")
+    assert(test_multiple_kills(), "Multiple kills test failed")
+    return true
+}

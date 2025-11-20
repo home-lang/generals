@@ -1,0 +1,741 @@
+// ============================================================================
+// Formations System - Complete Implementation
+// Based on Thyme's formation architecture
+// ============================================================================
+//
+// Formations provide organized unit movement and positioning in groups.
+// C&C Generals uses formations for:
+// - Group movement (maintain relative positions)
+// - Combat effectiveness (spread units, flanking)
+// - Line of sight and fire arcs
+// - Strategic positioning
+//
+// References:
+// - Thyme/src/game/logic/object/armedunit.h (FormationID)
+// - Thyme/src/game/common/formation.h
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// Phase 1: Formation Types (from C&C Generals)
+// ============================================================================
+
+enum FormationType {
+    TIGHT_LINE,           // Tight horizontal line
+    LOOSE_LINE,           // Spread out horizontal line
+    COLUMN,               // Single file column
+    WEDGE,                // V-shaped wedge
+    SCATTERED,            // Random scattered positions
+    TIGHT_CIRCLE,         // Defensive circle
+    LOOSE_CIRCLE,         // Loose defensive circle
+    CUSTOM_1,             // Mission-specific
+    CUSTOM_2,
+    CUSTOM_3,
+}
+
+// ============================================================================
+// Phase 2: Formation Position Entry
+// ============================================================================
+
+struct FormationPositionEntry {
+    offset_x: Float,        // Offset X from formation center
+    offset_y: Float,        // Offset Y from formation center
+    angle: Float,           // Facing angle relative to formation
+    priority: Int,          // Priority for slot assignment (0 = highest)
+}
+
+fn create_position_entry(offset_x: Float, offset_y: Float, angle: Float, priority: Int) -> FormationPositionEntry {
+    let entry = FormationPositionEntry {}
+    entry.offset_x = offset_x
+    entry.offset_y = offset_y
+    entry.angle = angle
+    entry.priority = priority
+    return entry
+}
+
+// ============================================================================
+// Phase 3: Formation Template
+// ============================================================================
+
+struct FormationTemplate {
+    formation_type: FormationType,
+    name: String,
+    positions: Collection<FormationPositionEntry>,
+    max_units: Int,
+    spacing: Float,         // Base spacing between units
+}
+
+fn create_formation_template(
+    formation_type: FormationType,
+    name: String,
+    spacing: Float,
+    max_units: Int
+) -> FormationTemplate {
+    let template = FormationTemplate {}
+    template.formation_type = formation_type
+    template.name = name
+    template.positions = Collection<FormationPositionEntry> {}
+    template.max_units = max_units
+    template.spacing = spacing
+    return template
+}
+
+fn add_position(template: FormationTemplate, position: FormationPositionEntry) {
+    template.positions.add(position)
+}
+
+/// Generate positions procedurally based on formation type
+fn generate_positions(template: FormationTemplate) {
+    if template.formation_type == FormationType::TIGHT_LINE {
+        generate_line(template, 1.0)
+    } else if template.formation_type == FormationType::LOOSE_LINE {
+        generate_line(template, 2.5)
+    } else if template.formation_type == FormationType::COLUMN {
+        generate_column(template, 1.2)
+    } else if template.formation_type == FormationType::WEDGE {
+        generate_wedge(template)
+    } else if template.formation_type == FormationType::SCATTERED {
+        generate_scattered(template)
+    } else if template.formation_type == FormationType::TIGHT_CIRCLE {
+        generate_circle(template, 1.0)
+    } else if template.formation_type == FormationType::LOOSE_CIRCLE {
+        generate_circle(template, 2.0)
+    }
+}
+
+fn generate_line(template: FormationTemplate, spacing_multiplier: Float) {
+    let effective_spacing = template.spacing * spacing_multiplier
+    let half_width = (template.max_units as Float) * effective_spacing * 0.5
+
+    for i in 0..template.max_units {
+        let x = -half_width + (i as Float) * effective_spacing
+        let pos = create_position_entry(x, 0.0, 0.0, i)
+        add_position(template, pos)
+    }
+}
+
+fn generate_column(template: FormationTemplate, spacing_multiplier: Float) {
+    let effective_spacing = template.spacing * spacing_multiplier
+
+    for i in 0..template.max_units {
+        let y = -(i as Float) * effective_spacing
+        let pos = create_position_entry(0.0, y, 0.0, i)
+        add_position(template, pos)
+    }
+}
+
+fn generate_wedge(template: FormationTemplate) {
+    // V-shaped formation: leader at front, units spread back
+    let pos_leader = create_position_entry(0.0, 0.0, 0.0, 0)
+    add_position(template, pos_leader)
+
+    let row = 1
+    for i in 1..template.max_units {
+        let side = if (i - 1) % 2 == 0 { -1.0 } else { 1.0 }
+        let slot = (i - 1) / 2 + 1
+
+        let x = side * (slot as Float) * template.spacing
+        let y = -(row as Float) * template.spacing
+
+        let pos = create_position_entry(x, y, 0.0, i)
+        add_position(template, pos)
+
+        if (i - 1) % 2 == 1 {
+            row = row + 1
+        }
+    }
+}
+
+fn generate_scattered(template: FormationTemplate) {
+    // Simple pseudo-random generation using index-based formula
+    let radius = template.spacing * sqrt(template.max_units as Float)
+
+    for i in 0..template.max_units {
+        // Pseudo-random angle using golden ratio
+        let angle = ((i as Float) * 2.39996322972865332) % (2.0 * 3.14159265359)
+        // Pseudo-random distance
+        let dist = (((i as Float) * 0.618033988749895) % 1.0) * radius
+
+        let x = cos(angle) * dist
+        let y = sin(angle) * dist
+
+        let pos = create_position_entry(x, y, angle, i)
+        add_position(template, pos)
+    }
+}
+
+fn generate_circle(template: FormationTemplate, spacing_multiplier: Float) {
+    let effective_spacing = template.spacing * spacing_multiplier
+    let radius = effective_spacing * (template.max_units as Float) / (2.0 * 3.14159265359)
+
+    for i in 0..template.max_units {
+        let angle = (i as Float) * (2.0 * 3.14159265359 / (template.max_units as Float))
+        let x = cos(angle) * radius
+        let y = sin(angle) * radius
+
+        let pos = create_position_entry(x, y, angle, i)
+        add_position(template, pos)
+    }
+}
+
+// ============================================================================
+// Phase 4: Formation Assignment (Slots)
+// ============================================================================
+
+struct FormationSlot {
+    position_index: Int,    // Index into template positions
+    unit_id: Int,           // Assigned unit ID (-1 if empty)
+    world_position_x: Float, // Calculated world position X
+    world_position_y: Float, // Calculated world position Y
+    world_angle: Float,     // Calculated world angle
+}
+
+// ============================================================================
+// Phase 5: Formation Instance (Active Formation)
+// ============================================================================
+
+struct Formation {
+    id: Int,
+    template: FormationTemplate,
+    center_x: Float,        // Formation center position X
+    center_y: Float,        // Formation center position Y
+    angle: Float,           // Formation facing angle
+    slots: Collection<FormationSlot>,
+}
+
+fn create_formation(
+    id: Int,
+    template: FormationTemplate,
+    center_x: Float,
+    center_y: Float,
+    angle: Float
+) -> Formation {
+    let formation = Formation {}
+    formation.id = id
+    formation.template = template
+    formation.center_x = center_x
+    formation.center_y = center_y
+    formation.angle = angle
+    formation.slots = Collection<FormationSlot> {}
+
+    // Create slots from template positions
+    for i in 0..template.positions.len() {
+        let entry = template.positions.get(i)
+        let world_pos = calculate_world_position(center_x, center_y, angle, entry.offset_x, entry.offset_y)
+
+        let slot = FormationSlot {}
+        slot.position_index = i
+        slot.unit_id = -1  // Empty slot
+        slot.world_position_x = world_pos.x
+        slot.world_position_y = world_pos.y
+        slot.world_angle = normalize_angle(angle + entry.angle)
+
+        formation.slots.add(slot)
+    }
+
+    return formation
+}
+
+/// Assign a unit to the nearest available slot
+fn assign_unit(formation: Formation, unit_id: Int, unit_pos_x: Float, unit_pos_y: Float) -> Int {
+    let best_slot_idx = -1
+    let best_dist = 99999999.0
+
+    for i in 0..formation.slots.len() {
+        let slot = formation.slots.get(i)
+        if slot.unit_id != -1 {
+            continue
+        }
+
+        let dx = slot.world_position_x - unit_pos_x
+        let dy = slot.world_position_y - unit_pos_y
+        let dist = sqrt(dx * dx + dy * dy)
+
+        if dist < best_dist {
+            best_dist = dist
+            best_slot_idx = i
+        }
+    }
+
+    if best_slot_idx >= 0 {
+        let slot = formation.slots.get(best_slot_idx)
+        slot.unit_id = unit_id
+        return best_slot_idx
+    }
+
+    return -1
+}
+
+/// Remove a unit from the formation
+fn remove_unit(formation: Formation, unit_id: Int) -> Bool {
+    for i in 0..formation.slots.len() {
+        let slot = formation.slots.get(i)
+        if slot.unit_id == unit_id {
+            slot.unit_id = -1
+            return true
+        }
+    }
+    return false
+}
+
+/// Update formation center and recalculate all slot positions
+fn update_formation_position(formation: Formation, new_center_x: Float, new_center_y: Float, new_angle: Float) {
+    formation.center_x = new_center_x
+    formation.center_y = new_center_y
+    formation.angle = new_angle
+
+    for i in 0..formation.slots.len() {
+        let slot = formation.slots.get(i)
+        let entry = formation.template.positions.get(i)
+        let world_pos = calculate_world_position(new_center_x, new_center_y, new_angle, entry.offset_x, entry.offset_y)
+
+        slot.world_position_x = world_pos.x
+        slot.world_position_y = world_pos.y
+        slot.world_angle = normalize_angle(new_angle + entry.angle)
+    }
+}
+
+/// Get the world position for a specific slot
+fn get_slot_position(formation: Formation, slot_index: Int) -> Vec2Result {
+    let result = Vec2Result {}
+    if slot_index >= formation.slots.len() {
+        result.valid = false
+        result.x = 0.0
+        result.y = 0.0
+        return result
+    }
+
+    let slot = formation.slots.get(slot_index)
+    result.valid = true
+    result.x = slot.world_position_x
+    result.y = slot.world_position_y
+    return result
+}
+
+/// Get the world angle for a specific slot
+fn get_slot_angle(formation: Formation, slot_index: Int) -> FloatResult {
+    let result = FloatResult {}
+    if slot_index >= formation.slots.len() {
+        result.valid = false
+        result.value = 0.0
+        return result
+    }
+
+    let slot = formation.slots.get(slot_index)
+    result.valid = true
+    result.value = slot.world_angle
+    return result
+}
+
+/// Count assigned units
+fn get_unit_count(formation: Formation) -> Int {
+    let count = 0
+    for i in 0..formation.slots.len() {
+        let slot = formation.slots.get(i)
+        if slot.unit_id != -1 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// Check if formation is full
+fn is_formation_full(formation: Formation) -> Bool {
+    return get_unit_count(formation) == formation.template.max_units
+}
+
+/// Check if formation is empty
+fn is_formation_empty(formation: Formation) -> Bool {
+    return get_unit_count(formation) == 0
+}
+
+// ============================================================================
+// Phase 6: Formation Manager
+// ============================================================================
+
+struct FormationManager {
+    templates: Collection<FormationTemplate>,
+    formations: Collection<Formation>,
+    next_formation_id: Int,
+}
+
+fn create_formation_manager() -> FormationManager {
+    let manager = FormationManager {}
+    manager.templates = Collection<FormationTemplate> {}
+    manager.formations = Collection<Formation> {}
+    manager.next_formation_id = 1
+    return manager
+}
+
+/// Initialize default C&C Generals formations
+fn initialize_defaults(manager: FormationManager) {
+    // Tight line formation
+    let tight_line = create_formation_template(FormationType::TIGHT_LINE, "TightLine", 10.0, 20)
+    generate_positions(tight_line)
+    manager.templates.add(tight_line)
+
+    // Loose line formation
+    let loose_line = create_formation_template(FormationType::LOOSE_LINE, "LooseLine", 10.0, 20)
+    generate_positions(loose_line)
+    manager.templates.add(loose_line)
+
+    // Column formation
+    let column = create_formation_template(FormationType::COLUMN, "Column", 10.0, 20)
+    generate_positions(column)
+    manager.templates.add(column)
+
+    // Wedge formation
+    let wedge = create_formation_template(FormationType::WEDGE, "Wedge", 12.0, 20)
+    generate_positions(wedge)
+    manager.templates.add(wedge)
+
+    // Scattered formation
+    let scattered = create_formation_template(FormationType::SCATTERED, "Scattered", 8.0, 20)
+    generate_positions(scattered)
+    manager.templates.add(scattered)
+
+    // Circle formations
+    let tight_circle = create_formation_template(FormationType::TIGHT_CIRCLE, "TightCircle", 10.0, 16)
+    generate_positions(tight_circle)
+    manager.templates.add(tight_circle)
+
+    let loose_circle = create_formation_template(FormationType::LOOSE_CIRCLE, "LooseCircle", 10.0, 16)
+    generate_positions(loose_circle)
+    manager.templates.add(loose_circle)
+}
+
+/// Get template by type
+fn get_template(manager: FormationManager, formation_type: FormationType) -> TemplateResult {
+    let result = TemplateResult {}
+
+    for i in 0..manager.templates.len() {
+        let template = manager.templates.get(i)
+        if template.formation_type == formation_type {
+            result.valid = true
+            result.template = template
+            return result
+        }
+    }
+
+    result.valid = false
+    return result
+}
+
+/// Create a new formation instance
+fn create_formation_instance(
+    manager: FormationManager,
+    formation_type: FormationType,
+    center_x: Float,
+    center_y: Float,
+    angle: Float
+) -> Int {
+    let template_result = get_template(manager, formation_type)
+    if !template_result.valid {
+        return -1
+    }
+
+    let id = manager.next_formation_id
+    manager.next_formation_id = manager.next_formation_id + 1
+
+    let formation = create_formation(id, template_result.template, center_x, center_y, angle)
+    manager.formations.add(formation)
+
+    return id
+}
+
+/// Get formation by ID
+fn get_formation(manager: FormationManager, formation_id: Int) -> FormationResult {
+    let result = FormationResult {}
+
+    for i in 0..manager.formations.len() {
+        let formation = manager.formations.get(i)
+        if formation.id == formation_id {
+            result.valid = true
+            result.formation = formation
+            return result
+        }
+    }
+
+    result.valid = false
+    return result
+}
+
+/// Remove a formation
+fn remove_formation(manager: FormationManager, formation_id: Int) -> Bool {
+    for i in 0..manager.formations.len() {
+        let formation = manager.formations.get(i)
+        if formation.id == formation_id {
+            manager.formations.remove(i)
+            return true
+        }
+    }
+    return false
+}
+
+/// Update all formations
+fn update_manager(manager: FormationManager, dt: Float) {
+    // Formation positions are updated on-demand via update_formation_position()
+    // This can be used for dynamic behaviors like rotating formations
+}
+
+/// Cleanup empty formations
+fn cleanup_empty_formations(manager: FormationManager) {
+    let i = 0
+    while i < manager.formations.len() {
+        let formation = manager.formations.get(i)
+        if is_formation_empty(formation) {
+            manager.formations.remove(i)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// ============================================================================
+// Utility Functions and Helper Structs
+// ============================================================================
+
+struct Vec2Result {
+    valid: Bool,
+    x: Float,
+    y: Float,
+}
+
+struct FloatResult {
+    valid: Bool,
+    value: Float,
+}
+
+struct TemplateResult {
+    valid: Bool,
+    template: FormationTemplate,
+}
+
+struct FormationResult {
+    valid: Bool,
+    formation: Formation,
+}
+
+struct WorldPosition {
+    x: Float,
+    y: Float,
+}
+
+fn calculate_world_position(center_x: Float, center_y: Float, angle: Float, offset_x: Float, offset_y: Float) -> WorldPosition {
+    let cos_a = cos(angle)
+    let sin_a = sin(angle)
+
+    let rotated_x = offset_x * cos_a - offset_y * sin_a
+    let rotated_y = offset_x * sin_a + offset_y * cos_a
+
+    let result = WorldPosition {}
+    result.x = center_x + rotated_x
+    result.y = center_y + rotated_y
+    return result
+}
+
+fn normalize_angle(angle: Float) -> Float {
+    let result = angle
+    while result > 3.14159265359 {
+        result = result - 2.0 * 3.14159265359
+    }
+    while result < -3.14159265359 {
+        result = result + 2.0 * 3.14159265359
+    }
+    return result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_line_generation() -> Bool {
+    let template = create_formation_template(FormationType::TIGHT_LINE, "TestLine", 10.0, 5)
+    generate_positions(template)
+
+    assert(template.positions.len() == 5, "Line should have 5 positions")
+
+    // Check symmetry around center
+    let first = template.positions.get(0)
+    let last = template.positions.get(4)
+    let diff = abs(first.offset_x + last.offset_x)
+    assert(diff < 0.1, "Line should be symmetric")
+
+    return true
+}
+
+fn test_wedge_generation() -> Bool {
+    let template = create_formation_template(FormationType::WEDGE, "TestWedge", 10.0, 7)
+    generate_positions(template)
+
+    assert(template.positions.len() == 7, "Wedge should have 7 positions")
+
+    // Leader should be at origin
+    let leader = template.positions.get(0)
+    assert(leader.offset_x == 0.0, "Leader X should be 0")
+    assert(leader.offset_y == 0.0, "Leader Y should be 0")
+
+    return true
+}
+
+fn test_circle_generation() -> Bool {
+    let template = create_formation_template(FormationType::TIGHT_CIRCLE, "TestCircle", 10.0, 8)
+    generate_positions(template)
+
+    assert(template.positions.len() == 8, "Circle should have 8 positions")
+
+    // All positions should be roughly same distance from center
+    let first = template.positions.get(0)
+    let first_dist = sqrt(first.offset_x * first.offset_x + first.offset_y * first.offset_y)
+
+    for i in 0..template.positions.len() {
+        let pos = template.positions.get(i)
+        let dist = sqrt(pos.offset_x * pos.offset_x + pos.offset_y * pos.offset_y)
+        let diff = abs(first_dist - dist)
+        assert(diff < 0.1, "All circle positions should be equidistant")
+    }
+
+    return true
+}
+
+fn test_slot_assignment() -> Bool {
+    let template = create_formation_template(FormationType::TIGHT_LINE, "TestLine", 10.0, 5)
+    generate_positions(template)
+
+    let formation = create_formation(1, template, 100.0, 100.0, 0.0)
+
+    // Assign units
+    let slot1 = assign_unit(formation, 101, 90.0, 100.0)
+    assert(slot1 >= 0, "Should assign unit to slot")
+
+    let slot2 = assign_unit(formation, 102, 110.0, 100.0)
+    assert(slot2 >= 0, "Should assign second unit to slot")
+
+    assert(get_unit_count(formation) == 2, "Should have 2 units")
+
+    return true
+}
+
+fn test_position_updates() -> Bool {
+    let template = create_formation_template(FormationType::TIGHT_LINE, "TestLine", 10.0, 3)
+    generate_positions(template)
+
+    let formation = create_formation(1, template, 0.0, 0.0, 0.0)
+
+    let old_slot = formation.slots.get(0)
+    let old_x = old_slot.world_position_x
+    let old_y = old_slot.world_position_y
+
+    // Move formation
+    update_formation_position(formation, 100.0, 100.0, 0.0)
+
+    let new_slot = formation.slots.get(0)
+    assert(new_slot.world_position_x != old_x, "Position X should change")
+    assert(new_slot.world_position_y != old_y, "Position Y should change")
+
+    return true
+}
+
+fn test_rotation() -> Bool {
+    let template = create_formation_template(FormationType::TIGHT_LINE, "TestLine", 10.0, 3)
+    generate_positions(template)
+
+    let formation = create_formation(1, template, 0.0, 0.0, 0.0)
+
+    // Rotate 90 degrees
+    update_formation_position(formation, 0.0, 0.0, 3.14159265359 / 2.0)
+
+    // Line should now be vertical instead of horizontal
+    let slot = formation.slots.get(0)
+    assert(abs(slot.world_position_y) > 1.0, "Should have Y offset after rotation")
+
+    return true
+}
+
+fn test_manager_creation() -> Bool {
+    let manager = create_formation_manager()
+    initialize_defaults(manager)
+
+    let template_result = get_template(manager, FormationType::WEDGE)
+    assert(template_result.valid, "Should find wedge template")
+    assert(template_result.template.formation_type == FormationType::WEDGE, "Should be wedge type")
+
+    let formation_id = create_formation_instance(manager, FormationType::WEDGE, 0.0, 0.0, 0.0)
+    assert(formation_id > 0, "Should create formation")
+
+    let formation_result = get_formation(manager, formation_id)
+    assert(formation_result.valid, "Should find formation")
+    assert(formation_result.formation.id == formation_id, "Should match ID")
+
+    return true
+}
+
+fn test_cleanup_empty() -> Bool {
+    let manager = create_formation_manager()
+    initialize_defaults(manager)
+
+    let id1 = create_formation_instance(manager, FormationType::TIGHT_LINE, 0.0, 0.0, 0.0)
+    let id2 = create_formation_instance(manager, FormationType::WEDGE, 100.0, 100.0, 0.0)
+
+    // id2 has a unit, id1 is empty
+    let formation2_result = get_formation(manager, id2)
+    if formation2_result.valid {
+        assign_unit(formation2_result.formation, 101, 100.0, 100.0)
+    }
+
+    assert(manager.formations.len() == 2, "Should have 2 formations")
+
+    cleanup_empty_formations(manager)
+
+    // Only formation with unit should remain
+    assert(manager.formations.len() == 1, "Should have 1 formation after cleanup")
+
+    let id1_result = get_formation(manager, id1)
+    assert(!id1_result.valid, "Empty formation should be removed")
+
+    let id2_result = get_formation(manager, id2)
+    assert(id2_result.valid, "Formation with unit should remain")
+
+    return true
+}
+
+fn test_world_position_rotation() -> Bool {
+    let pos1 = calculate_world_position(100.0, 100.0, 0.0, 10.0, 0.0)
+    assert(abs(pos1.x - 110.0) < 0.01, "No rotation X should be 110")
+    assert(abs(pos1.y - 100.0) < 0.01, "No rotation Y should be 100")
+
+    // 90 degree rotation
+    let pos2 = calculate_world_position(100.0, 100.0, 3.14159265359 / 2.0, 10.0, 0.0)
+    assert(abs(pos2.x - 100.0) < 0.01, "90 degree rotation X should be 100")
+    assert(abs(pos2.y - 110.0) < 0.01, "90 degree rotation Y should be 110")
+
+    return true
+}
+
+fn test_angle_normalization() -> Bool {
+    let angle1 = normalize_angle(4.0 * 3.14159265359)
+    assert(abs(angle1) < 0.01, "4*PI should normalize to 0")
+
+    let angle2 = normalize_angle(-4.0 * 3.14159265359)
+    assert(abs(angle2) < 0.01, "-4*PI should normalize to 0")
+
+    let angle3 = normalize_angle(3.14159265359 + 0.5)
+    assert(angle3 < 3.14159265359 && angle3 > -3.14159265359, "Should be in valid range")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_line_generation(), "Line generation test failed")
+    assert(test_wedge_generation(), "Wedge generation test failed")
+    assert(test_circle_generation(), "Circle generation test failed")
+    assert(test_slot_assignment(), "Slot assignment test failed")
+    assert(test_position_updates(), "Position updates test failed")
+    assert(test_rotation(), "Rotation test failed")
+    assert(test_manager_creation(), "Manager creation test failed")
+    assert(test_cleanup_empty(), "Cleanup empty test failed")
+    assert(test_world_position_rotation(), "World position rotation test failed")
+    assert(test_angle_normalization(), "Angle normalization test failed")
+    return true
+}

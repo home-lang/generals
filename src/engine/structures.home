@@ -1,0 +1,888 @@
+// ============================================================================
+// Structures/Buildings System - Complete Implementation
+// Based on Thyme's structure architecture
+// ============================================================================
+//
+// Buildings provide base construction, production, defenses, and superweapons.
+// Key mechanics:
+// - Construction (dozer placement, build time, cost)
+// - Production queues (units, upgrades)
+// - Power management (supply/demand)
+// - Defenses (fire weapons, garrison)
+// - Superweapons (timers, targeting)
+// - Damage states (pristine → damaged → rubble)
+//
+// References:
+// - Thyme/src/game/logic/object/structure.h
+// - Thyme/src/game/logic/object/productionupdate.h
+// - Thyme/src/game/logic/object/armedstructure.h
+
+import "basics/collection"
+import "basics/math"
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+fn create_vec2(x: Float, y: Float) -> Vec2 {
+    let v = Vec2 {}
+    v.x = x
+    v.y = y
+    return v
+}
+
+// ============================================================================
+// Phase 1: Building Types (from C&C Generals)
+// ============================================================================
+
+enum BuildingType {
+    // USA Buildings
+    USA_COMMAND_CENTER,
+    USA_POWER_PLANT,
+    USA_COLD_FUSION_REACTOR,
+    USA_SUPPLY_CENTER,
+    USA_BARRACKS,
+    USA_WAR_FACTORY,
+    USA_AIRFIELD,
+    USA_STRATEGY_CENTER,
+    USA_PATRIOT,
+    USA_FIRE_BASE,
+    USA_PARTICLE_CANNON,
+
+    // China Buildings
+    CHINA_COMMAND_CENTER,
+    CHINA_POWER_PLANT,
+    CHINA_NUCLEAR_REACTOR,
+    CHINA_SUPPLY_CENTER,
+    CHINA_BARRACKS,
+    CHINA_WAR_FACTORY,
+    CHINA_AIRFIELD,
+    CHINA_PROPAGANDA_CENTER,
+    CHINA_GATLING_CANNON,
+    CHINA_BUNKER,
+    CHINA_NUCLEAR_MISSILE,
+
+    // GLA Buildings
+    GLA_COMMAND_CENTER,
+    GLA_SUPPLY_STASH,
+    GLA_BARRACKS,
+    GLA_ARMS_DEALER,
+    GLA_BLACK_MARKET,
+    GLA_PALACE,
+    GLA_STINGER_SITE,
+    GLA_TUNNEL_NETWORK,
+    GLA_SCUD_STORM,
+
+    // Neutral
+    TECH_BUILDING,
+    OIL_DERRICK,
+    BRIDGE_REPAIR_HUT,
+
+    COUNT,
+}
+
+/// Get building name for display
+fn get_building_name(building_type: BuildingType) -> String {
+    if building_type == BuildingType::USA_COMMAND_CENTER {
+        return "Command Center"
+    } else if building_type == BuildingType::USA_POWER_PLANT {
+        return "Power Plant"
+    } else if building_type == BuildingType::USA_COLD_FUSION_REACTOR {
+        return "Cold Fusion Reactor"
+    } else if building_type == BuildingType::USA_SUPPLY_CENTER {
+        return "Supply Center"
+    } else if building_type == BuildingType::USA_BARRACKS {
+        return "Barracks"
+    } else if building_type == BuildingType::USA_WAR_FACTORY {
+        return "War Factory"
+    } else if building_type == BuildingType::USA_PARTICLE_CANNON {
+        return "Particle Cannon"
+    } else if building_type == BuildingType::CHINA_NUCLEAR_MISSILE {
+        return "Nuclear Missile"
+    } else if building_type == BuildingType::GLA_SCUD_STORM {
+        return "SCUD Storm"
+    }
+    return "Building"
+}
+
+// ============================================================================
+// Phase 2: Building States
+// ============================================================================
+
+enum BuildingState {
+    PLACEMENT,        // Being placed by dozer
+    CONSTRUCTING,     // Under construction
+    ACTIVE,           // Fully operational
+    DAMAGED,          // Damaged but functional
+    SEVERELY_DAMAGED, // Critical damage
+    DISABLED,         // Temporarily disabled (power off, EMP)
+    SELLING,          // Being sold
+    DESTROYED,        // Dead/rubble
+}
+
+enum DamageState {
+    PRISTINE,
+    DAMAGED,
+    REALLY_DAMAGED,
+    RUBBLE,
+}
+
+// ============================================================================
+// Phase 3: Production Queue Entry
+// ============================================================================
+
+enum ProductionType {
+    UNIT,
+    UPGRADE,
+    SPECIAL_POWER,
+}
+
+struct ProductionEntry {
+    production_type: ProductionType,
+    object_id: Int,        // Unit type, upgrade ID, etc.
+    progress: Float,       // 0.0 to 1.0
+    time_remaining: Float, // Seconds
+    total_time: Float,     // Total build time
+    cost: Int,             // Cost in money
+    can_cancel: Bool,
+}
+
+fn create_production_entry(
+    production_type: ProductionType,
+    object_id: Int,
+    build_time: Float,
+    cost: Int,
+) -> ProductionEntry {
+    let entry = ProductionEntry {}
+    entry.production_type = production_type
+    entry.object_id = object_id
+    entry.progress = 0.0
+    entry.time_remaining = build_time
+    entry.total_time = build_time
+    entry.cost = cost
+    entry.can_cancel = true
+    return entry
+}
+
+fn update_production_entry(entry: ProductionEntry, dt: Float) -> Bool {
+    entry.time_remaining = entry.time_remaining - dt
+    entry.progress = 1.0 - (entry.time_remaining / entry.total_time)
+    return entry.time_remaining <= 0.0
+}
+
+fn is_production_complete(entry: ProductionEntry) -> Bool {
+    return entry.progress >= 1.0
+}
+
+// ============================================================================
+// Phase 4: Building Template
+// ============================================================================
+
+struct BuildingTemplate {
+    name: String,
+    building_type: BuildingType,
+    display_name: String,
+
+    // Cost and build time
+    cost: Int,
+    build_time: Float,          // Seconds
+    refund_percent: Float,      // 0.5 = 50% refund on sell
+
+    // Physical properties
+    footprint_width: Int,     // Grid cells
+    footprint_height: Int,
+    max_health: Float,
+
+    // Power
+    provides_power: Int,      // Negative = consumes
+    requires_power: Bool,
+
+    // Production
+    can_produce_units: Bool,
+    can_produce_upgrades: Bool,
+    production_queue_size: Int,
+
+    // Defense
+    is_defensive: Bool,
+    weapon_range: Float,
+    weapon_damage: Float,
+
+    // Prerequisites
+    has_required_building: Bool,
+    required_building: BuildingType,
+    has_required_upgrade: Bool,
+    required_upgrade: Int,
+
+    // Special
+    is_superweapon: Bool,
+    superweapon_recharge_time: Float,
+}
+
+fn create_building_template(
+    name: String,
+    building_type: BuildingType,
+    cost: Int,
+    build_time: Float,
+) -> BuildingTemplate {
+    let template = BuildingTemplate {}
+    template.name = name
+    template.building_type = building_type
+    template.display_name = get_building_name(building_type)
+    template.cost = cost
+    template.build_time = build_time
+    template.refund_percent = 0.5
+    template.footprint_width = 2
+    template.footprint_height = 2
+    template.max_health = 1000.0
+    template.provides_power = 0
+    template.requires_power = false
+    template.can_produce_units = false
+    template.can_produce_upgrades = false
+    template.production_queue_size = 0
+    template.is_defensive = false
+    template.weapon_range = 0.0
+    template.weapon_damage = 0.0
+    template.has_required_building = false
+    template.required_building = BuildingType::USA_COMMAND_CENTER
+    template.has_required_upgrade = false
+    template.required_upgrade = 0
+    template.is_superweapon = false
+    template.superweapon_recharge_time = 0.0
+    return template
+}
+
+// ============================================================================
+// Phase 5: Building Instance
+// ============================================================================
+
+struct Building {
+    id: Int,
+    template: BuildingTemplate,
+    player_index: Int,
+    team: Int,
+
+    // State
+    state: BuildingState,
+    damage_state: DamageState,
+    health: Float,
+    construction_progress: Float,
+
+    // Position
+    position: Vec2,
+    angle: Float,
+
+    // Production
+    production_queue: Collection<ProductionEntry>,
+    has_current_production: Bool,
+    current_production: ProductionEntry,
+    production_paused: Bool,
+
+    // Power
+    is_powered: Bool,
+    power_consumption: Int,
+
+    // Superweapon
+    superweapon_ready: Bool,
+    superweapon_timer: Float,
+
+    // Garrison (for bunkers, etc.)
+    garrisoned_units: Collection<Int>,
+    max_garrison: Int,
+}
+
+fn create_building(
+    id: Int,
+    template: BuildingTemplate,
+    player_index: Int,
+    team: Int,
+    position: Vec2,
+) -> Building {
+    let building = Building {}
+    building.id = id
+    building.template = template
+    building.player_index = player_index
+    building.team = team
+    building.state = BuildingState::CONSTRUCTING
+    building.damage_state = DamageState::PRISTINE
+    building.health = template.max_health
+    building.construction_progress = 0.0
+    building.position = position
+    building.angle = 0.0
+    building.production_queue = Collection<ProductionEntry> {}
+    building.has_current_production = false
+    building.current_production = create_production_entry(ProductionType::UNIT, 0, 0.0, 0)
+    building.production_paused = false
+    building.is_powered = true
+    building.power_consumption = if template.provides_power < 0 { abs(template.provides_power) } else { 0 }
+    building.superweapon_ready = false
+    building.superweapon_timer = 0.0
+    building.garrisoned_units = Collection<Int> {}
+    building.max_garrison = 0
+    return building
+}
+
+/// Update building
+fn update_building(building: Building, dt: Float) {
+    if building.state == BuildingState::CONSTRUCTING {
+        update_construction(building, dt)
+    } else if building.state == BuildingState::ACTIVE {
+        update_production(building, dt)
+        if building.template.is_superweapon {
+            update_superweapon(building, dt)
+        }
+    } else if building.state == BuildingState::SELLING {
+        // TODO: Selling animation
+        building.state = BuildingState::DESTROYED
+    }
+
+    update_damage_state(building)
+}
+
+fn update_construction(building: Building, dt: Float) {
+    if building.template.build_time <= 0.0 {
+        building.construction_progress = 1.0
+    } else {
+        let rate = dt / building.template.build_time
+        building.construction_progress = building.construction_progress + rate
+    }
+
+    if building.construction_progress >= 1.0 {
+        building.construction_progress = 1.0
+        building.state = BuildingState::ACTIVE
+    }
+}
+
+fn update_production(building: Building, dt: Float) {
+    if !building.is_powered || building.production_paused {
+        return
+    }
+
+    // Process current production
+    if building.has_current_production {
+        let complete = update_production_entry(building.current_production, dt)
+        if complete {
+            // Production complete
+            // TODO: Spawn unit or apply upgrade
+            building.has_current_production = false
+        }
+    }
+
+    // Start next production
+    if !building.has_current_production && building.production_queue.len() > 0 {
+        building.current_production = building.production_queue.get(0)
+        building.production_queue.remove(0)
+        building.has_current_production = true
+    }
+}
+
+fn update_superweapon(building: Building, dt: Float) {
+    if building.superweapon_ready {
+        return
+    }
+
+    building.superweapon_timer = building.superweapon_timer + dt
+    if building.superweapon_timer >= building.template.superweapon_recharge_time {
+        building.superweapon_ready = true
+    }
+}
+
+fn update_damage_state(building: Building) {
+    let health_percent = building.health / building.template.max_health
+
+    if health_percent <= 0.0 {
+        building.damage_state = DamageState::RUBBLE
+        building.state = BuildingState::DESTROYED
+    } else if health_percent < 0.25 {
+        building.damage_state = DamageState::REALLY_DAMAGED
+        building.state = BuildingState::SEVERELY_DAMAGED
+    } else if health_percent < 0.5 {
+        building.damage_state = DamageState::DAMAGED
+        building.state = BuildingState::DAMAGED
+    } else {
+        building.damage_state = DamageState::PRISTINE
+        if building.state == BuildingState::DAMAGED || building.state == BuildingState::SEVERELY_DAMAGED {
+            building.state = BuildingState::ACTIVE
+        }
+    }
+}
+
+/// Queue production
+fn queue_production(building: Building, entry: ProductionEntry) -> Bool {
+    if building.production_queue.len() >= building.template.production_queue_size {
+        return false
+    }
+    building.production_queue.add(entry)
+    return true
+}
+
+/// Cancel production
+struct CancelResult {
+    success: Bool,
+    entry: ProductionEntry,
+}
+
+fn cancel_production(building: Building, index: Int) -> CancelResult {
+    let result = CancelResult {}
+    result.success = false
+
+    if index >= building.production_queue.len() {
+        return result
+    }
+
+    result.success = true
+    result.entry = building.production_queue.get(index)
+    building.production_queue.remove(index)
+    return result
+}
+
+/// Take damage
+fn take_building_damage(building: Building, damage: Float) {
+    building.health = building.health - damage
+    if building.health < 0.0 {
+        building.health = 0.0
+        building.state = BuildingState::DESTROYED
+    }
+}
+
+/// Repair
+fn repair_building(building: Building, amount: Float) {
+    building.health = building.health + amount
+    if building.health > building.template.max_health {
+        building.health = building.template.max_health
+    }
+}
+
+/// Sell building
+fn sell_building(building: Building) -> Int {
+    let refund_float = (building.template.cost as Float) * building.template.refund_percent
+    let refund = refund_float as Int
+    building.state = BuildingState::SELLING
+    return refund
+}
+
+/// Fire superweapon
+fn fire_superweapon(building: Building) -> Bool {
+    if !building.superweapon_ready {
+        return false
+    }
+
+    building.superweapon_ready = false
+    building.superweapon_timer = 0.0
+    return true
+}
+
+/// Garrison unit
+fn garrison_unit(building: Building, unit_id: Int) -> Bool {
+    if building.garrisoned_units.len() >= building.max_garrison {
+        return false
+    }
+    building.garrisoned_units.add(unit_id)
+    return true
+}
+
+/// Ungarrison unit
+fn ungarrison_unit(building: Building, unit_id: Int) -> Bool {
+    for i in 0..building.garrisoned_units.len() {
+        let id = building.garrisoned_units.get(i)
+        if id == unit_id {
+            building.garrisoned_units.remove(i)
+            return true
+        }
+    }
+    return false
+}
+
+/// Check if construction is complete
+fn is_construction_complete(building: Building) -> Bool {
+    return building.state != BuildingState::CONSTRUCTING && building.state != BuildingState::PLACEMENT
+}
+
+/// Check if operational
+fn is_operational(building: Building) -> Bool {
+    return building.state == BuildingState::ACTIVE && building.is_powered
+}
+
+/// Get production progress
+fn get_production_progress(building: Building) -> Float {
+    if building.has_current_production {
+        return building.current_production.progress
+    }
+    return 0.0
+}
+
+// ============================================================================
+// Phase 6: Building Manager
+// ============================================================================
+
+struct TemplateEntry {
+    template: BuildingTemplate,
+}
+
+struct BuildingEntry {
+    building: Building,
+}
+
+struct BuildingManager {
+    templates: Collection<TemplateEntry>,
+    buildings: Collection<BuildingEntry>,
+    next_id: Int,
+}
+
+fn create_building_manager() -> BuildingManager {
+    let manager = BuildingManager {}
+    manager.templates = Collection<TemplateEntry> {}
+    manager.buildings = Collection<BuildingEntry> {}
+    manager.next_id = 1
+    return manager
+}
+
+/// Add template
+fn add_building_template(manager: BuildingManager, template: BuildingTemplate) {
+    let entry = TemplateEntry {}
+    entry.template = template
+    manager.templates.add(entry)
+}
+
+/// Find template by type
+struct TemplateResult {
+    found: Bool,
+    template: BuildingTemplate,
+}
+
+fn find_building_template(manager: BuildingManager, building_type: BuildingType) -> TemplateResult {
+    let result = TemplateResult {}
+    result.found = false
+
+    for i in 0..manager.templates.len() {
+        let entry = manager.templates.get(i)
+        if entry.template.building_type == building_type {
+            result.found = true
+            result.template = entry.template
+            return result
+        }
+    }
+
+    return result
+}
+
+/// Create building
+fn create_manager_building(
+    manager: BuildingManager,
+    building_type: BuildingType,
+    player_index: Int,
+    team: Int,
+    position: Vec2,
+) -> Int {
+    let template_result = find_building_template(manager, building_type)
+    if !template_result.found {
+        return -1
+    }
+
+    let id = manager.next_id
+    manager.next_id = manager.next_id + 1
+
+    let building = create_building(id, template_result.template, player_index, team, position)
+    let entry = BuildingEntry {}
+    entry.building = building
+    manager.buildings.add(entry)
+
+    return id
+}
+
+/// Get building by ID
+struct BuildingResult {
+    found: Bool,
+    building: Building,
+}
+
+fn get_manager_building(manager: BuildingManager, id: Int) -> BuildingResult {
+    let result = BuildingResult {}
+    result.found = false
+
+    for i in 0..manager.buildings.len() {
+        let entry = manager.buildings.get(i)
+        if entry.building.id == id {
+            result.found = true
+            result.building = entry.building
+            return result
+        }
+    }
+
+    return result
+}
+
+/// Remove building
+fn remove_manager_building(manager: BuildingManager, id: Int) -> Bool {
+    for i in 0..manager.buildings.len() {
+        let entry = manager.buildings.get(i)
+        if entry.building.id == id {
+            manager.buildings.remove(i)
+            return true
+        }
+    }
+    return false
+}
+
+/// Update all buildings
+fn update_building_manager(manager: BuildingManager, dt: Float) {
+    let i = 0
+    while i < manager.buildings.len() {
+        let entry = manager.buildings.get(i)
+        update_building(entry.building, dt)
+        manager.buildings.set(i, entry)
+
+        if entry.building.state == BuildingState::DESTROYED {
+            manager.buildings.remove(i)
+            continue
+        }
+
+        i = i + 1
+    }
+}
+
+/// Initialize default building templates
+fn initialize_building_defaults(manager: BuildingManager) {
+    // USA Buildings
+    let usa_cc = create_building_template(
+        "AmericaCommandCenter", BuildingType::USA_COMMAND_CENTER, 2000, 20.0
+    )
+    usa_cc.footprint_width = 3
+    usa_cc.footprint_height = 3
+    usa_cc.max_health = 5000.0
+    add_building_template(manager, usa_cc)
+
+    let usa_barracks = create_building_template(
+        "AmericaBarracks", BuildingType::USA_BARRACKS, 500, 10.0
+    )
+    usa_barracks.can_produce_units = true
+    usa_barracks.production_queue_size = 5
+    usa_barracks.requires_power = true
+    add_building_template(manager, usa_barracks)
+
+    let usa_particle = create_building_template(
+        "AmericaParticleCannon", BuildingType::USA_PARTICLE_CANNON, 5000, 60.0
+    )
+    usa_particle.is_superweapon = true
+    usa_particle.superweapon_recharge_time = 360.0  // 6 minutes
+    usa_particle.footprint_width = 3
+    usa_particle.footprint_height = 3
+    add_building_template(manager, usa_particle)
+
+    // China Buildings
+    let china_nuke = create_building_template(
+        "ChinaNuclearMissile", BuildingType::CHINA_NUCLEAR_MISSILE, 5000, 60.0
+    )
+    china_nuke.is_superweapon = true
+    china_nuke.superweapon_recharge_time = 360.0
+    add_building_template(manager, china_nuke)
+
+    // GLA Buildings
+    let gla_scud = create_building_template(
+        "GLAScudStorm", BuildingType::GLA_SCUD_STORM, 5000, 60.0
+    )
+    gla_scud.is_superweapon = true
+    gla_scud.superweapon_recharge_time = 360.0
+    add_building_template(manager, gla_scud)
+}
+
+/// Get player's buildings
+fn get_player_buildings(manager: BuildingManager, player_index: Int) -> Collection<Building> {
+    let result = Collection<Building> {}
+
+    for i in 0..manager.buildings.len() {
+        let entry = manager.buildings.get(i)
+        if entry.building.player_index == player_index {
+            result.add(entry.building)
+        }
+    }
+
+    return result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_building_template_init() -> Bool {
+    let template = create_building_template(
+        "TestBuilding", BuildingType::USA_COMMAND_CENTER, 1000, 20.0
+    )
+
+    assert(template.name == "TestBuilding", "Name should match")
+    assert(template.cost == 1000, "Cost should be 1000")
+    assert(template.build_time == 20.0, "Build time should be 20")
+
+    return true
+}
+
+fn test_building_construction() -> Bool {
+    let template = create_building_template(
+        "TestBuilding", BuildingType::USA_BARRACKS, 500, 10.0
+    )
+
+    let position = create_vec2(100.0, 100.0)
+    let building = create_building(1, template, 0, 0, position)
+
+    assert(building.state == BuildingState::CONSTRUCTING, "Should be constructing")
+    assert(building.construction_progress == 0.0, "Progress should be 0")
+
+    // Update for 5 seconds (50% complete)
+    update_building(building, 5.0)
+    assert(building.construction_progress >= 0.49 && building.construction_progress <= 0.51, "Progress should be ~50%")
+    assert(building.state == BuildingState::CONSTRUCTING, "Should still be constructing")
+
+    // Complete construction
+    update_building(building, 5.0)
+    assert(building.construction_progress == 1.0, "Progress should be 100%")
+    assert(building.state == BuildingState::ACTIVE, "Should be active")
+
+    return true
+}
+
+fn test_building_production_queue() -> Bool {
+    let template = create_building_template(
+        "TestBarracks", BuildingType::USA_BARRACKS, 500, 10.0
+    )
+    template.can_produce_units = true
+    template.production_queue_size = 5
+
+    let position = create_vec2(0.0, 0.0)
+    let building = create_building(1, template, 0, 0, position)
+
+    // Complete construction first
+    building.state = BuildingState::ACTIVE
+    building.construction_progress = 1.0
+
+    // Queue production
+    let entry = create_production_entry(ProductionType::UNIT, 101, 15.0, 300)
+    let queued = queue_production(building, entry)
+    assert(queued, "Should queue successfully")
+    assert(building.production_queue.len() == 1, "Queue should have 1 entry")
+
+    // Update to start production
+    update_building(building, 0.1)
+    assert(building.has_current_production, "Should have current production")
+    assert(building.production_queue.len() == 0, "Queue should be empty")
+
+    // Update production
+    update_building(building, 7.5)  // 50%
+    assert(get_production_progress(building) >= 0.49 && get_production_progress(building) <= 0.51, "Progress should be ~50%")
+
+    // Complete production
+    update_building(building, 7.5)
+    assert(!building.has_current_production, "Should not have current production after completion")
+
+    return true
+}
+
+fn test_building_damage_and_repair() -> Bool {
+    let template = create_building_template(
+        "TestBuilding", BuildingType::USA_COMMAND_CENTER, 1000, 10.0
+    )
+
+    let position = create_vec2(0.0, 0.0)
+    let building = create_building(1, template, 0, 0, position)
+
+    building.state = BuildingState::ACTIVE
+    let initial_health = building.health
+
+    // Take damage
+    take_building_damage(building, 300.0)
+    assert(building.health < initial_health, "Health should decrease")
+
+    // Repair
+    repair_building(building, 100.0)
+    assert(building.health > initial_health - 300.0, "Health should increase")
+
+    // Destroy
+    take_building_damage(building, 10000.0)
+    assert(building.state == BuildingState::DESTROYED, "Should be destroyed")
+
+    return true
+}
+
+fn test_building_sell() -> Bool {
+    let template = create_building_template(
+        "TestBuilding", BuildingType::USA_BARRACKS, 1000, 10.0
+    )
+
+    let position = create_vec2(0.0, 0.0)
+    let building = create_building(1, template, 0, 0, position)
+
+    let refund = sell_building(building)
+    assert(refund == 500, "Refund should be 50% (500)")
+    assert(building.state == BuildingState::SELLING, "Should be selling")
+
+    return true
+}
+
+fn test_building_superweapon() -> Bool {
+    let template = create_building_template(
+        "ParticleCannon", BuildingType::USA_PARTICLE_CANNON, 5000, 60.0
+    )
+    template.is_superweapon = true
+    template.superweapon_recharge_time = 30.0
+
+    let position = create_vec2(0.0, 0.0)
+    let building = create_building(1, template, 0, 0, position)
+
+    building.state = BuildingState::ACTIVE
+
+    // Not ready initially
+    assert(!building.superweapon_ready, "Should not be ready initially")
+
+    // Charge halfway
+    update_building(building, 15.0)
+    assert(!building.superweapon_ready, "Should not be ready at 50%")
+
+    // Fully charged
+    update_building(building, 15.0)
+    assert(building.superweapon_ready, "Should be ready at 100%")
+
+    // Fire
+    let fired = fire_superweapon(building)
+    assert(fired, "Should fire successfully")
+    assert(!building.superweapon_ready, "Should not be ready after firing")
+
+    return true
+}
+
+fn test_building_manager_creation() -> Bool {
+    let manager = create_building_manager()
+
+    initialize_building_defaults(manager)
+
+    let template_result = find_building_template(manager, BuildingType::USA_BARRACKS)
+    assert(template_result.found, "Should find template")
+
+    let position = create_vec2(100.0, 100.0)
+    let building_id = create_manager_building(manager, BuildingType::USA_BARRACKS, 0, 0, position)
+    assert(building_id > 0, "Should create building")
+
+    let building_result = get_manager_building(manager, building_id)
+    assert(building_result.found, "Should find building")
+    assert(building_result.building.id == building_id, "Building ID should match")
+
+    return true
+}
+
+fn test_get_building_names() -> Bool {
+    assert(get_building_name(BuildingType::USA_COMMAND_CENTER) == "Command Center", "Command Center name should match")
+    assert(get_building_name(BuildingType::USA_PARTICLE_CANNON) == "Particle Cannon", "Particle Cannon name should match")
+    assert(get_building_name(BuildingType::GLA_SCUD_STORM) == "SCUD Storm", "SCUD Storm name should match")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_building_template_init(), "Building template init test failed")
+    assert(test_building_construction(), "Building construction test failed")
+    assert(test_building_production_queue(), "Building production queue test failed")
+    assert(test_building_damage_and_repair(), "Building damage/repair test failed")
+    assert(test_building_sell(), "Building sell test failed")
+    assert(test_building_superweapon(), "Building superweapon test failed")
+    assert(test_building_manager_creation(), "Building manager creation test failed")
+    assert(test_get_building_names(), "Get building names test failed")
+    return true
+}

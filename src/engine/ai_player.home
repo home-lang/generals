@@ -1,0 +1,596 @@
+// ============================================================================
+// AI Player System
+// High-level AI strategic decision making
+// Based on Thyme's AI system
+// ============================================================================
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// AI Enums and Types
+// ============================================================================
+
+/// AI difficulty level
+enum AIDifficulty {
+    EASY,
+    MEDIUM,
+    HARD,
+    BRUTAL,
+}
+
+/// AI personality type (from Thyme's AI scripts)
+enum AIPersonality {
+    AGGRESSIVE,  // Rush-focused
+    DEFENSIVE,   // Turtle, tech up
+    BALANCED,    // Mix of both
+    ECONOMIC,    // Economy-focused
+}
+
+/// AI strategic state
+enum AIState {
+    EARLY_GAME,    // 0-5 minutes: Build base, scouts
+    MID_GAME,      // 5-15 minutes: Expand, tech up
+    LATE_GAME,     // 15+ minutes: Mass armies
+    DESPERATE,     // Losing badly
+    WINNING,       // Ahead
+}
+
+/// Squad role
+enum SquadRole {
+    SCOUT,
+    ATTACK,
+    DEFEND,
+    HARASS,
+    SUPPORT,
+}
+
+/// Squad state
+enum SquadState {
+    IDLE,
+    MOVING,
+    ATTACKING,
+    DEFENDING,
+    RETREATING,
+}
+
+/// Building type (simplified enum for AI decision making)
+enum BuildingType {
+    USA_COMMAND_CENTER,
+    USA_BARRACKS,
+    USA_SUPPLY_CENTER,
+    USA_WAR_FACTORY,
+    USA_STRATEGY_CENTER,
+    USA_PARTICLE_CANNON,
+    USA_COLD_FUSION_REACTOR,
+}
+
+// ============================================================================
+// Vec2 Helper
+// ============================================================================
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+fn vec2_init(x: Float, y: Float) -> Vec2 {
+    let v = Vec2 {}
+    v.x = x
+    v.y = y
+    return v
+}
+
+// ============================================================================
+// Build Order Entry
+// ============================================================================
+
+struct BuildOrderEntry {
+    building_type: BuildingType,
+    priority: Int,          // 0-255, higher = more important
+    min_money: Int,         // Don't build until we have this much
+    has_prerequisite: Bool,
+    prerequisite: BuildingType,  // Requires this building first
+}
+
+fn create_build_order_entry(building_type: BuildingType, priority: Int) -> BuildOrderEntry {
+    let entry = BuildOrderEntry {}
+    entry.building_type = building_type
+    entry.priority = priority
+    entry.min_money = 0
+    entry.has_prerequisite = false
+    entry.prerequisite = BuildingType::USA_COMMAND_CENTER
+    return entry
+}
+
+// ============================================================================
+// AI Squad (group of units)
+// ============================================================================
+
+struct AISquad {
+    id: Int,
+    unit_ids: Collection<Int>,
+    role: SquadRole,
+    target_position: Vec2,
+    has_target_position: Bool,
+    state: SquadState,
+}
+
+fn create_squad(id: Int, role: SquadRole) -> AISquad {
+    let squad = AISquad {}
+    squad.id = id
+    squad.unit_ids = Collection<Int> {}
+    squad.role = role
+    squad.target_position = vec2_init(0.0, 0.0)
+    squad.has_target_position = false
+    squad.state = SquadState::IDLE
+    return squad
+}
+
+fn add_unit_to_squad(squad: AISquad, unit_id: Int) {
+    squad.unit_ids.add(unit_id)
+}
+
+fn remove_unit_from_squad(squad: AISquad, unit_id: Int) {
+    let new_units = Collection<Int> {}
+    for i in 0..squad.unit_ids.len() {
+        let id = squad.unit_ids.get(i)
+        if id != unit_id {
+            new_units.add(id)
+        }
+    }
+    squad.unit_ids = new_units
+}
+
+fn get_squad_size(squad: AISquad) -> Int {
+    return squad.unit_ids.len()
+}
+
+// ============================================================================
+// Simplified Entity and Economy Stubs
+// ============================================================================
+
+struct Entity {
+    id: Int,
+    active: Bool,
+    team: Int,
+    entity_type: Int,  // 0 = building, 1 = unit
+}
+
+struct EconomyManager {
+    money: Int,
+    energy_sufficient: Bool,
+    building_count: Int,
+}
+
+struct EntityManager {
+    entities: Collection<Entity>,
+}
+
+// ============================================================================
+// AI Player Controller
+// ============================================================================
+
+struct AIPlayer {
+    player_index: Int,
+    team_id: Int,
+    difficulty: AIDifficulty,
+    personality: AIPersonality,
+    state: AIState,
+
+    // References to game managers
+    money: Int,          // Simplified economy reference
+    energy_ok: Bool,
+    building_count: Int,
+    unit_count: Int,
+
+    // Squads
+    squads: Collection<AISquad>,
+    next_squad_id: Int,
+
+    // Build queue
+    build_queue: Collection<BuildOrderEntry>,
+
+    // Timers
+    game_time: Float,
+    last_build_check: Float,
+    last_attack_check: Float,
+    last_scout_check: Float,
+    last_economy_check: Float,
+
+    // Statistics
+    units_built: Int,
+    units_lost: Int,
+    enemies_killed: Int,
+
+    // Thresholds (vary by difficulty)
+    build_check_interval: Float,
+    attack_threshold: Int,  // Min units before attacking
+    max_squads: Int,
+}
+
+fn create_ai_player(
+    player_index: Int,
+    team_id: Int,
+    difficulty: AIDifficulty,
+    personality: AIPersonality
+) -> AIPlayer {
+    // Set difficulty parameters
+    let build_interval = 5.0
+    if difficulty == AIDifficulty::MEDIUM {
+        build_interval = 3.0
+    } else if difficulty == AIDifficulty::HARD {
+        build_interval = 2.0
+    } else if difficulty == AIDifficulty::BRUTAL {
+        build_interval = 1.0
+    }
+
+    let attack_threshold = 15
+    if difficulty == AIDifficulty::MEDIUM {
+        attack_threshold = 10
+    } else if difficulty == AIDifficulty::HARD {
+        attack_threshold = 7
+    } else if difficulty == AIDifficulty::BRUTAL {
+        attack_threshold = 5
+    }
+
+    let ai = AIPlayer {}
+    ai.player_index = player_index
+    ai.team_id = team_id
+    ai.difficulty = difficulty
+    ai.personality = personality
+    ai.state = AIState::EARLY_GAME
+    ai.money = 5000
+    ai.energy_ok = true
+    ai.building_count = 0
+    ai.unit_count = 0
+    ai.squads = Collection<AISquad> {}
+    ai.next_squad_id = 1
+    ai.build_queue = Collection<BuildOrderEntry> {}
+    ai.game_time = 0.0
+    ai.last_build_check = 0.0
+    ai.last_attack_check = 0.0
+    ai.last_scout_check = 0.0
+    ai.last_economy_check = 0.0
+    ai.units_built = 0
+    ai.units_lost = 0
+    ai.enemies_killed = 0
+    ai.build_check_interval = build_interval
+    ai.attack_threshold = attack_threshold
+    ai.max_squads = 10
+
+    return ai
+}
+
+/// Main AI update
+fn update_ai_player(ai: AIPlayer, dt: Float) {
+    ai.game_time = ai.game_time + dt
+
+    // Update game state
+    update_game_state(ai)
+
+    // Check timers for different AI tasks
+    if ai.game_time - ai.last_economy_check > 2.0 {
+        update_economy(ai)
+        ai.last_economy_check = ai.game_time
+    }
+
+    if ai.game_time - ai.last_build_check > ai.build_check_interval {
+        update_building(ai)
+        ai.last_build_check = ai.game_time
+    }
+
+    if ai.game_time - ai.last_scout_check > 10.0 {
+        update_scouting(ai)
+        ai.last_scout_check = ai.game_time
+    }
+
+    if ai.game_time - ai.last_attack_check > 5.0 {
+        update_attacks(ai)
+        ai.last_attack_check = ai.game_time
+    }
+
+    // Update squads
+    update_squads(ai, dt)
+}
+
+/// Update game state based on time and situation
+fn update_game_state(ai: AIPlayer) {
+    if ai.game_time < 300.0 {  // 5 minutes
+        ai.state = AIState::EARLY_GAME
+    } else if ai.game_time < 900.0 {  // 15 minutes
+        ai.state = AIState::MID_GAME
+    } else {
+        ai.state = AIState::LATE_GAME
+    }
+
+    // Check if desperate (few buildings left)
+    if ai.building_count < 3 {
+        ai.state = AIState::DESPERATE
+    }
+
+    // Check if winning (lots of units)
+    if ai.unit_count > 50 {
+        ai.state = AIState::WINNING
+    }
+}
+
+/// Update economy decisions
+fn update_economy(ai: AIPlayer) {
+    // Always try to build supply buildings if low on income
+    if ai.money < 1000 {
+        queue_building(ai, BuildingType::USA_SUPPLY_CENTER, 200)
+    }
+
+    // Build power if needed
+    if !ai.energy_ok {
+        queue_building(ai, BuildingType::USA_COLD_FUSION_REACTOR, 255)
+    }
+}
+
+/// Update building decisions
+fn update_building(ai: AIPlayer) {
+    // Early game: Command Center → Barracks → Supply
+    if ai.state == AIState::EARLY_GAME {
+        if !has_building(ai, BuildingType::USA_COMMAND_CENTER) {
+            queue_building(ai, BuildingType::USA_COMMAND_CENTER, 255)
+        } else if !has_building(ai, BuildingType::USA_BARRACKS) {
+            queue_building(ai, BuildingType::USA_BARRACKS, 200)
+        } else if !has_building(ai, BuildingType::USA_SUPPLY_CENTER) {
+            queue_building(ai, BuildingType::USA_SUPPLY_CENTER, 190)
+        }
+    } else if ai.state == AIState::MID_GAME {
+        // Tech up
+        if !has_building(ai, BuildingType::USA_WAR_FACTORY) {
+            queue_building(ai, BuildingType::USA_WAR_FACTORY, 180)
+        }
+        if !has_building(ai, BuildingType::USA_STRATEGY_CENTER) {
+            queue_building(ai, BuildingType::USA_STRATEGY_CENTER, 150)
+        }
+    } else if ai.state == AIState::LATE_GAME {
+        // Build superweapons
+        if !has_building(ai, BuildingType::USA_PARTICLE_CANNON) {
+            queue_building(ai, BuildingType::USA_PARTICLE_CANNON, 100)
+        }
+    } else if ai.state == AIState::DESPERATE {
+        // Just try to rebuild basics
+        if !has_building(ai, BuildingType::USA_BARRACKS) {
+            queue_building(ai, BuildingType::USA_BARRACKS, 255)
+        }
+    }
+
+    // Process build queue
+    process_build_queue(ai)
+}
+
+/// Update scouting
+fn update_scouting(ai: AIPlayer) {
+    // Check if we have a scout squad
+    let has_scout = false
+    for i in 0..ai.squads.len() {
+        let squad = ai.squads.get(i)
+        if squad.role == SquadRole::SCOUT {
+            has_scout = true
+            break
+        }
+    }
+
+    if !has_scout && ai.unit_count > 3 {
+        // Create scout squad
+        create_squad_for_ai(ai, SquadRole::SCOUT)
+    }
+}
+
+/// Update attack decisions
+fn update_attacks(ai: AIPlayer) {
+    // Aggressive personality attacks sooner
+    let threshold = ai.attack_threshold
+    if ai.personality == AIPersonality::AGGRESSIVE {
+        threshold = threshold / 2
+    } else if ai.personality == AIPersonality::DEFENSIVE {
+        threshold = threshold * 2
+    } else if ai.personality == AIPersonality::ECONOMIC {
+        threshold = threshold * 3
+    }
+
+    if ai.unit_count >= threshold {
+        // Create attack squad if we don't have one
+        let has_attack_squad = false
+        for i in 0..ai.squads.len() {
+            let squad = ai.squads.get(i)
+            if squad.role == SquadRole::ATTACK && squad.state != SquadState::IDLE {
+                has_attack_squad = true
+                break
+            }
+        }
+
+        if !has_attack_squad {
+            launch_attack(ai)
+        }
+    }
+}
+
+/// Update all squads
+fn update_squads(ai: AIPlayer, dt: Float) {
+    for i in 0..ai.squads.len() {
+        let squad = ai.squads.get(i)
+
+        if squad.state == SquadState::IDLE {
+            // Assign orders based on role
+            if squad.role == SquadRole::SCOUT {
+                // Send to random location (simplified)
+                squad.target_position = vec2_init(500.0, 500.0)
+                squad.has_target_position = true
+                squad.state = SquadState::MOVING
+            } else if squad.role == SquadRole::ATTACK {
+                // Find enemy base
+                squad.state = SquadState::ATTACKING
+            }
+        }
+    }
+}
+
+/// Queue a building for construction
+fn queue_building(ai: AIPlayer, building_type: BuildingType, priority: Int) {
+    let entry = create_build_order_entry(building_type, priority)
+    ai.build_queue.add(entry)
+}
+
+/// Process build queue
+fn process_build_queue(ai: AIPlayer) {
+    if ai.build_queue.len() == 0 {
+        return
+    }
+
+    // Sort by priority (simple bubble sort)
+    for i in 0..(ai.build_queue.len() - 1) {
+        let entry1 = ai.build_queue.get(i)
+        let entry2 = ai.build_queue.get(i + 1)
+        if entry1.priority < entry2.priority {
+            // Swap (simplified - in real code would use swap operation)
+            let temp = entry1
+            ai.build_queue.set(i, entry2)
+            ai.build_queue.set(i + 1, temp)
+        }
+    }
+
+    // Try to build first item
+    let entry = ai.build_queue.get(0)
+    if can_afford_building(ai, entry.building_type) {
+        // TODO: Find placement location and actually build
+        // For now just remove from queue
+        ai.build_queue.remove(0)
+        ai.building_count = ai.building_count + 1
+    }
+}
+
+/// Check if AI has a specific building (simplified)
+fn has_building(ai: AIPlayer, building_type: BuildingType) -> Bool {
+    // Simplified check - in real implementation would search actual buildings
+    return ai.building_count > 0
+}
+
+/// Check if can afford building (simplified)
+fn can_afford_building(ai: AIPlayer, building_type: BuildingType) -> Bool {
+    // Simplified - real implementation would check actual costs
+    return ai.money >= 500
+}
+
+/// Create a new squad
+fn create_squad_for_ai(ai: AIPlayer, role: SquadRole) -> Int {
+    let id = ai.next_squad_id
+    ai.next_squad_id = ai.next_squad_id + 1
+
+    let squad = create_squad(id, role)
+    ai.squads.add(squad)
+
+    return id
+}
+
+/// Launch attack
+fn launch_attack(ai: AIPlayer) {
+    let squad_id = create_squad_for_ai(ai, SquadRole::ATTACK)
+
+    // In real implementation, would add units to squad
+    // For now, simplified
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_ai_initialization() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::MEDIUM, AIPersonality::BALANCED)
+
+    assert(ai.difficulty == AIDifficulty::MEDIUM, "Difficulty should be MEDIUM")
+    assert(ai.state == AIState::EARLY_GAME, "State should be EARLY_GAME")
+    assert(ai.personality == AIPersonality::BALANCED, "Personality should be BALANCED")
+
+    return true
+}
+
+fn test_game_state_progression() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::EASY, AIPersonality::BALANCED)
+
+    // Early game
+    ai.game_time = 100.0
+    update_game_state(ai)
+    assert(ai.state == AIState::EARLY_GAME, "Should be early game")
+
+    // Mid game
+    ai.game_time = 500.0
+    update_game_state(ai)
+    assert(ai.state == AIState::MID_GAME, "Should be mid game")
+
+    // Late game
+    ai.game_time = 1000.0
+    update_game_state(ai)
+    assert(ai.state == AIState::LATE_GAME, "Should be late game")
+
+    return true
+}
+
+fn test_desperate_state() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::EASY, AIPersonality::BALANCED)
+
+    ai.building_count = 2
+    update_game_state(ai)
+
+    assert(ai.state == AIState::DESPERATE, "Should be desperate with few buildings")
+
+    return true
+}
+
+fn test_winning_state() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::EASY, AIPersonality::BALANCED)
+
+    ai.unit_count = 60
+    update_game_state(ai)
+
+    assert(ai.state == AIState::WINNING, "Should be winning with many units")
+
+    return true
+}
+
+fn test_squad_creation() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::MEDIUM, AIPersonality::BALANCED)
+
+    let squad_id = create_squad_for_ai(ai, SquadRole::SCOUT)
+
+    assert(squad_id > 0, "Should return valid squad ID")
+    assert(ai.squads.len() == 1, "Should have 1 squad")
+
+    return true
+}
+
+fn test_build_queue() -> Bool {
+    let ai = create_ai_player(0, 0, AIDifficulty::MEDIUM, AIPersonality::BALANCED)
+
+    queue_building(ai, BuildingType::USA_BARRACKS, 200)
+    queue_building(ai, BuildingType::USA_SUPPLY_CENTER, 100)
+
+    assert(ai.build_queue.len() == 2, "Build queue should have 2 entries")
+
+    return true
+}
+
+fn test_difficulty_thresholds() -> Bool {
+    let ai_easy = create_ai_player(0, 0, AIDifficulty::EASY, AIPersonality::BALANCED)
+    let ai_brutal = create_ai_player(1, 1, AIDifficulty::BRUTAL, AIPersonality::BALANCED)
+
+    assert(ai_easy.build_check_interval > ai_brutal.build_check_interval, "Easy should build slower")
+    assert(ai_easy.attack_threshold > ai_brutal.attack_threshold, "Easy should attack later")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_ai_initialization(), "AI initialization test failed")
+    assert(test_game_state_progression(), "Game state progression test failed")
+    assert(test_desperate_state(), "Desperate state test failed")
+    assert(test_winning_state(), "Winning state test failed")
+    assert(test_squad_creation(), "Squad creation test failed")
+    assert(test_build_queue(), "Build queue test failed")
+    assert(test_difficulty_thresholds(), "Difficulty thresholds test failed")
+    return true
+}

@@ -1,0 +1,507 @@
+// ============================================================================
+// Damage/Armor System - Complete Implementation
+// Based on Thyme's damage calculation architecture
+// Pure Home implementation - converted from Zig
+// ============================================================================
+//
+// Comprehensive damage system with:
+// - Damage types (small arms, explosive, fire, poison, etc.)
+// - Armor types (light, medium, heavy, structure)
+// - Damage modifiers (bonuses vs specific armor)
+// - Armor piercing
+// - Splash damage
+// - Damage over time (DOT)
+// - Veterancy bonuses
+
+// ============================================================================
+// Phase 1: Damage Types
+// ============================================================================
+
+enum DamageType {
+    SMALL_ARMS,      // Rifles, machine guns
+    GRENADE,         // Grenades, grenade launchers
+    ARMOR_PIERCING,  // Tank shells, AP rounds
+    EXPLOSIVE,       // Bombs, missiles
+    FIRE,            // Flame throwers, molotovs
+    LASER,           // Laser weapons
+    POISON,          // Anthrax, toxins
+    RADIATION,       // Nuclear weapons
+    PARTICLE_BEAM,   // Particle cannon
+    CRUSH,           // Being run over
+    SNIPER,          // Sniper rifles
+    FORCE,           // Force effects
+    HACK,            // Hacking damage
+    WATER,           // Water damage
+    STATUS,          // Status effects
+    UNRESISTABLE,    // Cannot be reduced
+    COUNT,
+}
+
+fn get_damage_type_name(damage_type: DamageType) -> String {
+    if damage_type == DamageType::SMALL_ARMS { return "Small Arms" }
+    if damage_type == DamageType::GRENADE { return "Grenade" }
+    if damage_type == DamageType::ARMOR_PIERCING { return "Armor Piercing" }
+    if damage_type == DamageType::EXPLOSIVE { return "Explosive" }
+    if damage_type == DamageType::FIRE { return "Fire" }
+    if damage_type == DamageType::LASER { return "Laser" }
+    if damage_type == DamageType::POISON { return "Poison" }
+    if damage_type == DamageType::RADIATION { return "Radiation" }
+    if damage_type == DamageType::PARTICLE_BEAM { return "Particle Beam" }
+    if damage_type == DamageType::CRUSH { return "Crush" }
+    if damage_type == DamageType::SNIPER { return "Sniper" }
+    return "Unknown"
+}
+
+// ============================================================================
+// Phase 2: Armor Types
+// ============================================================================
+
+enum ArmorType {
+    NONE,            // No armor
+    INFANTRY_LIGHT,  // Light infantry
+    INFANTRY_HEAVY,  // Rangers, tank hunters
+    VEHICLE_LIGHT,   // Humvees, buggies
+    VEHICLE_MEDIUM,  // APCs, light tanks
+    VEHICLE_HEAVY,   // Main battle tanks
+    AIRCRAFT,        // Planes, helicopters
+    STRUCTURE,       // Buildings
+    WALL,            // Walls, gates
+    COUNT,
+}
+
+fn get_armor_type_name(armor_type: ArmorType) -> String {
+    if armor_type == ArmorType::NONE { return "No Armor" }
+    if armor_type == ArmorType::INFANTRY_LIGHT { return "Light Infantry" }
+    if armor_type == ArmorType::INFANTRY_HEAVY { return "Heavy Infantry" }
+    if armor_type == ArmorType::VEHICLE_LIGHT { return "Light Vehicle" }
+    if armor_type == ArmorType::VEHICLE_MEDIUM { return "Medium Vehicle" }
+    if armor_type == ArmorType::VEHICLE_HEAVY { return "Heavy Vehicle" }
+    if armor_type == ArmorType::AIRCRAFT { return "Aircraft" }
+    if armor_type == ArmorType::STRUCTURE { return "Structure" }
+    if armor_type == ArmorType::WALL { return "Wall" }
+    return "Unknown"
+}
+
+// ============================================================================
+// Phase 3: Damage Modifier Table
+// ============================================================================
+
+struct DamageModifierTable {
+    // modifiers[damage_type][armor_type] = multiplier
+    modifiers: Collection<Collection<Float>>,
+
+    fn init() -> DamageModifierTable {
+        let table = DamageModifierTable {
+            modifiers: Collection::init(),
+        }
+
+        // Initialize 16x9 table
+        for i in 0..16 {
+            let row = Collection::init()
+            for j in 0..9 {
+                row.add(1.0)
+            }
+            table.modifiers.add(row)
+        }
+
+        table.init_defaults()
+        return table
+    }
+
+    fn init_defaults(self) {
+        // SMALL_ARMS damage
+        self.set(DamageType::SMALL_ARMS, ArmorType::INFANTRY_LIGHT, 1.0)
+        self.set(DamageType::SMALL_ARMS, ArmorType::INFANTRY_HEAVY, 0.75)
+        self.set(DamageType::SMALL_ARMS, ArmorType::VEHICLE_LIGHT, 0.5)
+        self.set(DamageType::SMALL_ARMS, ArmorType::VEHICLE_MEDIUM, 0.25)
+        self.set(DamageType::SMALL_ARMS, ArmorType::VEHICLE_HEAVY, 0.1)
+        self.set(DamageType::SMALL_ARMS, ArmorType::AIRCRAFT, 0.3)
+        self.set(DamageType::SMALL_ARMS, ArmorType::STRUCTURE, 0.1)
+
+        // ARMOR_PIERCING damage
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::INFANTRY_LIGHT, 1.5)
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::INFANTRY_HEAVY, 1.25)
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::VEHICLE_LIGHT, 1.5)
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::VEHICLE_MEDIUM, 1.25)
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::VEHICLE_HEAVY, 1.0)
+        self.set(DamageType::ARMOR_PIERCING, ArmorType::STRUCTURE, 0.5)
+
+        // EXPLOSIVE damage
+        self.set(DamageType::EXPLOSIVE, ArmorType::INFANTRY_LIGHT, 1.5)
+        self.set(DamageType::EXPLOSIVE, ArmorType::INFANTRY_HEAVY, 1.25)
+        self.set(DamageType::EXPLOSIVE, ArmorType::VEHICLE_LIGHT, 1.0)
+        self.set(DamageType::EXPLOSIVE, ArmorType::VEHICLE_MEDIUM, 0.75)
+        self.set(DamageType::EXPLOSIVE, ArmorType::VEHICLE_HEAVY, 0.5)
+        self.set(DamageType::EXPLOSIVE, ArmorType::STRUCTURE, 1.5)
+
+        // FIRE damage
+        self.set(DamageType::FIRE, ArmorType::INFANTRY_LIGHT, 2.0)
+        self.set(DamageType::FIRE, ArmorType::INFANTRY_HEAVY, 1.5)
+        self.set(DamageType::FIRE, ArmorType::VEHICLE_LIGHT, 0.75)
+        self.set(DamageType::FIRE, ArmorType::VEHICLE_MEDIUM, 0.5)
+        self.set(DamageType::FIRE, ArmorType::VEHICLE_HEAVY, 0.25)
+        self.set(DamageType::FIRE, ArmorType::STRUCTURE, 1.0)
+
+        // SNIPER damage
+        self.set(DamageType::SNIPER, ArmorType::INFANTRY_LIGHT, 10.0)  // One-shot infantry
+        self.set(DamageType::SNIPER, ArmorType::INFANTRY_HEAVY, 5.0)
+        self.set(DamageType::SNIPER, ArmorType::VEHICLE_LIGHT, 0.1)
+        self.set(DamageType::SNIPER, ArmorType::VEHICLE_MEDIUM, 0.05)
+        self.set(DamageType::SNIPER, ArmorType::VEHICLE_HEAVY, 0.01)
+    }
+
+    fn set(self, damage_type: DamageType, armor_type: ArmorType, multiplier: Float) {
+        let d = damage_type as Int
+        let a = armor_type as Int
+
+        if d < 16 && a < 9 {
+            let row = self.modifiers.get(d)
+            row.set(a, multiplier)
+        }
+    }
+
+    fn get(self, damage_type: DamageType, armor_type: ArmorType) -> Float {
+        let d = damage_type as Int
+        let a = armor_type as Int
+
+        if d < 16 && a < 9 {
+            let row = self.modifiers.get(d)
+            return row.get(a)
+        }
+        return 1.0
+    }
+}
+
+// ============================================================================
+// Phase 4: Damage Instance
+// ============================================================================
+
+struct DamageInfo {
+    amount: Float,
+    damage_type: DamageType,
+    armor_piercing: Float,     // 0.0 to 1.0 (ignores armor)
+    splash_radius: Float,      // 0 = no splash
+    splash_falloff: Float,     // 0.0 to 1.0
+    is_critical: Bool,         // Critical hit
+    source_entity_id: Int,
+    has_source: Bool,
+    veterancy_bonus: Float,    // From attacker veterancy
+
+    fn init(amount: Float, damage_type: DamageType) -> DamageInfo {
+        let info = DamageInfo {
+            amount: amount,
+            damage_type: damage_type,
+            armor_piercing: 0.0,
+            splash_radius: 0.0,
+            splash_falloff: 1.0,
+            is_critical: false,
+            source_entity_id: 0,
+            has_source: false,
+            veterancy_bonus: 1.0,
+        }
+        return info
+    }
+
+    fn with_armor_piercing(self, ap: Float) -> DamageInfo {
+        let result = self
+        result.armor_piercing = ap
+        return result
+    }
+
+    fn with_splash(self, radius: Float, falloff: Float) -> DamageInfo {
+        let result = self
+        result.splash_radius = radius
+        result.splash_falloff = falloff
+        return result
+    }
+
+    fn with_veterancy(self, bonus: Float) -> DamageInfo {
+        let result = self
+        result.veterancy_bonus = bonus
+        return result
+    }
+}
+
+// ============================================================================
+// Phase 5: Armor Instance
+// ============================================================================
+
+struct ArmorInfo {
+    armor_type: ArmorType,
+    armor_value: Float,        // Base armor (damage reduction)
+    resistances: Collection<Float>,    // Per-damage-type resistance
+
+    fn init(armor_type: ArmorType, armor_value: Float) -> ArmorInfo {
+        let info = ArmorInfo {
+            armor_type: armor_type,
+            armor_value: armor_value,
+            resistances: Collection::init(),
+        }
+
+        // Initialize 16 resistances to 0.0
+        for i in 0..16 {
+            info.resistances.add(0.0)
+        }
+
+        return info
+    }
+
+    fn set_resistance(self, damage_type: DamageType, resistance: Float) {
+        let idx = damage_type as Int
+        if idx < 16 {
+            self.resistances.set(idx, resistance)
+        }
+    }
+
+    fn get_resistance(self, damage_type: DamageType) -> Float {
+        let idx = damage_type as Int
+        if idx < 16 {
+            return self.resistances.get(idx)
+        }
+        return 0.0
+    }
+}
+
+// ============================================================================
+// Phase 6: Damage Calculation
+// ============================================================================
+
+struct DamageCalculator {
+    modifier_table: DamageModifierTable,
+
+    fn init() -> DamageCalculator {
+        let calc = DamageCalculator {
+            modifier_table: DamageModifierTable::init(),
+        }
+        return calc
+    }
+
+    /// Calculate final damage after all modifiers
+    fn calculate_damage(self, damage: DamageInfo, armor: ArmorInfo) -> Float {
+        let final_damage = damage.amount
+
+        // Apply veterancy bonus
+        final_damage = final_damage * damage.veterancy_bonus
+
+        // Apply damage type vs armor type modifier
+        let type_modifier = self.modifier_table.get(damage.damage_type, armor.armor_type)
+        final_damage = final_damage * type_modifier
+
+        // Apply armor resistance
+        let resistance = armor.get_resistance(damage.damage_type)
+        final_damage = final_damage * (1.0 - resistance)
+
+        // Apply armor value (damage reduction)
+        let armor_reduction = armor.armor_value * (1.0 - damage.armor_piercing)
+        final_damage = final_damage - armor_reduction
+        if final_damage < 0.0 {
+            final_damage = 0.0
+        }
+
+        // Critical hits (50% bonus)
+        if damage.is_critical {
+            final_damage = final_damage * 1.5
+        }
+
+        return final_damage
+    }
+
+    /// Calculate splash damage at distance from impact
+    fn calculate_splash_damage(self, damage: DamageInfo, armor: ArmorInfo, distance: Float) -> Float {
+        if damage.splash_radius <= 0.0 || distance > damage.splash_radius {
+            return 0.0
+        }
+
+        // Calculate falloff
+        let falloff_ratio = distance / damage.splash_radius
+        let falloff_multiplier = 1.0 - (falloff_ratio * damage.splash_falloff)
+
+        if falloff_multiplier < 0.0 {
+            return 0.0
+        }
+
+        // Calculate base damage with falloff
+        let modified_damage = damage
+        modified_damage.amount = modified_damage.amount * falloff_multiplier
+
+        return self.calculate_damage(modified_damage, armor)
+    }
+}
+
+// ============================================================================
+// Phase 7: Damage Over Time (DOT)
+// ============================================================================
+
+struct DamageOverTime {
+    damage_per_second: Float,
+    damage_type: DamageType,
+    duration: Float,           // Total duration in seconds
+    elapsed: Float,            // Time elapsed
+    tick_rate: Float,          // How often to apply damage
+    last_tick: Float,
+
+    fn init(dps: Float, damage_type: DamageType, duration: Float) -> DamageOverTime {
+        let dot = DamageOverTime {
+            damage_per_second: dps,
+            damage_type: damage_type,
+            duration: duration,
+            elapsed: 0.0,
+            tick_rate: 0.5,  // Apply every 0.5 seconds
+            last_tick: 0.0,
+        }
+        return dot
+    }
+
+    fn update(self, dt: Float) -> DamageInfo? {
+        self.elapsed = self.elapsed + dt
+        self.last_tick = self.last_tick + dt
+
+        if self.elapsed >= self.duration {
+            return null  // Expired
+        }
+
+        if self.last_tick >= self.tick_rate {
+            self.last_tick = self.last_tick - self.tick_rate
+            let damage_amount = self.damage_per_second * self.tick_rate
+            return DamageInfo::init(damage_amount, self.damage_type)
+        }
+
+        return null
+    }
+
+    fn is_expired(self) -> Bool {
+        return self.elapsed >= self.duration
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_damage_modifier_table() -> Bool {
+    let table = DamageModifierTable::init()
+
+    let mod = table.get(DamageType::SMALL_ARMS, ArmorType::VEHICLE_HEAVY)
+    assert(mod == 0.1, "Small arms vs heavy vehicle")
+
+    let mod2 = table.get(DamageType::ARMOR_PIERCING, ArmorType::VEHICLE_HEAVY)
+    assert(mod2 == 1.0, "AP vs heavy vehicle")
+
+    return true
+}
+
+fn test_damage_calculator_basic() -> Bool {
+    let calc = DamageCalculator::init()
+
+    let damage = DamageInfo::init(100.0, DamageType::SMALL_ARMS)
+    let armor = ArmorInfo::init(ArmorType::INFANTRY_LIGHT, 0.0)
+
+    let final_damage = calc.calculate_damage(damage, armor)
+    assert(final_damage == 100.0, "Basic damage")
+
+    return true
+}
+
+fn test_damage_calculator_armor_modifier() -> Bool {
+    let calc = DamageCalculator::init()
+
+    let damage = DamageInfo::init(100.0, DamageType::SMALL_ARMS)
+    let armor = ArmorInfo::init(ArmorType::VEHICLE_HEAVY, 0.0)
+
+    let final_damage = calc.calculate_damage(damage, armor)
+    assert(final_damage == 10.0, "Armor type modifier")  // 100 * 0.1
+
+    return true
+}
+
+fn test_damage_calculator_armor_piercing() -> Bool {
+    let calc = DamageCalculator::init()
+
+    let damage = DamageInfo::init(100.0, DamageType::SMALL_ARMS)
+    damage.armor_piercing = 0.5  // 50% armor piercing
+
+    let armor = ArmorInfo::init(ArmorType::INFANTRY_LIGHT, 20.0)
+
+    // Base: 100, armor reduction: 20 * (1 - 0.5) = 10
+    // Final: 100 - 10 = 90
+    let final_damage = calc.calculate_damage(damage, armor)
+    assert(final_damage == 90.0, "Armor piercing")
+
+    return true
+}
+
+fn test_damage_calculator_splash() -> Bool {
+    let calc = DamageCalculator::init()
+
+    let damage = DamageInfo::init(200.0, DamageType::EXPLOSIVE)
+    damage.splash_radius = 10.0
+    damage.splash_falloff = 1.0  // Full falloff
+
+    let armor = ArmorInfo::init(ArmorType::INFANTRY_LIGHT, 0.0)
+
+    // At center (distance 0)
+    let center_damage = calc.calculate_splash_damage(damage, armor, 0.0)
+    assert(center_damage == 300.0, "Center splash damage")  // 200 * 1.5 (explosive vs infantry)
+
+    // At edge (distance 10)
+    let edge_damage = calc.calculate_splash_damage(damage, armor, 10.0)
+    assert(edge_damage == 0.0, "Edge splash damage")
+
+    return true
+}
+
+fn test_damage_over_time() -> Bool {
+    let dot = DamageOverTime::init(10.0, DamageType::POISON, 5.0)
+
+    // First tick at 0.5 seconds
+    let dmg1 = dot.update(0.5)
+    assert(dmg1 != null, "First tick exists")
+    assert(dmg1.amount == 5.0, "First tick amount")  // 10 dps * 0.5s
+
+    // No tick at 0.6 seconds (needs 1.0 total)
+    let dmg2 = dot.update(0.1)
+    assert(dmg2 == null, "No tick yet")
+
+    // Second tick at 1.0 seconds
+    let dmg3 = dot.update(0.4)
+    assert(dmg3 != null, "Second tick exists")
+
+    return true
+}
+
+fn test_damage_over_time_expiration() -> Bool {
+    let dot = DamageOverTime::init(10.0, DamageType::FIRE, 2.0)
+
+    assert(!dot.is_expired(), "Not expired initially")
+
+    let _ = dot.update(2.5)
+    assert(dot.is_expired(), "Expired after duration")
+
+    return true
+}
+
+fn test_damage_info_builders() -> Bool {
+    let damage = DamageInfo::init(100.0, DamageType::EXPLOSIVE)
+    damage = damage.with_armor_piercing(0.3)
+    damage = damage.with_splash(15.0, 0.8)
+    damage = damage.with_veterancy(1.25)
+
+    assert(damage.amount == 100.0, "Amount")
+    assert(damage.armor_piercing == 0.3, "Armor piercing")
+    assert(damage.splash_radius == 15.0, "Splash radius")
+    assert(damage.veterancy_bonus == 1.25, "Veterancy bonus")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_damage_modifier_table(), "Test 1: Damage modifier table")
+    assert(test_damage_calculator_basic(), "Test 2: Damage calculator basic")
+    assert(test_damage_calculator_armor_modifier(), "Test 3: Armor modifier")
+    assert(test_damage_calculator_armor_piercing(), "Test 4: Armor piercing")
+    assert(test_damage_calculator_splash(), "Test 5: Splash damage")
+    assert(test_damage_over_time(), "Test 6: Damage over time")
+    assert(test_damage_over_time_expiration(), "Test 7: DOT expiration")
+    assert(test_damage_info_builders(), "Test 8: Damage info builders")
+    return true
+}

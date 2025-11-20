@@ -1,0 +1,1077 @@
+// ============================================================================
+// Phase 5: Terrain System - Complete Implementation
+// Based on Thyme's terrain architecture
+// ============================================================================
+//
+// Architecture:
+// - TerrainLogic: Game logic (heightmap, collisions, bridges, waypoints)
+// - TerrainVisual: Rendering (textures, water, effects, props)
+// - TerrainType: Material properties (textures, construction rules)
+// - TerrainRoad: Roads and bridges
+//
+// References:
+// - Thyme/src/game/logic/map/terrainlogic.h
+// - Thyme/src/game/client/terrain/terrainvisual.h
+// - Thyme/src/game/common/terraintypes.h
+// - Thyme/src/game/client/terrain/terrainroads.h
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// Core Types
+// ============================================================================
+
+struct Coord2D {
+    x: Float,
+    y: Float,
+}
+
+struct Coord3D {
+    x: Float,
+    y: Float,
+    z: Float,
+}
+
+struct ICoord2D {
+    x: Int,
+    y: Int,
+}
+
+struct Region2D {
+    lo_x: Float,
+    lo_y: Float,
+    hi_x: Float,
+    hi_y: Float,
+}
+
+fn region_contains(region: Region2D, x: Float, y: Float) -> Bool {
+    return x >= region.lo_x && x <= region.hi_x && y >= region.lo_y && y <= region.hi_y
+}
+
+struct Region3D {
+    lo: Coord3D,
+    hi: Coord3D,
+}
+
+// ============================================================================
+// Phase 5.1: Terrain Types (37 types from C&C Generals)
+// ============================================================================
+
+enum TerrainClass {
+    NONE,
+    DESERT_1,
+    DESERT_2,
+    DESERT_3,
+    EASTERN_EUROPE_1,
+    EASTERN_EUROPE_2,
+    EASTERN_EUROPE_3,
+    SWISS_1,
+    SWISS_2,
+    SWISS_3,
+    SNOW_1,
+    SNOW_2,
+    SNOW_3,
+    DIRT,
+    GRASS,
+    TRANSITION,
+    ROCK,
+    SAND,
+    CLIFF,
+    WOOD,
+    BLEND_EDGE,
+    DESERT_LIVE,
+    DESERT_DRY,
+    SAND_ACCENT,
+    BEACH_TROPICAL,
+    BEACH_PARK,
+    MOUNTAIN_RUGGED,
+    GRASS_COBBLESTONE,
+    GRASS_ACCENT,
+    RESIDENTIAL,
+    SNOW_RUGGED,
+    SNOW_FLAT,
+    FIELD,
+    ASPHALT,
+    CONCRETE,
+    CHINA,
+    ROCK_ACCENT,
+    URBAN,
+    COUNT,
+}
+
+struct TerrainType {
+    name: String,
+    texture: String,
+    class: TerrainClass,
+    blend_edge_texture: Bool,
+    restrict_construction: Bool,
+}
+
+fn create_terrain_type(name: String, texture: String, class: TerrainClass) -> TerrainType {
+    let terrain = TerrainType {}
+    terrain.name = name
+    terrain.texture = texture
+    terrain.class = class
+    terrain.blend_edge_texture = false
+    terrain.restrict_construction = false
+    return terrain
+}
+
+struct TerrainTypeEntry {
+    terrain: TerrainType,
+}
+
+struct TerrainTypeCollection {
+    terrain_list: Collection<TerrainTypeEntry>,
+}
+
+fn create_terrain_type_collection() -> TerrainTypeCollection {
+    let collection = TerrainTypeCollection {}
+    collection.terrain_list = Collection<TerrainTypeEntry> {}
+    return collection
+}
+
+fn add_terrain(collection: TerrainTypeCollection, terrain: TerrainType) {
+    let entry = TerrainTypeEntry {}
+    entry.terrain = terrain
+    collection.terrain_list.add(entry)
+}
+
+fn find_terrain(collection: TerrainTypeCollection, name: String) -> TerrainType {
+    for i in 0..collection.terrain_list.len() {
+        let entry = collection.terrain_list.get(i)
+        if entry.terrain.name == name {
+            return entry.terrain
+        }
+    }
+    return create_terrain_type("", "", TerrainClass::NONE)
+}
+
+// ============================================================================
+// Phase 5.2: World Height Map
+// ============================================================================
+
+struct WorldHeightMap {
+    width: Int,
+    height: Int,
+    cell_size: Float,
+    heights: Collection<Int>,         // u16 values (width * height)
+    tile_indices: Collection<Int>,    // u8 values (width * height)
+}
+
+fn create_world_height_map(width: Int, height: Int, cell_size: Float) -> WorldHeightMap {
+    let map = WorldHeightMap {}
+    map.width = width
+    map.height = height
+    map.cell_size = cell_size
+    map.heights = Collection<Int> {}
+    map.tile_indices = Collection<Int> {}
+
+    let num_cells = width * height
+    for i in 0..num_cells {
+        map.heights.add(0)
+        map.tile_indices.add(0)
+    }
+
+    return map
+}
+
+fn get_ground_height(map: WorldHeightMap, x: Float, y: Float) -> Float {
+    let cell_x = (x / map.cell_size) as Int
+    let cell_y = (y / map.cell_size) as Int
+
+    if cell_x < 0 || cell_y < 0 || cell_x >= map.width || cell_y >= map.height {
+        return 0.0
+    }
+
+    let idx = cell_y * map.width + cell_x
+    return map.heights.get(idx) as Float
+}
+
+fn set_raw_map_height(map: WorldHeightMap, pos: ICoord2D, height: Int) {
+    if pos.x < 0 || pos.y < 0 || pos.x >= map.width || pos.y >= map.height {
+        return
+    }
+
+    let idx = pos.y * map.width + pos.x
+    let clamped = max(0, min(65535, height))
+    map.heights.set(idx, clamped)
+}
+
+fn get_raw_map_height(map: WorldHeightMap, pos: ICoord2D) -> Int {
+    if pos.x < 0 || pos.y < 0 || pos.x >= map.width || pos.y >= map.height {
+        return 0
+    }
+
+    let idx = pos.y * map.width + pos.x
+    return map.heights.get(idx)
+}
+
+/// Get interpolated height at exact world position with normal
+fn get_ground_height_with_normal(map: WorldHeightMap, x: Float, y: Float, normal: Coord3D) -> Float {
+    let cell_x_f = x / map.cell_size
+    let cell_y_f = y / map.cell_size
+    let cell_x = floor(cell_x_f) as Int
+    let cell_y = floor(cell_y_f) as Int
+
+    if cell_x < 0 || cell_y < 0 || cell_x >= (map.width - 1) || cell_y >= (map.height - 1) {
+        normal.x = 0.0
+        normal.y = 0.0
+        normal.z = 1.0
+        return 0.0
+    }
+
+    // Get heights of quad corners
+    let idx00 = cell_y * map.width + cell_x
+    let idx10 = idx00 + 1
+    let idx01 = idx00 + map.width
+    let idx11 = idx01 + 1
+
+    let h00 = map.heights.get(idx00) as Float
+    let h10 = map.heights.get(idx10) as Float
+    let h01 = map.heights.get(idx01) as Float
+    let h11 = map.heights.get(idx11) as Float
+
+    // Bilinear interpolation
+    let fx = cell_x_f - floor(cell_x_f)
+    let fy = cell_y_f - floor(cell_y_f)
+
+    let h0 = h00 * (1.0 - fx) + h10 * fx
+    let h1 = h01 * (1.0 - fx) + h11 * fx
+    let height = h0 * (1.0 - fy) + h1 * fy
+
+    // Calculate normal from height gradient
+    let dx = (h10 - h00) / map.cell_size
+    let dy = (h01 - h00) / map.cell_size
+
+    let len = sqrt(dx * dx + dy * dy + 1.0)
+    normal.x = -dx / len
+    normal.y = -dy / len
+    normal.z = 1.0 / len
+
+    return height
+}
+
+fn is_cliff_cell(map: WorldHeightMap, x: Float, y: Float) -> Bool {
+    let cell_x = (x / map.cell_size) as Int
+    let cell_y = (y / map.cell_size) as Int
+
+    if cell_x < 1 || cell_y < 1 || cell_x >= (map.width - 1) || cell_y >= (map.height - 1) {
+        return false
+    }
+
+    // Check height difference with neighbors
+    let idx = cell_y * map.width + cell_x
+    let center_height = map.heights.get(idx)
+
+    let cliff_threshold = 100  // Cliff if height difference > 100
+
+    // Check left neighbor
+    let left = map.heights.get(idx - 1)
+    let diff_left = if center_height > left { center_height - left } else { left - center_height }
+    if diff_left > cliff_threshold {
+        return true
+    }
+
+    // Check right neighbor
+    let right = map.heights.get(idx + 1)
+    let diff_right = if center_height > right { center_height - right } else { right - center_height }
+    if diff_right > cliff_threshold {
+        return true
+    }
+
+    // Check top neighbor
+    let top = map.heights.get(idx - map.width)
+    let diff_top = if center_height > top { center_height - top } else { top - center_height }
+    if diff_top > cliff_threshold {
+        return true
+    }
+
+    // Check bottom neighbor
+    let bottom = map.heights.get(idx + map.width)
+    let diff_bottom = if center_height > bottom { center_height - bottom } else { bottom - center_height }
+    if diff_bottom > cliff_threshold {
+        return true
+    }
+
+    return false
+}
+
+// ============================================================================
+// Phase 5.3: Pathfinding Layers
+// ============================================================================
+
+enum PathfindLayerEnum {
+    GROUND,
+    AIR,
+    WATER,
+    BRIDGE_1,
+    BRIDGE_2,
+    BRIDGE_3,
+    BRIDGE_4,
+    COUNT,
+}
+
+// ============================================================================
+// Phase 5.4: Waypoints
+// ============================================================================
+
+struct Waypoint {
+    id: Int,
+    name: String,
+    location: Coord3D,
+    link_ids: Collection<Int>,    // IDs of linked waypoints
+    path_label_1: String,
+    path_label_2: String,
+    path_label_3: String,
+    path_is_bidirectional: Bool,
+}
+
+fn create_waypoint(
+    id: Int,
+    name: String,
+    location: Coord3D,
+    label1: String,
+    label2: String,
+    label3: String,
+    bidirectional: Bool,
+) -> Waypoint {
+    let wp = Waypoint {}
+    wp.id = id
+    wp.name = name
+    wp.location = location
+    wp.link_ids = Collection<Int> {}
+    wp.path_label_1 = label1
+    wp.path_label_2 = label2
+    wp.path_label_3 = label3
+    wp.path_is_bidirectional = bidirectional
+    return wp
+}
+
+fn add_waypoint_link(waypoint: Waypoint, waypoint_id: Int) {
+    if waypoint.link_ids.len() < 8 {
+        waypoint.link_ids.add(waypoint_id)
+    }
+}
+
+// ============================================================================
+// Phase 5.5: Bridges
+// ============================================================================
+
+enum BridgeTowerType {
+    FROM_LEFT,
+    FROM_RIGHT,
+    TO_LEFT,
+    TO_RIGHT,
+    MAX_TOWERS,
+}
+
+enum BodyDamageType {
+    PRISTINE,
+    DAMAGED,
+    REALLY_DAMAGED,
+    RUBBLE,
+    COUNT,
+}
+
+struct BridgeInfo {
+    from: Coord3D,
+    to: Coord3D,
+    bridge_width: Float,
+    from_left: Coord3D,
+    from_right: Coord3D,
+    to_left: Coord3D,
+    to_right: Coord3D,
+    bridge_index: Int,
+    cur_damage_state: BodyDamageType,
+    bridge_object_id: Int,
+    tower_object_ids: Collection<Int>,   // 4 tower IDs
+    is_destroyed: Bool,
+}
+
+struct Bridge {
+    info: BridgeInfo,
+    template_name: String,
+    bounds: Region2D,
+    layer: PathfindLayerEnum,
+}
+
+fn create_bridge(info: BridgeInfo, template_name: String, layer: PathfindLayerEnum) -> Bridge {
+    // Calculate bounding box
+    let min_x = min(info.from.x, info.to.x) - info.bridge_width * 0.5
+    let max_x = max(info.from.x, info.to.x) + info.bridge_width * 0.5
+    let min_y = min(info.from.y, info.to.y) - info.bridge_width * 0.5
+    let max_y = max(info.from.y, info.to.y) + info.bridge_width * 0.5
+
+    let bridge = Bridge {}
+    bridge.info = info
+    bridge.template_name = template_name
+    bridge.bounds = Region2D {}
+    bridge.bounds.lo_x = min_x
+    bridge.bounds.lo_y = min_y
+    bridge.bounds.hi_x = max_x
+    bridge.bounds.hi_y = max_y
+    bridge.layer = layer
+    return bridge
+}
+
+fn is_point_on_bridge(bridge: Bridge, loc: Coord3D) -> Bool {
+    return region_contains(bridge.bounds, loc.x, loc.y)
+}
+
+fn get_bridge_height(bridge: Bridge, loc: Coord3D) -> Float {
+    if !is_point_on_bridge(bridge, loc) {
+        return 0.0
+    }
+
+    // Linear interpolation between from and to heights
+    let dx = bridge.info.to.x - bridge.info.from.x
+    let dy = bridge.info.to.y - bridge.info.from.y
+    let len = sqrt(dx * dx + dy * dy)
+
+    if len < 0.001 {
+        return bridge.info.from.z
+    }
+
+    let px = loc.x - bridge.info.from.x
+    let py = loc.y - bridge.info.from.y
+    let t = (px * dx + py * dy) / (len * len)
+    let t_clamped = max(0.0, min(1.0, t))
+
+    return bridge.info.from.z * (1.0 - t_clamped) + bridge.info.to.z * t_clamped
+}
+
+// ============================================================================
+// Phase 5.6: Water System
+// ============================================================================
+
+struct WaterHandle {
+    polygon_index: Int,    // Index into terrain's polygon_triggers collection
+    has_polygon: Bool,
+}
+
+struct PolygonTrigger {
+    name: String,
+    points: Collection<Coord3D>,
+    water_height: Float,
+}
+
+fn create_polygon_trigger(name: String, water_height: Float) -> PolygonTrigger {
+    let trigger = PolygonTrigger {}
+    trigger.name = name
+    trigger.points = Collection<Coord3D> {}
+    trigger.water_height = water_height
+    return trigger
+}
+
+fn add_polygon_point(trigger: PolygonTrigger, point: Coord3D) {
+    trigger.points.add(point)
+}
+
+fn polygon_contains_point(trigger: PolygonTrigger, x: Float, y: Float) -> Bool {
+    if trigger.points.len() < 3 {
+        return false
+    }
+
+    // Ray casting algorithm
+    let inside = false
+    let j = trigger.points.len() - 1
+
+    for i in 0..trigger.points.len() {
+        let pi = trigger.points.get(i)
+        let pj = trigger.points.get(j)
+
+        if (pi.y > y) != (pj.y > y) && x < (pj.x - pi.x) * (y - pi.y) / (pj.y - pi.y) + pi.x {
+            inside = !inside
+        }
+
+        j = i
+    }
+
+    return inside
+}
+
+struct DynamicWaterEntry {
+    water_handle_index: Int,
+    change_per_frame: Float,
+    target_height: Float,
+    damage_amount: Float,
+    current_height: Float,
+}
+
+// ============================================================================
+// Phase 5.7: Terrain Logic (Main System)
+// ============================================================================
+
+struct WaypointEntry {
+    waypoint: Waypoint,
+}
+
+struct BridgeEntry {
+    bridge: Bridge,
+}
+
+struct PolygonEntry {
+    polygon: PolygonTrigger,
+}
+
+struct TerrainLogic {
+    height_map: WorldHeightMap,
+    boundaries: Collection<ICoord2D>,
+    active_boundary: Int,
+    waypoints: Collection<WaypointEntry>,
+    bridges: Collection<BridgeEntry>,
+    polygon_triggers: Collection<PolygonEntry>,
+    bridge_damage_states_changed: Bool,
+    filename: String,
+    water_grid_enabled: Bool,
+    water_to_update: Collection<DynamicWaterEntry>,
+}
+
+fn create_terrain_logic(width: Int, height: Int, cell_size: Float) -> TerrainLogic {
+    let terrain = TerrainLogic {}
+    terrain.height_map = create_world_height_map(width, height, cell_size)
+    terrain.boundaries = Collection<ICoord2D> {}
+    terrain.active_boundary = -1
+    terrain.waypoints = Collection<WaypointEntry> {}
+    terrain.bridges = Collection<BridgeEntry> {}
+    terrain.polygon_triggers = Collection<PolygonEntry> {}
+    terrain.bridge_damage_states_changed = false
+    terrain.filename = ""
+    terrain.water_grid_enabled = false
+    terrain.water_to_update = Collection<DynamicWaterEntry> {}
+    return terrain
+}
+
+fn update_terrain_logic(terrain: TerrainLogic, dt: Float) {
+    // Update dynamic water
+    let i = 0
+    while i < terrain.water_to_update.len() {
+        let entry = terrain.water_to_update.get(i)
+        entry.current_height = entry.current_height + entry.change_per_frame
+
+        let reached_target = false
+        if entry.change_per_frame > 0.0 && entry.current_height >= entry.target_height {
+            reached_target = true
+        } else if entry.change_per_frame < 0.0 && entry.current_height <= entry.target_height {
+            reached_target = true
+        }
+
+        if reached_target {
+            entry.current_height = entry.target_height
+            terrain.water_to_update.remove(i)
+            continue
+        }
+
+        terrain.water_to_update.set(i, entry)
+        i = i + 1
+    }
+}
+
+fn get_terrain_ground_height(terrain: TerrainLogic, x: Float, y: Float, normal: Coord3D, has_normal: Bool) -> Float {
+    if has_normal {
+        return get_ground_height_with_normal(terrain.height_map, x, y, normal)
+    } else {
+        return get_ground_height(terrain.height_map, x, y)
+    }
+}
+
+fn get_layer_height(terrain: TerrainLogic, x: Float, y: Float, layer: PathfindLayerEnum, normal: Coord3D, has_normal: Bool) -> Float {
+    // Check if on a bridge for this layer
+    for i in 0..terrain.bridges.len() {
+        let entry = terrain.bridges.get(i)
+        if entry.bridge.layer == layer {
+            let loc = Coord3D {}
+            loc.x = x
+            loc.y = y
+            loc.z = 0.0
+            if is_point_on_bridge(entry.bridge, loc) {
+                let height = get_bridge_height(entry.bridge, loc)
+                if has_normal {
+                    // Bridges are flat
+                    normal.x = 0.0
+                    normal.y = 0.0
+                    normal.z = 1.0
+                }
+                return height
+            }
+        }
+    }
+
+    // Default to ground height
+    return get_terrain_ground_height(terrain, x, y, normal, has_normal)
+}
+
+fn is_underwater(terrain: TerrainLogic, x: Float, y: Float, water_z: Float, ground_z: Float, has_water_z: Bool, has_ground_z: Bool) -> Bool {
+    let ground_height = get_ground_height(terrain.height_map, x, y)
+
+    if has_ground_z {
+        ground_z = ground_height
+    }
+
+    // Check water polygons
+    for i in 0..terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(i)
+        if polygon_contains_point(entry.polygon, x, y) {
+            if has_water_z {
+                water_z = entry.polygon.water_height
+            }
+            return ground_height < entry.polygon.water_height
+        }
+    }
+
+    return false
+}
+
+fn is_terrain_cliff_cell(terrain: TerrainLogic, x: Float, y: Float) -> Bool {
+    return is_cliff_cell(terrain.height_map, x, y)
+}
+
+fn find_bridge_at(terrain: TerrainLogic, loc: Coord3D) -> Int {
+    for i in 0..terrain.bridges.len() {
+        let entry = terrain.bridges.get(i)
+        if is_point_on_bridge(entry.bridge, loc) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn find_bridge_layer_at(terrain: TerrainLogic, loc: Coord3D, layer: PathfindLayerEnum) -> Int {
+    for i in 0..terrain.bridges.len() {
+        let entry = terrain.bridges.get(i)
+        if entry.bridge.layer == layer && is_point_on_bridge(entry.bridge, loc) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn add_terrain_waypoint(terrain: TerrainLogic, waypoint: Waypoint) {
+    let entry = WaypointEntry {}
+    entry.waypoint = waypoint
+    terrain.waypoints.add(entry)
+}
+
+fn get_waypoint_by_name(terrain: TerrainLogic, name: String) -> Int {
+    for i in 0..terrain.waypoints.len() {
+        let entry = terrain.waypoints.get(i)
+        if entry.waypoint.name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+fn get_waypoint_by_id(terrain: TerrainLogic, id: Int) -> Int {
+    for i in 0..terrain.waypoints.len() {
+        let entry = terrain.waypoints.get(i)
+        if entry.waypoint.id == id {
+            return i
+        }
+    }
+    return -1
+}
+
+fn add_terrain_bridge(terrain: TerrainLogic, bridge: Bridge) {
+    let entry = BridgeEntry {}
+    entry.bridge = bridge
+    terrain.bridges.add(entry)
+}
+
+fn add_terrain_polygon_trigger(terrain: TerrainLogic, trigger: PolygonTrigger) {
+    let entry = PolygonEntry {}
+    entry.polygon = trigger
+    terrain.polygon_triggers.add(entry)
+}
+
+fn get_trigger_area_by_name(terrain: TerrainLogic, name: String) -> Int {
+    for i in 0..terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(i)
+        if entry.polygon.name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+fn get_water_handle(terrain: TerrainLogic, x: Float, y: Float) -> WaterHandle {
+    for i in 0..terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(i)
+        if polygon_contains_point(entry.polygon, x, y) {
+            let handle = WaterHandle {}
+            handle.polygon_index = i
+            handle.has_polygon = true
+            return handle
+        }
+    }
+
+    let handle = WaterHandle {}
+    handle.polygon_index = -1
+    handle.has_polygon = false
+    return handle
+}
+
+fn get_water_handle_by_name(terrain: TerrainLogic, name: String) -> WaterHandle {
+    for i in 0..terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(i)
+        if entry.polygon.name == name {
+            let handle = WaterHandle {}
+            handle.polygon_index = i
+            handle.has_polygon = true
+            return handle
+        }
+    }
+
+    let handle = WaterHandle {}
+    handle.polygon_index = -1
+    handle.has_polygon = false
+    return handle
+}
+
+fn get_water_height(terrain: TerrainLogic, water: WaterHandle) -> Float {
+    if water.has_polygon && water.polygon_index >= 0 && water.polygon_index < terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(water.polygon_index)
+        return entry.polygon.water_height
+    }
+    return 0.0
+}
+
+fn set_water_height(terrain: TerrainLogic, water: WaterHandle, height: Float) {
+    if water.has_polygon && water.polygon_index >= 0 && water.polygon_index < terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(water.polygon_index)
+        entry.polygon.water_height = height
+        terrain.polygon_triggers.set(water.polygon_index, entry)
+    }
+}
+
+fn change_water_height_over_time(
+    terrain: TerrainLogic,
+    water: WaterHandle,
+    final_height: Float,
+    transition_time: Float,
+    damage_amount: Float,
+) {
+    if water.has_polygon && water.polygon_index >= 0 && water.polygon_index < terrain.polygon_triggers.len() {
+        let entry = terrain.polygon_triggers.get(water.polygon_index)
+        let current = entry.polygon.water_height
+        let change_per_frame = (final_height - current) / (transition_time * 30.0)  // Assume 30 FPS
+
+        let water_entry = DynamicWaterEntry {}
+        water_entry.water_handle_index = water.polygon_index
+        water_entry.change_per_frame = change_per_frame
+        water_entry.target_height = final_height
+        water_entry.damage_amount = damage_amount
+        water_entry.current_height = current
+
+        terrain.water_to_update.add(water_entry)
+    }
+}
+
+fn find_closest_edge_point(terrain: TerrainLogic, pos: Coord3D) -> Coord3D {
+    let world_width = (terrain.height_map.width as Float) * terrain.height_map.cell_size
+    let world_height = (terrain.height_map.height as Float) * terrain.height_map.cell_size
+
+    let closest = Coord3D {}
+    closest.x = pos.x
+    closest.y = pos.y
+    closest.z = pos.z
+
+    // Clamp to map edges
+    if pos.x < 0.0 {
+        closest.x = 0.0
+    }
+    if pos.x > world_width {
+        closest.x = world_width
+    }
+    if pos.y < 0.0 {
+        closest.y = 0.0
+    }
+    if pos.y > world_height {
+        closest.y = world_height
+    }
+
+    return closest
+}
+
+fn find_farthest_edge_point(terrain: TerrainLogic, pos: Coord3D) -> Coord3D {
+    let world_width = (terrain.height_map.width as Float) * terrain.height_map.cell_size
+    let world_height = (terrain.height_map.height as Float) * terrain.height_map.cell_size
+
+    let to_left = pos.x
+    let to_right = world_width - pos.x
+    let to_top = pos.y
+    let to_bottom = world_height - pos.y
+
+    let max_dist = max(max(to_left, to_right), max(to_top, to_bottom))
+
+    if max_dist == to_left {
+        let result = Coord3D {}
+        result.x = 0.0
+        result.y = pos.y
+        result.z = pos.z
+        return result
+    }
+    if max_dist == to_right {
+        let result = Coord3D {}
+        result.x = world_width
+        result.y = pos.y
+        result.z = pos.z
+        return result
+    }
+    if max_dist == to_top {
+        let result = Coord3D {}
+        result.x = pos.x
+        result.y = 0.0
+        result.z = pos.z
+        return result
+    }
+
+    let result = Coord3D {}
+    result.x = pos.x
+    result.y = world_height
+    result.z = pos.z
+    return result
+}
+
+fn is_clear_line_of_sight(terrain: TerrainLogic, pos1: Coord3D, pos2: Coord3D) -> Bool {
+    let dx = pos2.x - pos1.x
+    let dy = pos2.y - pos1.y
+    let dz = pos2.z - pos1.z
+    let dist = sqrt(dx * dx + dy * dy + dz * dz)
+
+    if dist < 0.001 {
+        return true
+    }
+
+    let steps_float = max(10.0, dist / terrain.height_map.cell_size)
+    let steps = steps_float as Int
+    let step_x = dx / steps_float
+    let step_y = dy / steps_float
+    let step_z = dz / steps_float
+
+    for i in 0..steps {
+        let t = (i as Float) / steps_float
+        let check_x = pos1.x + step_x * t
+        let check_y = pos1.y + step_y * t
+        let check_z = pos1.z + step_z * t
+
+        let ground_height = get_ground_height(terrain.height_map, check_x, check_y)
+
+        // Line of sight blocked by terrain
+        if check_z < ground_height {
+            return false
+        }
+    }
+
+    return true
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_terrain_type_creation() -> Bool {
+    let collection = create_terrain_type_collection()
+
+    let grass = create_terrain_type("Grass", "grass.dds", TerrainClass::GRASS)
+    add_terrain(collection, grass)
+
+    let desert = create_terrain_type("Desert", "desert.dds", TerrainClass::DESERT_1)
+    add_terrain(collection, desert)
+
+    let found = find_terrain(collection, "Grass")
+    assert(found.texture == "grass.dds", "Grass texture should match")
+
+    return true
+}
+
+fn test_world_height_map_queries() -> Bool {
+    let height_map = create_world_height_map(10, 10, 10.0)
+
+    // Set some heights
+    let pos1 = ICoord2D {}
+    pos1.x = 5
+    pos1.y = 5
+    set_raw_map_height(height_map, pos1, 100)
+
+    let pos2 = ICoord2D {}
+    pos2.x = 6
+    pos2.y = 5
+    set_raw_map_height(height_map, pos2, 150)
+
+    let height1 = get_raw_map_height(height_map, pos1)
+    assert(height1 == 100, "Height should be 100")
+
+    let height2 = get_ground_height(height_map, 50.0, 50.0)
+    assert(height2 == 100.0, "Ground height should be 100")
+
+    return true
+}
+
+fn test_world_height_map_cliff_detection() -> Bool {
+    let height_map = create_world_height_map(10, 10, 10.0)
+
+    // Create cliff
+    let pos1 = ICoord2D {}
+    pos1.x = 5
+    pos1.y = 5
+    set_raw_map_height(height_map, pos1, 100)
+
+    let pos2 = ICoord2D {}
+    pos2.x = 6
+    pos2.y = 5
+    set_raw_map_height(height_map, pos2, 300)  // Large height difference
+
+    let is_cliff = is_cliff_cell(height_map, 50.0, 50.0)
+    assert(is_cliff, "Should be a cliff")
+
+    return true
+}
+
+fn test_waypoint_creation() -> Bool {
+    let loc = Coord3D {}
+    loc.x = 100.0
+    loc.y = 100.0
+    loc.z = 0.0
+
+    let wp1 = create_waypoint(1, "Base", loc, "MainPath", "", "", true)
+
+    let loc2 = Coord3D {}
+    loc2.x = 200.0
+    loc2.y = 200.0
+    loc2.z = 0.0
+
+    let wp2 = create_waypoint(2, "Forward", loc2, "MainPath", "", "", true)
+
+    add_waypoint_link(wp1, wp2.id)
+    assert(wp1.link_ids.len() == 1, "Should have 1 link")
+
+    return true
+}
+
+fn test_bridge_point_containment() -> Bool {
+    let from = Coord3D {}
+    from.x = 0.0
+    from.y = 0.0
+    from.z = 10.0
+
+    let to = Coord3D {}
+    to.x = 100.0
+    to.y = 0.0
+    to.z = 15.0
+
+    let info = BridgeInfo {}
+    info.from = from
+    info.to = to
+    info.bridge_width = 20.0
+    info.from_left = from
+    info.from_right = from
+    info.to_left = to
+    info.to_right = to
+    info.bridge_index = 0
+    info.cur_damage_state = BodyDamageType::PRISTINE
+    info.bridge_object_id = 1
+    info.tower_object_ids = Collection<Int> {}
+    for i in 0..4 {
+        info.tower_object_ids.add(0)
+    }
+    info.is_destroyed = false
+
+    let bridge = create_bridge(info, "TestBridge", PathfindLayerEnum::BRIDGE_1)
+
+    // Test point on bridge
+    let test_loc = Coord3D {}
+    test_loc.x = 50.0
+    test_loc.y = 0.0
+    test_loc.z = 0.0
+    assert(is_point_on_bridge(bridge, test_loc), "Point should be on bridge")
+
+    // Test height interpolation
+    let height = get_bridge_height(bridge, test_loc)
+    assert(height >= 12.0 && height <= 13.0, "Height should be ~12.5")
+
+    return true
+}
+
+fn test_polygon_trigger_containment() -> Bool {
+    let trigger = create_polygon_trigger("Lake", 5.0)
+
+    // Create square
+    let p1 = Coord3D {}
+    p1.x = 0.0
+    p1.y = 0.0
+    p1.z = 0.0
+    add_polygon_point(trigger, p1)
+
+    let p2 = Coord3D {}
+    p2.x = 100.0
+    p2.y = 0.0
+    p2.z = 0.0
+    add_polygon_point(trigger, p2)
+
+    let p3 = Coord3D {}
+    p3.x = 100.0
+    p3.y = 100.0
+    p3.z = 0.0
+    add_polygon_point(trigger, p3)
+
+    let p4 = Coord3D {}
+    p4.x = 0.0
+    p4.y = 100.0
+    p4.z = 0.0
+    add_polygon_point(trigger, p4)
+
+    assert(polygon_contains_point(trigger, 50.0, 50.0), "Center should be inside")
+    assert(!polygon_contains_point(trigger, 150.0, 150.0), "Outside point should not be inside")
+
+    return true
+}
+
+fn test_terrain_logic_ground_height() -> Bool {
+    let terrain = create_terrain_logic(10, 10, 10.0)
+
+    let pos = ICoord2D {}
+    pos.x = 5
+    pos.y = 5
+    set_raw_map_height(terrain.height_map, pos, 100)
+
+    let normal = Coord3D {}
+    let height = get_terrain_ground_height(terrain, 50.0, 50.0, normal, false)
+    assert(height == 100.0, "Height should be 100")
+
+    return true
+}
+
+fn test_terrain_logic_waypoint_system() -> Bool {
+    let terrain = create_terrain_logic(10, 10, 10.0)
+
+    let loc = Coord3D {}
+    loc.x = 50.0
+    loc.y = 50.0
+    loc.z = 0.0
+
+    let wp = create_waypoint(1, "Spawn1", loc, "AttackPath", "", "", false)
+    add_terrain_waypoint(terrain, wp)
+
+    let found_idx = get_waypoint_by_name(terrain, "Spawn1")
+    assert(found_idx >= 0, "Should find waypoint")
+
+    let found_by_id_idx = get_waypoint_by_id(terrain, 1)
+    assert(found_by_id_idx >= 0, "Should find waypoint by ID")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_terrain_type_creation(), "Terrain type creation test failed")
+    assert(test_world_height_map_queries(), "World height map queries test failed")
+    assert(test_world_height_map_cliff_detection(), "World height map cliff detection test failed")
+    assert(test_waypoint_creation(), "Waypoint creation test failed")
+    assert(test_bridge_point_containment(), "Bridge point containment test failed")
+    assert(test_polygon_trigger_containment(), "Polygon trigger containment test failed")
+    assert(test_terrain_logic_ground_height(), "Terrain logic ground height test failed")
+    assert(test_terrain_logic_waypoint_system(), "Terrain logic waypoint system test failed")
+    return true
+}

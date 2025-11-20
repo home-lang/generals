@@ -1,0 +1,318 @@
+// ============================================================================
+// Camera System for 2D RTS View
+// Handles world-to-screen coordinate transformation
+// ============================================================================
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// 2D Vector Helper
+// ============================================================================
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+fn vec2_init(x: Float, y: Float) -> Vec2 {
+    let v = Vec2 {}
+    v.x = x
+    v.y = y
+    return v
+}
+
+fn vec2_sub(a: Vec2, b: Vec2) -> Vec2 {
+    return vec2_init(a.x - b.x, a.y - b.y)
+}
+
+fn vec2_scale(v: Vec2, s: Float) -> Vec2 {
+    return vec2_init(v.x * s, v.y * s)
+}
+
+// ============================================================================
+// Camera Structure
+// ============================================================================
+
+/// 2D Camera for RTS game
+struct Camera {
+    /// Camera position in world space
+    position: Vec2,
+
+    /// Zoom level (1.0 = normal, 2.0 = 2x zoom in, 0.5 = 2x zoom out)
+    zoom: Float,
+
+    /// Viewport size (screen dimensions)
+    viewport_width: Float,
+    viewport_height: Float,
+
+    /// Camera movement speed (units per second)
+    pan_speed: Float,
+
+    /// Zoom speed (zoom factor per second)
+    zoom_speed: Float,
+
+    /// Min/max zoom levels
+    min_zoom: Float,
+    max_zoom: Float,
+}
+
+fn create_camera(viewport_width: Float, viewport_height: Float) -> Camera {
+    let camera = Camera {}
+    camera.position = vec2_init(0.0, 0.0)
+    camera.zoom = 1.0
+    camera.viewport_width = viewport_width
+    camera.viewport_height = viewport_height
+    camera.pan_speed = 500.0   // pixels per second
+    camera.zoom_speed = 2.0    // zoom factor per second
+    camera.min_zoom = 0.25     // 4x zoom out
+    camera.max_zoom = 4.0      // 4x zoom in
+    return camera
+}
+
+/// Convert world coordinates to screen coordinates
+fn world_to_screen(camera: Camera, world_pos: Vec2) -> Vec2 {
+    // Apply camera transformation
+    let relative = vec2_sub(world_pos, camera.position)
+    let scaled = vec2_scale(relative, camera.zoom)
+
+    // Center on screen
+    let screen_x = scaled.x + camera.viewport_width / 2.0
+    let screen_y = scaled.y + camera.viewport_height / 2.0
+
+    return vec2_init(screen_x, screen_y)
+}
+
+/// Convert screen coordinates to world coordinates
+fn screen_to_world(camera: Camera, screen_pos: Vec2) -> Vec2 {
+    // Uncenter from screen
+    let centered_x = screen_pos.x - camera.viewport_width / 2.0
+    let centered_y = screen_pos.y - camera.viewport_height / 2.0
+
+    // Unscale and add camera position
+    let world_x = centered_x / camera.zoom + camera.position.x
+    let world_y = centered_y / camera.zoom + camera.position.y
+
+    return vec2_init(world_x, world_y)
+}
+
+/// Pan camera (move in world space)
+fn pan(camera: Camera, delta_x: Float, delta_y: Float) {
+    camera.position.x = camera.position.x + delta_x
+    camera.position.y = camera.position.y + delta_y
+}
+
+/// Pan with delta time (for smooth movement)
+fn pan_with_delta(camera: Camera, dir_x: Float, dir_y: Float, dt: Float) {
+    let distance = camera.pan_speed * dt / camera.zoom  // Adjust speed based on zoom
+    camera.position.x = camera.position.x + dir_x * distance
+    camera.position.y = camera.position.y + dir_y * distance
+}
+
+/// Zoom in/out
+fn set_zoom(camera: Camera, new_zoom: Float) {
+    // Clamp zoom between min and max
+    let clamped = new_zoom
+    if clamped < camera.min_zoom {
+        clamped = camera.min_zoom
+    }
+    if clamped > camera.max_zoom {
+        clamped = camera.max_zoom
+    }
+    camera.zoom = clamped
+}
+
+/// Zoom with delta (smooth zoom)
+fn zoom_with_delta(camera: Camera, zoom_delta: Float, dt: Float) {
+    let new_zoom = camera.zoom * (1.0 + zoom_delta * camera.zoom_speed * dt)
+    set_zoom(camera, new_zoom)
+}
+
+/// Reset camera to default position and zoom
+fn reset_camera(camera: Camera) {
+    camera.position = vec2_init(0.0, 0.0)
+    camera.zoom = 1.0
+}
+
+/// Update viewport size (called when window is resized)
+fn set_viewport_size(camera: Camera, width: Float, height: Float) {
+    camera.viewport_width = width
+    camera.viewport_height = height
+}
+
+/// Check if a world position is visible on screen
+fn is_visible(camera: Camera, world_pos: Vec2, margin: Float) -> Bool {
+    let screen_pos = world_to_screen(camera, world_pos)
+
+    return screen_pos.x >= -margin &&
+           screen_pos.x <= camera.viewport_width + margin &&
+           screen_pos.y >= -margin &&
+           screen_pos.y <= camera.viewport_height + margin
+}
+
+/// Get visible world bounds
+struct VisibleBounds {
+    min_x: Float,
+    min_y: Float,
+    max_x: Float,
+    max_y: Float,
+}
+
+fn get_visible_bounds(camera: Camera) -> VisibleBounds {
+    let top_left = screen_to_world(camera, vec2_init(0.0, 0.0))
+    let bottom_right = screen_to_world(camera, vec2_init(camera.viewport_width, camera.viewport_height))
+
+    let bounds = VisibleBounds {}
+    bounds.min_x = top_left.x
+    bounds.min_y = top_left.y
+    bounds.max_x = bottom_right.x
+    bounds.max_y = bottom_right.y
+
+    return bounds
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_world_to_screen() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    // Center of world should map to center of screen
+    let world_center = vec2_init(0.0, 0.0)
+    let screen_center = world_to_screen(camera, world_center)
+
+    assert(abs(screen_center.x - 400.0) < 0.01, "Screen X should be 400")
+    assert(abs(screen_center.y - 300.0) < 0.01, "Screen Y should be 300")
+
+    return true
+}
+
+fn test_screen_to_world() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    // Center of screen should map to center of world
+    let screen_center = vec2_init(400.0, 300.0)
+    let world_center = screen_to_world(camera, screen_center)
+
+    assert(abs(world_center.x) < 0.01, "World X should be 0")
+    assert(abs(world_center.y) < 0.01, "World Y should be 0")
+
+    return true
+}
+
+fn test_pan() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    pan(camera, 100.0, 50.0)
+
+    assert(camera.position.x == 100.0, "Position X should be 100")
+    assert(camera.position.y == 50.0, "Position Y should be 50")
+
+    return true
+}
+
+fn test_zoom() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    set_zoom(camera, 2.0)
+    assert(camera.zoom == 2.0, "Zoom should be 2.0")
+
+    // Test clamping to max
+    set_zoom(camera, 10.0)
+    assert(camera.zoom == 4.0, "Zoom should clamp to max 4.0")
+
+    // Test clamping to min
+    set_zoom(camera, 0.1)
+    assert(camera.zoom == 0.25, "Zoom should clamp to min 0.25")
+
+    return true
+}
+
+fn test_zoom_with_delta() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    // Zoom in slightly
+    zoom_with_delta(camera, 0.1, 1.0)
+    assert(camera.zoom > 1.0, "Zoom should increase")
+
+    return true
+}
+
+fn test_pan_with_delta() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    pan_with_delta(camera, 1.0, 0.0, 1.0)
+    assert(camera.position.x > 0.0, "Position X should increase")
+
+    return true
+}
+
+fn test_reset() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    pan(camera, 100.0, 50.0)
+    set_zoom(camera, 2.0)
+
+    reset_camera(camera)
+
+    assert(camera.position.x == 0.0, "Position X should reset")
+    assert(camera.position.y == 0.0, "Position Y should reset")
+    assert(camera.zoom == 1.0, "Zoom should reset")
+
+    return true
+}
+
+fn test_viewport_resize() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    set_viewport_size(camera, 1024.0, 768.0)
+
+    assert(camera.viewport_width == 1024.0, "Width should update")
+    assert(camera.viewport_height == 768.0, "Height should update")
+
+    return true
+}
+
+fn test_visibility() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    // Position at center should be visible
+    let center = vec2_init(0.0, 0.0)
+    assert(is_visible(camera, center, 0.0), "Center should be visible")
+
+    // Position far away should not be visible
+    let far_away = vec2_init(10000.0, 10000.0)
+    assert(!is_visible(camera, far_away, 0.0), "Far position should not be visible")
+
+    return true
+}
+
+fn test_visible_bounds() -> Bool {
+    let camera = create_camera(800.0, 600.0)
+
+    let bounds = get_visible_bounds(camera)
+
+    // At zoom 1.0, visible area should be viewport size
+    let width = bounds.max_x - bounds.min_x
+    let height = bounds.max_y - bounds.min_y
+
+    assert(abs(width - 800.0) < 1.0, "Visible width should match viewport")
+    assert(abs(height - 600.0) < 1.0, "Visible height should match viewport")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_world_to_screen(), "World to screen test failed")
+    assert(test_screen_to_world(), "Screen to world test failed")
+    assert(test_pan(), "Pan test failed")
+    assert(test_zoom(), "Zoom test failed")
+    assert(test_zoom_with_delta(), "Zoom with delta test failed")
+    assert(test_pan_with_delta(), "Pan with delta test failed")
+    assert(test_reset(), "Reset test failed")
+    assert(test_viewport_resize(), "Viewport resize test failed")
+    assert(test_visibility(), "Visibility test failed")
+    assert(test_visible_bounds(), "Visible bounds test failed")
+    return true
+}

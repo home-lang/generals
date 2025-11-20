@@ -1,0 +1,628 @@
+// ============================================================================
+// Command Queue System - Complete Implementation
+// Based on Thyme's command architecture
+// ============================================================================
+//
+// Command system handles all player orders to units/buildings:
+// - Move commands (click, waypoints, formations)
+// - Attack commands (attack-move, force attack, stop)
+// - Build commands (construct building, repair)
+// - Special commands (garrison, capture, use special power)
+// - Queue management (shift-queue, cancel)
+//
+// References:
+// - Thyme/src/game/logic/object/update.h
+// - Thyme/src/game/network/gamelogic.h (CommandSourceType)
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// Phase 1: Command Types
+// ============================================================================
+
+enum CommandType {
+    // Movement
+    MOVE,                // Move to location
+    ATTACK_MOVE,         // Move and engage enemies
+    STOP,                // Stop current action
+    GUARD,               // Guard location/unit
+    PATROL,              // Patrol between waypoints
+
+    // Combat
+    ATTACK,              // Attack specific target
+    FORCE_ATTACK,        // Force attack (including friendlies)
+    FORCE_FIRE,          // Fire at ground
+
+    // Construction
+    BUILD,               // Build structure
+    REPAIR,              // Repair building/unit
+    SELL,                // Sell building
+
+    // Special
+    GARRISON,            // Enter building/transport
+    EVACUATE,            // Exit building/transport
+    CAPTURE,             // Capture building
+    SABOTAGE,            // Sabotage building
+    HACK,                // Hack building
+    SNIPE,               // Snipe infantry
+
+    // Production
+    PRODUCE_UNIT,        // Queue unit production
+    CANCEL_PRODUCTION,   // Cancel production
+    RALLY_POINT,         // Set rally point
+
+    // Powers
+    USE_SPECIAL_POWER,   // Activate special power
+    UPGRADE,             // Research upgrade
+
+    // Formation
+    SET_FORMATION,       // Change formation
+    FORMATION_MOVE,      // Move in formation
+
+    // Misc
+    FOLLOW,              // Follow target
+    SET_STANCE,          // Set combat stance
+    RETREAT,             // Retreat to base
+    SCATTER,             // Scatter units
+}
+
+/// Command priority (for queue ordering)
+enum CommandPriority {
+    LOW,
+    NORMAL,
+    HIGH,
+    CRITICAL,
+}
+
+/// Combat stance
+enum CombatStance {
+    AGGRESSIVE,    // Attack enemies on sight
+    DEFENSIVE,     // Only attack when attacked
+    HOLD_POSITION, // Don't move, only attack in range
+    HOLD_FIRE,     // Don't attack at all
+}
+
+// ============================================================================
+// Phase 2: Command Structure
+// ============================================================================
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+}
+
+fn vec2_init(x: Float, y: Float) -> Vec2 {
+    let v = Vec2 {}
+    v.x = x
+    v.y = y
+    return v
+}
+
+fn vec3_init(x: Float, y: Float, z: Float) -> Vec3 {
+    let v = Vec3 {}
+    v.x = x
+    v.y = y
+    v.z = z
+    return v
+}
+
+struct Command {
+    command_type: CommandType,
+    priority: CommandPriority,
+
+    // Targets
+    target_entity_id: Int,       // Target unit/building ID (-1 if none)
+    target_position: Vec3,       // Target world position
+    has_target_position: Bool,   // Whether target_position is valid
+    waypoints: Collection<Vec3>, // For patrol/waypoint movement
+    has_waypoints: Bool,
+
+    // Parameters (only some fields used per command type)
+    building_type: Int,          // For BUILD command (-1 if none)
+    formation_type: Int,         // For SET_FORMATION (-1 if none)
+    special_power_id: Int,       // For USE_SPECIAL_POWER (-1 if none)
+    stance: CombatStance,        // For SET_STANCE
+    has_stance: Bool,
+    queue_shift: Bool,           // Shift-queue (add to queue vs replace)
+
+    // Metadata
+    issuer_player: Int,          // Who issued this command
+    frame_issued: Int,           // Game frame when issued
+    is_queued: Bool,             // In command queue vs immediate
+}
+
+fn create_command(command_type: CommandType) -> Command {
+    let cmd = Command {}
+    cmd.command_type = command_type
+    cmd.priority = CommandPriority::NORMAL
+    cmd.target_entity_id = -1
+    cmd.target_position = vec3_init(0.0, 0.0, 0.0)
+    cmd.has_target_position = false
+    cmd.waypoints = Collection<Vec3> {}
+    cmd.has_waypoints = false
+    cmd.building_type = -1
+    cmd.formation_type = -1
+    cmd.special_power_id = -1
+    cmd.stance = CombatStance::AGGRESSIVE
+    cmd.has_stance = false
+    cmd.queue_shift = false
+    cmd.issuer_player = -1
+    cmd.frame_issued = 0
+    cmd.is_queued = false
+    return cmd
+}
+
+/// Create move command
+fn create_move_command(position: Vec3, shift_queue: Bool) -> Command {
+    let cmd = create_command(CommandType::MOVE)
+    cmd.target_position = position
+    cmd.has_target_position = true
+    cmd.queue_shift = shift_queue
+    return cmd
+}
+
+/// Create attack command
+fn create_attack_command(target_id: Int, shift_queue: Bool) -> Command {
+    let cmd = create_command(CommandType::ATTACK)
+    cmd.target_entity_id = target_id
+    cmd.queue_shift = shift_queue
+    return cmd
+}
+
+/// Create build command
+fn create_build_command(building_type: Int, position: Vec3) -> Command {
+    let cmd = create_command(CommandType::BUILD)
+    cmd.building_type = building_type
+    cmd.target_position = position
+    cmd.has_target_position = true
+    return cmd
+}
+
+/// Create special power command
+fn create_special_power_command(power_id: Int, position: Vec3) -> Command {
+    let cmd = create_command(CommandType::USE_SPECIAL_POWER)
+    cmd.special_power_id = power_id
+    cmd.target_position = position
+    cmd.has_target_position = true
+    return cmd
+}
+
+// ============================================================================
+// Phase 3: Command Queue (Per Entity)
+// ============================================================================
+
+struct CommandQueue {
+    commands: Collection<Command>,
+    current_command: Command,
+    has_current_command: Bool,
+    entity_id: Int,
+}
+
+fn create_command_queue(entity_id: Int) -> CommandQueue {
+    let queue = CommandQueue {}
+    queue.commands = Collection<Command> {}
+    queue.current_command = create_command(CommandType::STOP)
+    queue.has_current_command = false
+    queue.entity_id = entity_id
+    return queue
+}
+
+/// Add command to queue
+fn add_command(queue: CommandQueue, command: Command) {
+    if command.queue_shift {
+        // Shift-queue: add to end
+        queue.commands.add(command)
+    } else {
+        // Replace queue
+        clear_queue(queue)
+        queue.commands.add(command)
+    }
+}
+
+/// Get next command
+fn pop_command(queue: CommandQueue) -> CommandResult {
+    let result = CommandResult {}
+    result.has_command = false
+
+    if queue.commands.len() == 0 {
+        return result
+    }
+
+    result.has_command = true
+    result.command = queue.commands.get(0)
+    queue.commands.remove(0)
+    return result
+}
+
+/// Clear all commands
+fn clear_queue(queue: CommandQueue) {
+    queue.commands = Collection<Command> {}
+    queue.has_current_command = false
+}
+
+/// Peek at next command without removing
+fn peek_command(queue: CommandQueue) -> CommandResult {
+    let result = CommandResult {}
+    result.has_command = false
+
+    if queue.commands.len() == 0 {
+        return result
+    }
+
+    result.has_command = true
+    result.command = queue.commands.get(0)
+    return result
+}
+
+/// Get queue length
+fn get_queue_length(queue: CommandQueue) -> Int {
+    return queue.commands.len()
+}
+
+/// Check if queue is empty
+fn is_queue_empty(queue: CommandQueue) -> Bool {
+    return queue.commands.len() == 0 && !queue.has_current_command
+}
+
+/// Start executing next command
+fn execute_next_command(queue: CommandQueue) -> Bool {
+    if queue.has_current_command {
+        return false
+    }
+
+    let result = pop_command(queue)
+    if result.has_command {
+        queue.current_command = result.command
+        queue.has_current_command = true
+        return true
+    }
+
+    return false
+}
+
+/// Complete current command
+fn complete_current_command(queue: CommandQueue) {
+    queue.has_current_command = false
+}
+
+/// Cancel current command
+fn cancel_current_command(queue: CommandQueue) {
+    queue.has_current_command = false
+}
+
+// ============================================================================
+// Phase 4: Command Manager (Global)
+// ============================================================================
+
+struct QueueEntry {
+    entity_id: Int,
+    queue: CommandQueue,
+}
+
+struct CommandManager {
+    command_queues: Collection<QueueEntry>,  // entity_id -> queue
+    command_history: Collection<Command>,    // For replay/network
+    current_frame: Int,
+}
+
+fn create_command_manager() -> CommandManager {
+    let manager = CommandManager {}
+    manager.command_queues = Collection<QueueEntry> {}
+    manager.command_history = Collection<Command> {}
+    manager.current_frame = 0
+    return manager
+}
+
+/// Issue command to entity
+fn issue_command(manager: CommandManager, entity_id: Int, command: Command) {
+    // Get or create queue for entity
+    let queue = get_or_create_queue(manager, entity_id)
+
+    // Add command
+    command.frame_issued = manager.current_frame
+    add_command(queue, command)
+
+    // Record in history (for network/replay)
+    manager.command_history.add(command)
+}
+
+/// Issue command to multiple entities
+fn issue_group_command(manager: CommandManager, entity_ids: Collection<Int>, command: Command) {
+    for i in 0..entity_ids.len() {
+        let entity_id = entity_ids.get(i)
+        issue_command(manager, entity_id, command)
+    }
+}
+
+/// Get queue for entity
+fn get_queue(manager: CommandManager, entity_id: Int) -> QueueResult {
+    let result = QueueResult {}
+    result.found = false
+
+    for i in 0..manager.command_queues.len() {
+        let entry = manager.command_queues.get(i)
+        if entry.entity_id == entity_id {
+            result.found = true
+            result.queue = entry.queue
+            return result
+        }
+    }
+
+    return result
+}
+
+/// Get or create queue for entity
+fn get_or_create_queue(manager: CommandManager, entity_id: Int) -> CommandQueue {
+    // Try to find existing queue
+    for i in 0..manager.command_queues.len() {
+        let entry = manager.command_queues.get(i)
+        if entry.entity_id == entity_id {
+            return entry.queue
+        }
+    }
+
+    // Create new queue
+    let queue = create_command_queue(entity_id)
+    let entry = QueueEntry {}
+    entry.entity_id = entity_id
+    entry.queue = queue
+
+    manager.command_queues.add(entry)
+    return queue
+}
+
+/// Remove entity queue (when entity dies)
+fn remove_entity(manager: CommandManager, entity_id: Int) {
+    let new_queues = Collection<QueueEntry> {}
+
+    for i in 0..manager.command_queues.len() {
+        let entry = manager.command_queues.get(i)
+        if entry.entity_id != entity_id {
+            new_queues.add(entry)
+        }
+    }
+
+    manager.command_queues = new_queues
+}
+
+/// Update frame counter
+fn update_manager(manager: CommandManager, frame: Int) {
+    manager.current_frame = frame
+}
+
+/// Clear all commands for all entities
+fn clear_all_commands(manager: CommandManager) {
+    for i in 0..manager.command_queues.len() {
+        let entry = manager.command_queues.get(i)
+        clear_queue(entry.queue)
+    }
+}
+
+/// Get total queued commands
+fn get_total_queued_commands(manager: CommandManager) -> Int {
+    let total = 0
+
+    for i in 0..manager.command_queues.len() {
+        let entry = manager.command_queues.get(i)
+        total = total + get_queue_length(entry.queue)
+        if entry.queue.has_current_command {
+            total = total + 1
+        }
+    }
+
+    return total
+}
+
+// ============================================================================
+// Helper Result Types
+// ============================================================================
+
+struct CommandResult {
+    has_command: Bool,
+    command: Command,
+}
+
+struct QueueResult {
+    found: Bool,
+    queue: CommandQueue,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_command_creation() -> Bool {
+    let cmd = create_command(CommandType::MOVE)
+    assert(cmd.command_type == CommandType::MOVE, "Command type should be MOVE")
+    assert(cmd.priority == CommandPriority::NORMAL, "Priority should be NORMAL")
+
+    return true
+}
+
+fn test_move_helper() -> Bool {
+    let pos = vec3_init(100.0, 100.0, 0.0)
+    let cmd = create_move_command(pos, false)
+
+    assert(cmd.command_type == CommandType::MOVE, "Command type should be MOVE")
+    assert(cmd.has_target_position, "Should have target position")
+    assert(cmd.target_position.x == 100.0, "X should be 100")
+
+    return true
+}
+
+fn test_attack_helper() -> Bool {
+    let cmd = create_attack_command(42, true)
+
+    assert(cmd.command_type == CommandType::ATTACK, "Command type should be ATTACK")
+    assert(cmd.target_entity_id == 42, "Target ID should be 42")
+    assert(cmd.queue_shift, "Should be shift queued")
+
+    return true
+}
+
+fn test_queue_add_and_pop() -> Bool {
+    let queue = create_command_queue(1)
+
+    let cmd1 = create_command(CommandType::MOVE)
+    cmd1.queue_shift = true  // Add to queue
+
+    let cmd2 = create_command(CommandType::ATTACK)
+    cmd2.queue_shift = true  // Add to queue
+
+    add_command(queue, cmd1)
+    add_command(queue, cmd2)
+
+    assert(get_queue_length(queue) == 2, "Queue should have 2 commands")
+
+    let result = pop_command(queue)
+    assert(result.has_command, "Should have command")
+    assert(result.command.command_type == CommandType::MOVE, "First command should be MOVE")
+    assert(get_queue_length(queue) == 1, "Queue should have 1 command left")
+
+    return true
+}
+
+fn test_shift_queue() -> Bool {
+    let queue = create_command_queue(1)
+
+    let cmd1 = create_command(CommandType::MOVE)
+    cmd1.queue_shift = false  // Replace queue
+    add_command(queue, cmd1)
+
+    let cmd2 = create_command(CommandType::ATTACK)
+    cmd2.queue_shift = true  // Add to queue
+    add_command(queue, cmd2)
+
+    assert(get_queue_length(queue) == 2, "Queue should have 2 commands")
+
+    let cmd3 = create_command(CommandType::STOP)
+    cmd3.queue_shift = false  // Replace queue
+    add_command(queue, cmd3)
+
+    assert(get_queue_length(queue) == 1, "Queue should have 1 command after replace")
+
+    return true
+}
+
+fn test_execute_and_complete() -> Bool {
+    let queue = create_command_queue(1)
+
+    let cmd = create_command(CommandType::MOVE)
+    add_command(queue, cmd)
+
+    assert(!queue.has_current_command, "Should not have current command initially")
+
+    let started = execute_next_command(queue)
+    assert(started, "Should start command")
+    assert(queue.has_current_command, "Should have current command")
+
+    complete_current_command(queue)
+    assert(!queue.has_current_command, "Should not have current command after complete")
+
+    return true
+}
+
+fn test_manager_issue_command() -> Bool {
+    let manager = create_command_manager()
+
+    let cmd = create_command(CommandType::MOVE)
+    issue_command(manager, 1, cmd)
+
+    let result = get_queue(manager, 1)
+    assert(result.found, "Should find queue for entity 1")
+    assert(get_queue_length(result.queue) == 1, "Queue should have 1 command")
+
+    return true
+}
+
+fn test_group_command() -> Bool {
+    let manager = create_command_manager()
+
+    let entity_ids = Collection<Int> {}
+    entity_ids.add(1)
+    entity_ids.add(2)
+    entity_ids.add(3)
+
+    let cmd = create_command(CommandType::ATTACK)
+    issue_group_command(manager, entity_ids, cmd)
+
+    let result1 = get_queue(manager, 1)
+    let result2 = get_queue(manager, 2)
+    let result3 = get_queue(manager, 3)
+
+    assert(result1.found && get_queue_length(result1.queue) == 1, "Entity 1 should have command")
+    assert(result2.found && get_queue_length(result2.queue) == 1, "Entity 2 should have command")
+    assert(result3.found && get_queue_length(result3.queue) == 1, "Entity 3 should have command")
+
+    return true
+}
+
+fn test_remove_entity() -> Bool {
+    let manager = create_command_manager()
+
+    let cmd = create_command(CommandType::MOVE)
+    issue_command(manager, 1, cmd)
+
+    let result1 = get_queue(manager, 1)
+    assert(result1.found, "Should find queue for entity 1")
+
+    remove_entity(manager, 1)
+
+    let result2 = get_queue(manager, 1)
+    assert(!result2.found, "Should not find queue after removal")
+
+    return true
+}
+
+fn test_total_queued_commands() -> Bool {
+    let manager = create_command_manager()
+
+    let cmd = create_command(CommandType::MOVE)
+    cmd.queue_shift = true  // Add to queue instead of replace
+
+    issue_command(manager, 1, cmd)
+    issue_command(manager, 2, cmd)
+    issue_command(manager, 2, cmd)
+
+    let total = get_total_queued_commands(manager)
+    assert(total == 3, "Should have 3 total queued commands")
+
+    return true
+}
+
+fn test_clear_all() -> Bool {
+    let manager = create_command_manager()
+
+    let cmd = create_command(CommandType::MOVE)
+    issue_command(manager, 1, cmd)
+    issue_command(manager, 2, cmd)
+
+    clear_all_commands(manager)
+
+    let total = get_total_queued_commands(manager)
+    assert(total == 0, "Should have no queued commands after clear all")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_command_creation(), "Command creation test failed")
+    assert(test_move_helper(), "Move helper test failed")
+    assert(test_attack_helper(), "Attack helper test failed")
+    assert(test_queue_add_and_pop(), "Queue add and pop test failed")
+    assert(test_shift_queue(), "Shift queue test failed")
+    assert(test_execute_and_complete(), "Execute and complete test failed")
+    assert(test_manager_issue_command(), "Manager issue command test failed")
+    assert(test_group_command(), "Group command test failed")
+    assert(test_remove_entity(), "Remove entity test failed")
+    assert(test_total_queued_commands(), "Total queued commands test failed")
+    assert(test_clear_all(), "Clear all test failed")
+    return true
+}

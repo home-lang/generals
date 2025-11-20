@@ -1,0 +1,480 @@
+// ============================================================================
+// Fog of War System for Generals RTS
+// Tracks visibility and exploration state for each team
+// ============================================================================
+
+import "basics/collection"
+import "basics/math"
+
+// ============================================================================
+// Visibility State
+// ============================================================================
+
+/// Visibility state for a grid cell
+enum VisibilityState {
+    UNEXPLORED,  // Never seen (black)
+    EXPLORED,    // Seen before but not visible now (gray)
+    VISIBLE,     // Currently visible (normal rendering)
+}
+
+// ============================================================================
+// Fog Cell
+// ============================================================================
+
+/// Fog of War grid cell
+struct FogCell {
+    visibility: VisibilityState,
+    last_visible_frame: Int,
+}
+
+fn create_fog_cell() -> FogCell {
+    let cell = FogCell {}
+    cell.visibility = VisibilityState::UNEXPLORED
+    cell.last_visible_frame = 0
+    return cell
+}
+
+fn set_cell_visible(cell: FogCell, frame: Int) {
+    cell.visibility = VisibilityState::VISIBLE
+    cell.last_visible_frame = frame
+}
+
+fn set_cell_explored(cell: FogCell) {
+    if cell.visibility == VisibilityState::UNEXPLORED {
+        cell.visibility = VisibilityState::EXPLORED
+    }
+}
+
+fn clear_cell_visibility(cell: FogCell) {
+    if cell.visibility == VisibilityState::VISIBLE {
+        cell.visibility = VisibilityState::EXPLORED
+    }
+}
+
+// ============================================================================
+// Vec2 Helper
+// ============================================================================
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+fn vec2_init(x: Float, y: Float) -> Vec2 {
+    let v = Vec2 {}
+    v.x = x
+    v.y = y
+    return v
+}
+
+// ============================================================================
+// Simplified Entity for Fog of War
+// ============================================================================
+
+struct Transform {
+    position: Vec2,
+}
+
+struct Entity {
+    active: Bool,
+    team: Int,
+    transform: Transform,
+    has_unit_data: Bool,
+    has_building_data: Bool,
+}
+
+// ============================================================================
+// Team Fog of War
+// ============================================================================
+
+/// Fog of War manager for a single team
+struct TeamFogOfWar {
+    grid: Collection<FogCell>,
+    grid_width: Int,
+    grid_height: Int,
+    cell_size: Float,
+    world_width: Float,
+    world_height: Float,
+    current_frame: Int,
+}
+
+fn create_team_fog(world_width: Float, world_height: Float, cell_size: Float) -> TeamFogOfWar {
+    let grid_width = ceil(world_width / cell_size) as Int
+    let grid_height = ceil(world_height / cell_size) as Int
+    let grid_size = grid_width * grid_height
+
+    let grid = Collection<FogCell> {}
+    for i in 0..grid_size {
+        grid.add(create_fog_cell())
+    }
+
+    let fog = TeamFogOfWar {}
+    fog.grid = grid
+    fog.grid_width = grid_width
+    fog.grid_height = grid_height
+    fog.cell_size = cell_size
+    fog.world_width = world_width
+    fog.world_height = world_height
+    fog.current_frame = 0
+
+    return fog
+}
+
+/// Convert world position to grid coordinates
+struct GridCoords {
+    valid: Bool,
+    x: Int,
+    y: Int,
+}
+
+fn world_to_grid(fog: TeamFogOfWar, world_pos: Vec2) -> GridCoords {
+    let result = GridCoords {}
+    result.valid = false
+    result.x = 0
+    result.y = 0
+
+    // Offset world position to grid space (0-based)
+    let grid_x_f = (world_pos.x + fog.world_width / 2.0) / fog.cell_size
+    let grid_y_f = (world_pos.y + fog.world_height / 2.0) / fog.cell_size
+
+    if grid_x_f < 0.0 || grid_y_f < 0.0 {
+        return result
+    }
+
+    let grid_x = floor(grid_x_f) as Int
+    let grid_y = floor(grid_y_f) as Int
+
+    if grid_x >= fog.grid_width || grid_y >= fog.grid_height {
+        return result
+    }
+
+    result.valid = true
+    result.x = grid_x
+    result.y = grid_y
+    return result
+}
+
+/// Get grid cell at grid coordinates
+fn get_cell(fog: TeamFogOfWar, grid_x: Int, grid_y: Int) -> FogCell {
+    let index = grid_y * fog.grid_width + grid_x
+    return fog.grid.get(index)
+}
+
+/// Reveal circular area around a position
+fn reveal_area(fog: TeamFogOfWar, center: Vec2, radius: Float) {
+    let radius_sq = radius * radius
+
+    // Calculate grid bounds to check
+    let min_x_f = (center.x - radius + fog.world_width / 2.0) / fog.cell_size
+    let max_x_f = (center.x + radius + fog.world_width / 2.0) / fog.cell_size
+    let min_y_f = (center.y - radius + fog.world_height / 2.0) / fog.cell_size
+    let max_y_f = (center.y + radius + fog.world_height / 2.0) / fog.cell_size
+
+    let min_x = max(0, floor(min_x_f) as Int)
+    let max_x = min(fog.grid_width - 1, ceil(max_x_f) as Int)
+    let min_y = max(0, floor(min_y_f) as Int)
+    let max_y = min(fog.grid_height - 1, ceil(max_y_f) as Int)
+
+    for y in min_y..(max_y + 1) {
+        for x in min_x..(max_x + 1) {
+            // Calculate cell center in world space
+            let cell_world_x = (x as Float) * fog.cell_size - fog.world_width / 2.0 + fog.cell_size / 2.0
+            let cell_world_y = (y as Float) * fog.cell_size - fog.world_height / 2.0 + fog.cell_size / 2.0
+
+            // Check if cell is within vision radius
+            let dx = cell_world_x - center.x
+            let dy = cell_world_y - center.y
+            let dist_sq = dx * dx + dy * dy
+
+            if dist_sq <= radius_sq {
+                let cell = get_cell(fog, x, y)
+                set_cell_visible(cell, fog.current_frame)
+            }
+        }
+    }
+}
+
+/// Clear all visibility (but keep explored state)
+fn clear_fog_visibility(fog: TeamFogOfWar) {
+    for i in 0..fog.grid.len() {
+        let cell = fog.grid.get(i)
+        clear_cell_visibility(cell)
+    }
+}
+
+/// Update fog of war for a new frame
+fn update_team_fog(fog: TeamFogOfWar, entities: Collection<Entity>, team: Int) {
+    fog.current_frame = fog.current_frame + 1
+    clear_fog_visibility(fog)
+
+    // Reveal areas around friendly units and buildings
+    for i in 0..entities.len() {
+        let entity = entities.get(i)
+        if !entity.active {
+            continue
+        }
+        if entity.team != team {
+            continue
+        }
+
+        // Calculate vision radius
+        let vision_radius = 0.0
+        if entity.has_unit_data {
+            vision_radius = 200.0  // Units have 200 unit vision
+        } else if entity.has_building_data {
+            vision_radius = 300.0  // Buildings have 300 unit vision
+        }
+
+        if vision_radius > 0.0 {
+            reveal_area(fog, entity.transform.position, vision_radius)
+        }
+    }
+}
+
+/// Check visibility of a world position
+fn is_fog_visible(fog: TeamFogOfWar, world_pos: Vec2) -> Bool {
+    let coords = world_to_grid(fog, world_pos)
+    if !coords.valid {
+        return false
+    }
+
+    let cell = get_cell(fog, coords.x, coords.y)
+    return cell.visibility == VisibilityState::VISIBLE
+}
+
+/// Check if position has been explored
+fn is_fog_explored(fog: TeamFogOfWar, world_pos: Vec2) -> Bool {
+    let coords = world_to_grid(fog, world_pos)
+    if !coords.valid {
+        return false
+    }
+
+    let cell = get_cell(fog, coords.x, coords.y)
+    return cell.visibility != VisibilityState::UNEXPLORED
+}
+
+/// Get visibility state at world position
+fn get_fog_visibility_state(fog: TeamFogOfWar, world_pos: Vec2) -> VisibilityState {
+    let coords = world_to_grid(fog, world_pos)
+    if !coords.valid {
+        return VisibilityState::UNEXPLORED
+    }
+
+    let cell = get_cell(fog, coords.x, coords.y)
+    return cell.visibility
+}
+
+// ============================================================================
+// Fog of War Manager (for all teams)
+// ============================================================================
+
+/// Fog of War manager for all teams
+struct FogOfWarManager {
+    team_fogs: Collection<TeamFogOfWar>,
+    enabled: Bool,
+}
+
+fn create_fog_manager(num_teams: Int, world_width: Float, world_height: Float, cell_size: Float) -> FogOfWarManager {
+    let team_fogs = Collection<TeamFogOfWar> {}
+
+    for i in 0..num_teams {
+        let fog = create_team_fog(world_width, world_height, cell_size)
+        team_fogs.add(fog)
+    }
+
+    let manager = FogOfWarManager {}
+    manager.team_fogs = team_fogs
+    manager.enabled = true
+
+    return manager
+}
+
+fn update_fog_manager(manager: FogOfWarManager, entities: Collection<Entity>) {
+    if !manager.enabled {
+        return
+    }
+
+    for team_id in 0..manager.team_fogs.len() {
+        let fog = manager.team_fogs.get(team_id)
+        update_team_fog(fog, entities, team_id)
+    }
+}
+
+fn is_manager_visible(manager: FogOfWarManager, team: Int, world_pos: Vec2) -> Bool {
+    if !manager.enabled {
+        return true
+    }
+    if team >= manager.team_fogs.len() {
+        return false
+    }
+
+    let fog = manager.team_fogs.get(team)
+    return is_fog_visible(fog, world_pos)
+}
+
+fn get_manager_visibility_state(manager: FogOfWarManager, team: Int, world_pos: Vec2) -> VisibilityState {
+    if !manager.enabled {
+        return VisibilityState::VISIBLE
+    }
+    if team >= manager.team_fogs.len() {
+        return VisibilityState::UNEXPLORED
+    }
+
+    let fog = manager.team_fogs.get(team)
+    return get_fog_visibility_state(fog, world_pos)
+}
+
+fn toggle_fog(manager: FogOfWarManager) {
+    manager.enabled = !manager.enabled
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_fog_cell_init() -> Bool {
+    let cell = create_fog_cell()
+    assert(cell.visibility == VisibilityState::UNEXPLORED, "Should be unexplored")
+    assert(cell.last_visible_frame == 0, "Frame should be 0")
+    return true
+}
+
+fn test_fog_cell_transitions() -> Bool {
+    let cell = create_fog_cell()
+
+    // Initially unexplored
+    assert(cell.visibility == VisibilityState::UNEXPLORED, "Should be unexplored initially")
+
+    // Set visible
+    set_cell_visible(cell, 1)
+    assert(cell.visibility == VisibilityState::VISIBLE, "Should be visible")
+    assert(cell.last_visible_frame == 1, "Frame should be 1")
+
+    // Clear visibility (visible -> explored)
+    clear_cell_visibility(cell)
+    assert(cell.visibility == VisibilityState::EXPLORED, "Should be explored after clear")
+
+    // Clear again (should stay explored)
+    clear_cell_visibility(cell)
+    assert(cell.visibility == VisibilityState::EXPLORED, "Should stay explored")
+
+    return true
+}
+
+fn test_team_fog_init() -> Bool {
+    let fog = create_team_fog(1000.0, 1000.0, 50.0)
+
+    assert(fog.grid_width == 20, "Grid width should be 20")  // 1000 / 50
+    assert(fog.grid_height == 20, "Grid height should be 20")
+    assert(fog.grid.len() == 400, "Grid should have 400 cells")  // 20 * 20
+
+    return true
+}
+
+fn test_world_to_grid() -> Bool {
+    let fog = create_team_fog(1000.0, 1000.0, 50.0)
+
+    // Center of world (0, 0) should map to grid (10, 10)
+    let center = world_to_grid(fog, vec2_init(0.0, 0.0))
+    assert(center.valid, "Center should be valid")
+    assert(center.x == 10, "Center X should be 10")
+    assert(center.y == 10, "Center Y should be 10")
+
+    // Top-left corner (-500, -500) should map to grid (0, 0)
+    let top_left = world_to_grid(fog, vec2_init(-500.0, -500.0))
+    assert(top_left.valid, "Top-left should be valid")
+    assert(top_left.x == 0, "Top-left X should be 0")
+    assert(top_left.y == 0, "Top-left Y should be 0")
+
+    return true
+}
+
+fn test_reveal_area() -> Bool {
+    let fog = create_team_fog(1000.0, 1000.0, 50.0)
+
+    // Reveal area at center with radius 100
+    reveal_area(fog, vec2_init(0.0, 0.0), 100.0)
+
+    // Center should be visible
+    assert(is_fog_visible(fog, vec2_init(0.0, 0.0)), "Center should be visible")
+
+    // Point within radius should be visible
+    assert(is_fog_visible(fog, vec2_init(50.0, 50.0)), "Point within radius should be visible")
+
+    // Point far away should not be visible
+    assert(!is_fog_visible(fog, vec2_init(300.0, 300.0)), "Far point should not be visible")
+
+    return true
+}
+
+fn test_explored_state() -> Bool {
+    let fog = create_team_fog(1000.0, 1000.0, 50.0)
+
+    let center = vec2_init(0.0, 0.0)
+
+    // Initially unexplored
+    assert(!is_fog_explored(fog, center), "Should be unexplored initially")
+
+    // Reveal area
+    reveal_area(fog, center, 100.0)
+    assert(is_fog_explored(fog, center), "Should be explored after reveal")
+
+    // Clear visibility
+    clear_fog_visibility(fog)
+    assert(is_fog_explored(fog, center), "Should stay explored after clear")
+    assert(!is_fog_visible(fog, center), "Should not be visible after clear")
+
+    return true
+}
+
+fn test_manager_creation() -> Bool {
+    let manager = create_fog_manager(4, 1000.0, 1000.0, 50.0)
+
+    assert(manager.team_fogs.len() == 4, "Should have 4 team fogs")
+    assert(manager.enabled, "Should be enabled by default")
+
+    return true
+}
+
+fn test_manager_toggle() -> Bool {
+    let manager = create_fog_manager(2, 1000.0, 1000.0, 50.0)
+
+    assert(manager.enabled, "Should be enabled")
+    toggle_fog(manager)
+    assert(!manager.enabled, "Should be disabled")
+    toggle_fog(manager)
+    assert(manager.enabled, "Should be enabled again")
+
+    return true
+}
+
+fn test_manager_visibility() -> Bool {
+    let manager = create_fog_manager(2, 1000.0, 1000.0, 50.0)
+
+    let pos = vec2_init(0.0, 0.0)
+
+    // Initially not visible
+    assert(!is_manager_visible(manager, 0, pos), "Should not be visible initially")
+
+    // Reveal for team 0
+    let fog = manager.team_fogs.get(0)
+    reveal_area(fog, pos, 100.0)
+
+    assert(is_manager_visible(manager, 0, pos), "Should be visible for team 0")
+    assert(!is_manager_visible(manager, 1, pos), "Should not be visible for team 1")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_fog_cell_init(), "Fog cell init test failed")
+    assert(test_fog_cell_transitions(), "Fog cell transitions test failed")
+    assert(test_team_fog_init(), "Team fog init test failed")
+    assert(test_world_to_grid(), "World to grid test failed")
+    assert(test_reveal_area(), "Reveal area test failed")
+    assert(test_explored_state(), "Explored state test failed")
+    assert(test_manager_creation(), "Manager creation test failed")
+    assert(test_manager_toggle(), "Manager toggle test failed")
+    assert(test_manager_visibility(), "Manager visibility test failed")
+    return true
+}

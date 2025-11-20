@@ -1,0 +1,606 @@
+// ============================================================================
+// Projectile System
+// Physical projectiles with ballistic trajectories, homing, and collision
+// Based on Thyme's projectile system
+// ============================================================================
+
+import "basics/collection"
+import "basics/math"
+
+/// Projectile type
+enum ProjectileType {
+    BULLET,          // Instant hit
+    BALLISTIC,       // Gravity-affected projectile (tank shells)
+    GUIDED_MISSILE,  // Homing missile
+    ROCKET,          // Non-homing rocket
+    BEAM,            // Laser beam (instant)
+    GRENADE,         // Lobbed projectile
+}
+
+/// Projectile state
+enum ProjectileState {
+    ACTIVE,
+    HIT_TARGET,
+    HIT_GROUND,
+    EXPLODED,
+    FIZZLED,  // Missed and despawned
+}
+
+/// Damage type (from combat system)
+enum DamageType {
+    ARMOR_PIERCING,
+    HOLLOW_POINT,
+    SMALL_ARMS,
+    EXPLOSION,
+    FIRE,
+    LASER,
+    POISON,
+    SNIPER,
+    STRUCTURE,
+    RADIATION,
+}
+
+/// Weapon bonus flags
+struct WeaponBonus {
+    vs_infantry: Bool,
+    vs_vehicle: Bool,
+    vs_aircraft: Bool,
+    vs_structure: Bool,
+}
+
+/// 3D Vector
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+}
+
+fn vec3_init(x: Float, y: Float, z: Float) -> Vec3 {
+    let v = Vec3 {}
+    v.x = x
+    v.y = y
+    v.z = z
+    return v
+}
+
+fn vec3_add(a: Vec3, b: Vec3) -> Vec3 {
+    return vec3_init(a.x + b.x, a.y + b.y, a.z + b.z)
+}
+
+fn vec3_sub(a: Vec3, b: Vec3) -> Vec3 {
+    return vec3_init(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+fn vec3_scale(v: Vec3, s: Float) -> Vec3 {
+    return vec3_init(v.x * s, v.y * s, v.z * s)
+}
+
+fn vec3_length(v: Vec3) -> Float {
+    return sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+}
+
+fn vec3_normalize(v: Vec3) -> Vec3 {
+    let len = vec3_length(v)
+    if len > 0.0001 {
+        return vec3_scale(v, 1.0 / len)
+    }
+    return vec3_init(0.0, 0.0, 0.0)
+}
+
+fn vec3_lerp(a: Vec3, b: Vec3, t: Float) -> Vec3 {
+    return vec3_init(
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t
+    )
+}
+
+/// Simple entity transform (for collision detection)
+struct Transform {
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+}
+
+/// Simple entity structure (for collision detection)
+struct Entity {
+    id: Int,
+    active: Bool,
+    transform: Transform,
+    health: Float,
+}
+
+// ============================================================================
+// Projectile Data Structure
+// ============================================================================
+
+struct Projectile {
+    id: Int,
+    projectile_type: ProjectileType,
+    state: ProjectileState,
+
+    // Position and movement
+    position: Vec3,
+    velocity: Vec3,
+    acceleration: Vec3,     // For gravity
+    speed: Float,
+    lifetime: Float,
+    max_lifetime: Float,
+
+    // Source and target
+    source_entity_id: Int,  // -1 if none
+    target_entity_id: Int,  // -1 if none
+    target_position: Vec3,  // Last known target position
+
+    // Homing properties
+    is_homing: Bool,
+    turn_rate: Float,       // Radians per second
+    lock_on_delay: Float,
+    time_since_launch: Float,
+
+    // Damage properties
+    damage: Float,
+    damage_type: DamageType,
+    piercing: Float,
+    bonus: WeaponBonus,
+    explosion_radius: Float,
+    friendly_fire: Bool,
+
+    // Visual properties
+    model_id: Int,
+    trail_effect_id: Int,
+    impact_effect_id: Int,
+    rotation: Float,
+
+    // Physics
+    gravity: Float,
+    air_resistance: Float,
+    bounce_count: Int,
+    max_bounces: Int,
+}
+
+fn create_projectile(
+    id: Int,
+    projectile_type: ProjectileType,
+    start_pos: Vec3,
+    target_pos: Vec3,
+    speed: Float,
+    damage: Float
+) -> Projectile {
+    let direction = vec3_normalize(vec3_sub(target_pos, start_pos))
+    let velocity = vec3_scale(direction, speed)
+
+    let proj = Projectile {}
+    proj.id = id
+    proj.projectile_type = projectile_type
+    proj.state = ProjectileState::ACTIVE
+    proj.position = start_pos
+    proj.velocity = velocity
+    proj.acceleration = vec3_init(0.0, 0.0, 0.0)
+    proj.speed = speed
+    proj.lifetime = 0.0
+    proj.max_lifetime = 10.0
+    proj.source_entity_id = -1
+    proj.target_entity_id = -1
+    proj.target_position = target_pos
+    proj.is_homing = false
+    proj.turn_rate = 0.0
+    proj.lock_on_delay = 0.0
+    proj.time_since_launch = 0.0
+    proj.damage = damage
+    proj.damage_type = DamageType::SMALL_ARMS
+    proj.piercing = 0.0
+    proj.bonus = WeaponBonus {}
+    proj.bonus.vs_infantry = false
+    proj.bonus.vs_vehicle = false
+    proj.bonus.vs_aircraft = false
+    proj.bonus.vs_structure = false
+    proj.explosion_radius = 0.0
+    proj.friendly_fire = false
+    proj.model_id = 0
+    proj.trail_effect_id = 0
+    proj.impact_effect_id = 0
+    proj.rotation = 0.0
+    proj.gravity = 0.0
+    proj.air_resistance = 0.0
+    proj.bounce_count = 0
+    proj.max_bounces = 0
+
+    return proj
+}
+
+/// Update projectile physics and guidance
+fn update_projectile(proj: Projectile, dt: Float, entities: Collection<Entity>) {
+    if proj.state != ProjectileState::ACTIVE {
+        return
+    }
+
+    proj.lifetime = proj.lifetime + dt
+    proj.time_since_launch = proj.time_since_launch + dt
+
+    // Check lifetime
+    if proj.lifetime >= proj.max_lifetime {
+        proj.state = ProjectileState::FIZZLED
+        return
+    }
+
+    // Apply gravity
+    if proj.gravity != 0.0 {
+        proj.acceleration.z = proj.acceleration.z - proj.gravity * dt
+    }
+
+    // Apply air resistance
+    if proj.air_resistance > 0.0 {
+        let drag = vec3_scale(proj.velocity, proj.air_resistance * dt)
+        proj.velocity = vec3_sub(proj.velocity, drag)
+    }
+
+    // Homing logic
+    if proj.is_homing && proj.time_since_launch > proj.lock_on_delay {
+        if proj.target_entity_id >= 0 {
+            // Find target entity
+            for i in 0..entities.len() {
+                let entity = entities.get(i)
+                if entity.id == proj.target_entity_id && entity.active {
+                    // Update target position
+                    proj.target_position = vec3_init(
+                        entity.transform.position_x,
+                        entity.transform.position_y,
+                        entity.transform.position_z
+                    )
+
+                    // Calculate direction to target
+                    let to_target = vec3_sub(proj.target_position, proj.position)
+                    let dist = vec3_length(to_target)
+
+                    if dist > 1.0 {
+                        let desired_velocity = vec3_scale(vec3_normalize(to_target), proj.speed)
+
+                        // Turn towards target
+                        let turn_amount = proj.turn_rate * dt
+                        proj.velocity = vec3_lerp(proj.velocity, desired_velocity, turn_amount)
+                        proj.velocity = vec3_scale(vec3_normalize(proj.velocity), proj.speed)
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    // Apply velocity
+    proj.velocity = vec3_add(proj.velocity, vec3_scale(proj.acceleration, dt))
+    proj.position = vec3_add(proj.position, vec3_scale(proj.velocity, dt))
+
+    // Reset acceleration for next frame
+    if proj.gravity == 0.0 {
+        proj.acceleration = vec3_init(0.0, 0.0, 0.0)
+    }
+
+    // Check ground collision
+    if proj.position.z < 0.0 {
+        if proj.bounce_count < proj.max_bounces {
+            // Bounce
+            proj.position.z = 0.0
+            proj.velocity.z = -proj.velocity.z * 0.5  // 50% energy retained
+            proj.bounce_count = proj.bounce_count + 1
+        } else {
+            // Hit ground
+            proj.position.z = 0.0
+            proj.state = ProjectileState::HIT_GROUND
+        }
+    }
+
+    // Check entity collisions
+    check_collisions(proj, entities)
+}
+
+/// Check for collisions with entities
+fn check_collisions(proj: Projectile, entities: Collection<Entity>) {
+    for i in 0..entities.len() {
+        let entity = entities.get(i)
+        if !entity.active {
+            continue
+        }
+
+        // Don't hit source entity
+        if proj.source_entity_id >= 0 {
+            if entity.id == proj.source_entity_id {
+                continue
+            }
+        }
+
+        // Check distance
+        let dx = entity.transform.position_x - proj.position.x
+        let dy = entity.transform.position_y - proj.position.y
+        let dist_sq = dx * dx + dy * dy
+
+        // Collision radius (approximate entity size)
+        let collision_radius = 5.0
+        if dist_sq < collision_radius * collision_radius {
+            // Hit!
+            proj.state = ProjectileState::HIT_TARGET
+            return
+        }
+    }
+}
+
+/// Create ballistic projectile (tank shell)
+fn create_ballistic_projectile(
+    id: Int,
+    start_pos: Vec3,
+    target_pos: Vec3,
+    muzzle_velocity: Float,
+    damage: Float
+) -> Projectile {
+    let proj = create_projectile(id, ProjectileType::BALLISTIC, start_pos, target_pos, muzzle_velocity, damage)
+
+    // Calculate ballistic arc
+    let dx = target_pos.x - start_pos.x
+    let dy = target_pos.y - start_pos.y
+    let dz = target_pos.z - start_pos.z
+    let ground_dist = sqrt(dx * dx + dy * dy)
+
+    // Simple ballistic calculation (assumes 45-degree optimal angle)
+    let gravity = 9.8
+    let time_of_flight = ground_dist / muzzle_velocity
+    let initial_z_velocity = (dz + 0.5 * gravity * time_of_flight * time_of_flight) / time_of_flight
+
+    proj.velocity = vec3_init(
+        dx / time_of_flight,
+        dy / time_of_flight,
+        initial_z_velocity
+    )
+    proj.gravity = gravity
+    proj.max_lifetime = time_of_flight * 1.5  // Add margin
+
+    return proj
+}
+
+/// Create guided missile
+fn create_guided_missile(
+    id: Int,
+    start_pos: Vec3,
+    target_entity_id: Int,
+    speed: Float,
+    turn_rate: Float,
+    damage: Float
+) -> Projectile {
+    let proj = create_projectile(id, ProjectileType::GUIDED_MISSILE, start_pos, vec3_init(0.0, 0.0, 0.0), speed, damage)
+    proj.target_entity_id = target_entity_id
+    proj.is_homing = true
+    proj.turn_rate = turn_rate
+    proj.lock_on_delay = 0.5  // Half second before homing activates
+    return proj
+}
+
+// ============================================================================
+// Projectile Manager
+// ============================================================================
+
+struct ProjectileManager {
+    projectiles: Collection<Projectile>,
+    next_id: Int,
+}
+
+fn create_projectile_manager() -> ProjectileManager {
+    let manager = ProjectileManager {}
+    manager.projectiles = Collection<Projectile> {}
+    manager.next_id = 1
+    return manager
+}
+
+/// Spawn a new projectile
+fn spawn_projectile(manager: ProjectileManager, projectile: Projectile) -> Int {
+    let id = manager.next_id
+    manager.next_id = manager.next_id + 1
+
+    projectile.id = id
+    manager.projectiles.add(projectile)
+
+    return id
+}
+
+/// Update all projectiles
+fn update_projectiles(manager: ProjectileManager, dt: Float, entities: Collection<Entity>) {
+    let i = 0
+    while i < manager.projectiles.len() {
+        let proj = manager.projectiles.get(i)
+        update_projectile(proj, dt, entities)
+
+        // Remove inactive projectiles
+        if proj.state != ProjectileState::ACTIVE {
+            manager.projectiles.remove(i)
+            // Don't increment i, check same index again
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+/// Get projectile count
+fn get_projectile_count(manager: ProjectileManager) -> Int {
+    return manager.projectiles.len()
+}
+
+/// Apply projectile damage to entities
+fn apply_projectile_damage(
+    manager: ProjectileManager,
+    proj: Projectile,
+    entities: Collection<Entity>
+) {
+    if proj.explosion_radius > 0.0 {
+        // Area damage
+        for i in 0..entities.len() {
+            let entity = entities.get(i)
+            if !entity.active {
+                continue
+            }
+
+            let dx = entity.transform.position_x - proj.position.x
+            let dy = entity.transform.position_y - proj.position.y
+            let dist = sqrt(dx * dx + dy * dy)
+
+            if dist <= proj.explosion_radius {
+                // Calculate falloff
+                let falloff = 1.0 - (dist / proj.explosion_radius)
+                let effective_damage = proj.damage * falloff
+
+                // Apply damage
+                entity.health = entity.health - effective_damage
+                if entity.health <= 0.0 {
+                    entity.active = false
+                }
+            }
+        }
+    } else {
+        // Single target damage
+        if proj.target_entity_id >= 0 {
+            for i in 0..entities.len() {
+                let entity = entities.get(i)
+                if entity.id == proj.target_entity_id && entity.active {
+                    entity.health = entity.health - proj.damage
+                    if entity.health <= 0.0 {
+                        entity.active = false
+                    }
+                    break
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_projectile_init() -> Bool {
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 100.0, 0.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 500.0, 50.0)
+
+    assert(proj.id == 1, "Projectile ID should be 1")
+    assert(proj.projectile_type == ProjectileType::BULLET, "Type should be BULLET")
+    assert(proj.state == ProjectileState::ACTIVE, "State should be ACTIVE")
+
+    return true
+}
+
+fn test_projectile_movement() -> Bool {
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 0.0, 0.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 100.0, 50.0)
+
+    let entities = Collection<Entity> {}
+    update_projectile(proj, 0.1, entities)
+
+    // Projectile should have moved in X direction
+    assert(proj.position.x > 0.0, "Projectile should move in X")
+    assert(abs(proj.position.y) < 0.01, "Y should remain near 0")
+
+    return true
+}
+
+fn test_projectile_lifetime() -> Bool {
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 0.0, 0.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 100.0, 50.0)
+    proj.max_lifetime = 1.0
+
+    let entities = Collection<Entity> {}
+    update_projectile(proj, 1.5, entities)
+
+    assert(proj.state == ProjectileState::FIZZLED, "Should fizzle after max lifetime")
+
+    return true
+}
+
+fn test_ballistic_creation() -> Bool {
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 0.0, 0.0)
+    let proj = create_ballistic_projectile(1, start, target, 100.0, 75.0)
+
+    assert(proj.projectile_type == ProjectileType::BALLISTIC, "Should be BALLISTIC type")
+    assert(proj.gravity > 0.0, "Should have gravity")
+
+    return true
+}
+
+fn test_guided_missile() -> Bool {
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let proj = create_guided_missile(1, start, 999, 200.0, 2.0, 100.0)
+
+    assert(proj.projectile_type == ProjectileType::GUIDED_MISSILE, "Should be GUIDED_MISSILE type")
+    assert(proj.is_homing, "Should be homing")
+    assert(proj.target_entity_id == 999, "Should target entity 999")
+
+    return true
+}
+
+fn test_manager_spawn() -> Bool {
+    let manager = create_projectile_manager()
+
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 0.0, 0.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 100.0, 50.0)
+
+    let id = spawn_projectile(manager, proj)
+    assert(id > 0, "Should return valid ID")
+    assert(get_projectile_count(manager) == 1, "Should have 1 projectile")
+
+    return true
+}
+
+fn test_manager_update() -> Bool {
+    let manager = create_projectile_manager()
+
+    let start = vec3_init(0.0, 0.0, 0.0)
+    let target = vec3_init(100.0, 0.0, 0.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 100.0, 50.0)
+
+    spawn_projectile(manager, proj)
+
+    let entities = Collection<Entity> {}
+    update_projectiles(manager, 0.1, entities)
+
+    // Projectile should still be active
+    if get_projectile_count(manager) > 0 {
+        let moved_proj = manager.projectiles.get(0)
+        assert(moved_proj.position.x > 0.0, "Projectile should have moved")
+    }
+
+    return true
+}
+
+fn test_ground_collision() -> Bool {
+    let start = vec3_init(0.0, 0.0, 10.0)
+    let target = vec3_init(100.0, 0.0, -10.0)
+    let proj = create_projectile(1, ProjectileType::BULLET, start, target, 100.0, 50.0)
+    proj.max_bounces = 0
+
+    let entities = Collection<Entity> {}
+
+    // Update until it hits ground
+    for i in 0..100 {
+        update_projectile(proj, 0.1, entities)
+        if proj.state != ProjectileState::ACTIVE {
+            break
+        }
+    }
+
+    assert(proj.state == ProjectileState::HIT_GROUND, "Should hit ground")
+    assert(proj.position.z == 0.0, "Z should be 0 at ground")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_projectile_init(), "Projectile init test failed")
+    assert(test_projectile_movement(), "Projectile movement test failed")
+    assert(test_projectile_lifetime(), "Projectile lifetime test failed")
+    assert(test_ballistic_creation(), "Ballistic creation test failed")
+    assert(test_guided_missile(), "Guided missile test failed")
+    assert(test_manager_spawn(), "Manager spawn test failed")
+    assert(test_manager_update(), "Manager update test failed")
+    assert(test_ground_collision(), "Ground collision test failed")
+    return true
+}

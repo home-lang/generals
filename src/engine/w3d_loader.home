@@ -1,0 +1,618 @@
+// W3D Loader - Pure Home Implementation
+// Load Westwood 3D model format (.w3d files from C&C Generals)
+//
+// W3D Format Structure:
+// - Hierarchical chunk-based binary format
+// - Little-endian byte order
+// - Each chunk has: type (4 bytes), size (4 bytes), data (variable)
+
+// W3D Chunk Types
+enum ChunkType {
+    // Top-level chunks
+    MESH = 0x00000000,
+    HIERARCHY = 0x00000100,
+    ANIMATION = 0x00000200,
+    COMPRESSED_ANIMATION = 0x00000280,
+    MORPH_ANIMATION = 0x000002C0,
+    HLOD = 0x00000700,
+    BOX = 0x00000740,
+    HMODEL = 0x00000300,
+    LOD_MODEL = 0x00000400,
+    COLLECTION = 0x00000420,
+
+    // Mesh chunks
+    VERTICES = 0x00000002,
+    VERTEX_NORMALS = 0x00000003,
+    MESH_USER_TEXT = 0x0000000C,
+    VERTEX_INFLUENCES = 0x0000000E,
+    MESH_HEADER3 = 0x0000001F,
+    TRIANGLES = 0x00000020,
+    VERTEX_SHADE_INDICES = 0x00000022,
+    MATERIAL_INFO = 0x00000028,
+    SHADERS = 0x00000029,
+    VERTEX_MATERIALS = 0x0000002A,
+    VERTEX_MATERIAL = 0x0000002B,
+    VERTEX_MATERIAL_NAME = 0x0000002C,
+    VERTEX_MATERIAL_INFO = 0x0000002D,
+    TEXTURES = 0x00000030,
+    TEXTURE = 0x00000031,
+    TEXTURE_NAME = 0x00000032,
+    TEXTURE_INFO = 0x00000033,
+
+    // Hierarchy chunks
+    HIERARCHY_HEADER = 0x00000101,
+    PIVOTS = 0x00000102,
+    PIVOT_FIXUPS = 0x00000103,
+
+    // Animation chunks
+    ANIMATION_HEADER = 0x00000201,
+    ANIMATION_CHANNEL = 0x00000202,
+    BIT_CHANNEL = 0x00000203,
+
+    // Compressed animation chunks
+    COMPRESSED_ANIMATION_HEADER = 0x00000281,
+    COMPRESSED_ANIMATION_CHANNEL = 0x00000282,
+    COMPRESSED_BIT_CHANNEL = 0x00000283,
+}
+
+// W3D Chunk Header
+struct ChunkHeader {
+    chunk_type: Int,  // ChunkType as int
+    chunk_size: Int,  // Size of chunk data (not including header)
+
+    fn init() -> ChunkHeader {
+        let header = ChunkHeader {
+            chunk_type: 0,
+            chunk_size: 0,
+        }
+        return header
+    }
+}
+
+// Vec3 for vertices and normals
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+
+    fn init(x: Float, y: Float, z: Float) -> Vec3 {
+        let vec = Vec3 { x: x, y: y, z: z }
+        return vec
+    }
+}
+
+// Vec2 for texture coordinates
+struct Vec2 {
+    x: Float,
+    y: Float,
+
+    fn init(x: Float, y: Float) -> Vec2 {
+        let vec = Vec2 { x: x, y: y }
+        return vec
+    }
+}
+
+// Triangle
+struct Triangle {
+    vertex_indices: Collection<Int>,  // 3 vertex indices
+    normal: Vec3,
+    attributes: Int,
+
+    fn init() -> Triangle {
+        let tri = Triangle {
+            vertex_indices: Collection::init(),
+            normal: Vec3::init(0.0, 0.0, 1.0),
+            attributes: 0,
+        }
+        tri.vertex_indices.add(0)
+        tri.vertex_indices.add(0)
+        tri.vertex_indices.add(0)
+        return tri
+    }
+}
+
+// Mesh data
+struct W3DMesh {
+    name: String,
+    vertices: Collection<Vec3>,
+    normals: Collection<Vec3>,
+    tex_coords: Collection<Vec2>,
+    triangles: Collection<Triangle>,
+    material_name: String,
+    texture_name: String,
+
+    fn init(name: String) -> W3DMesh {
+        let mesh = W3DMesh {
+            name: name,
+            vertices: Collection::init(),
+            normals: Collection::init(),
+            tex_coords: Collection::init(),
+            triangles: Collection::init(),
+            material_name: "",
+            texture_name: "",
+        }
+        return mesh
+    }
+
+    fn add_vertex(self, v: Vec3) {
+        self.vertices.add(v)
+    }
+
+    fn add_normal(self, n: Vec3) {
+        self.normals.add(n)
+    }
+
+    fn add_tex_coord(self, uv: Vec2) {
+        self.tex_coords.add(uv)
+    }
+
+    fn add_triangle(self, t: Triangle) {
+        self.triangles.add(t)
+    }
+}
+
+// Bone/Pivot in hierarchy
+struct W3DBone {
+    name: String,
+    parent_index: Int,
+    position: Vec3,
+    rotation: Vec3,  // Euler angles
+
+    fn init(name: String) -> W3DBone {
+        let bone = W3DBone {
+            name: name,
+            parent_index: -1,
+            position: Vec3::init(0.0, 0.0, 0.0),
+            rotation: Vec3::init(0.0, 0.0, 0.0),
+        }
+        return bone
+    }
+}
+
+// Skeleton hierarchy
+struct W3DHierarchy {
+    name: String,
+    bones: Collection<W3DBone>,
+
+    fn init(name: String) -> W3DHierarchy {
+        let hierarchy = W3DHierarchy {
+            name: name,
+            bones: Collection::init(),
+        }
+        return hierarchy
+    }
+
+    fn add_bone(self, bone: W3DBone) {
+        self.bones.add(bone)
+    }
+
+    fn get_bone_count(self) -> Int {
+        return self.bones.len()
+    }
+}
+
+// Animation keyframe
+struct AnimationKeyframe {
+    time: Float,
+    position: Vec3,
+    rotation: Vec3,
+    scale: Vec3,
+
+    fn init(time: Float) -> AnimationKeyframe {
+        let keyframe = AnimationKeyframe {
+            time: time,
+            position: Vec3::init(0.0, 0.0, 0.0),
+            rotation: Vec3::init(0.0, 0.0, 0.0),
+            scale: Vec3::init(1.0, 1.0, 1.0),
+        }
+        return keyframe
+    }
+}
+
+// Animation channel (one per bone)
+struct AnimationChannel {
+    bone_index: Int,
+    keyframes: Collection<AnimationKeyframe>,
+
+    fn init(bone_index: Int) -> AnimationChannel {
+        let channel = AnimationChannel {
+            bone_index: bone_index,
+            keyframes: Collection::init(),
+        }
+        return channel
+    }
+
+    fn add_keyframe(self, keyframe: AnimationKeyframe) {
+        self.keyframes.add(keyframe)
+    }
+}
+
+// Complete animation
+struct W3DAnimation {
+    name: String,
+    duration: Float,
+    frame_rate: Float,
+    channels: Collection<AnimationChannel>,
+
+    fn init(name: String) -> W3DAnimation {
+        let animation = W3DAnimation {
+            name: name,
+            duration: 0.0,
+            frame_rate: 30.0,
+            channels: Collection::init(),
+        }
+        return animation
+    }
+
+    fn add_channel(self, channel: AnimationChannel) {
+        self.channels.add(channel)
+    }
+}
+
+// Complete W3D model
+struct W3DModel {
+    name: String,
+    meshes: Collection<W3DMesh>,
+    hierarchy: W3DHierarchy?,
+    animations: Collection<W3DAnimation>,
+
+    fn init(name: String) -> W3DModel {
+        let model = W3DModel {
+            name: name,
+            meshes: Collection::init(),
+            hierarchy: null,
+            animations: Collection::init(),
+        }
+        return model
+    }
+
+    fn add_mesh(self, mesh: W3DMesh) {
+        self.meshes.add(mesh)
+    }
+
+    fn set_hierarchy(self, hierarchy: W3DHierarchy) {
+        self.hierarchy = hierarchy
+    }
+
+    fn add_animation(self, animation: W3DAnimation) {
+        self.animations.add(animation)
+    }
+}
+
+// Binary reader for W3D files
+struct BinaryReader {
+    data: Collection<Int>,  // Byte array
+    position: Int,
+
+    fn init(data: Collection<Int>) -> BinaryReader {
+        let reader = BinaryReader {
+            data: data,
+            position: 0,
+        }
+        return reader
+    }
+
+    fn read_u8(self) -> Int {
+        if self.position >= self.data.len() {
+            return 0
+        }
+        let value = self.data.get(self.position)
+        self.position = self.position + 1
+        return value
+    }
+
+    fn read_u16(self) -> Int {
+        let b0 = self.read_u8()
+        let b1 = self.read_u8()
+        return b0 + (b1 * 256)  // Little-endian
+    }
+
+    fn read_u32(self) -> Int {
+        let b0 = self.read_u8()
+        let b1 = self.read_u8()
+        let b2 = self.read_u8()
+        let b3 = self.read_u8()
+        return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)  // Little-endian
+    }
+
+    fn read_i32(self) -> Int {
+        let unsigned = self.read_u32()
+        // Convert to signed
+        if unsigned > 2147483647 {
+            return unsigned - 4294967296
+        }
+        return unsigned
+    }
+
+    fn read_float(self) -> Float {
+        let bits = self.read_u32()
+        // Convert bits to float (IEEE 754)
+        // Simplified: would need proper float conversion
+        return bits  // Placeholder
+    }
+
+    fn read_string(self, length: Int) -> String {
+        let result = ""
+        for i in 0..length {
+            let byte = self.read_u8()
+            if byte == 0 {
+                break  // Null terminator
+            }
+            // Convert byte to character
+            result = result + byte  // Simplified
+        }
+        return result
+    }
+
+    fn read_vec3(self) -> Vec3 {
+        let x = self.read_float()
+        let y = self.read_float()
+        let z = self.read_float()
+        return Vec3::init(x, y, z)
+    }
+
+    fn read_vec2(self) -> Vec2 {
+        let x = self.read_float()
+        let y = self.read_float()
+        return Vec2::init(x, y)
+    }
+
+    fn skip(self, bytes: Int) {
+        self.position = self.position + bytes
+    }
+
+    fn get_position(self) -> Int {
+        return self.position
+    }
+
+    fn set_position(self, pos: Int) {
+        self.position = pos
+    }
+}
+
+// W3D Loader
+struct W3DLoader {
+    reader: BinaryReader?,
+
+    fn init() -> W3DLoader {
+        let loader = W3DLoader {
+            reader: null,
+        }
+        return loader
+    }
+
+    fn load_from_file(self, filename: String) -> W3DModel? {
+        // Would read file into byte array
+        // For now, return null as placeholder
+        return null
+    }
+
+    fn load_from_data(self, data: Collection<Int>) -> W3DModel? {
+        self.reader = BinaryReader::init(data)
+        let model = W3DModel::init("model")
+
+        // Parse chunks
+        while self.reader.get_position() < data.len() {
+            let header = self.read_chunk_header()
+
+            if header.chunk_type == ChunkType::MESH {
+                let mesh = self.parse_mesh(header.chunk_size)
+                if mesh != null {
+                    model.add_mesh(mesh)
+                }
+            } else if header.chunk_type == ChunkType::HIERARCHY {
+                let hierarchy = self.parse_hierarchy(header.chunk_size)
+                if hierarchy != null {
+                    model.set_hierarchy(hierarchy)
+                }
+            } else if header.chunk_type == ChunkType::ANIMATION {
+                let animation = self.parse_animation(header.chunk_size)
+                if animation != null {
+                    model.add_animation(animation)
+                }
+            } else {
+                // Skip unknown chunk
+                self.reader.skip(header.chunk_size)
+            }
+        }
+
+        return model
+    }
+
+    fn read_chunk_header(self) -> ChunkHeader {
+        let header = ChunkHeader::init()
+        header.chunk_type = self.reader.read_u32()
+        header.chunk_size = self.reader.read_u32()
+        return header
+    }
+
+    fn parse_mesh(self, chunk_size: Int) -> W3DMesh? {
+        let mesh = W3DMesh::init("mesh")
+        let chunk_end = self.reader.get_position() + chunk_size
+
+        // Parse mesh sub-chunks
+        while self.reader.get_position() < chunk_end {
+            let header = self.read_chunk_header()
+
+            if header.chunk_type == ChunkType::VERTICES {
+                let vertex_count = header.chunk_size / 12  // 3 floats
+                for i in 0..vertex_count {
+                    let v = self.reader.read_vec3()
+                    mesh.add_vertex(v)
+                }
+            } else if header.chunk_type == ChunkType::VERTEX_NORMALS {
+                let normal_count = header.chunk_size / 12
+                for i in 0..normal_count {
+                    let n = self.reader.read_vec3()
+                    mesh.add_normal(n)
+                }
+            } else if header.chunk_type == ChunkType::TRIANGLES {
+                let triangle_count = header.chunk_size / 32  // Approximate
+                for i in 0..triangle_count {
+                    let tri = Triangle::init()
+                    tri.vertex_indices.set(0, self.reader.read_u32())
+                    tri.vertex_indices.set(1, self.reader.read_u32())
+                    tri.vertex_indices.set(2, self.reader.read_u32())
+                    tri.attributes = self.reader.read_u32()
+                    tri.normal = self.reader.read_vec3()
+                    mesh.add_triangle(tri)
+                }
+            } else if header.chunk_type == ChunkType::TEXTURE_NAME {
+                mesh.texture_name = self.reader.read_string(header.chunk_size)
+            } else {
+                self.reader.skip(header.chunk_size)
+            }
+        }
+
+        return mesh
+    }
+
+    fn parse_hierarchy(self, chunk_size: Int) -> W3DHierarchy? {
+        let hierarchy = W3DHierarchy::init("skeleton")
+        let chunk_end = self.reader.get_position() + chunk_size
+
+        while self.reader.get_position() < chunk_end {
+            let header = self.read_chunk_header()
+
+            if header.chunk_type == ChunkType::PIVOTS {
+                let bone_count = header.chunk_size / 64  // Approximate
+                for i in 0..bone_count {
+                    let bone = W3DBone::init("bone_" + i)
+                    bone.position = self.reader.read_vec3()
+                    bone.rotation = self.reader.read_vec3()
+                    bone.parent_index = self.reader.read_i32()
+                    hierarchy.add_bone(bone)
+                }
+            } else {
+                self.reader.skip(header.chunk_size)
+            }
+        }
+
+        return hierarchy
+    }
+
+    fn parse_animation(self, chunk_size: Int) -> W3DAnimation? {
+        let animation = W3DAnimation::init("animation")
+        let chunk_end = self.reader.get_position() + chunk_size
+
+        while self.reader.get_position() < chunk_end {
+            let header = self.read_chunk_header()
+
+            if header.chunk_type == ChunkType::ANIMATION_CHANNEL {
+                let channel = self.parse_animation_channel(header.chunk_size)
+                if channel != null {
+                    animation.add_channel(channel)
+                }
+            } else {
+                self.reader.skip(header.chunk_size)
+            }
+        }
+
+        return animation
+    }
+
+    fn parse_animation_channel(self, chunk_size: Int) -> AnimationChannel? {
+        let channel = AnimationChannel::init(0)
+
+        // Simplified: would parse keyframe data
+        self.reader.skip(chunk_size)
+
+        return channel
+    }
+}
+
+// Tests
+fn test_chunk_header() -> Bool {
+    let header = ChunkHeader::init()
+    assert(header.chunk_type == 0, "Chunk type initialized")
+    assert(header.chunk_size == 0, "Chunk size initialized")
+    return true
+}
+
+fn test_mesh_creation() -> Bool {
+    let mesh = W3DMesh::init("test_mesh")
+    assert(mesh.name == "test_mesh", "Mesh name")
+    assert(mesh.vertices.len() == 0, "No vertices initially")
+
+    mesh.add_vertex(Vec3::init(1.0, 2.0, 3.0))
+    assert(mesh.vertices.len() == 1, "One vertex added")
+
+    return true
+}
+
+fn test_hierarchy_creation() -> Bool {
+    let hierarchy = W3DHierarchy::init("skeleton")
+    assert(hierarchy.name == "skeleton", "Hierarchy name")
+
+    let bone = W3DBone::init("root")
+    bone.parent_index = -1
+    hierarchy.add_bone(bone)
+
+    assert(hierarchy.get_bone_count() == 1, "One bone added")
+
+    return true
+}
+
+fn test_animation_creation() -> Bool {
+    let animation = W3DAnimation::init("walk")
+    assert(animation.name == "walk", "Animation name")
+    assert(animation.frame_rate == 30.0, "Default frame rate")
+
+    let channel = AnimationChannel::init(0)
+    channel.add_keyframe(AnimationKeyframe::init(0.0))
+    animation.add_channel(channel)
+
+    assert(animation.channels.len() == 1, "One channel added")
+
+    return true
+}
+
+fn test_binary_reader() -> Bool {
+    let data = Collection::init()
+    data.add(0x12)
+    data.add(0x34)
+    data.add(0x56)
+    data.add(0x78)
+
+    let reader = BinaryReader::init(data)
+
+    let b1 = reader.read_u8()
+    assert(b1 == 0x12, "Read first byte")
+
+    reader.set_position(0)
+    let u32 = reader.read_u32()
+    assert(u32 == 0x78563412, "Read u32 little-endian")
+
+    return true
+}
+
+fn test_w3d_model() -> Bool {
+    let model = W3DModel::init("tank")
+    assert(model.name == "tank", "Model name")
+    assert(model.meshes.len() == 0, "No meshes initially")
+
+    let mesh = W3DMesh::init("turret")
+    model.add_mesh(mesh)
+
+    assert(model.meshes.len() == 1, "One mesh added")
+
+    return true
+}
+
+fn test_loader_creation() -> Bool {
+    let loader = W3DLoader::init()
+    assert(loader.reader == null, "No reader initially")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_chunk_header(), "Test 1: Chunk header")
+    assert(test_mesh_creation(), "Test 2: Mesh creation")
+    assert(test_hierarchy_creation(), "Test 3: Hierarchy creation")
+    assert(test_animation_creation(), "Test 4: Animation creation")
+    assert(test_binary_reader(), "Test 5: Binary reader")
+    assert(test_w3d_model(), "Test 6: W3D model")
+    assert(test_loader_creation(), "Test 7: Loader creation")
+    return true
+}

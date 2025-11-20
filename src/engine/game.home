@@ -1,0 +1,600 @@
+// Generals Game Engine - Main Game Class
+// Based on C&C Generals game architecture
+
+import "basics/collection"
+
+/// Game state
+enum GameState {
+    LOADING,
+    MAIN_MENU,
+    IN_GAME,
+    PAUSED,
+    QUITTING,
+}
+
+/// Input state
+struct InputState {
+    mouse_x: Float,
+    mouse_y: Float,
+    mouse_left_down: Bool,
+    mouse_right_down: Bool,
+    mouse_left_clicked: Bool,
+    mouse_right_clicked: Bool,
+    quit_requested: Bool,
+    // Keyboard state
+    key_up: Bool,
+    key_down: Bool,
+    key_left: Bool,
+    key_right: Bool,
+    key_w: Bool,
+    key_a: Bool,
+    key_s: Bool,
+    key_d: Bool,
+}
+
+fn create_input_state() -> InputState {
+    let input = InputState {}
+    input.mouse_x = 0.0
+    input.mouse_y = 0.0
+    input.mouse_left_down = false
+    input.mouse_right_down = false
+    input.mouse_left_clicked = false
+    input.mouse_right_clicked = false
+    input.quit_requested = false
+    input.key_up = false
+    input.key_down = false
+    input.key_left = false
+    input.key_right = false
+    input.key_w = false
+    input.key_a = false
+    input.key_s = false
+    input.key_d = false
+    return input
+}
+
+/// Platform identifier
+enum Platform {
+    MACOS,
+    WINDOWS,
+    LINUX,
+    UNSUPPORTED,
+}
+
+fn detect_platform() -> Platform {
+    // This would be determined at compile time or runtime
+    // For now, return MACOS as placeholder
+    return Platform::MACOS
+}
+
+/// Main game class - entry point for the Generals engine
+struct Game {
+    state: GameState,
+    running: Bool,
+    delta_time: Float,
+    total_time: Float,
+    platform: Platform,
+
+    // Window and renderer (platform-specific handles)
+    has_window: Bool,
+    window_ptr: Int,
+    has_renderer: Bool,
+    renderer_ptr: Int,
+
+    // Camera
+    camera_pos_x: Float,
+    camera_pos_y: Float,
+    camera_zoom: Float,
+    screen_width: Int,
+    screen_height: Int,
+
+    // Entity management (simplified - would integrate with entity.home)
+    entity_count: Int,
+    max_entities: Int,
+
+    // Player resources
+    player_supplies: Float,
+    player_power_used: Int,
+    player_power_available: Int,
+
+    // Player team (for fog of war rendering)
+    player_team: Int,
+
+    // Input state
+    input: InputState,
+
+    // Test texture handle
+    has_test_texture: Bool,
+    test_texture_id: Int,
+}
+
+// Target frame rates
+const TARGET_LOGIC_FPS: Float = 30.0
+const TARGET_LOGIC_TIME: Float = 1.0 / TARGET_LOGIC_FPS
+const TARGET_RENDER_FPS: Float = 60.0
+const TARGET_RENDER_TIME: Float = 1.0 / TARGET_RENDER_FPS
+
+fn create_game() -> Game {
+    let world_width = 4000.0
+    let world_height = 4000.0
+    let num_teams = 4  // Support up to 4 teams
+    let fog_cell_size = 64.0  // 64x64 fog grid cells
+
+    let game = Game {}
+    game.state = GameState::LOADING
+    game.running = false
+    game.delta_time = 0.0
+    game.total_time = 0.0
+    game.platform = detect_platform()
+    game.has_window = false
+    game.window_ptr = 0
+    game.has_renderer = false
+    game.renderer_ptr = 0
+
+    // Camera initialization
+    game.camera_pos_x = 0.0
+    game.camera_pos_y = 0.0
+    game.camera_zoom = 1.0
+    game.screen_width = 1024
+    game.screen_height = 768
+
+    // Entity management
+    game.entity_count = 0
+    game.max_entities = 1000
+
+    // Player resources
+    game.player_supplies = 10000.0
+    game.player_power_used = 0
+    game.player_power_available = 10
+
+    // Player team
+    game.player_team = 0  // Player is team 0
+
+    // Input state
+    game.input = create_input_state()
+
+    // Test texture
+    game.has_test_texture = false
+    game.test_texture_id = 0
+
+    return game
+}
+
+fn destroy_game(game: Game) {
+    // Clean up platform-specific resources
+    if game.platform == Platform::MACOS {
+        destroy_macos_game(game)
+    } else if game.platform == Platform::WINDOWS {
+        destroy_windows_game(game)
+    } else if game.platform == Platform::LINUX {
+        destroy_linux_game(game)
+    }
+}
+
+/// Initialize game systems
+fn startup_game(game: Game) {
+    // Game initialization
+    if game.platform == Platform::MACOS {
+        startup_macos_game(game)
+    } else if game.platform == Platform::WINDOWS {
+        startup_windows_game(game)
+    } else if game.platform == Platform::LINUX {
+        startup_linux_game(game)
+    }
+
+    game.state = GameState::MAIN_MENU
+    game.running = true
+}
+
+/// Main game loop
+fn run_game(game: Game) {
+    let logic_accumulator = 0.0
+    let render_accumulator = 0.0
+    let last_time = get_current_time()  // Would use platform timer
+
+    while game.running {
+        // Calculate delta time
+        let current_time = get_current_time()
+        game.delta_time = current_time - last_time
+        last_time = current_time
+
+        logic_accumulator = logic_accumulator + game.delta_time
+        render_accumulator = render_accumulator + game.delta_time
+
+        // Process input
+        process_game_input(game)
+
+        // Fixed timestep logic update (30 FPS)
+        while logic_accumulator >= TARGET_LOGIC_TIME {
+            update_game(game, TARGET_LOGIC_TIME)
+            logic_accumulator = logic_accumulator - TARGET_LOGIC_TIME
+            game.total_time = game.total_time + TARGET_LOGIC_TIME
+        }
+
+        // Render at 60 FPS
+        if render_accumulator >= TARGET_RENDER_TIME {
+            let alpha = logic_accumulator / TARGET_LOGIC_TIME
+            render_game(game, alpha)
+            render_accumulator = 0.0
+        }
+
+        // Small sleep to prevent busy-waiting (1ms)
+        sleep_milliseconds(1)
+    }
+}
+
+fn process_game_input(game: Game) {
+    if game.platform == Platform::MACOS {
+        process_macos_input(game)
+    } else if game.platform == Platform::WINDOWS {
+        process_windows_input(game)
+    } else if game.platform == Platform::LINUX {
+        process_linux_input(game)
+    }
+}
+
+fn update_game(game: Game, dt: Float) {
+    // Update camera movement based on keyboard input
+    let dir_x = 0.0
+    let dir_y = 0.0
+
+    // Arrow keys or WASD
+    if game.input.key_left || game.input.key_a {
+        dir_x = dir_x - 1.0
+    }
+    if game.input.key_right || game.input.key_d {
+        dir_x = dir_x + 1.0
+    }
+    if game.input.key_up || game.input.key_w {
+        dir_y = dir_y - 1.0
+    }
+    if game.input.key_down || game.input.key_s {
+        dir_y = dir_y + 1.0
+    }
+
+    // Normalize diagonal movement
+    if dir_x != 0.0 && dir_y != 0.0 {
+        let len = sqrt(dir_x * dir_x + dir_y * dir_y)
+        dir_x = dir_x / len
+        dir_y = dir_y / len
+    }
+
+    // Pan camera (simplified - would integrate with camera.home)
+    if dir_x != 0.0 || dir_y != 0.0 {
+        let camera_speed = 500.0  // Units per second
+        game.camera_pos_x = game.camera_pos_x + dir_x * camera_speed * dt
+        game.camera_pos_y = game.camera_pos_y + dir_y * camera_speed * dt
+    }
+
+    // Handle unit selection with left click
+    if game.input.mouse_left_clicked {
+        // Convert mouse screen position to world position
+        let world_x = screen_to_world_x(game, game.input.mouse_x)
+        let world_y = screen_to_world_y(game, game.input.mouse_y)
+
+        // Try to select a unit at the clicked position
+        // Would integrate with entity manager
+    }
+
+    // Handle unit movement with right click
+    if game.input.mouse_right_clicked {
+        // Convert mouse screen position to world position
+        let target_x = screen_to_world_x(game, game.input.mouse_x)
+        let target_y = screen_to_world_y(game, game.input.mouse_y)
+
+        // Find selected unit and give it a move order
+        // Would integrate with entity manager and pathfinding
+    }
+
+    // Update entities (would integrate with entity.home)
+    // Update combat system (would integrate with combat.home)
+    // Update particle system
+    // Update fog of war
+    // Update UI
+    // Update minimap
+
+    // State machine
+    if game.state == GameState::LOADING {
+        // Transition to main menu after loading
+        game.state = GameState::MAIN_MENU
+    } else if game.state == GameState::MAIN_MENU {
+        // Update main menu
+    } else if game.state == GameState::IN_GAME {
+        // Update game logic
+        // - Unit movement
+        // - Combat
+        // - AI
+        // - Economy
+    } else if game.state == GameState::PAUSED {
+        // Paused - no updates
+    } else if game.state == GameState::QUITTING {
+        game.running = false
+    }
+}
+
+fn render_game(game: Game, alpha: Float) {
+    if game.platform == Platform::MACOS {
+        render_macos_game(game, alpha)
+    } else if game.platform == Platform::WINDOWS {
+        render_windows_game(game, alpha)
+    } else if game.platform == Platform::LINUX {
+        render_linux_game(game, alpha)
+    }
+}
+
+fn quit_game(game: Game) {
+    game.state = GameState::QUITTING
+}
+
+// ============================================================================
+// Coordinate Conversion
+// ============================================================================
+
+fn screen_to_world_x(game: Game, screen_x: Float) -> Float {
+    // Convert screen X to world X (accounting for camera position and zoom)
+    let center_x = (game.screen_width as Float) / 2.0
+    let offset_x = (screen_x - center_x) / game.camera_zoom
+    return game.camera_pos_x + offset_x
+}
+
+fn screen_to_world_y(game: Game, screen_y: Float) -> Float {
+    // Convert screen Y to world Y (accounting for camera position and zoom)
+    let center_y = (game.screen_height as Float) / 2.0
+    let offset_y = (screen_y - center_y) / game.camera_zoom
+    return game.camera_pos_y + offset_y
+}
+
+fn world_to_screen_x(game: Game, world_x: Float) -> Float {
+    // Convert world X to screen X
+    let center_x = (game.screen_width as Float) / 2.0
+    let offset_x = (world_x - game.camera_pos_x) * game.camera_zoom
+    return center_x + offset_x
+}
+
+fn world_to_screen_y(game: Game, world_y: Float) -> Float {
+    // Convert world Y to screen Y
+    let center_y = (game.screen_height as Float) / 2.0
+    let offset_y = (world_y - game.camera_pos_y) * game.camera_zoom
+    return center_y + offset_y
+}
+
+// ============================================================================
+// Platform-specific implementations (stubs)
+// ============================================================================
+
+fn destroy_macos_game(game: Game) {
+    // TODO: Clean up macOS resources
+}
+
+fn destroy_windows_game(game: Game) {
+    // TODO: Clean up Windows resources
+}
+
+fn destroy_linux_game(game: Game) {
+    // TODO: Clean up Linux resources
+}
+
+fn startup_macos_game(game: Game) {
+    // TODO: Initialize macOS window, renderer, etc.
+    game.has_window = true
+    game.has_renderer = true
+}
+
+fn startup_windows_game(game: Game) {
+    // TODO: Initialize Windows window, renderer, etc.
+    game.has_window = true
+    game.has_renderer = true
+}
+
+fn startup_linux_game(game: Game) {
+    // TODO: Initialize Linux window, renderer, etc.
+    game.has_window = true
+    game.has_renderer = true
+}
+
+fn process_macos_input(game: Game) {
+    // TODO: Process macOS window events
+    // Update mouse position, keyboard state, mouse buttons
+}
+
+fn process_windows_input(game: Game) {
+    // TODO: Process Windows messages
+}
+
+fn process_linux_input(game: Game) {
+    // TODO: Process X11/Wayland events
+}
+
+fn render_macos_game(game: Game, alpha: Float) {
+    // TODO: Render frame on macOS
+    // - Render all entities with proper z-ordering
+    // - Render particles
+    // - Render UI panels and buttons
+    // - Render minimap with entities and camera viewport
+}
+
+fn render_windows_game(game: Game, alpha: Float) {
+    // TODO: Render frame on Windows
+}
+
+fn render_linux_game(game: Game, alpha: Float) {
+    // TODO: Render frame on Linux
+}
+
+// ============================================================================
+// Platform utility functions (stubs)
+// ============================================================================
+
+fn get_current_time() -> Float {
+    // TODO: Get high-resolution time in seconds
+    // Would use platform-specific timer (e.g., mach_absolute_time on macOS)
+    return 0.0
+}
+
+fn sleep_milliseconds(ms: Int) {
+    // TODO: Sleep for specified milliseconds
+    // Would use platform-specific sleep (e.g., nanosleep on POSIX)
+}
+
+fn sqrt(x: Float) -> Float {
+    // TODO: Square root implementation
+    // Would use math library or intrinsic
+    return x  // Placeholder
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_game_creation() -> Bool {
+    let game = create_game()
+
+    assert(game.state == GameState::LOADING, "Game should start in loading state")
+    assert(!game.running, "Game should not be running initially")
+    assert(game.screen_width == 1024, "Screen width should be 1024")
+    assert(game.screen_height == 768, "Screen height should be 768")
+    assert(game.entity_count == 0, "Should start with no entities")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn test_input_state_creation() -> Bool {
+    let input = create_input_state()
+
+    assert(input.mouse_x == 0.0, "Mouse X should start at 0")
+    assert(input.mouse_y == 0.0, "Mouse Y should start at 0")
+    assert(!input.mouse_left_down, "Left mouse should not be down")
+    assert(!input.mouse_right_down, "Right mouse should not be down")
+    assert(!input.key_w, "W key should not be pressed")
+
+    return true
+}
+
+fn test_platform_detection() -> Bool {
+    let platform = detect_platform()
+
+    // Should detect one of the supported platforms
+    assert(
+        platform == Platform::MACOS ||
+        platform == Platform::WINDOWS ||
+        platform == Platform::LINUX,
+        "Should detect a valid platform"
+    )
+
+    return true
+}
+
+fn test_game_state_machine() -> Bool {
+    let game = create_game()
+
+    assert(game.state == GameState::LOADING, "Should start in loading")
+
+    game.state = GameState::MAIN_MENU
+    assert(game.state == GameState::MAIN_MENU, "Should transition to main menu")
+
+    game.state = GameState::IN_GAME
+    assert(game.state == GameState::IN_GAME, "Should transition to in game")
+
+    game.state = GameState::PAUSED
+    assert(game.state == GameState::PAUSED, "Should transition to paused")
+
+    quit_game(game)
+    assert(game.state == GameState::QUITTING, "Should transition to quitting")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn test_camera_movement() -> Bool {
+    let game = create_game()
+
+    let initial_x = game.camera_pos_x
+    let initial_y = game.camera_pos_y
+
+    // Simulate pressing right key
+    game.input.key_right = true
+    update_game(game, 0.1)  // 100ms update
+
+    // Camera should have moved right
+    assert(game.camera_pos_x > initial_x, "Camera should move right")
+    assert(game.camera_pos_y == initial_y, "Camera Y should not change")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn test_screen_to_world_conversion() -> Bool {
+    let game = create_game()
+    game.camera_pos_x = 1000.0
+    game.camera_pos_y = 500.0
+    game.camera_zoom = 1.0
+
+    // Center of screen should map to camera position
+    let center_x = (game.screen_width as Float) / 2.0
+    let center_y = (game.screen_height as Float) / 2.0
+
+    let world_x = screen_to_world_x(game, center_x)
+    let world_y = screen_to_world_y(game, center_y)
+
+    assert(world_x >= 999.0 && world_x <= 1001.0, "World X should be ~1000")
+    assert(world_y >= 499.0 && world_y <= 501.0, "World Y should be ~500")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn test_world_to_screen_conversion() -> Bool {
+    let game = create_game()
+    game.camera_pos_x = 0.0
+    game.camera_pos_y = 0.0
+    game.camera_zoom = 1.0
+
+    // Camera position should map to center of screen
+    let screen_x = world_to_screen_x(game, 0.0)
+    let screen_y = world_to_screen_y(game, 0.0)
+
+    let center_x = (game.screen_width as Float) / 2.0
+    let center_y = (game.screen_height as Float) / 2.0
+
+    assert(screen_x == center_x, "Screen X should be center")
+    assert(screen_y == center_y, "Screen Y should be center")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn test_player_resources() -> Bool {
+    let game = create_game()
+
+    assert(game.player_supplies == 10000.0, "Should start with 10000 supplies")
+    assert(game.player_power_available == 10, "Should start with 10 power")
+    assert(game.player_power_used == 0, "Should start with 0 power used")
+
+    // Modify resources
+    game.player_supplies = 15000.0
+    game.player_power_used = 5
+
+    assert(game.player_supplies == 15000.0, "Supplies should be updated")
+    assert(game.player_power_used == 5, "Power used should be updated")
+
+    destroy_game(game)
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_game_creation(), "Game creation test failed")
+    assert(test_input_state_creation(), "Input state creation test failed")
+    assert(test_platform_detection(), "Platform detection test failed")
+    assert(test_game_state_machine(), "Game state machine test failed")
+    assert(test_camera_movement(), "Camera movement test failed")
+    assert(test_screen_to_world_conversion(), "Screen to world conversion test failed")
+    assert(test_world_to_screen_conversion(), "World to screen conversion test failed")
+    assert(test_player_resources(), "Player resources test failed")
+    return true
+}
