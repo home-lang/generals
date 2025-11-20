@@ -15,6 +15,8 @@ const Camera = @import("camera.zig").Camera;
 const EntityManager = @import("entity.zig").EntityManager;
 const Sprite = @import("entity.zig").Sprite;
 const Pathfinder = @import("pathfinding.zig").Pathfinder;
+const ResourceManager = @import("resource.zig").ResourceManager;
+const PlayerResources = @import("resource.zig").PlayerResources;
 const math = @import("math");
 const Vec2 = math.Vec2(f32);
 
@@ -68,6 +70,10 @@ pub const Game = struct {
     // Pathfinding
     pathfinder: Pathfinder,
 
+    // Resource management
+    resource_manager: ResourceManager,
+    player_resources: PlayerResources,
+
     // Input state
     input: InputState,
 
@@ -92,6 +98,8 @@ pub const Game = struct {
             .camera = Camera.init(1024, 768),
             .entity_manager = try EntityManager.init(allocator),
             .pathfinder = Pathfinder.init(allocator, 32.0), // 32-unit grid
+            .resource_manager = try ResourceManager.init(allocator),
+            .player_resources = PlayerResources.init(),
             .input = .{},
             .test_texture = null,
         };
@@ -100,6 +108,9 @@ pub const Game = struct {
     pub fn deinit(self: *Game) void {
         // Clean up entity manager
         self.entity_manager.deinit();
+
+        // Clean up resource manager
+        self.resource_manager.deinit();
 
         // Clean up test texture
         if (builtin.os.tag == .macos) {

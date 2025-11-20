@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const math = @import("math");
 const Vec2 = math.Vec2(f32);
 const Path = @import("pathfinding.zig").Path;
+const ProductionQueue = @import("production.zig").ProductionQueue;
 
 /// Entity ID - unique identifier for each entity
 pub const EntityId = u32;
@@ -74,6 +75,15 @@ pub const Sprite = struct {
     }
 };
 
+/// AI State for units
+pub const AIState = enum {
+    idle,       // Standing still, scanning for enemies
+    attacking,  // Currently engaged in combat
+    chasing,    // Moving toward an enemy
+    fleeing,    // Running away (low health)
+    player_controlled, // Under player control
+};
+
 /// Unit component - unit-specific data
 pub const UnitData = struct {
     unit_type: []const u8, // e.g. "AmericaTankCrusader"
@@ -87,6 +97,9 @@ pub const UnitData = struct {
     attack_cooldown: f32, // Seconds between attacks
     time_since_attack: f32, // Accumulator
     target_id: ?EntityId, // Current attack target
+    // AI
+    ai_state: AIState,
+    is_ai_controlled: bool, // If false, player controls this unit
 
     pub fn init(unit_type: []const u8, max_health: f32, speed: f32) UnitData {
         return .{
@@ -100,6 +113,8 @@ pub const UnitData = struct {
             .attack_cooldown = 1.0, // 1 second between attacks
             .time_since_attack = 0.0,
             .target_id = null,
+            .ai_state = .idle,
+            .is_ai_controlled = true, // AI by default
         };
     }
 
@@ -118,6 +133,7 @@ pub const BuildingData = struct {
     health: f32,
     max_health: f32,
     construction_progress: f32, // 0.0 to 1.0
+    production_queue: ?ProductionQueue, // null if building can't produce
 
     pub fn init(building_type: []const u8, max_health: f32) BuildingData {
         return .{
@@ -125,7 +141,24 @@ pub const BuildingData = struct {
             .health = max_health,
             .max_health = max_health,
             .construction_progress = 1.0,
+            .production_queue = null,
         };
+    }
+
+    pub fn initWithProduction(allocator: Allocator, building_type: []const u8, max_health: f32) !BuildingData {
+        return .{
+            .building_type = building_type,
+            .health = max_health,
+            .max_health = max_health,
+            .construction_progress = 1.0,
+            .production_queue = try ProductionQueue.init(allocator, 5),
+        };
+    }
+
+    pub fn deinit(self: *BuildingData) void {
+        if (self.production_queue) |*queue| {
+            queue.deinit();
+        }
     }
 };
 
@@ -210,6 +243,9 @@ pub const Entity = struct {
     pub fn deinit(self: *Entity) void {
         if (self.movement) |*movement| {
             movement.deinit();
+        }
+        if (self.building_data) |*building_data| {
+            building_data.deinit();
         }
     }
 };
@@ -371,13 +407,97 @@ pub const EntityManager = struct {
         for (self.entities.items) |*entity| {
             if (!entity.active) continue;
 
-            // Update combat for units
+            // Update AI and combat for units
             if (entity.unit_data) |*unit_data| {
                 // Update attack cooldown
                 unit_data.time_since_attack += dt_f32;
 
-                // Find target if we don't have one
-                if (unit_data.target_id == null) {
+                // AI behavior (only for AI-controlled units)
+                if (unit_data.is_ai_controlled) {
+                    // Check health for flee behavior
+                    const health_pct = unit_data.health / unit_data.max_health;
+
+                    // Find nearest enemy for awareness
+                    const nearest_enemy = self.findNearestEnemy(entity.id, entity.team, entity.transform.position, unit_data.attack_range * 2.0);
+
+                    // State machine
+                    switch (unit_data.ai_state) {
+                        .idle => {
+                            // Scan for enemies
+                            if (nearest_enemy != null) {
+                                unit_data.ai_state = .chasing;
+                                unit_data.target_id = nearest_enemy;
+                            }
+                        },
+                        .chasing => {
+                            // If low health, flee
+                            if (health_pct < 0.3) {
+                                unit_data.ai_state = .fleeing;
+                                unit_data.target_id = null;
+                            }
+                            // If enemy in attack range, switch to attacking
+                            else if (unit_data.target_id != null) {
+                                var in_attack_range = false;
+                                for (self.entities.items) |*target| {
+                                    if (target.id == unit_data.target_id.? and target.active) {
+                                        const dx = target.transform.position.x - entity.transform.position.x;
+                                        const dy = target.transform.position.y - entity.transform.position.y;
+                                        const dist_sq = dx * dx + dy * dy;
+                                        if (dist_sq <= unit_data.attack_range * unit_data.attack_range) {
+                                            in_attack_range = true;
+                                            unit_data.ai_state = .attacking;
+                                        }
+                                        break;
+                                    }
+                                }
+                                // Target lost, return to idle
+                                if (!in_attack_range and nearest_enemy == null) {
+                                    unit_data.ai_state = .idle;
+                                    unit_data.target_id = null;
+                                }
+                            }
+                        },
+                        .attacking => {
+                            // If low health, flee
+                            if (health_pct < 0.3) {
+                                unit_data.ai_state = .fleeing;
+                                unit_data.target_id = null;
+                            }
+                            // If target out of range, chase
+                            else if (unit_data.target_id != null) {
+                                var still_in_range = false;
+                                for (self.entities.items) |*target| {
+                                    if (target.id == unit_data.target_id.? and target.active) {
+                                        const dx = target.transform.position.x - entity.transform.position.x;
+                                        const dy = target.transform.position.y - entity.transform.position.y;
+                                        const dist_sq = dx * dx + dy * dy;
+                                        if (dist_sq <= unit_data.attack_range * unit_data.attack_range) {
+                                            still_in_range = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!still_in_range) {
+                                    unit_data.ai_state = .chasing;
+                                }
+                            } else {
+                                unit_data.ai_state = .idle;
+                            }
+                        },
+                        .fleeing => {
+                            // If health recovered, return to idle
+                            if (health_pct > 0.5) {
+                                unit_data.ai_state = .idle;
+                            }
+                        },
+                        .player_controlled => {
+                            // Player controls this unit, no AI
+                        },
+                    }
+                }
+
+                // Find target if we don't have one (for both AI and player units)
+                if (unit_data.target_id == null and unit_data.ai_state != .fleeing) {
                     unit_data.target_id = self.findNearestEnemy(entity.id, entity.team, entity.transform.position, unit_data.attack_range);
                 }
 
