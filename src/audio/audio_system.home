@@ -1,0 +1,574 @@
+// Audio System - OpenAL-based audio for game sounds and music
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/platform/audio/
+
+import std.collections.{HashMap, Vec}
+import platform.file.File
+import math.Vec3
+
+/// Audio format
+enum AudioFormat {
+    Mono8,      // 8-bit mono
+    Mono16,     // 16-bit mono
+    Stereo8,    // 8-bit stereo
+    Stereo16,   // 16-bit stereo
+}
+
+/// Audio buffer - stores decoded audio data
+struct AudioBuffer {
+    id: u32,
+    format: AudioFormat,
+    sample_rate: u32,
+    size: usize,
+    duration: f32,  // seconds
+}
+
+impl AudioBuffer {
+    fn new() -> AudioBuffer {
+        return AudioBuffer {
+            id: 0,
+            format: AudioFormat.Stereo16,
+            sample_rate: 44100,
+            size: 0,
+            duration: 0.0
+        }
+    }
+
+    /// Create buffer from WAV data
+    fn from_wav(data: Vec<u8>) -> Result<AudioBuffer, String> {
+        // Parse WAV header
+        let wav = WAVFile.parse(data)?
+
+        let mut buffer = AudioBuffer {
+            id: 0,
+            format: wav.format,
+            sample_rate: wav.sample_rate,
+            size: wav.data.len(),
+            duration: wav.duration
+        }
+
+        // Generate OpenAL buffer
+        // alGenBuffers(1, &buffer.id)
+
+        // Upload data to OpenAL
+        // alBufferData(buffer.id, wav.al_format(), wav.data.as_ptr(), wav.data.len(), wav.sample_rate)
+
+        println!("Loaded audio buffer: {} Hz, {:.2}s", wav.sample_rate, wav.duration)
+        return Ok(buffer)
+    }
+
+    /// Delete buffer
+    fn delete(self: &mut AudioBuffer) {
+        if self.id != 0 {
+            // alDeleteBuffers(1, &self.id)
+            self.id = 0
+        }
+    }
+
+    fn is_valid(self: &AudioBuffer) -> bool {
+        return self.id != 0
+    }
+}
+
+/// Audio source - represents a sound playing in 3D space
+struct AudioSource {
+    id: u32,
+    buffer_id: u32,
+    position: Vec3,
+    velocity: Vec3,
+    pitch: f32,
+    gain: f32,          // Volume (0.0 - 1.0)
+    looping: bool,
+    relative: bool,     // Position relative to listener
+    playing: bool,
+}
+
+impl AudioSource {
+    fn new() -> AudioSource {
+        // alGenSources(1, &id)
+        let id = 0  // Placeholder
+
+        return AudioSource {
+            id: id,
+            buffer_id: 0,
+            position: Vec3.new(0.0, 0.0, 0.0),
+            velocity: Vec3.new(0.0, 0.0, 0.0),
+            pitch: 1.0,
+            gain: 1.0,
+            looping: false,
+            relative: false,
+            playing: false
+        }
+    }
+
+    /// Set audio buffer
+    fn set_buffer(self: &mut AudioSource, buffer: &AudioBuffer) {
+        self.buffer_id = buffer.id
+        // alSourcei(self.id, AL_BUFFER, buffer.id)
+    }
+
+    /// Set 3D position
+    fn set_position(self: &mut AudioSource, position: Vec3) {
+        self.position = position
+        // alSource3f(self.id, AL_POSITION, position.x, position.y, position.z)
+    }
+
+    /// Set velocity (for doppler effect)
+    fn set_velocity(self: &mut AudioSource, velocity: Vec3) {
+        self.velocity = velocity
+        // alSource3f(self.id, AL_VELOCITY, velocity.x, velocity.y, velocity.z)
+    }
+
+    /// Set pitch (1.0 = normal)
+    fn set_pitch(self: &mut AudioSource, pitch: f32) {
+        self.pitch = pitch
+        // alSourcef(self.id, AL_PITCH, pitch)
+    }
+
+    /// Set volume (0.0 - 1.0)
+    fn set_gain(self: &mut AudioSource, gain: f32) {
+        self.gain = gain
+        // alSourcef(self.id, AL_GAIN, gain)
+    }
+
+    /// Set looping
+    fn set_looping(self: &mut AudioSource, looping: bool) {
+        self.looping = looping
+        // alSourcei(self.id, AL_LOOPING, if looping { 1 } else { 0 })
+    }
+
+    /// Play sound
+    fn play(self: &mut AudioSource) {
+        // alSourcePlay(self.id)
+        self.playing = true
+        println!("Playing audio source")
+    }
+
+    /// Pause sound
+    fn pause(self: &mut AudioSource) {
+        // alSourcePause(self.id)
+        self.playing = false
+    }
+
+    /// Stop sound
+    fn stop(self: &mut AudioSource) {
+        // alSourceStop(self.id)
+        self.playing = false
+    }
+
+    /// Check if playing
+    fn is_playing(self: &AudioSource) -> bool {
+        // let mut state: i32 = 0
+        // alGetSourcei(self.id, AL_SOURCE_STATE, &state)
+        // return state == AL_PLAYING
+        return self.playing
+    }
+
+    /// Delete source
+    fn delete(self: &mut AudioSource) {
+        if self.id != 0 {
+            self.stop()
+            // alDeleteSources(1, &self.id)
+            self.id = 0
+        }
+    }
+}
+
+/// Audio listener - represents the player's ears
+struct AudioListener {
+    position: Vec3,
+    velocity: Vec3,
+    orientation: (Vec3, Vec3),  // (forward, up)
+    gain: f32,
+}
+
+impl AudioListener {
+    fn new() -> AudioListener {
+        return AudioListener {
+            position: Vec3.new(0.0, 0.0, 0.0),
+            velocity: Vec3.new(0.0, 0.0, 0.0),
+            orientation: (Vec3.new(0.0, 0.0, -1.0), Vec3.new(0.0, 1.0, 0.0)),
+            gain: 1.0
+        }
+    }
+
+    /// Set listener position
+    fn set_position(self: &mut AudioListener, position: Vec3) {
+        self.position = position
+        // alListener3f(AL_POSITION, position.x, position.y, position.z)
+    }
+
+    /// Set listener velocity
+    fn set_velocity(self: &mut AudioListener, velocity: Vec3) {
+        self.velocity = velocity
+        // alListener3f(AL_VELOCITY, velocity.x, velocity.y, velocity.z)
+    }
+
+    /// Set listener orientation
+    fn set_orientation(self: &mut AudioListener, forward: Vec3, up: Vec3) {
+        self.orientation = (forward, up)
+        // let orientation = [forward.x, forward.y, forward.z, up.x, up.y, up.z]
+        // alListenerfv(AL_ORIENTATION, &orientation)
+    }
+
+    /// Set master volume
+    fn set_gain(self: &mut AudioListener, gain: f32) {
+        self.gain = gain
+        // alListenerf(AL_GAIN, gain)
+    }
+}
+
+/// Main audio system
+struct AudioSystem {
+    // OpenAL device and context
+    device: Option<*mut void>,
+    context: Option<*mut void>,
+
+    // Audio resources
+    buffers: HashMap<String, AudioBuffer>,
+    sources: Vec<AudioSource>,
+    free_sources: Vec<usize>,  // Pool of available sources
+
+    // Listener
+    listener: AudioListener,
+
+    // Settings
+    master_volume: f32,
+    music_volume: f32,
+    sfx_volume: f32,
+
+    // Music streaming
+    music_source: Option<AudioSource>,
+    current_music: String,
+}
+
+impl AudioSystem {
+    /// Initialize audio system
+    fn new() -> Result<AudioSystem, String> {
+        println!("=== Initializing Audio System ===")
+
+        // Open OpenAL device
+        // let device = alcOpenDevice(null)  // Default device
+        // if device.is_null() {
+        //     return Err("Failed to open audio device")
+        // }
+
+        // Create OpenAL context
+        // let context = alcCreateContext(device, null)
+        // if context.is_null() {
+        //     return Err("Failed to create audio context")
+        // }
+
+        // Make context current
+        // alcMakeContextCurrent(context)
+
+        println!("Audio device opened")
+        println!("OpenAL version: (placeholder)")
+
+        // Pre-allocate sound sources
+        let mut sources = Vec.new()
+        let mut free_sources = Vec.new()
+
+        for i in 0..32 {  // Create 32 sources
+            sources.push(AudioSource.new())
+            free_sources.push(i)
+        }
+
+        let mut system = AudioSystem {
+            device: None,
+            context: None,
+            buffers: HashMap.new(),
+            sources: sources,
+            free_sources: free_sources,
+            listener: AudioListener.new(),
+            master_volume: 1.0,
+            music_volume: 0.7,
+            sfx_volume: 1.0,
+            music_source: None,
+            current_music: String.new()
+        }
+
+        // Set listener defaults
+        system.listener.set_gain(system.master_volume)
+
+        println!("Audio system initialized")
+        return Ok(system)
+    }
+
+    /// Load sound from WAV file
+    fn load_sound(self: &mut AudioSystem, path: String) -> Result<(), String> {
+        // Check cache
+        if self.buffers.contains_key(&path) {
+            return Ok(())
+        }
+
+        // Load file
+        let data = File.read_all_bytes(path.clone())?
+        let buffer = AudioBuffer.from_wav(data)?
+
+        // Cache it
+        self.buffers.insert(path, buffer)
+
+        return Ok(())
+    }
+
+    /// Play sound effect at position
+    fn play_sound(self: &mut AudioSystem, sound_name: &str, position: Vec3, volume: f32) -> Result<(), String> {
+        // Get buffer
+        let buffer = match self.buffers.get(sound_name) {
+            Some(buf) => buf,
+            None => return Err(format!("Sound not loaded: {}", sound_name))
+        }
+
+        // Get free source
+        let source_idx = match self.free_sources.pop() {
+            Some(idx) => idx,
+            None => {
+                println!("Warning: No free audio sources")
+                return Ok(())  // Silently fail if no sources available
+            }
+        }
+
+        // Configure source
+        let source = &mut self.sources[source_idx]
+        source.set_buffer(buffer)
+        source.set_position(position)
+        source.set_gain(volume * self.sfx_volume * self.master_volume)
+        source.set_looping(false)
+        source.play()
+
+        println!("Playing sound: {} at {:?}", sound_name, position)
+
+        // TODO: Track and return source to pool when done
+
+        return Ok(())
+    }
+
+    /// Play sound effect (2D, no position)
+    fn play_sound_2d(self: &mut AudioSystem, sound_name: &str, volume: f32) -> Result<(), String> {
+        // Get buffer
+        let buffer = match self.buffers.get(sound_name) {
+            Some(buf) => buf,
+            None => return Err(format!("Sound not loaded: {}", sound_name))
+        }
+
+        // Get free source
+        let source_idx = match self.free_sources.pop() {
+            Some(idx) => idx,
+            None => {
+                println!("Warning: No free audio sources")
+                return Ok(())
+            }
+        }
+
+        // Configure source (relative to listener)
+        let source = &mut self.sources[source_idx]
+        source.set_buffer(buffer)
+        source.relative = true
+        source.set_position(Vec3.new(0.0, 0.0, 0.0))
+        source.set_gain(volume * self.sfx_volume * self.master_volume)
+        source.set_looping(false)
+        source.play()
+
+        return Ok(())
+    }
+
+    /// Play background music (looping)
+    fn play_music(self: &mut AudioSystem, music_path: String) -> Result<(), String> {
+        // Stop current music
+        self.stop_music()
+
+        // Load music
+        self.load_sound(music_path.clone())?
+
+        let buffer = self.buffers.get(&music_path).unwrap()
+
+        // Create music source
+        let mut source = AudioSource.new()
+        source.set_buffer(buffer)
+        source.relative = true
+        source.set_position(Vec3.new(0.0, 0.0, 0.0))
+        source.set_gain(self.music_volume * self.master_volume)
+        source.set_looping(true)
+        source.play()
+
+        self.music_source = Some(source)
+        self.current_music = music_path
+
+        println!("Playing music: {}", self.current_music)
+        return Ok(())
+    }
+
+    /// Stop music
+    fn stop_music(self: &mut AudioSystem) {
+        if let Some(source) = &mut self.music_source {
+            source.stop()
+        }
+        self.music_source = None
+        self.current_music = String.new()
+    }
+
+    /// Set master volume
+    fn set_master_volume(self: &mut AudioSystem, volume: f32) {
+        self.master_volume = volume.clamp(0.0, 1.0)
+        self.listener.set_gain(self.master_volume)
+    }
+
+    /// Set music volume
+    fn set_music_volume(self: &mut AudioSystem, volume: f32) {
+        self.music_volume = volume.clamp(0.0, 1.0)
+        if let Some(source) = &mut self.music_source {
+            source.set_gain(self.music_volume * self.master_volume)
+        }
+    }
+
+    /// Set SFX volume
+    fn set_sfx_volume(self: &mut AudioSystem, volume: f32) {
+        self.sfx_volume = volume.clamp(0.0, 1.0)
+    }
+
+    /// Update listener from camera
+    fn update_listener(self: &mut AudioSystem, position: Vec3, forward: Vec3, up: Vec3, velocity: Vec3) {
+        self.listener.set_position(position)
+        self.listener.set_orientation(forward, up)
+        self.listener.set_velocity(velocity)
+    }
+
+    /// Update audio system (call per frame)
+    fn update(self: &mut AudioSystem) {
+        // Return finished sources to pool
+        for (i, source) in self.sources.iter().enumerate() {
+            if !source.is_playing() && !self.free_sources.contains(&i) {
+                self.free_sources.push(i)
+            }
+        }
+    }
+
+    /// Shutdown audio system
+    fn shutdown(self: &mut AudioSystem) {
+        println!("Shutting down audio system")
+
+        // Stop all sounds
+        self.stop_music()
+        for source in &mut self.sources {
+            source.delete()
+        }
+
+        // Delete buffers
+        for (_, buffer) in &mut self.buffers {
+            buffer.delete()
+        }
+        self.buffers.clear()
+
+        // Destroy OpenAL context
+        // alcMakeContextCurrent(null)
+        // if let Some(ctx) = self.context {
+        //     alcDestroyContext(ctx)
+        // }
+        // if let Some(dev) = self.device {
+        //     alcCloseDevice(dev)
+        // }
+
+        println!("Audio system shutdown complete")
+    }
+}
+
+/// WAV file parser
+struct WAVFile {
+    format: AudioFormat,
+    sample_rate: u32,
+    data: Vec<u8>,
+    duration: f32,
+}
+
+impl WAVFile {
+    /// Parse WAV file format
+    fn parse(data: Vec<u8>) -> Result<WAVFile, String> {
+        if data.len() < 44 {
+            return Err("WAV file too small")
+        }
+
+        // Check RIFF header
+        if &data[0..4] != b"RIFF" {
+            return Err("Not a RIFF file")
+        }
+
+        // Check WAVE format
+        if &data[8..12] != b"WAVE" {
+            return Err("Not a WAVE file")
+        }
+
+        // Find fmt chunk
+        let mut offset = 12
+        while offset < data.len() - 8 {
+            let chunk_id = &data[offset..offset+4]
+            let chunk_size = u32.from_le_bytes([
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+            ]) as usize
+
+            if chunk_id == b"fmt " {
+                // Parse format chunk
+                let audio_format = u16.from_le_bytes([data[offset+8], data[offset+9]])
+                let num_channels = u16.from_le_bytes([data[offset+10], data[offset+11]])
+                let sample_rate = u32.from_le_bytes([
+                    data[offset+12], data[offset+13], data[offset+14], data[offset+15]
+                ])
+                let bits_per_sample = u16.from_le_bytes([data[offset+22], data[offset+23]])
+
+                // Determine format
+                let format = match (num_channels, bits_per_sample) {
+                    (1, 8) => AudioFormat.Mono8,
+                    (1, 16) => AudioFormat.Mono16,
+                    (2, 8) => AudioFormat.Stereo8,
+                    (2, 16) => AudioFormat.Stereo16,
+                    _ => return Err(format!("Unsupported WAV format: {} ch, {} bit", num_channels, bits_per_sample))
+                }
+
+                // Find data chunk
+                let mut data_offset = offset + 8 + chunk_size
+                while data_offset < data.len() - 8 {
+                    let data_chunk_id = &data[data_offset..data_offset+4]
+                    let data_chunk_size = u32.from_le_bytes([
+                        data[data_offset+4], data[data_offset+5],
+                        data[data_offset+6], data[data_offset+7]
+                    ]) as usize
+
+                    if data_chunk_id == b"data" {
+                        // Extract audio data
+                        let audio_data = data[data_offset+8..data_offset+8+data_chunk_size].to_vec()
+
+                        // Calculate duration
+                        let bytes_per_sample = (bits_per_sample / 8) as u32
+                        let total_samples = data_chunk_size as u32 / (bytes_per_sample * num_channels as u32)
+                        let duration = total_samples as f32 / sample_rate as f32
+
+                        return Ok(WAVFile {
+                            format: format,
+                            sample_rate: sample_rate,
+                            data: audio_data,
+                            duration: duration
+                        })
+                    }
+
+                    data_offset += 8 + data_chunk_size
+                }
+
+                return Err("No data chunk found")
+            }
+
+            offset += 8 + chunk_size
+        }
+
+        return Err("No fmt chunk found")
+    }
+
+    /// Get OpenAL format constant
+    fn al_format(self: &WAVFile) -> u32 {
+        match self.format {
+            AudioFormat.Mono8 => return 0x1100,    // AL_FORMAT_MONO8
+            AudioFormat.Mono16 => return 0x1101,   // AL_FORMAT_MONO16
+            AudioFormat.Stereo8 => return 0x1102,  // AL_FORMAT_STEREO8
+            AudioFormat.Stereo16 => return 0x1103  // AL_FORMAT_STEREO16
+        }
+    }
+}

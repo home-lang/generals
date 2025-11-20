@@ -25,6 +25,9 @@ const MinimapIcon = @import("minimap.zig").MinimapIcon;
 const MinimapIconType = @import("minimap.zig").MinimapIconType;
 const FogOfWarManager = @import("fog_of_war.zig").FogOfWarManager;
 const VisibilityState = @import("fog_of_war.zig").VisibilityState;
+const ParticleSystem = @import("../renderer/particle_system.zig").ParticleSystem;
+const spawnExplosion = @import("../renderer/particle_system.zig").spawnExplosion;
+const CombatSystem = @import("combat.zig").CombatSystem;
 const math = @import("math");
 const Vec2 = math.Vec2(f32);
 
@@ -94,6 +97,9 @@ pub const Game = struct {
     // Player team (for fog of war rendering)
     player_team: TeamId,
 
+    // Particle system
+    particle_system: ParticleSystem,
+
     // Input state
     input: InputState,
 
@@ -129,6 +135,7 @@ pub const Game = struct {
             .minimap = Minimap.init(1024, 768, world_width, world_height),
             .fog_of_war = try FogOfWarManager.init(allocator, num_teams, world_width, world_height, fog_cell_size),
             .player_team = 0, // Player is team 0
+            .particle_system = try ParticleSystem.init(allocator, 2000), // Max 2000 particles
             .input = .{},
             .test_texture = null,
         };
@@ -146,6 +153,9 @@ pub const Game = struct {
 
         // Clean up fog of war
         self.fog_of_war.deinit();
+
+        // Clean up particle system
+        self.particle_system.deinit();
 
         // Clean up test texture
         if (builtin.os.tag == .macos) {
@@ -216,6 +226,11 @@ pub const Game = struct {
             _ = try self.entity_manager.createUnit(60, 80, "TestUnit5", sprite, 1);
 
             std.debug.print("Created {} entities\n", .{self.entity_manager.getEntityCount()});
+
+            // Test particle effects
+            std.debug.print("Creating test particle effects...\n", .{});
+            try spawnExplosion(&self.particle_system, 100, 100); // Screen space for now
+            std.debug.print("Particle system initialized with {} max particles\n", .{self.particle_system.max_particles});
 
             // Show window
             self.window.?.show();
@@ -364,6 +379,12 @@ pub const Game = struct {
         // Update entities
         self.entity_manager.update(dt);
 
+        // Update combat system
+        CombatSystem.updateCombat(self.entity_manager.getActiveEntities(), &self.particle_system, @floatCast(dt));
+
+        // Update particle system
+        self.particle_system.update(@floatCast(dt));
+
         // Update fog of war
         self.fog_of_war.update(self.entity_manager.getActiveEntities());
 
@@ -490,6 +511,9 @@ pub const Game = struct {
                         }
                     }
 
+                    // Render particles
+                    self.renderParticles(renderer, &ctx);
+
                     // Render UI
                     self.renderUI(renderer, &ctx);
 
@@ -497,6 +521,30 @@ pub const Game = struct {
                     renderer.endFrame(&ctx);
                 }
             }
+        }
+    }
+
+    fn renderParticles(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
+        const particles = self.particle_system.getActiveParticles();
+        for (particles) |particle| {
+            if (!particle.active) continue;
+
+            // Transform world position to screen coordinates
+            const world_pos = Vec2.init(particle.position.x, particle.position.y);
+            const screen_pos = self.camera.worldToScreen(world_pos);
+
+            // Draw particle as colored circle
+            renderer.drawRect(
+                ctx,
+                screen_pos.x - particle.size / 2,
+                screen_pos.y - particle.size / 2,
+                particle.size,
+                particle.size,
+                particle.color.r,
+                particle.color.g,
+                particle.color.b,
+                particle.color.a,
+            );
         }
     }
 

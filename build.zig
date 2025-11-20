@@ -161,4 +161,22 @@ pub fn build(b: *std.Build) void {
     const test_sprite_step = b.step("test-sprite", "Test sprite rendering");
     const run_test_sprite = b.addRunArtifact(test_sprite);
     test_sprite_step.dependOn(&run_test_sprite.step);
+
+    // Test W3D loader executable
+    const test_w3d = b.addExecutable(.{
+        .name = "test_w3d",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test_w3d.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    test_w3d.root_module.addImport("math", math_mod);
+
+    b.installArtifact(test_w3d);
+
+    const test_w3d_step = b.step("test-w3d", "Test W3D model loading");
+    const run_test_w3d = b.addRunArtifact(test_w3d);
+    test_w3d_step.dependOn(&run_test_w3d.step);
 }

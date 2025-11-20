@@ -1,0 +1,416 @@
+// Camera - 3D camera system for viewing
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/w3d/renderer/camera.h
+
+import math.{Vec2, Vec3, Vec4, Mat4, Quat}
+
+/// Camera projection type
+enum ProjectionType {
+    Perspective,
+    Orthographic,
+}
+
+/// Camera for 3D rendering
+struct Camera {
+    // Position and orientation
+    position: Vec3,
+    rotation: Quat,
+
+    // View vectors (cached)
+    forward: Vec3,
+    right: Vec3,
+    up: Vec3,
+
+    // Projection settings
+    projection_type: ProjectionType,
+
+    // Perspective projection
+    fov_horizontal: f32,  // Field of view (radians)
+    fov_vertical: f32,
+    near_plane: f32,
+    far_plane: f32,
+
+    // Orthographic projection
+    ortho_left: f32,
+    ortho_right: f32,
+    ortho_bottom: f32,
+    ortho_top: f32,
+
+    // Cached matrices
+    view_matrix: Mat4,
+    projection_matrix: Mat4,
+    view_projection_matrix: Mat4,
+
+    // Dirty flags
+    view_dirty: bool,
+    projection_dirty: bool,
+}
+
+impl Camera {
+    /// Create perspective camera
+    fn perspective(fov_degrees: f32, aspect_ratio: f32, near: f32, far: f32) -> Camera {
+        let fov_rad = fov_degrees * 3.14159265 / 180.0
+        let fov_h = fov_rad
+        let fov_v = 2.0 * math.atan(math.tan(fov_h * 0.5) / aspect_ratio)
+
+        let mut camera = Camera {
+            position: Vec3.new(0.0, 0.0, 0.0),
+            rotation: Quat.identity(),
+            forward: Vec3.new(0.0, 0.0, -1.0),
+            right: Vec3.new(1.0, 0.0, 0.0),
+            up: Vec3.new(0.0, 1.0, 0.0),
+            projection_type: ProjectionType.Perspective,
+            fov_horizontal: fov_h,
+            fov_vertical: fov_v,
+            near_plane: near,
+            far_plane: far,
+            ortho_left: 0.0,
+            ortho_right: 0.0,
+            ortho_bottom: 0.0,
+            ortho_top: 0.0,
+            view_matrix: Mat4.identity(),
+            projection_matrix: Mat4.identity(),
+            view_projection_matrix: Mat4.identity(),
+            view_dirty: true,
+            projection_dirty: true
+        }
+
+        camera.update_projection()
+        return camera
+    }
+
+    /// Create orthographic camera
+    fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Camera {
+        let mut camera = Camera {
+            position: Vec3.new(0.0, 0.0, 0.0),
+            rotation: Quat.identity(),
+            forward: Vec3.new(0.0, 0.0, -1.0),
+            right: Vec3.new(1.0, 0.0, 0.0),
+            up: Vec3.new(0.0, 1.0, 0.0),
+            projection_type: ProjectionType.Orthographic,
+            fov_horizontal: 0.0,
+            fov_vertical: 0.0,
+            near_plane: near,
+            far_plane: far,
+            ortho_left: left,
+            ortho_right: right,
+            ortho_bottom: bottom,
+            ortho_top: top,
+            view_matrix: Mat4.identity(),
+            projection_matrix: Mat4.identity(),
+            view_projection_matrix: Mat4.identity(),
+            view_dirty: true,
+            projection_dirty: true
+        }
+
+        camera.update_projection()
+        return camera
+    }
+
+    /// RTS camera (isometric-style top-down view)
+    fn rts_camera(aspect_ratio: f32) -> Camera {
+        let mut camera = Camera.perspective(60.0, aspect_ratio, 1.0, 10000.0)
+
+        // Position camera above and behind looking down
+        camera.set_position(Vec3.new(0.0, 100.0, 100.0))
+        camera.look_at(Vec3.new(0.0, 0.0, 0.0), Vec3.new(0.0, 1.0, 0.0))
+
+        return camera
+    }
+
+    /// Set camera position
+    fn set_position(self: &mut Camera, position: Vec3) {
+        self.position = position
+        self.view_dirty = true
+    }
+
+    /// Set camera rotation
+    fn set_rotation(self: &mut Camera, rotation: Quat) {
+        self.rotation = rotation
+        self.update_view_vectors()
+        self.view_dirty = true
+    }
+
+    /// Look at target point
+    fn look_at(self: &mut Camera, target: Vec3, up: Vec3) {
+        // Calculate forward direction
+        self.forward = (target - self.position).normalized()
+
+        // Calculate right vector
+        self.right = self.forward.cross(&up).normalized()
+
+        // Recalculate up vector
+        self.up = self.right.cross(&self.forward).normalized()
+
+        // Convert to quaternion rotation
+        // This is simplified - full implementation needs matrix->quat conversion
+        self.rotation = Quat.identity()
+
+        self.view_dirty = true
+    }
+
+    /// Update view vectors from rotation quaternion
+    fn update_view_vectors(self: &mut Camera) {
+        // Rotate basis vectors by quaternion
+        self.forward = self.rotation.rotate_vec3(&Vec3.new(0.0, 0.0, -1.0))
+        self.right = self.rotation.rotate_vec3(&Vec3.new(1.0, 0.0, 0.0))
+        self.up = self.rotation.rotate_vec3(&Vec3.new(0.0, 1.0, 0.0))
+    }
+
+    /// Move camera in local space
+    fn move_local(self: &mut Camera, offset: Vec3) {
+        self.position += self.right * offset.x
+        self.position += self.up * offset.y
+        self.position += self.forward * offset.z
+        self.view_dirty = true
+    }
+
+    /// Move camera in world space
+    fn move_world(self: &mut Camera, offset: Vec3) {
+        self.position += offset
+        self.view_dirty = true
+    }
+
+    /// Rotate camera by euler angles (radians)
+    fn rotate_euler(self: &mut Camera, pitch: f32, yaw: f32, roll: f32) {
+        let rot = Quat.from_euler(pitch, yaw, roll)
+        self.rotation = self.rotation * rot
+        self.rotation.normalize()
+        self.update_view_vectors()
+        self.view_dirty = true
+    }
+
+    /// Set field of view (degrees)
+    fn set_fov(self: &mut Camera, fov_degrees: f32, aspect_ratio: f32) {
+        let fov_rad = fov_degrees * 3.14159265 / 180.0
+        self.fov_horizontal = fov_rad
+        self.fov_vertical = 2.0 * math.atan(math.tan(fov_rad * 0.5) / aspect_ratio)
+        self.projection_dirty = true
+    }
+
+    /// Set near and far planes
+    fn set_planes(self: &mut Camera, near: f32, far: f32) {
+        self.near_plane = near
+        self.far_plane = far
+        self.projection_dirty = true
+    }
+
+    /// Update view matrix
+    fn update_view(self: &mut Camera) {
+        if !self.view_dirty {
+            return
+        }
+
+        // Create view matrix from position and orientation
+        // This is the inverse of the camera's transform matrix
+
+        // Build rotation matrix from view vectors
+        let mut rot = Mat4.identity()
+        rot.rows[0] = Vec4.new(self.right.x, self.right.y, self.right.z, 0.0)
+        rot.rows[1] = Vec4.new(self.up.x, self.up.y, self.up.z, 0.0)
+        rot.rows[2] = Vec4.new(-self.forward.x, -self.forward.y, -self.forward.z, 0.0)
+        rot.rows[3] = Vec4.new(0.0, 0.0, 0.0, 1.0)
+
+        // Build translation matrix
+        let mut trans = Mat4.identity()
+        trans.rows[0].w = -self.position.x
+        trans.rows[1].w = -self.position.y
+        trans.rows[2].w = -self.position.z
+
+        // Combine: view = rotation * translation
+        self.view_matrix = rot * trans
+
+        // Update combined matrix
+        self.view_projection_matrix = self.projection_matrix * self.view_matrix
+
+        self.view_dirty = false
+    }
+
+    /// Update projection matrix
+    fn update_projection(self: &mut Camera) {
+        if !self.projection_dirty {
+            return
+        }
+
+        match self.projection_type {
+            ProjectionType.Perspective => {
+                self.projection_matrix = Mat4.perspective_fov(
+                    self.fov_horizontal,
+                    self.fov_vertical,
+                    self.near_plane,
+                    self.far_plane
+                )
+            },
+            ProjectionType.Orthographic => {
+                self.projection_matrix = Mat4.orthographic(
+                    self.ortho_left,
+                    self.ortho_right,
+                    self.ortho_bottom,
+                    self.ortho_top,
+                    self.near_plane,
+                    self.far_plane
+                )
+            }
+        }
+
+        // Update combined matrix
+        self.view_projection_matrix = self.projection_matrix * self.view_matrix
+
+        self.projection_dirty = false
+    }
+
+    /// Get view matrix
+    fn view_matrix(self: &mut Camera) -> &Mat4 {
+        self.update_view()
+        return &self.view_matrix
+    }
+
+    /// Get projection matrix
+    fn projection_matrix(self: &mut Camera) -> &Mat4 {
+        self.update_projection()
+        return &self.projection_matrix
+    }
+
+    /// Get combined view-projection matrix
+    fn view_projection_matrix(self: &mut Camera) -> &Mat4 {
+        self.update_view()
+        self.update_projection()
+        return &self.view_projection_matrix
+    }
+
+    /// Get camera position
+    fn position(self: &Camera) -> &Vec3 {
+        return &self.position
+    }
+
+    /// Get camera forward vector
+    fn forward(self: &Camera) -> &Vec3 {
+        return &self.forward
+    }
+
+    /// Get camera right vector
+    fn right(self: &Camera) -> &Vec3 {
+        return &self.right
+    }
+
+    /// Get camera up vector
+    fn up(self: &Camera) -> &Vec3 {
+        return &self.up
+    }
+}
+
+/// RTS camera controller for C&C Generals-style camera movement
+struct RTSCameraController {
+    camera: Camera,
+
+    // Movement settings
+    move_speed: f32,
+    rotate_speed: f32,
+    zoom_speed: f32,
+
+    // Zoom limits
+    min_zoom: f32,
+    max_zoom: f32,
+    current_zoom: f32,
+
+    // Rotation limits
+    min_pitch: f32,
+    max_pitch: f32,
+
+    // Screen edge scrolling
+    edge_scroll_enabled: bool,
+    edge_scroll_margin: f32,  // pixels from edge
+}
+
+impl RTSCameraController {
+    fn new(aspect_ratio: f32) -> RTSCameraController {
+        return RTSCameraController {
+            camera: Camera.rts_camera(aspect_ratio),
+            move_speed: 50.0,
+            rotate_speed: 1.0,
+            zoom_speed: 10.0,
+            min_zoom: 20.0,
+            max_zoom: 500.0,
+            current_zoom: 100.0,
+            min_pitch: -1.5,  // radians (~-86 degrees)
+            max_pitch: -0.1,  // radians (~-6 degrees)
+            edge_scroll_enabled: true,
+            edge_scroll_margin: 10.0
+        }
+    }
+
+    /// Update camera movement (WASD or arrow keys)
+    fn move_camera(self: &mut RTSCameraController, forward: f32, right: f32, dt: f32) {
+        let move_amount = self.move_speed * dt
+
+        // Move in world XZ plane (ignore Y)
+        let mut offset = Vec3.new(0.0, 0.0, 0.0)
+        offset.x = right * move_amount
+        offset.z = forward * move_amount
+
+        self.camera.move_world(offset)
+    }
+
+    /// Rotate camera (middle mouse drag)
+    fn rotate_camera(self: &mut RTSCameraController, delta_x: f32, delta_y: f32) {
+        let yaw = -delta_x * self.rotate_speed * 0.01
+        let pitch = -delta_y * self.rotate_speed * 0.01
+
+        // TODO: Clamp pitch to limits
+
+        self.camera.rotate_euler(pitch, yaw, 0.0)
+    }
+
+    /// Zoom camera (mouse wheel)
+    fn zoom_camera(self: &mut RTSCameraController, delta: f32) {
+        self.current_zoom += delta * self.zoom_speed
+
+        // Clamp zoom
+        if self.current_zoom < self.min_zoom {
+            self.current_zoom = self.min_zoom
+        }
+        if self.current_zoom > self.max_zoom {
+            self.current_zoom = self.max_zoom
+        }
+
+        // Move camera forward/backward along view direction
+        let zoom_offset = self.camera.forward() * (delta * self.zoom_speed)
+        self.camera.move_world(zoom_offset)
+    }
+
+    /// Update camera from mouse position (edge scrolling)
+    fn update_edge_scroll(self: &mut RTSCameraController, mouse_x: f32, mouse_y: f32, screen_width: f32, screen_height: f32, dt: f32) {
+        if !self.edge_scroll_enabled {
+            return
+        }
+
+        let mut forward = 0.0
+        let mut right = 0.0
+
+        // Top edge
+        if mouse_y < self.edge_scroll_margin {
+            forward = 1.0
+        }
+        // Bottom edge
+        if mouse_y > screen_height - self.edge_scroll_margin {
+            forward = -1.0
+        }
+        // Left edge
+        if mouse_x < self.edge_scroll_margin {
+            right = -1.0
+        }
+        // Right edge
+        if mouse_x > screen_width - self.edge_scroll_margin {
+            right = 1.0
+        }
+
+        if forward != 0.0 || right != 0.0 {
+            self.move_camera(forward, right, dt)
+        }
+    }
+
+    /// Get camera reference
+    fn camera(self: &mut RTSCameraController) -> &mut Camera {
+        return &mut self.camera
+    }
+}

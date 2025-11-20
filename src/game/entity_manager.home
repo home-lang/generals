@@ -1,0 +1,402 @@
+// Entity Manager - Manages all game entities
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/game/logic/object/
+
+import std.collections.{HashMap, Vec}
+import math.{Vec2, Vec3}
+import game.entity.{Entity, EntityId, EntityHandle, EntityFlags}
+
+/// Entity manager - manages all entities in the game world
+struct EntityManager {
+    entities: HashMap<EntityId, Entity>,
+    next_id: EntityId,
+
+    // Spatial partitioning for fast queries
+    grid_size: f32,
+    spatial_grid: HashMap<(i32, i32), Vec<EntityId>>,
+
+    // Cached queries
+    selected_entities: Vec<EntityId>,
+
+    // Stats
+    entity_count: usize,
+    active_count: usize,
+}
+
+impl EntityManager {
+    fn new() -> EntityManager {
+        return EntityManager {
+            entities: HashMap.new(),
+            next_id: 1,
+            grid_size: 10.0,
+            spatial_grid: HashMap.new(),
+            selected_entities: Vec.new(),
+            entity_count: 0,
+            active_count: 0
+        }
+    }
+
+    /// Create new entity
+    fn create_entity(self: &mut EntityManager, name: String) -> EntityId {
+        let id = self.next_id
+        self.next_id += 1
+
+        let entity = Entity.new(id, name)
+        self.entities.insert(id, entity)
+        self.entity_count += 1
+        self.active_count += 1
+
+        println!("Created entity: {} (id: {})", name, id)
+        return id
+    }
+
+    /// Get entity by ID
+    fn get_entity(self: &EntityManager, id: EntityId) -> Option<&Entity> {
+        return self.entities.get(&id)
+    }
+
+    /// Get entity mutably
+    fn get_entity_mut(self: &mut EntityManager, id: EntityId) -> Option<&mut Entity> {
+        return self.entities.get_mut(&id)
+    }
+
+    /// Delete entity
+    fn delete_entity(self: &mut EntityManager, id: EntityId) {
+        if let Some(entity) = self.entities.remove(&id) {
+            self.entity_count -= 1
+            if entity.has_flag(EntityFlags.Active as u32) {
+                self.active_count -= 1
+            }
+            println!("Deleted entity: {} (id: {})", entity.name, id)
+        }
+    }
+
+    /// Mark entity for deletion
+    fn mark_entity_dead(self: &mut EntityManager, id: EntityId) {
+        if let Some(entity) = self.get_entity_mut(id) {
+            entity.mark_dead()
+        }
+    }
+
+    /// Update all entities
+    fn update(self: &mut EntityManager, dt: f32) {
+        // Update all active entities
+        for (id, entity) in &mut self.entities {
+            if entity.has_flag(EntityFlags.Active as u32) {
+                entity.update(dt)
+            }
+        }
+
+        // Clean up dead entities
+        self.cleanup_dead_entities()
+
+        // Update spatial grid
+        self.update_spatial_grid()
+    }
+
+    /// Remove all entities marked as dead
+    fn cleanup_dead_entities(self: &mut EntityManager) {
+        let mut to_delete = Vec.new()
+
+        for (id, entity) in &self.entities {
+            if entity.is_dead() {
+                to_delete.push(*id)
+            }
+        }
+
+        for id in to_delete {
+            self.delete_entity(id)
+        }
+    }
+
+    /// Update spatial partitioning grid
+    fn update_spatial_grid(self: &mut EntityManager) {
+        // Clear grid
+        self.spatial_grid.clear()
+
+        // Add entities to grid cells
+        for (id, entity) in &self.entities {
+            let pos = &entity.transform.position
+            let cell = self.world_to_grid(pos)
+
+            if !self.spatial_grid.contains_key(&cell) {
+                self.spatial_grid.insert(cell, Vec.new())
+            }
+
+            if let Some(cell_entities) = self.spatial_grid.get_mut(&cell) {
+                cell_entities.push(*id)
+            }
+        }
+    }
+
+    /// Convert world position to grid cell
+    fn world_to_grid(self: &EntityManager, pos: &Vec3) -> (i32, i32) {
+        let x = (pos.x / self.grid_size).floor() as i32
+        let z = (pos.z / self.grid_size).floor() as i32
+        return (x, z)
+    }
+
+    /// Find entities near position
+    fn find_entities_near(self: &EntityManager, position: &Vec3, radius: f32) -> Vec<EntityId> {
+        let mut result = Vec.new()
+
+        // Get grid cell
+        let center_cell = self.world_to_grid(position)
+
+        // Check neighboring cells
+        let cell_radius = (radius / self.grid_size).ceil() as i32
+
+        for dx in -cell_radius..=cell_radius {
+            for dz in -cell_radius..=cell_radius {
+                let cell = (center_cell.0 + dx, center_cell.1 + dz)
+
+                if let Some(cell_entities) = self.spatial_grid.get(&cell) {
+                    for entity_id in cell_entities {
+                        if let Some(entity) = self.get_entity(*entity_id) {
+                            let dist = (entity.transform.position - position).length()
+                            if dist <= radius {
+                                result.push(*entity_id)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Find entities in rectangle
+    fn find_entities_in_rect(self: &EntityManager, min: &Vec3, max: &Vec3) -> Vec<EntityId> {
+        let mut result = Vec.new()
+
+        for (id, entity) in &self.entities {
+            let pos = &entity.transform.position
+
+            if pos.x >= min.x && pos.x <= max.x &&
+               pos.z >= min.z && pos.z <= max.z {
+                result.push(*id)
+            }
+        }
+
+        return result
+    }
+
+    /// Select entity
+    fn select_entity(self: &mut EntityManager, id: EntityId) {
+        if let Some(entity) = self.get_entity_mut(id) {
+            if let Some(selectable) = &mut entity.selectable {
+                if !selectable.selected {
+                    selectable.selected = true
+                    self.selected_entities.push(id)
+                    println!("Selected: {}", entity.name)
+                }
+            }
+        }
+    }
+
+    /// Deselect entity
+    fn deselect_entity(self: &mut EntityManager, id: EntityId) {
+        if let Some(entity) = self.get_entity_mut(id) {
+            if let Some(selectable) = &mut entity.selectable {
+                selectable.selected = false
+            }
+        }
+
+        // Remove from selected list
+        self.selected_entities.retain(|&eid| eid != id)
+    }
+
+    /// Deselect all entities
+    fn deselect_all(self: &mut EntityManager) {
+        for id in &self.selected_entities {
+            if let Some(entity) = self.get_entity_mut(*id) {
+                if let Some(selectable) = &mut entity.selectable {
+                    selectable.selected = false
+                }
+            }
+        }
+
+        self.selected_entities.clear()
+        println!("Deselected all")
+    }
+
+    /// Select entities in rectangle (box selection)
+    fn select_in_rect(self: &mut EntityManager, min: &Vec3, max: &Vec3, replace: bool) {
+        if replace {
+            self.deselect_all()
+        }
+
+        let entities = self.find_entities_in_rect(min, max)
+        for id in entities {
+            self.select_entity(id)
+        }
+
+        println!("Selected {} entities", self.selected_entities.len())
+    }
+
+    /// Get selected entity count
+    fn selected_count(self: &EntityManager) -> usize {
+        return self.selected_entities.len()
+    }
+
+    /// Get all selected entities
+    fn get_selected(self: &EntityManager) -> &Vec<EntityId> {
+        return &self.selected_entities
+    }
+
+    /// Get entities by flag
+    fn get_entities_with_flag(self: &EntityManager, flag: u32) -> Vec<EntityId> {
+        let mut result = Vec.new()
+
+        for (id, entity) in &self.entities {
+            if entity.has_flag(flag) {
+                result.push(*id)
+            }
+        }
+
+        return result
+    }
+
+    /// Get entities by team
+    fn get_entities_by_team(self: &EntityManager, team_id: u32) -> Vec<EntityId> {
+        let mut result = Vec.new()
+
+        for (id, entity) in &self.entities {
+            if entity.team_id == team_id {
+                result.push(*id)
+            }
+        }
+
+        return result
+    }
+
+    /// Count entities
+    fn count(self: &EntityManager) -> usize {
+        return self.entity_count
+    }
+
+    /// Count active entities
+    fn active_count(self: &EntityManager) -> usize {
+        return self.active_count
+    }
+
+    /// Clear all entities
+    fn clear(self: &mut EntityManager) {
+        self.entities.clear()
+        self.spatial_grid.clear()
+        self.selected_entities.clear()
+        self.entity_count = 0
+        self.active_count = 0
+        println!("Cleared all entities")
+    }
+
+    /// Print statistics
+    fn print_stats(self: &EntityManager) {
+        println!("Entity Manager Stats:")
+        println!("  Total Entities: {}", self.entity_count)
+        println!("  Active Entities: {}", self.active_count)
+        println!("  Selected Entities: {}", self.selected_entities.len())
+        println!("  Grid Cells: {}", self.spatial_grid.len())
+    }
+}
+
+/// Entity factory for creating specific entity types
+struct EntityFactory {
+    manager: EntityManager,
+}
+
+impl EntityFactory {
+    fn new() -> EntityFactory {
+        return EntityFactory {
+            manager: EntityManager.new()
+        }
+    }
+
+    /// Create unit entity
+    fn create_unit(self: &mut EntityFactory, unit_type: String, position: Vec3, team_id: u32) -> EntityId {
+        let id = self.manager.create_entity(unit_type.clone())
+
+        if let Some(entity) = self.manager.get_entity_mut(id) {
+            // Set transform
+            entity.transform.set_position(position)
+
+            // Add components based on unit type
+            entity.health = Some(Health.new(100))
+            entity.movement = Some(Movement.new(5.0))
+            entity.selectable = Some(Selectable.new(1.0))
+
+            // Set team and type
+            entity.team_id = team_id
+            entity.unit_type = unit_type
+
+            // Set flags
+            entity.set_flag(EntityFlags.Unit as u32, true)
+            entity.set_flag(EntityFlags.Visible as u32, true)
+
+            if team_id == 0 {
+                entity.set_flag(EntityFlags.Ally as u32, true)
+            } else {
+                entity.set_flag(EntityFlags.Enemy as u32, true)
+            }
+        }
+
+        return id
+    }
+
+    /// Create building entity
+    fn create_building(self: &mut EntityFactory, building_type: String, position: Vec3, team_id: u32) -> EntityId {
+        let id = self.manager.create_entity(building_type.clone())
+
+        if let Some(entity) = self.manager.get_entity_mut(id) {
+            // Set transform
+            entity.transform.set_position(position)
+
+            // Buildings have more health, no movement
+            entity.health = Some(Health.new(500))
+            entity.selectable = Some(Selectable.new(2.0))
+
+            // Set team and type
+            entity.team_id = team_id
+            entity.unit_type = building_type
+
+            // Set flags
+            entity.set_flag(EntityFlags.Building as u32, true)
+            entity.set_flag(EntityFlags.Visible as u32, true)
+
+            if team_id == 0 {
+                entity.set_flag(EntityFlags.Ally as u32, true)
+            } else {
+                entity.set_flag(EntityFlags.Enemy as u32, true)
+            }
+        }
+
+        return id
+    }
+
+    /// Create projectile entity
+    fn create_projectile(self: &mut EntityFactory, position: Vec3, direction: Vec3, speed: f32) -> EntityId {
+        let id = self.manager.create_entity(String.from("Projectile"))
+
+        if let Some(entity) = self.manager.get_entity_mut(id) {
+            // Set transform
+            entity.transform.set_position(position)
+
+            // Projectiles have movement but no health
+            let mut movement = Movement.new(speed)
+            movement.velocity = direction * speed
+            entity.movement = Some(movement)
+
+            // Set flags
+            entity.set_flag(EntityFlags.Projectile as u32, true)
+            entity.set_flag(EntityFlags.Visible as u32, true)
+        }
+
+        return id
+    }
+
+    /// Get entity manager
+    fn entities(self: &mut EntityFactory) -> &mut EntityManager {
+        return &mut self.manager
+    }
+}

@@ -1,0 +1,355 @@
+// Renderer - Main rendering system
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/w3d/renderer/
+
+import std.collections.HashMap
+import platform.time.{GameTimer, Time}
+import math.{Vec2, Vec3, Vec4, Mat4}
+import renderer.gl_context.{GLContext, WindowConfig, GLVersion, GLCapabilities}
+import renderer.shader.{ShaderProgram, DefaultShaders}
+import renderer.texture.{Texture, TextureManager, TextureParams}
+import renderer.camera.{Camera, RTSCameraController}
+import renderer.mesh.{Mesh, MeshBuilder, Vertex}
+
+/// Render statistics
+struct RenderStats {
+    frame_count: u64,
+    draw_calls: u32,
+    triangles: u32,
+    vertices: u32,
+    fps: f32,
+    frame_time_ms: f32,
+}
+
+impl RenderStats {
+    fn new() -> RenderStats {
+        return RenderStats {
+            frame_count: 0,
+            draw_calls: 0,
+            triangles: 0,
+            vertices: 0,
+            fps: 0.0,
+            frame_time_ms: 0.0
+        }
+    }
+
+    fn reset_frame_stats(self: &mut RenderStats) {
+        self.draw_calls = 0
+        self.triangles = 0
+        self.vertices = 0
+    }
+
+    fn print(self: &RenderStats) {
+        println!("Render Stats:")
+        println!("  Frame: {}", self.frame_count)
+        println!("  FPS: {:.1}", self.fps)
+        println!("  Frame Time: {:.2} ms", self.frame_time_ms)
+        println!("  Draw Calls: {}", self.draw_calls)
+        println!("  Triangles: {}", self.triangles)
+        println!("  Vertices: {}", self.vertices)
+    }
+}
+
+/// Main renderer
+struct Renderer {
+    // Core systems
+    gl_context: GLContext,
+    capabilities: GLCapabilities,
+
+    // Camera
+    camera: RTSCameraController,
+
+    // Shaders
+    basic_shader: ShaderProgram,
+    textured_shader: ShaderProgram,
+    current_shader: Option<*mut ShaderProgram>,
+
+    // Textures
+    texture_manager: TextureManager,
+
+    // Timing
+    timer: GameTimer,
+
+    // Stats
+    stats: RenderStats,
+
+    // State
+    clear_color: Vec4,
+    wireframe: bool,
+}
+
+impl Renderer {
+    /// Initialize renderer
+    fn new(config: WindowConfig) -> Result<Renderer, String> {
+        println!("=== Initializing Renderer ===")
+
+        // Create OpenGL context
+        let gl_context = GLContext.create(config, GLVersion.gl41_core())?
+
+        // Query capabilities
+        let capabilities = GLCapabilities.query()
+        capabilities.print()
+
+        // Create camera
+        let (width, height) = gl_context.framebuffer_size()
+        let aspect = (width as f32) / (height as f32)
+        let camera = RTSCameraController.new(aspect)
+
+        // Create shaders
+        println!("\nCompiling shaders...")
+        let basic_shader = DefaultShaders.create_basic()?
+        let textured_shader = DefaultShaders.create_textured()?
+
+        // Create texture manager
+        let texture_manager = TextureManager.new()
+
+        // Create timer
+        let timer = GameTimer.new()
+
+        let mut renderer = Renderer {
+            gl_context: gl_context,
+            capabilities: capabilities,
+            camera: camera,
+            basic_shader: basic_shader,
+            textured_shader: textured_shader,
+            current_shader: None,
+            texture_manager: texture_manager,
+            timer: timer,
+            stats: RenderStats.new(),
+            clear_color: Vec4.new(0.0, 0.0, 0.0, 1.0),
+            wireframe: false
+        }
+
+        println!("\n=== Renderer Initialized ===\n")
+        return Ok(renderer)
+    }
+
+    /// Begin frame
+    fn begin_frame(self: &mut Renderer) {
+        // Update timer
+        let dt = self.timer.delta()
+        self.stats.frame_time_ms = dt * 1000.0
+        self.stats.fps = self.timer.fps()
+
+        // Reset frame stats
+        self.stats.reset_frame_stats()
+
+        // Clear screen
+        self.gl_context.clear(self.clear_color)
+
+        // Update camera matrices
+        self.camera.camera().view_projection_matrix()
+    }
+
+    /// End frame
+    fn end_frame(self: &mut Renderer) {
+        // Swap buffers
+        self.gl_context.swap_buffers()
+
+        // Poll events
+        self.gl_context.poll_events()
+
+        // Increment frame count
+        self.stats.frame_count += 1
+
+        // Print stats every 60 frames
+        if self.stats.frame_count % 60 == 0 {
+            self.stats.print()
+        }
+    }
+
+    /// Set clear color
+    fn set_clear_color(self: &mut Renderer, color: Vec4) {
+        self.clear_color = color
+    }
+
+    /// Toggle wireframe mode
+    fn toggle_wireframe(self: &mut Renderer) {
+        self.wireframe = !self.wireframe
+        // gl.PolygonMode(GL_FRONT_AND_BACK, if self.wireframe { GL_LINE } else { GL_FILL })
+        println!("Wireframe: {}", self.wireframe)
+    }
+
+    /// Use basic shader
+    fn use_basic_shader(self: &mut Renderer) {
+        self.basic_shader.use_program()
+        self.current_shader = Some(&mut self.basic_shader)
+    }
+
+    /// Use textured shader
+    fn use_textured_shader(self: &mut Renderer) {
+        self.textured_shader.use_program()
+        self.current_shader = Some(&mut self.textured_shader)
+    }
+
+    /// Draw mesh with current shader
+    fn draw_mesh(self: &mut Renderer, mesh: &Mesh, model_matrix: &Mat4) {
+        // Get view-projection matrix
+        let vp_matrix = self.camera.camera().view_projection_matrix()
+
+        // Calculate MVP matrix
+        let mvp_matrix = vp_matrix * model_matrix
+
+        // Set uniform
+        if let Some(shader) = &self.current_shader {
+            shader.set_mat4("uModelViewProjection", &mvp_matrix)
+        }
+
+        // Draw mesh
+        mesh.draw()
+
+        // Update stats
+        self.stats.draw_calls += 1
+        // TODO: Count actual triangles/vertices from mesh
+    }
+
+    /// Draw textured mesh
+    fn draw_textured_mesh(self: &mut Renderer, mesh: &Mesh, texture: &Texture, model_matrix: &Mat4) {
+        self.use_textured_shader()
+
+        // Bind texture
+        texture.bind(0)
+
+        // Draw mesh
+        self.draw_mesh(mesh, model_matrix)
+    }
+
+    /// Get camera controller
+    fn camera(self: &mut Renderer) -> &mut RTSCameraController {
+        return &mut self.camera
+    }
+
+    /// Get texture manager
+    fn textures(self: &mut Renderer) -> &mut TextureManager {
+        return &mut self.texture_manager
+    }
+
+    /// Check if window should close
+    fn should_close(self: &Renderer) -> bool {
+        return self.gl_context.should_close()
+    }
+
+    /// Get framebuffer size
+    fn framebuffer_size(self: &Renderer) -> (u32, u32) {
+        return self.gl_context.framebuffer_size()
+    }
+
+    /// Get aspect ratio
+    fn aspect_ratio(self: &Renderer) -> f32 {
+        return self.gl_context.aspect_ratio()
+    }
+
+    /// Toggle fullscreen
+    fn toggle_fullscreen(self: &mut Renderer) -> Result<(), String> {
+        return self.gl_context.toggle_fullscreen()
+    }
+
+    /// Set VSync
+    fn set_vsync(self: &mut Renderer, enabled: bool) {
+        self.gl_context.set_vsync(enabled)
+    }
+
+    /// Shutdown renderer
+    fn shutdown(self: &mut Renderer) {
+        println!("\n=== Shutting Down Renderer ===")
+
+        // Delete shaders
+        self.basic_shader.delete()
+        self.textured_shader.delete()
+
+        // Unload all textures
+        self.texture_manager.unload_all()
+
+        // Destroy GL context
+        self.gl_context.destroy()
+
+        println!("Renderer shutdown complete")
+    }
+}
+
+/// Render batch for efficient rendering
+struct RenderBatch {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    texture: Option<Texture>,
+    max_vertices: usize,
+    max_indices: usize,
+}
+
+impl RenderBatch {
+    fn new(max_vertices: usize, max_indices: usize) -> RenderBatch {
+        return RenderBatch {
+            vertices: Vec.with_capacity(max_vertices),
+            indices: Vec.with_capacity(max_indices),
+            texture: None,
+            max_vertices: max_vertices,
+            max_indices: max_indices
+        }
+    }
+
+    /// Add quad to batch
+    fn add_quad(self: &mut RenderBatch, position: Vec3, size: Vec2, color: Vec4) {
+        let idx = self.vertices.len() as u32
+
+        // Add vertices
+        self.vertices.push(Vertex.with_all(
+            position + Vec3.new(0.0, 0.0, 0.0),
+            Vec3.new(0.0, 0.0, 1.0),
+            Vec2.new(0.0, 0.0),
+            color
+        ))
+        self.vertices.push(Vertex.with_all(
+            position + Vec3.new(size.x, 0.0, 0.0),
+            Vec3.new(0.0, 0.0, 1.0),
+            Vec2.new(1.0, 0.0),
+            color
+        ))
+        self.vertices.push(Vertex.with_all(
+            position + Vec3.new(size.x, size.y, 0.0),
+            Vec3.new(0.0, 0.0, 1.0),
+            Vec2.new(1.0, 1.0),
+            color
+        ))
+        self.vertices.push(Vertex.with_all(
+            position + Vec3.new(0.0, size.y, 0.0),
+            Vec3.new(0.0, 0.0, 1.0),
+            Vec2.new(0.0, 1.0),
+            color
+        ))
+
+        // Add indices (two triangles)
+        self.indices.push(idx + 0)
+        self.indices.push(idx + 1)
+        self.indices.push(idx + 2)
+
+        self.indices.push(idx + 0)
+        self.indices.push(idx + 2)
+        self.indices.push(idx + 3)
+    }
+
+    /// Check if batch is full
+    fn is_full(self: &RenderBatch) -> bool {
+        return self.vertices.len() >= self.max_vertices ||
+               self.indices.len() >= self.max_indices
+    }
+
+    /// Clear batch
+    fn clear(self: &mut RenderBatch) {
+        self.vertices.clear()
+        self.indices.clear()
+        self.texture = None
+    }
+
+    /// Flush batch (submit to GPU)
+    fn flush(self: &mut RenderBatch) {
+        if self.vertices.len() == 0 {
+            return
+        }
+
+        // TODO: Upload to GPU and draw
+        println!("Flushing batch: {} vertices, {} indices",
+            self.vertices.len(), self.indices.len())
+
+        self.clear()
+    }
+}

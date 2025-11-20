@@ -1,0 +1,410 @@
+// Game - Main game loop and state management
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/game/
+
+import std.collections.HashMap
+import platform.time.{GameTimer, FrameLimiter, Time}
+import math.{Vec2, Vec3, Vec4, Mat4}
+import renderer.renderer.Renderer
+import renderer.gl_context.WindowConfig
+import renderer.mesh.{Mesh, MeshBuilder}
+import game.entity_manager.{EntityManager, EntityFactory}
+import game.entity.{EntityId, EntityFlags}
+import assets.ini_parser.IniFile
+import assets.big_archive.BigArchiveManager
+
+/// Game state
+enum GameState {
+    MainMenu,
+    Loading,
+    Playing,
+    Paused,
+    GameOver,
+}
+
+/// Player team
+struct Team {
+    id: u32,
+    name: String,
+    color: Vec4,
+    resources: i32,
+    power: i32,
+}
+
+impl Team {
+    fn new(id: u32, name: String, color: Vec4) -> Team {
+        return Team {
+            id: id,
+            name: name,
+            color: color,
+            resources: 1000,
+            power: 100
+        }
+    }
+}
+
+/// Main game instance
+struct Game {
+    // Core systems
+    renderer: Renderer,
+    entity_factory: EntityFactory,
+
+    // Asset management
+    archives: BigArchiveManager,
+    game_data: Option<IniFile>,
+
+    // Game state
+    state: GameState,
+    paused: bool,
+
+    // Teams
+    teams: Vec<Team>,
+    player_team: u32,
+
+    // Timing
+    frame_limiter: FrameLimiter,
+    game_time: f64,
+
+    // Debug
+    debug_mode: bool,
+    show_stats: bool,
+
+    // Test meshes
+    cube_mesh: Option<Mesh>,
+    grid_mesh: Option<Mesh>,
+}
+
+impl Game {
+    /// Initialize game
+    fn new() -> Result<Game, String> {
+        println!("=== Initializing C&C Generals Zero Hour ===\n")
+
+        // Create renderer
+        let mut config = WindowConfig.new()
+        config.title = String.from("C&C Generals Zero Hour - Home Engine")
+        config.width = 1920
+        config.height = 1080
+        config.fullscreen = false
+        config.vsync = true
+        config.msaa_samples = 4
+
+        let renderer = Renderer.new(config)?
+
+        // Create entity system
+        let entity_factory = EntityFactory.new()
+
+        // Create teams
+        let mut teams = Vec.new()
+        teams.push(Team.new(0, String.from("Player"), Vec4.new(0.0, 0.5, 1.0, 1.0)))  // Blue
+        teams.push(Team.new(1, String.from("Enemy"), Vec4.new(1.0, 0.0, 0.0, 1.0)))   // Red
+
+        // Create frame limiter (60 FPS)
+        let frame_limiter = FrameLimiter.new(60.0)
+
+        let mut game = Game {
+            renderer: renderer,
+            entity_factory: entity_factory,
+            archives: BigArchiveManager.new(),
+            game_data: None,
+            state: GameState.MainMenu,
+            paused: false,
+            teams: teams,
+            player_team: 0,
+            frame_limiter: frame_limiter,
+            game_time: 0.0,
+            debug_mode: true,
+            show_stats: true,
+            cube_mesh: None,
+            grid_mesh: None
+        }
+
+        // Load assets
+        game.load_assets()?
+
+        // Create test scene
+        game.create_test_scene()
+
+        println!("\n=== Game Initialized ===\n")
+        return Ok(game)
+    }
+
+    /// Load game assets
+    fn load_assets(self: &mut Game) -> Result<(), String> {
+        println!("Loading assets...")
+
+        // Load .BIG archives (if available)
+        // let archives_loaded = self.archives.load_from_directory("assets/")?
+        // println!("Loaded {} archives", archives_loaded)
+
+        // Load game data INI
+        // self.game_data = Some(IniFile.load("assets/gamedata.ini")?)
+
+        // Create test meshes
+        self.cube_mesh = Some(MeshBuilder.create_cube(1.0))
+        self.grid_mesh = Some(MeshBuilder.create_grid(100.0, 100.0, 20, 20))
+
+        println!("Assets loaded")
+        return Ok(())
+    }
+
+    /// Create test scene with some entities
+    fn create_test_scene(self: &mut Game) {
+        println!("Creating test scene...")
+
+        // Create some test units
+        for i in 0..5 {
+            let x = (i as f32) * 3.0 - 6.0
+            let pos = Vec3.new(x, 0.0, 0.0)
+            self.entity_factory.create_unit(
+                String.from("Tank"),
+                pos,
+                0  // Player team
+            )
+        }
+
+        // Create some enemy units
+        for i in 0..3 {
+            let x = (i as f32) * 3.0 - 3.0
+            let pos = Vec3.new(x, 0.0, 10.0)
+            self.entity_factory.create_unit(
+                String.from("Tank"),
+                pos,
+                1  // Enemy team
+            )
+        }
+
+        // Create a building
+        self.entity_factory.create_building(
+            String.from("Barracks"),
+            Vec3.new(-10.0, 0.0, -10.0),
+            0
+        )
+
+        println!("Test scene created")
+    }
+
+    /// Main game loop
+    fn run(self: &mut Game) {
+        println!("Starting game loop...\n")
+
+        self.state = GameState.Playing
+
+        // Main loop
+        loop {
+            // Check if window should close
+            if self.renderer.should_close() {
+                break
+            }
+
+            // Update game
+            let dt = self.update()
+
+            // Render frame
+            self.render()
+
+            // Limit frame rate
+            self.frame_limiter.wait_for_next_frame()
+
+            // Update game time
+            self.game_time += dt as f64
+        }
+
+        println!("\nExiting game loop")
+    }
+
+    /// Update game logic
+    fn update(self: &mut Game) -> f32 {
+        // Get delta time
+        let dt = self.renderer.timer.delta()
+
+        // Handle game state
+        match self.state {
+            GameState.Playing => {
+                if !self.paused {
+                    self.update_gameplay(dt)
+                }
+            },
+            GameState.MainMenu => {
+                // TODO: Menu logic
+            },
+            GameState.Paused => {
+                // Paused - no updates
+            },
+            _ => {}
+        }
+
+        // Process input
+        self.process_input(dt)
+
+        return dt
+    }
+
+    /// Update gameplay
+    fn update_gameplay(self: &mut Game, dt: f32) {
+        // Update all entities
+        self.entity_factory.entities().update(dt)
+
+        // Update camera (example: slowly rotate)
+        if self.debug_mode {
+            // Auto-rotate camera for demo
+            // let camera = self.renderer.camera()
+            // camera.camera().rotate_euler(0.0, dt * 0.1, 0.0)
+        }
+    }
+
+    /// Process player input
+    fn process_input(self: &mut Game, dt: f32) {
+        // TODO: Keyboard/mouse input
+        // For now, just example camera controls
+
+        // WASD camera movement
+        // if keyboard.is_key_down(Key.W) {
+        //     self.renderer.camera().move_camera(1.0, 0.0, dt)
+        // }
+        // if keyboard.is_key_down(Key.S) {
+        //     self.renderer.camera().move_camera(-1.0, 0.0, dt)
+        // }
+        // if keyboard.is_key_down(Key.A) {
+        //     self.renderer.camera().move_camera(0.0, -1.0, dt)
+        // }
+        // if keyboard.is_key_down(Key.D) {
+        //     self.renderer.camera().move_camera(0.0, 1.0, dt)
+        // }
+
+        // ESC to pause
+        // if keyboard.is_key_pressed(Key.Escape) {
+        //     self.toggle_pause()
+        // }
+    }
+
+    /// Render frame
+    fn render(self: &mut Game) {
+        // Begin frame
+        self.renderer.begin_frame()
+
+        // Set clear color
+        self.renderer.set_clear_color(Vec4.new(0.2, 0.3, 0.4, 1.0))
+
+        // Render game based on state
+        match self.state {
+            GameState.Playing | GameState.Paused => {
+                self.render_gameplay()
+            },
+            GameState.MainMenu => {
+                self.render_menu()
+            },
+            _ => {}
+        }
+
+        // End frame
+        self.renderer.end_frame()
+    }
+
+    /// Render gameplay
+    fn render_gameplay(self: &mut Game) {
+        // Render grid (terrain placeholder)
+        if let Some(grid) = &self.grid_mesh {
+            self.renderer.use_basic_shader()
+            let grid_transform = Mat4.identity()
+            self.renderer.draw_mesh(grid, &grid_transform)
+        }
+
+        // Render entities
+        self.render_entities()
+
+        // Render UI
+        self.render_ui()
+    }
+
+    /// Render all entities
+    fn render_entities(self: &mut Game) {
+        if self.cube_mesh.is_none() {
+            return
+        }
+
+        self.renderer.use_basic_shader()
+
+        let entities = self.entity_factory.entities()
+
+        // Render each visible entity
+        for (id, entity) in &entities.entities {
+            if !entity.has_flag(EntityFlags.Visible as u32) {
+                continue
+            }
+
+            // Get world transform
+            let transform = entity.transform.world_matrix()
+
+            // Render cube at entity position (placeholder for actual model)
+            self.renderer.draw_mesh(self.cube_mesh.as_ref().unwrap(), transform)
+        }
+    }
+
+    /// Render UI
+    fn render_ui(self: &mut Game) {
+        // TODO: Render HUD, minimap, selection boxes, etc.
+
+        if self.show_stats {
+            // Stats are auto-printed by renderer
+        }
+    }
+
+    /// Render main menu
+    fn render_menu(self: &mut Game) {
+        // TODO: Menu rendering
+    }
+
+    /// Toggle pause
+    fn toggle_pause(self: &mut Game) {
+        self.paused = !self.paused
+        if self.paused {
+            self.state = GameState.Paused
+            println!("Game paused")
+        } else {
+            self.state = GameState.Playing
+            println!("Game resumed")
+        }
+    }
+
+    /// Toggle debug mode
+    fn toggle_debug(self: &mut Game) {
+        self.debug_mode = !self.debug_mode
+        println!("Debug mode: {}", self.debug_mode)
+    }
+
+    /// Get team by ID
+    fn get_team(self: &Game, team_id: u32) -> Option<&Team> {
+        for team in &self.teams {
+            if team.id == team_id {
+                return Some(team)
+            }
+        }
+        return None
+    }
+
+    /// Shutdown game
+    fn shutdown(self: &mut Game) {
+        println!("\n=== Shutting Down Game ===")
+
+        // Print final stats
+        self.entity_factory.entities().print_stats()
+
+        // Clear entities
+        self.entity_factory.entities().clear()
+
+        // Shutdown renderer
+        self.renderer.shutdown()
+
+        println!("Game shutdown complete")
+    }
+}
+
+/// Game entry point
+fn main() -> Result<(), String> {
+    // Create and run game
+    let mut game = Game.new()?
+    game.run()
+    game.shutdown()
+
+    return Ok(())
+}
