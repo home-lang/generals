@@ -1,0 +1,271 @@
+// File - File I/O abstraction
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/game/common/system/file.h
+
+import std.io
+import std.fs
+
+/// File access modes (can be combined with bitwise OR)
+enum FileMode {
+    Read = 0x01,
+    Write = 0x02,
+    Append = 0x04,
+    Create = 0x08,
+    Truncate = 0x10,
+    Text = 0x20,
+    Binary = 0x40,
+}
+
+/// Seek modes for file positioning
+enum SeekMode {
+    Start,    // From beginning of file
+    Current,  // From current position
+    End,      // From end of file
+}
+
+/// File metadata information
+struct FileInfo {
+    size: u64,
+    modified_time: u64,
+    is_directory: bool,
+    exists: bool,
+}
+
+/// File handle abstraction
+struct File {
+    path: String,
+    handle: ?std.fs.File,
+    mode: u32,
+    is_open: bool,
+
+    /// Open a file with specified mode
+    fn open(path: String, mode: u32) -> Result<File, String> {
+        let mut file = File {
+            path: path,
+            handle: null,
+            mode: mode,
+            is_open: false
+        }
+
+        // Convert our mode flags to std.fs mode
+        let fs_mode = if mode & FileMode.Write != 0 {
+            if mode & FileMode.Append != 0 {
+                std.fs.OpenMode.Append
+            } else if mode & FileMode.Truncate != 0 {
+                std.fs.OpenMode.WriteTruncate
+            } else {
+                std.fs.OpenMode.Write
+            }
+        } else {
+            std.fs.OpenMode.Read
+        }
+
+        // Try to open the file
+        match std.fs.open(path, fs_mode) {
+            Ok(handle) => {
+                file.handle = handle
+                file.is_open = true
+                return Ok(file)
+            },
+            Err(e) => {
+                return Err("Failed to open file: " + path)
+            }
+        }
+    }
+
+    /// Close the file
+    fn close(self: &mut File) {
+        if self.is_open {
+            if let Some(handle) = self.handle {
+                handle.close()
+            }
+            self.is_open = false
+            self.handle = null
+        }
+    }
+
+    /// Read bytes from file
+    fn read(self: &mut File, buffer: &mut [u8]) -> Result<usize, String> {
+        if !self.is_open {
+            return Err("File not open")
+        }
+
+        if let Some(handle) = &self.handle {
+            match handle.read(buffer) {
+                Ok(bytes_read) => return Ok(bytes_read),
+                Err(e) => return Err("Read failed")
+            }
+        }
+
+        return Err("Invalid file handle")
+    }
+
+    /// Write bytes to file
+    fn write(self: &mut File, data: &[u8]) -> Result<usize, String> {
+        if !self.is_open {
+            return Err("File not open")
+        }
+
+        if let Some(handle) = &self.handle {
+            match handle.write(data) {
+                Ok(bytes_written) => return Ok(bytes_written),
+                Err(e) => return Err("Write failed")
+            }
+        }
+
+        return Err("Invalid file handle")
+    }
+
+    /// Seek to position in file
+    fn seek(self: &mut File, offset: i64, mode: SeekMode) -> Result<u64, String> {
+        if !self.is_open {
+            return Err("File not open")
+        }
+
+        if let Some(handle) = &self.handle {
+            let seek_mode = match mode {
+                SeekMode.Start => std.fs.SeekFrom.Start(offset as u64),
+                SeekMode.Current => std.fs.SeekFrom.Current(offset),
+                SeekMode.End => std.fs.SeekFrom.End(offset)
+            }
+
+            match handle.seek(seek_mode) {
+                Ok(pos) => return Ok(pos),
+                Err(e) => return Err("Seek failed")
+            }
+        }
+
+        return Err("Invalid file handle")
+    }
+
+    /// Get current file position
+    fn tell(self: &File) -> Result<u64, String> {
+        if !self.is_open {
+            return Err("File not open")
+        }
+
+        if let Some(handle) = &self.handle {
+            match handle.seek(std.fs.SeekFrom.Current(0)) {
+                Ok(pos) => return Ok(pos),
+                Err(e) => return Err("Tell failed")
+            }
+        }
+
+        return Err("Invalid file handle")
+    }
+
+    /// Get file size
+    fn size(self: &File) -> Result<u64, String> {
+        if let Some(handle) = &self.handle {
+            match handle.metadata() {
+                Ok(metadata) => return Ok(metadata.len()),
+                Err(e) => return Err("Failed to get file size")
+            }
+        }
+
+        return Err("Invalid file handle")
+    }
+
+    /// Check if at end of file
+    fn is_eof(self: &File) -> bool {
+        match self.tell() {
+            Ok(pos) => {
+                match self.size() {
+                    Ok(size) => return pos >= size,
+                    Err(_) => return false
+                }
+            },
+            Err(_) => return false
+        }
+    }
+
+    /// Read entire file as bytes
+    fn read_all_bytes(path: String) -> Result<Vec<u8>, String> {
+        match std.fs.read(path) {
+            Ok(data) => return Ok(data),
+            Err(e) => return Err("Failed to read file: " + path)
+        }
+    }
+
+    /// Read entire file as string
+    fn read_all_text(path: String) -> Result<String, String> {
+        match std.fs.read_to_string(path) {
+            Ok(text) => return Ok(text),
+            Err(e) => return Err("Failed to read file: " + path)
+        }
+    }
+
+    /// Write bytes to file (creates or truncates)
+    fn write_all_bytes(path: String, data: &[u8]) -> Result<(), String> {
+        match std.fs.write(path, data) {
+            Ok(_) => return Ok(()),
+            Err(e) => return Err("Failed to write file: " + path)
+        }
+    }
+
+    /// Write string to file (creates or truncates)
+    fn write_all_text(path: String, text: String) -> Result<(), String> {
+        return File.write_all_bytes(path, text.as_bytes())
+    }
+
+    /// Check if file exists
+    fn exists(path: String) -> bool {
+        return std.fs.exists(path)
+    }
+
+    /// Get file metadata
+    fn metadata(path: String) -> Result<FileInfo, String> {
+        match std.fs.metadata(path) {
+            Ok(meta) => {
+                return Ok(FileInfo {
+                    size: meta.len(),
+                    modified_time: meta.modified() as u64,
+                    is_directory: meta.is_dir(),
+                    exists: true
+                })
+            },
+            Err(e) => {
+                return Ok(FileInfo {
+                    size: 0,
+                    modified_time: 0,
+                    is_directory: false,
+                    exists: false
+                })
+            }
+        }
+    }
+
+    /// Delete file
+    fn delete(path: String) -> Result<(), String> {
+        match std.fs.remove_file(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => return Err("Failed to delete file: " + path)
+        }
+    }
+
+    /// Create directory
+    fn create_directory(path: String) -> Result<(), String> {
+        match std.fs.create_dir_all(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => return Err("Failed to create directory: " + path)
+        }
+    }
+
+    /// List files in directory
+    fn list_directory(path: String) -> Result<Vec<String>, String> {
+        match std.fs.read_dir(path) {
+            Ok(entries) => {
+                let mut files = Vec.new()
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        if let Some(name) = entry.file_name().to_str() {
+                            files.push(String.from(name))
+                        }
+                    }
+                }
+                return Ok(files)
+            },
+            Err(e) => return Err("Failed to read directory: " + path)
+        }
+    }
+}

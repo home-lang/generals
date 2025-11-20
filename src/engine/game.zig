@@ -8,15 +8,23 @@ const builtin = @import("builtin");
 // Platform-specific imports (macOS for now)
 const MacOSWindow = if (builtin.os.tag == .macos) @import("../platform/macos_window.zig").MacOSWindow else void;
 const SpriteRenderer = if (builtin.os.tag == .macos) @import("../platform/macos_sprite_renderer.zig").SpriteRenderer else void;
+const RenderContext = if (builtin.os.tag == .macos) @import("../platform/macos_sprite_renderer.zig").RenderContext else void;
 const GPUTexture = if (builtin.os.tag == .macos) @import("../platform/macos_sprite_renderer.zig").Texture else void;
 
 const TextureLoader = @import("texture.zig").Texture;
 const Camera = @import("camera.zig").Camera;
 const EntityManager = @import("entity.zig").EntityManager;
 const Sprite = @import("entity.zig").Sprite;
+const TeamId = @import("entity.zig").TeamId;
 const Pathfinder = @import("pathfinding.zig").Pathfinder;
 const ResourceManager = @import("resource.zig").ResourceManager;
 const PlayerResources = @import("resource.zig").PlayerResources;
+const UIManager = @import("ui.zig").UIManager;
+const Minimap = @import("minimap.zig").Minimap;
+const MinimapIcon = @import("minimap.zig").MinimapIcon;
+const MinimapIconType = @import("minimap.zig").MinimapIconType;
+const FogOfWarManager = @import("fog_of_war.zig").FogOfWarManager;
+const VisibilityState = @import("fog_of_war.zig").VisibilityState;
 const math = @import("math");
 const Vec2 = math.Vec2(f32);
 
@@ -74,6 +82,18 @@ pub const Game = struct {
     resource_manager: ResourceManager,
     player_resources: PlayerResources,
 
+    // UI management
+    ui_manager: UIManager,
+
+    // Minimap
+    minimap: Minimap,
+
+    // Fog of War
+    fog_of_war: FogOfWarManager,
+
+    // Player team (for fog of war rendering)
+    player_team: TeamId,
+
     // Input state
     input: InputState,
 
@@ -87,6 +107,11 @@ pub const Game = struct {
     const TARGET_RENDER_TIME: f64 = 1.0 / TARGET_RENDER_FPS;
 
     pub fn init(allocator: Allocator) !Game {
+        const world_width: f32 = 4000.0;
+        const world_height: f32 = 4000.0;
+        const num_teams: usize = 4; // Support up to 4 teams
+        const fog_cell_size: f32 = 64.0; // 64x64 fog grid cells
+
         return Game{
             .allocator = allocator,
             .state = .loading,
@@ -100,6 +125,10 @@ pub const Game = struct {
             .pathfinder = Pathfinder.init(allocator, 32.0), // 32-unit grid
             .resource_manager = try ResourceManager.init(allocator),
             .player_resources = PlayerResources.init(),
+            .ui_manager = UIManager.init(allocator, 1024, 768),
+            .minimap = Minimap.init(1024, 768, world_width, world_height),
+            .fog_of_war = try FogOfWarManager.init(allocator, num_teams, world_width, world_height, fog_cell_size),
+            .player_team = 0, // Player is team 0
             .input = .{},
             .test_texture = null,
         };
@@ -111,6 +140,12 @@ pub const Game = struct {
 
         // Clean up resource manager
         self.resource_manager.deinit();
+
+        // Clean up UI manager
+        self.ui_manager.deinit();
+
+        // Clean up fog of war
+        self.fog_of_war.deinit();
 
         // Clean up test texture
         if (builtin.os.tag == .macos) {
@@ -329,6 +364,37 @@ pub const Game = struct {
         // Update entities
         self.entity_manager.update(dt);
 
+        // Update fog of war
+        self.fog_of_war.update(self.entity_manager.getActiveEntities());
+
+        // Update UI
+        self.ui_manager.update(self.input.mouse_x, self.input.mouse_y, self.input.mouse_left_clicked);
+
+        // Update minimap
+        self.minimap.update(1024); // Screen width
+
+        // Handle minimap clicks (camera navigation)
+        if (self.input.mouse_left_clicked) {
+            if (self.minimap.handleClick(self.input.mouse_x, self.input.mouse_y)) |world_pos| {
+                self.camera.position = world_pos;
+                std.debug.print("Minimap click: moved camera to ({d:.1}, {d:.1})\n", .{ world_pos.x, world_pos.y });
+            }
+        }
+
+        // Update unit info panel based on selection
+        const entities = self.entity_manager.getActiveEntities();
+        for (entities) |*entity| {
+            if (!entity.active) continue;
+            if (entity.unit_data) |unit_data| {
+                if (unit_data.selected) {
+                    self.ui_manager.setSelectedUnit(entity.id, unit_data.unit_type, unit_data.health, unit_data.max_health);
+                    break;
+                }
+            }
+        } else {
+            self.ui_manager.clearSelection();
+        }
+
         switch (self.state) {
             .loading => {
                 // Transition to main menu after loading
@@ -368,6 +434,10 @@ pub const Game = struct {
                     for (entities) |entity| {
                         if (!entity.active) continue;
                         if (entity.sprite == null) continue;
+
+                        // Check fog of war visibility
+                        const visibility = self.fog_of_war.getVisibilityState(self.player_team, entity.transform.position);
+                        if (visibility == .unexplored) continue; // Don't render unexplored entities
 
                         const sprite = entity.sprite.?;
 
@@ -420,11 +490,141 @@ pub const Game = struct {
                         }
                     }
 
+                    // Render UI
+                    self.renderUI(renderer, &ctx);
+
                     // End frame
                     renderer.endFrame(&ctx);
                 }
             }
         }
+    }
+
+    fn renderUI(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
+        if (!self.ui_manager.show_ui) return;
+
+        // Render resource display (top bar)
+        const res_panel = &self.ui_manager.resource_display.panel;
+        if (res_panel.visible) {
+            renderer.drawRect(ctx, res_panel.x, res_panel.y, res_panel.width, res_panel.height,
+                res_panel.background_color[0], res_panel.background_color[1],
+                res_panel.background_color[2], res_panel.background_color[3]);
+            // TODO: Render text for supplies and power values
+        }
+
+        // Render unit info panel (bottom left)
+        const unit_panel = &self.ui_manager.unit_info_panel.panel;
+        if (unit_panel.visible) {
+            renderer.drawRect(ctx, unit_panel.x, unit_panel.y, unit_panel.width, unit_panel.height,
+                unit_panel.background_color[0], unit_panel.background_color[1],
+                unit_panel.background_color[2], unit_panel.background_color[3]);
+            // TODO: Render text for unit name and health
+        }
+
+        // Render production queue display (bottom right)
+        const prod_panel = &self.ui_manager.production_display.panel;
+        if (prod_panel.visible) {
+            renderer.drawRect(ctx, prod_panel.x, prod_panel.y, prod_panel.width, prod_panel.height,
+                prod_panel.background_color[0], prod_panel.background_color[1],
+                prod_panel.background_color[2], prod_panel.background_color[3]);
+            // TODO: Render production queue items
+        }
+
+        // Render command panel (bottom center)
+        const cmd_panel = &self.ui_manager.command_panel.panel;
+        if (cmd_panel.visible) {
+            renderer.drawRect(ctx, cmd_panel.x, cmd_panel.y, cmd_panel.width, cmd_panel.height,
+                cmd_panel.background_color[0], cmd_panel.background_color[1],
+                cmd_panel.background_color[2], cmd_panel.background_color[3]);
+
+            // Render command buttons
+            for (0..self.ui_manager.command_panel.button_count) |i| {
+                const button = &self.ui_manager.command_panel.buttons[i];
+                const btn_panel = &button.panel;
+                if (btn_panel.visible) {
+                    renderer.drawRect(ctx, btn_panel.x, btn_panel.y, btn_panel.width, btn_panel.height,
+                        btn_panel.background_color[0], btn_panel.background_color[1],
+                        btn_panel.background_color[2], btn_panel.background_color[3]);
+                    // TODO: Render button label text
+                }
+            }
+        }
+
+        // Render minimap
+        self.renderMinimap(renderer, ctx);
+    }
+
+    fn renderMinimap(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
+        if (!self.minimap.visible) return;
+
+        const config = &self.minimap.config;
+
+        // Draw minimap background
+        renderer.drawRect(ctx, config.x, config.y, config.width, config.height,
+            config.background_color[0], config.background_color[1],
+            config.background_color[2], config.background_color[3]);
+
+        // Draw minimap border
+        const border = config.border_width;
+        renderer.drawRect(ctx, config.x - border, config.y - border,
+            config.width + border * 2, border,
+            config.border_color[0], config.border_color[1], config.border_color[2], config.border_color[3]);
+        renderer.drawRect(ctx, config.x - border, config.y + config.height,
+            config.width + border * 2, border,
+            config.border_color[0], config.border_color[1], config.border_color[2], config.border_color[3]);
+        renderer.drawRect(ctx, config.x - border, config.y,
+            border, config.height,
+            config.border_color[0], config.border_color[1], config.border_color[2], config.border_color[3]);
+        renderer.drawRect(ctx, config.x + config.width, config.y,
+            border, config.height,
+            config.border_color[0], config.border_color[1], config.border_color[2], config.border_color[3]);
+
+        // Draw entities on minimap
+        const entities = self.entity_manager.getActiveEntities();
+        for (entities) |entity| {
+            if (!entity.active) continue;
+
+            // Determine icon type based on entity type and team
+            var icon_type: MinimapIconType = .unit_neutral;
+            if (entity.unit_data != null) {
+                if (entity.team == 0) {
+                    icon_type = .unit_friendly;
+                } else {
+                    icon_type = .unit_enemy;
+                }
+            } else if (entity.building_data != null) {
+                if (entity.team == 0) {
+                    icon_type = .building_friendly;
+                } else {
+                    icon_type = .building_enemy;
+                }
+            }
+
+            const icon = MinimapIcon.init(entity.transform.position, icon_type);
+            const minimap_pos = config.worldToMinimap(entity.transform.position);
+            const color = icon.getColor();
+
+            // Draw icon as a small rectangle
+            renderer.drawRect(ctx,
+                minimap_pos.x - icon.size / 2, minimap_pos.y - icon.size / 2,
+                icon.size, icon.size,
+                color[0], color[1], color[2], color[3]);
+        }
+
+        // Draw camera viewport rectangle
+        const viewport = self.minimap.getCameraViewport(&self.camera);
+        const vp_color = self.minimap.camera_viewport_color;
+        const vp_border: f32 = 1.0;
+
+        // Draw viewport as outline (4 rectangles forming a frame)
+        renderer.drawRect(ctx, viewport.x, viewport.y, viewport.width, vp_border,
+            vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Top
+        renderer.drawRect(ctx, viewport.x, viewport.y + viewport.height - vp_border, viewport.width, vp_border,
+            vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Bottom
+        renderer.drawRect(ctx, viewport.x, viewport.y, vp_border, viewport.height,
+            vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Left
+        renderer.drawRect(ctx, viewport.x + viewport.width - vp_border, viewport.y, vp_border, viewport.height,
+            vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Right
     }
 
     pub fn quit(self: *Game) void {
