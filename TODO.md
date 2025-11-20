@@ -1,62 +1,170 @@
-# C&C Generals Zero Hour - Development TODO List
+# Command & Conquer: Generals - Complete Rewrite in Home Language
 
-**Last Updated:** November 16, 2025
-**Total Tasks:** 35
-**Status:** 0/35 Complete (0%)
+**Last Updated**: November 19, 2024
+**Project**: Rewrite C&C Generals Zero Hour from scratch in Home
+**Source Reference**: `~/Code/generals-old` (1.78M lines C++)
+**Target**: macOS & Windows cross-platform
+**Assets Ready**: 1.1GB at `~/Code/generals/assets`
+**Build System**: Zig 0.16-dev (✅ INSTALLED: 0.16.0-dev.1334+06d08daba)
 
----
+> **IMPORTANT**: This project uses **Zig 0.16-dev** which includes async I/O features not available in 0.15.
+> The async I/O is critical for non-blocking asset loading, network multiplayer, and smooth gameplay.
 
-## Phase 1: Complete Game Databases (9 tasks)
-
-- [ ] **Task 1:** Add remaining USA units (60+ units needed)
-- [ ] **Task 2:** Add remaining China units (60+ units needed)
-- [ ] **Task 3:** Add remaining GLA units (67+ units needed)
-- [ ] **Task 4:** Add remaining USA buildings (20+ buildings needed)
-- [ ] **Task 5:** Add remaining China buildings (18+ buildings needed)
-- [ ] **Task 6:** Add remaining GLA buildings (20+ buildings needed)
-- [ ] **Task 7:** Add remaining weapons (112+ weapons needed)
-- [ ] **Task 8:** Add remaining multiplayer maps (20+ maps needed)
-- [ ] **Task 9:** Add all campaign missions (24+ missions needed)
-
-## Phase 2: Core Game Systems (6 tasks)
-
-- [ ] **Task 10:** Create AI behavior system
-- [ ] **Task 11:** Create combat system
-- [ ] **Task 12:** Create economy system
-- [ ] **Task 13:** Create terrain/map renderer
-- [ ] **Task 14:** Create 3D model loader
-- [ ] **Task 15:** Create texture system
-
-## Phase 3: Asset Extraction (5 tasks)
-
-- [ ] **Task 16:** Extract 3D models (~1000 files, ~500MB)
-- [ ] **Task 17:** Extract textures (~2000 files, ~300MB)
-- [ ] **Task 18:** Extract audio files (~500 files, ~300MB)
-- [ ] **Task 19:** Extract video cinematics (~20 files, ~1GB)
-- [ ] **Task 20:** Extract map terrain data (~50 files, ~200MB)
-
-## Phase 4: Game Features (9 tasks)
-
-- [ ] **Task 21:** Implement audio engine
-- [ ] **Task 22:** Implement video playback
-- [ ] **Task 23:** Create UI system
-- [ ] **Task 24:** Create input system
-- [ ] **Task 25:** Create multiplayer networking
-- [ ] **Task 26:** Create save/load system
-- [ ] **Task 27:** Integrate all assets into build
-- [ ] **Task 28:** Create main menu
-- [ ] **Task 29:** Create skirmish mode
-
-## Phase 5: Testing & Release (6 tasks)
-
-- [ ] **Task 30:** Test all factions
-- [ ] **Task 31:** Test all generals
-- [ ] **Task 32:** Test multiplayer
-- [ ] **Task 33:** Performance optimization (60 FPS target)
-- [ ] **Task 34:** Build final distributable packages
-- [ ] **Task 35:** Create playable game executable
+View full detailed plan at: [DETAILED_IMPLEMENTATION_PLAN.md](./DETAILED_IMPLEMENTATION_PLAN.md)
 
 ---
 
-**Next:** Start Task 1 - Add remaining USA units to src/game_data/units.zig
-**See:** ROADMAP_TO_PLAYABLE.md for detailed implementation guide
+## ✅ Already Complete (Infrastructure)
+
+- ✅ 1.1GB game assets extracted (audio, textures, models, INI files)
+- ✅ DMG packaging system for macOS
+- ✅ App bundle creation infrastructure  
+- ✅ 100+ maps ready
+- ✅ All 56+ INI configuration files
+
+---
+
+## 🏠 Home Language Enhancements (~/Code/home)
+
+### Data Structures & I/O
+- [ ] Dynamic arrays with generics
+- [ ] HashMap<K,V> implementation
+- [ ] String operations (concat, format, parse)
+- [ ] **Async File I/O** (leverages Zig 0.16-dev async I/O)
+  - [ ] Non-blocking file read/write
+  - [ ] Async asset streaming
+  - [ ] Background loading for textures/models
+- [ ] **INI parser** (CRITICAL - loads all game data)
+- [ ] **Async .BIG archive reader** (EA's format with streaming)
+
+### Graphics & Rendering  
+- [ ] 2D sprite rendering
+- [ ] 3D model loading (W3D format)
+- [ ] Metal backend (macOS)
+- [ ] DirectX 12 backend (Windows)  
+- [ ] Texture loading (TGA, DDS)
+- [ ] Particle systems
+- [ ] Camera & viewport
+
+### Platform & Systems
+- [ ] Window management (both platforms)
+- [ ] Mouse & keyboard input
+- [ ] Audio playback (CoreAudio/WASAPI)
+- [ ] Math library (Vec2/3/4, Mat4, Quat)
+- [ ] **Async Networking** (TCP/UDP with Zig 0.16 async I/O)
+  - [ ] Non-blocking socket operations
+  - [ ] Async multiplayer packet handling
+  - [ ] Event loop integration
+- [ ] Threading & async task system (using Zig 0.16 features)
+
+---
+
+## 🎮 Game Engine Core
+
+### Foundation
+- [ ] **Async game loop** with fixed timestep (event-driven using Zig 0.16)
+- [ ] Object system & ID management
+- [ ] **Async resource manager** (background loading, no frame drops)
+  - [ ] Texture streaming
+  - [ ] Model loading in background
+  - [ ] Audio preloading
+- [ ] **Async INI data loading** (parse large files without blocking)
+- [ ] State machine (menu, game, paused)
+
+### Rendering
+- [ ] 3D renderer (units, buildings, terrain)
+- [ ] 2D UI renderer (HUD, menus)
+- [ ] Terrain system (heightmaps, textures)
+- [ ] Particle effects (explosions, smoke)
+- [ ] Camera controller (RTS-style)
+
+### Game Logic
+- [ ] **Unit system** (100+ unit types from FactionUnit.ini)
+- [ ] **Building system** (80+ buildings from FactionBuilding.ini)
+- [ ] Weapon & combat system
+- [ ] Economy (money, power, supply)
+- [ ] Upgrades & tech tree
+- [ ] Pathfinding (A* algorithm)
+- [ ] Unit AI (attack, defend, formations)
+- [ ] Strategic AI (build orders, tactics)
+
+### Interface
+- [ ] Main menu system
+- [ ] In-game HUD & command bar
+- [ ] Minimap with fog of war
+- [ ] Selection & control groups
+- [ ] Build menus from CommandButton.ini
+
+### Maps & Campaign
+- [ ] Map loading (100+ maps available)
+- [ ] Fog of war system
+- [ ] Mission scripting
+- [ ] 3 campaigns (USA, China, GLA)
+- [ ] Objectives & triggers
+
+### Multiplayer
+- [ ] Network synchronization (lockstep)
+- [ ] Lobby & matchmaking
+- [ ] LAN & online play
+- [ ] Chat system
+
+### Audio & Polish
+- [ ] Sound effects (3D positional)
+- [ ] Music playback
+- [ ] Voice lines (600+ from Eva.ini)
+- [ ] General powers & abilities
+- [ ] Options & settings
+- [ ] Modding support
+
+---
+
+## 📋 Implementation Phases
+
+### Phase 0: Language Foundation (3-4 months)
+Build core Home language features needed for game dev
+
+### Phase 1: Engine Core (2-3 months)
+Game loop, objects, resource loading, INI parsing
+
+### Phase 2: Rendering (2-3 months)  
+Get something visible on screen
+
+### Phase 3: Game Logic (3-4 months)
+Units, buildings, combat, economy
+
+### Phase 4: AI & Maps (2-3 months)
+Pathfinding, AI behavior, map loading
+
+### Phase 5: UI & Polish (2-3 months)
+Menus, HUD, audio, campaign
+
+### Phase 6: Multiplayer (2-3 months)
+Networking, lobby, synchronization
+
+**Total Estimate**: 16-23 months full-time
+
+---
+
+## 🎯 Next Steps
+
+1. **Start with Phase 0.1**: Implement HashMap in `~/Code/home/packages/collections/`
+2. **Then Phase 0.2**: Implement INI parser in `~/Code/home/packages/io/`
+3. **First Test**: Load and parse `FactionUnit.ini` successfully
+4. **Second Test**: Render a unit sprite on screen
+
+---
+
+## 📊 Progress Tracking
+
+| Component | Status | Priority |
+|-----------|--------|----------|
+| HashMap | ⬜ Not started | P0 |
+| INI Parser | ⬜ Not started | P0 |
+| File I/O | ⬜ Not started | P0 |
+| 2D Rendering | ⬜ Not started | P0 |
+| Math Library | ⬜ Not started | P0 |
+
+---
+
+**This is a from-scratch rewrite using Home language. The C++ source is our reference, not our codebase. We're building something cleaner, modern, and cross-platform from day one!**
+
