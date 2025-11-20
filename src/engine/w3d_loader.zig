@@ -407,8 +407,15 @@ pub const W3DModel = struct {
     }
 
     pub fn loadFromBytes(allocator: Allocator, data: []const u8) !W3DModel {
-        var stream = std.io.fixedBufferStream(data);
-        return try loadFromReader(allocator, stream.reader());
+        // BLOCKED: Zig 0.16-dev completely changed the std.Io.Reader API to use VTable
+        // The old std.io.fixedBufferStream() function is gone
+        // The new std.Io.Reader uses a complex VTable-based approach
+        // This needs to be reimplemented when Zig 0.16 API stabilizes
+        //
+        // For now, return an error until this can be properly fixed
+        _ = allocator;
+        _ = data;
+        return error.Zig016IoApiNotYetSupported;
     }
 
     fn loadFromReader(allocator: Allocator, reader: anytype) !W3DModel {
