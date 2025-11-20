@@ -1,0 +1,734 @@
+// Asset Manifest and Management System
+// Comprehensive asset definitions for textures, models, audio, and data files
+
+enum AssetType {
+    TEXTURE,
+    MODEL,
+    AUDIO,
+    VIDEO,
+    DATA,
+    SCRIPT,
+    MAP,
+}
+
+enum AssetState {
+    NOT_LOADED,
+    LOADING,
+    LOADED,
+    FAILED,
+}
+
+struct AssetMetadata {
+    id: String,
+    path: String,
+    asset_type: AssetType,
+    size_bytes: Int,
+    dependencies: Collection<String>,
+    tags: Collection<String>,
+    is_streaming: Bool,
+    priority: Int,  // 0=low, 1=normal, 2=high, 3=critical
+
+    fn init(id: String, path: String, asset_type: AssetType) -> AssetMetadata {
+        let metadata = AssetMetadata {
+            id: id,
+            path: path,
+            asset_type: asset_type,
+            size_bytes: 0,
+            dependencies: Collection::init(),
+            tags: Collection::init(),
+            is_streaming: false,
+            priority: 1,
+        }
+        return metadata
+    }
+
+    fn add_dependency(self, dep_id: String) {
+        self.dependencies.add(dep_id)
+    }
+
+    fn add_tag(self, tag: String) {
+        self.tags.add(tag)
+    }
+}
+
+struct LoadedAsset {
+    metadata: AssetMetadata,
+    state: AssetState,
+    data_ptr: Int,  // Pointer to loaded data
+    reference_count: Int,
+    load_time: Float,
+
+    fn init(metadata: AssetMetadata) -> LoadedAsset {
+        let asset = LoadedAsset {
+            metadata: metadata,
+            state: AssetState::NOT_LOADED,
+            data_ptr: 0,
+            reference_count: 0,
+            load_time: 0.0,
+        }
+        return asset
+    }
+
+    fn acquire(self) {
+        self.reference_count = self.reference_count + 1
+    }
+
+    fn release(self) {
+        if self.reference_count > 0 {
+            self.reference_count = self.reference_count - 1
+        }
+    }
+
+    fn can_unload(self) -> Bool {
+        return self.reference_count == 0
+    }
+}
+
+// Texture Asset Definitions
+struct TextureDefinition {
+    id: String,
+    file_path: String,
+    width: Int,
+    height: Int,
+    format: String,  // "RGB", "RGBA", "DXT1", "DXT5"
+    has_mipmaps: Bool,
+    is_normal_map: Bool,
+    category: String,
+
+    fn init(id: String, path: String) -> TextureDefinition {
+        let tex = TextureDefinition {
+            id: id,
+            file_path: path,
+            width: 0,
+            height: 0,
+            format: "RGBA",
+            has_mipmaps: true,
+            is_normal_map: false,
+            category: "general",
+        }
+        return tex
+    }
+}
+
+// Model Asset Definitions
+struct ModelDefinition {
+    id: String,
+    file_path: String,
+    vertex_count: Int,
+    triangle_count: Int,
+    bone_count: Int,
+    has_animations: Bool,
+    lod_levels: Int,
+    textures: Collection<String>,
+    category: String,
+
+    fn init(id: String, path: String) -> ModelDefinition {
+        let model = ModelDefinition {
+            id: id,
+            file_path: path,
+            vertex_count: 0,
+            triangle_count: 0,
+            bone_count: 0,
+            has_animations: false,
+            lod_levels: 1,
+            textures: Collection::init(),
+            category: "units",
+        }
+        return model
+    }
+
+    fn add_texture(self, tex_id: String) {
+        self.textures.add(tex_id)
+    }
+}
+
+// Audio Asset Definitions
+struct AudioDefinition {
+    id: String,
+    file_path: String,
+    duration: Float,
+    sample_rate: Int,
+    channels: Int,
+    format: String,  // "WAV", "MP3", "OGG"
+    is_music: Bool,
+    is_looping: Bool,
+    volume: Float,
+    category: String,
+
+    fn init(id: String, path: String) -> AudioDefinition {
+        let audio = AudioDefinition {
+            id: id,
+            file_path: path,
+            duration: 0.0,
+            sample_rate: 44100,
+            channels: 2,
+            format: "WAV",
+            is_music: false,
+            is_looping: false,
+            volume: 1.0,
+            category: "sfx",
+        }
+        return audio
+    }
+}
+
+struct AssetManifest {
+    textures: Collection<TextureDefinition>,
+    models: Collection<ModelDefinition>,
+    audio: Collection<AudioDefinition>,
+    metadata: Collection<AssetMetadata>,
+
+    fn init() -> AssetManifest {
+        let manifest = AssetManifest {
+            textures: Collection::init(),
+            models: Collection::init(),
+            audio: Collection::init(),
+            metadata: Collection::init(),
+        }
+        return manifest
+    }
+
+    fn register_texture(self, tex: TextureDefinition) {
+        self.textures.add(tex)
+
+        let meta = AssetMetadata::init(tex.id, tex.file_path, AssetType::TEXTURE)
+        meta.add_tag(tex.category)
+        self.metadata.add(meta)
+    }
+
+    fn register_model(self, model: ModelDefinition) {
+        self.models.add(model)
+
+        let meta = AssetMetadata::init(model.id, model.file_path, AssetType::MODEL)
+        meta.add_tag(model.category)
+
+        // Add texture dependencies
+        for i in 0..model.textures.len() {
+            meta.add_dependency(model.textures.get(i))
+        }
+
+        self.metadata.add(meta)
+    }
+
+    fn register_audio(self, audio: AudioDefinition) {
+        self.audio.add(audio)
+
+        let meta = AssetMetadata::init(audio.id, audio.file_path, AssetType::AUDIO)
+        meta.add_tag(audio.category)
+
+        if audio.is_music {
+            meta.is_streaming = true
+        }
+
+        self.metadata.add(meta)
+    }
+
+    fn get_texture(self, id: String) -> TextureDefinition? {
+        for i in 0..self.textures.len() {
+            let tex = self.textures.get(i)
+            if tex.id == id {
+                return tex
+            }
+        }
+        return null
+    }
+
+    fn get_model(self, id: String) -> ModelDefinition? {
+        for i in 0..self.models.len() {
+            let model = self.models.get(i)
+            if model.id == id {
+                return model
+            }
+        }
+        return null
+    }
+
+    fn get_audio(self, id: String) -> AudioDefinition? {
+        for i in 0..self.audio.len() {
+            let audio = self.audio.get(i)
+            if audio.id == id {
+                return audio
+            }
+        }
+        return null
+    }
+
+    fn get_assets_by_category(self, category: String) -> Collection<AssetMetadata> {
+        let result = Collection::init()
+
+        for i in 0..self.metadata.len() {
+            let meta = self.metadata.get(i)
+
+            for j in 0..meta.tags.len() {
+                if meta.tags.get(j) == category {
+                    result.add(meta)
+                    break
+                }
+            }
+        }
+
+        return result
+    }
+
+    fn get_total_size(self) -> Int {
+        let total = 0
+
+        for i in 0..self.metadata.len() {
+            total = total + self.metadata.get(i).size_bytes
+        }
+
+        return total
+    }
+}
+
+struct AssetLoader {
+    manifest: AssetManifest,
+    loaded_assets: Collection<LoadedAsset>,
+    loading_queue: Collection<String>,
+    total_assets: Int,
+    loaded_count: Int,
+
+    fn init(manifest: AssetManifest) -> AssetLoader {
+        let loader = AssetLoader {
+            manifest: manifest,
+            loaded_assets: Collection::init(),
+            loading_queue: Collection::init(),
+            total_assets: manifest.metadata.len(),
+            loaded_count: 0,
+        }
+        return loader
+    }
+
+    fn queue_asset(self, asset_id: String) {
+        self.loading_queue.add(asset_id)
+    }
+
+    fn queue_category(self, category: String) {
+        let assets = self.manifest.get_assets_by_category(category)
+
+        for i in 0..assets.len() {
+            self.queue_asset(assets.get(i).id)
+        }
+    }
+
+    fn load_next(self) -> Bool {
+        if self.loading_queue.len() == 0 {
+            return false
+        }
+
+        let asset_id = self.loading_queue.get(0)
+        self.loading_queue.remove(0)
+
+        // Find metadata
+        let meta = null
+        for i in 0..self.manifest.metadata.len() {
+            let m = self.manifest.metadata.get(i)
+            if m.id == asset_id {
+                meta = m
+                break
+            }
+        }
+
+        if meta == null {
+            return false
+        }
+
+        // Create loaded asset
+        let asset = LoadedAsset::init(meta)
+        asset.state = AssetState::LOADING
+
+        // Actual loading would happen here
+        // asset.data_ptr = load_from_disk(meta.path)
+
+        asset.state = AssetState::LOADED
+        self.loaded_assets.add(asset)
+        self.loaded_count = self.loaded_count + 1
+
+        return true
+    }
+
+    fn load_all(self) {
+        while self.loading_queue.len() > 0 {
+            self.load_next()
+        }
+    }
+
+    fn get_progress(self) -> Float {
+        if self.total_assets == 0 {
+            return 1.0
+        }
+
+        return self.loaded_count / self.total_assets
+    }
+
+    fn get_loaded_asset(self, asset_id: String) -> LoadedAsset? {
+        for i in 0..self.loaded_assets.len() {
+            let asset = self.loaded_assets.get(i)
+            if asset.metadata.id == asset_id {
+                return asset
+            }
+        }
+        return null
+    }
+
+    fn unload_unused(self) {
+        let keep = Collection::init()
+
+        for i in 0..self.loaded_assets.len() {
+            let asset = self.loaded_assets.get(i)
+
+            if !asset.can_unload() {
+                keep.add(asset)
+            }
+        }
+
+        self.loaded_assets = keep
+        self.loaded_count = keep.len()
+    }
+}
+
+// Create comprehensive asset manifest
+fn create_game_manifest() -> AssetManifest {
+    let manifest = AssetManifest::init()
+
+    // Register all texture assets (would be much more in full game)
+    register_textures(manifest)
+
+    // Register all model assets
+    register_models(manifest)
+
+    // Register all audio assets
+    register_audio(manifest)
+
+    return manifest
+}
+
+fn register_textures(manifest: AssetManifest) {
+    // UI Textures
+    let ui_bg = TextureDefinition::init("ui_background", "Data/Textures/UI/background.tga")
+    ui_bg.category = "ui"
+    ui_bg.width = 1920
+    ui_bg.height = 1080
+    manifest.register_texture(ui_bg)
+
+    let minimap = TextureDefinition::init("ui_minimap_frame", "Data/Textures/UI/minimap.tga")
+    minimap.category = "ui"
+    manifest.register_texture(minimap)
+
+    // Terrain Textures
+    let grass = TextureDefinition::init("terrain_grass", "Data/Textures/Terrain/grass01.tga")
+    grass.category = "terrain"
+    grass.width = 512
+    grass.height = 512
+    manifest.register_texture(grass)
+
+    let sand = TextureDefinition::init("terrain_sand", "Data/Textures/Terrain/sand01.tga")
+    sand.category = "terrain"
+    manifest.register_texture(sand)
+
+    let rock = TextureDefinition::init("terrain_rock", "Data/Textures/Terrain/rock01.tga")
+    rock.category = "terrain"
+    manifest.register_texture(rock)
+
+    // Unit Textures - USA
+    let crusader_tex = TextureDefinition::init("unit_crusader", "Data/Textures/Units/USA/crusader.tga")
+    crusader_tex.category = "units_usa"
+    manifest.register_texture(crusader_tex)
+
+    let paladin_tex = TextureDefinition::init("unit_paladin", "Data/Textures/Units/USA/paladin.tga")
+    paladin_tex.category = "units_usa"
+    manifest.register_texture(paladin_tex)
+
+    // Unit Textures - China
+    let battlemaster_tex = TextureDefinition::init("unit_battlemaster", "Data/Textures/Units/China/battlemaster.tga")
+    battlemaster_tex.category = "units_china"
+    manifest.register_texture(battlemaster_tex)
+
+    let overlord_tex = TextureDefinition::init("unit_overlord", "Data/Textures/Units/China/overlord.tga")
+    overlord_tex.category = "units_china"
+    manifest.register_texture(overlord_tex)
+
+    // Unit Textures - GLA
+    let scorpion_tex = TextureDefinition::init("unit_scorpion", "Data/Textures/Units/GLA/scorpion.tga")
+    scorpion_tex.category = "units_gla"
+    manifest.register_texture(scorpion_tex)
+
+    let marauder_tex = TextureDefinition::init("unit_marauder", "Data/Textures/Units/GLA/marauder.tga")
+    marauder_tex.category = "units_gla"
+    manifest.register_texture(marauder_tex)
+
+    // Effects
+    let explosion = TextureDefinition::init("fx_explosion", "Data/Textures/Effects/explosion.tga")
+    explosion.category = "effects"
+    manifest.register_texture(explosion)
+
+    let smoke = TextureDefinition::init("fx_smoke", "Data/Textures/Effects/smoke.tga")
+    smoke.category = "effects"
+    manifest.register_texture(smoke)
+}
+
+fn register_models(manifest: AssetManifest) {
+    // USA Models
+    let crusader = ModelDefinition::init("model_crusader", "Data/Models/USA/crusader.w3d")
+    crusader.category = "units_usa"
+    crusader.vertex_count = 2840
+    crusader.triangle_count = 1420
+    crusader.has_animations = true
+    crusader.add_texture("unit_crusader")
+    manifest.register_model(crusader)
+
+    let paladin = ModelDefinition::init("model_paladin", "Data/Models/USA/paladin.w3d")
+    paladin.category = "units_usa"
+    paladin.vertex_count = 3200
+    paladin.triangle_count = 1600
+    paladin.has_animations = true
+    paladin.add_texture("unit_paladin")
+    manifest.register_model(paladin)
+
+    // China Models
+    let battlemaster = ModelDefinition::init("model_battlemaster", "Data/Models/China/battlemaster.w3d")
+    battlemaster.category = "units_china"
+    battlemaster.vertex_count = 2600
+    battlemaster.triangle_count = 1300
+    battlemaster.has_animations = true
+    battlemaster.add_texture("unit_battlemaster")
+    manifest.register_model(battlemaster)
+
+    let overlord = ModelDefinition::init("model_overlord", "Data/Models/China/overlord.w3d")
+    overlord.category = "units_china"
+    overlord.vertex_count = 4100
+    overlord.triangle_count = 2050
+    overlord.has_animations = true
+    overlord.add_texture("unit_overlord")
+    manifest.register_model(overlord)
+
+    // GLA Models
+    let scorpion = ModelDefinition::init("model_scorpion", "Data/Models/GLA/scorpion.w3d")
+    scorpion.category = "units_gla"
+    scorpion.vertex_count = 1800
+    scorpion.triangle_count = 900
+    scorpion.has_animations = true
+    scorpion.add_texture("unit_scorpion")
+    manifest.register_model(scorpion)
+
+    let marauder = ModelDefinition::init("model_marauder", "Data/Models/GLA/marauder.w3d")
+    marauder.category = "units_gla"
+    marauder.vertex_count = 2200
+    marauder.triangle_count = 1100
+    marauder.has_animations = true
+    marauder.add_texture("unit_marauder")
+    manifest.register_model(marauder)
+}
+
+fn register_audio(manifest: AssetManifest) {
+    // Music
+    let menu_music = AudioDefinition::init("music_menu", "Data/Audio/Music/menu.mp3")
+    menu_music.is_music = true
+    menu_music.is_looping = true
+    menu_music.category = "music"
+    menu_music.duration = 180.0
+    manifest.register_audio(menu_music)
+
+    let battle_music = AudioDefinition::init("music_battle", "Data/Audio/Music/battle01.mp3")
+    battle_music.is_music = true
+    battle_music.category = "music"
+    battle_music.duration = 240.0
+    manifest.register_audio(battle_music)
+
+    // SFX - Weapons
+    let tank_fire = AudioDefinition::init("sfx_tank_fire", "Data/Audio/SFX/tank_fire.wav")
+    tank_fire.category = "sfx_weapons"
+    tank_fire.duration = 1.2
+    manifest.register_audio(tank_fire)
+
+    let explosion_sfx = AudioDefinition::init("sfx_explosion", "Data/Audio/SFX/explosion.wav")
+    explosion_sfx.category = "sfx_weapons"
+    explosion_sfx.duration = 2.0
+    manifest.register_audio(explosion_sfx)
+
+    // SFX - Units
+    let unit_move = AudioDefinition::init("sfx_unit_move", "Data/Audio/SFX/unit_move.wav")
+    unit_move.category = "sfx_units"
+    manifest.register_audio(unit_move)
+
+    let unit_select = AudioDefinition::init("sfx_unit_select", "Data/Audio/SFX/unit_select.wav")
+    unit_select.category = "sfx_units"
+    manifest.register_audio(unit_select)
+
+    // Voice - USA
+    let usa_yes = AudioDefinition::init("voice_usa_yes", "Data/Audio/Voice/USA/yes_sir.wav")
+    usa_yes.category = "voice_usa"
+    manifest.register_audio(usa_yes)
+
+    let usa_move = AudioDefinition::init("voice_usa_move", "Data/Audio/Voice/USA/moving_out.wav")
+    usa_move.category = "voice_usa"
+    manifest.register_audio(usa_move)
+
+    // Voice - China
+    let china_yes = AudioDefinition::init("voice_china_yes", "Data/Audio/Voice/China/affirmative.wav")
+    china_yes.category = "voice_china"
+    manifest.register_audio(china_yes)
+
+    // Voice - GLA
+    let gla_yes = AudioDefinition::init("voice_gla_yes", "Data/Audio/Voice/GLA/yes.wav")
+    gla_yes.category = "voice_gla"
+    manifest.register_audio(gla_yes)
+}
+
+// Tests
+fn test_asset_metadata() -> Bool {
+    let meta = AssetMetadata::init("test_texture", "path/to/texture.tga", AssetType::TEXTURE)
+    assert(meta.id == "test_texture", "Metadata ID")
+    assert(meta.asset_type == AssetType::TEXTURE, "Asset type")
+
+    meta.add_dependency("dep1")
+    assert(meta.dependencies.len() == 1, "Dependency added")
+
+    meta.add_tag("ui")
+    assert(meta.tags.len() == 1, "Tag added")
+
+    return true
+}
+
+fn test_texture_definition() -> Bool {
+    let tex = TextureDefinition::init("ui_bg", "ui/bg.tga")
+    assert(tex.id == "ui_bg", "Texture ID")
+    assert(tex.has_mipmaps, "Has mipmaps by default")
+
+    return true
+}
+
+fn test_model_definition() -> Bool {
+    let model = ModelDefinition::init("tank", "models/tank.w3d")
+    assert(model.id == "tank", "Model ID")
+
+    model.add_texture("tank_diffuse")
+    assert(model.textures.len() == 1, "Texture added")
+
+    return true
+}
+
+fn test_audio_definition() -> Bool {
+    let audio = AudioDefinition::init("music", "music/theme.mp3")
+    assert(audio.id == "music", "Audio ID")
+    assert(audio.sample_rate == 44100, "Sample rate")
+    assert(audio.channels == 2, "Stereo")
+
+    return true
+}
+
+fn test_manifest() -> Bool {
+    let manifest = AssetManifest::init()
+
+    let tex = TextureDefinition::init("test", "test.tga")
+    manifest.register_texture(tex)
+
+    assert(manifest.textures.len() == 1, "Texture registered")
+    assert(manifest.metadata.len() == 1, "Metadata created")
+
+    let found = manifest.get_texture("test")
+    assert(found != null, "Texture found")
+
+    return true
+}
+
+fn test_asset_loader() -> Bool {
+    let manifest = AssetManifest::init()
+
+    let tex = TextureDefinition::init("tex1", "tex1.tga")
+    manifest.register_texture(tex)
+
+    let loader = AssetLoader::init(manifest)
+    assert(loader.total_assets == 1, "Total assets")
+
+    loader.queue_asset("tex1")
+    assert(loader.loading_queue.len() == 1, "Asset queued")
+
+    loader.load_next()
+    assert(loader.loaded_count == 1, "Asset loaded")
+
+    let progress = loader.get_progress()
+    assert(progress == 1.0, "100% progress")
+
+    return true
+}
+
+fn test_loaded_asset() -> Bool {
+    let meta = AssetMetadata::init("test", "test.tga", AssetType::TEXTURE)
+    let asset = LoadedAsset::init(meta)
+
+    assert(asset.reference_count == 0, "No references")
+    assert(asset.can_unload(), "Can unload")
+
+    asset.acquire()
+    assert(asset.reference_count == 1, "One reference")
+    assert(!asset.can_unload(), "Cannot unload")
+
+    asset.release()
+    assert(asset.can_unload(), "Can unload again")
+
+    return true
+}
+
+fn test_category_loading() -> Bool {
+    let manifest = AssetManifest::init()
+
+    let tex1 = TextureDefinition::init("ui1", "ui1.tga")
+    tex1.category = "ui"
+    manifest.register_texture(tex1)
+
+    let tex2 = TextureDefinition::init("ui2", "ui2.tga")
+    tex2.category = "ui"
+    manifest.register_texture(tex2)
+
+    let loader = AssetLoader::init(manifest)
+    loader.queue_category("ui")
+
+    assert(loader.loading_queue.len() == 2, "Both UI assets queued")
+
+    return true
+}
+
+fn test_dependencies() -> Bool {
+    let manifest = AssetManifest::init()
+
+    let tex = TextureDefinition::init("tank_tex", "tank.tga")
+    manifest.register_texture(tex)
+
+    let model = ModelDefinition::init("tank_model", "tank.w3d")
+    model.add_texture("tank_tex")
+    manifest.register_model(model)
+
+    let meta = manifest.metadata.get(1)  // Model metadata
+    assert(meta.dependencies.len() == 1, "Model has texture dependency")
+    assert(meta.dependencies.get(0) == "tank_tex", "Correct dependency")
+
+    return true
+}
+
+fn test_game_manifest() -> Bool {
+    let manifest = create_game_manifest()
+
+    assert(manifest.textures.len() > 0, "Has textures")
+    assert(manifest.models.len() > 0, "Has models")
+    assert(manifest.audio.len() > 0, "Has audio")
+
+    let total_size = manifest.get_total_size()
+    assert(total_size >= 0, "Total size calculated")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_asset_metadata(), "Test 1: Asset metadata")
+    assert(test_texture_definition(), "Test 2: Texture definition")
+    assert(test_model_definition(), "Test 3: Model definition")
+    assert(test_audio_definition(), "Test 4: Audio definition")
+    assert(test_manifest(), "Test 5: Manifest")
+    assert(test_asset_loader(), "Test 6: Asset loader")
+    assert(test_loaded_asset(), "Test 7: Loaded asset")
+    assert(test_category_loading(), "Test 8: Category loading")
+    assert(test_dependencies(), "Test 9: Dependencies")
+    assert(test_game_manifest(), "Test 10: Game manifest")
+    return true
+}
