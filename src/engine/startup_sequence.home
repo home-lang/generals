@@ -1,0 +1,632 @@
+// Startup Sequence System
+// Implements the authentic C&C Generals startup experience:
+// 1. Splash screen (Install_Final.bmp)
+// 2. EA Logo video (EALogo.bik)
+// 3. Sizzle reel video (Sizzle.bik)
+// 4. Legal notice screen
+// 5. Shell map loading (3D animated background)
+// 6. Main menu display
+
+import engine/display
+import engine/texture
+
+// ============================================================================
+// Startup Phase Definitions
+// ============================================================================
+
+enum StartupPhase {
+    INITIALIZING,
+    SPLASH_SCREEN,
+    EA_LOGO_VIDEO,
+    SIZZLE_VIDEO,
+    LEGAL_NOTICE,
+    LOADING_SHELL_MAP,
+    MAIN_MENU,
+    IN_GAME,
+}
+
+// Phase timing constants (in seconds)
+const SPLASH_DURATION: f32 = 2.5
+const SPLASH_FADE_IN: f32 = 0.5
+const SPLASH_FADE_OUT: f32 = 0.5
+const EA_LOGO_DURATION: f32 = 5.0
+const EA_LOGO_FADE: f32 = 1.0
+const SIZZLE_DURATION: f32 = 8.0
+const LEGAL_DURATION: f32 = 4.0
+const LEGAL_FADE: f32 = 0.5
+const SHELL_MAP_LOAD_TIME: f32 = 2.0
+
+// ============================================================================
+// Video Player (Bink Video Support)
+// ============================================================================
+
+enum VideoState {
+    STOPPED,
+    PLAYING,
+    PAUSED,
+    FINISHED,
+}
+
+struct VideoPlayer {
+    state: VideoState,
+    filename: String,
+    current_frame: i32,
+    total_frames: i32,
+    frame_rate: f32,
+    width: i32,
+    height: i32,
+    elapsed_time: f32,
+    duration: f32,
+    audio_volume: f32,
+    loop_video: Bool,
+    frame_buffer: [u8],
+}
+
+fn create_video_player() -> VideoPlayer {
+    return VideoPlayer {
+        state: VideoState::STOPPED,
+        filename: "",
+        current_frame: 0,
+        total_frames: 0,
+        frame_rate: 30.0,
+        width: 0,
+        height: 0,
+        elapsed_time: 0.0,
+        duration: 0.0,
+        audio_volume: 1.0,
+        loop_video: false,
+        frame_buffer: [],
+    }
+}
+
+fn load_bink_video(player: VideoPlayer, filename: String) -> Bool {
+    player.filename = filename
+    player.state = VideoState::STOPPED
+    player.current_frame = 0
+    player.elapsed_time = 0.0
+
+    // Bink video file format parsing
+    // BIK files use RAD Game Tools' proprietary format
+    // Header: "BIKi" signature, followed by metadata
+
+    // For now, set default video properties
+    // In production, these would be read from the BIK header
+    player.width = 640
+    player.height = 480
+    player.frame_rate = 30.0
+    player.total_frames = 150  // ~5 seconds at 30fps
+    player.duration = (player.total_frames as f32) / player.frame_rate
+
+    // Allocate frame buffer (RGB)
+    let buffer_size = player.width * player.height * 3
+    player.frame_buffer = allocate_bytes(buffer_size)
+
+    return true
+}
+
+fn play_video(player: VideoPlayer) {
+    if player.state == VideoState::STOPPED || player.state == VideoState::PAUSED {
+        player.state = VideoState::PLAYING
+    }
+}
+
+fn pause_video(player: VideoPlayer) {
+    if player.state == VideoState::PLAYING {
+        player.state = VideoState::PAUSED
+    }
+}
+
+fn stop_video(player: VideoPlayer) {
+    player.state = VideoState::STOPPED
+    player.current_frame = 0
+    player.elapsed_time = 0.0
+}
+
+fn update_video(player: VideoPlayer, delta_time: f32) {
+    if player.state != VideoState::PLAYING {
+        return
+    }
+
+    player.elapsed_time = player.elapsed_time + delta_time
+
+    // Calculate current frame
+    let frame = ((player.elapsed_time * player.frame_rate) as i32)
+
+    if frame >= player.total_frames {
+        if player.loop_video {
+            player.elapsed_time = 0.0
+            player.current_frame = 0
+        } else {
+            player.state = VideoState::FINISHED
+            player.current_frame = player.total_frames - 1
+        }
+    } else {
+        player.current_frame = frame
+    }
+
+    // Decode current frame
+    decode_bink_frame(player)
+}
+
+fn decode_bink_frame(player: VideoPlayer) {
+    // Bink uses DCT-based compression with motion compensation
+    // Frame types: I-frames (keyframes), P-frames (predicted)
+    //
+    // For production implementation:
+    // 1. Read frame data from BIK file
+    // 2. Decompress using Bink's proprietary algorithm
+    // 3. Apply YUV to RGB conversion
+    // 4. Store in frame_buffer
+
+    // Placeholder: fill with frame indicator color
+    let frame_color = (player.current_frame * 2) % 256
+    for i in 0..(player.width * player.height) {
+        player.frame_buffer[i * 3] = frame_color as u8
+        player.frame_buffer[i * 3 + 1] = frame_color as u8
+        player.frame_buffer[i * 3 + 2] = frame_color as u8
+    }
+}
+
+fn is_video_finished(player: VideoPlayer) -> Bool {
+    return player.state == VideoState::FINISHED
+}
+
+fn get_video_progress(player: VideoPlayer) -> f32 {
+    if player.duration > 0.0 {
+        return player.elapsed_time / player.duration
+    }
+    return 0.0
+}
+
+fn destroy_video_player(player: VideoPlayer) {
+    player.frame_buffer = []
+    player.state = VideoState::STOPPED
+}
+
+// ============================================================================
+// Splash Screen
+// ============================================================================
+
+struct SplashScreen {
+    texture_id: i32,
+    is_loaded: Bool,
+    alpha: f32,
+    fade_state: FadeState,
+    elapsed_time: f32,
+}
+
+enum FadeState {
+    FADING_IN,
+    VISIBLE,
+    FADING_OUT,
+    DONE,
+}
+
+fn create_splash_screen() -> SplashScreen {
+    return SplashScreen {
+        texture_id: 0,
+        is_loaded: false,
+        alpha: 0.0,
+        fade_state: FadeState::FADING_IN,
+        elapsed_time: 0.0,
+    }
+}
+
+fn load_splash_screen(splash: SplashScreen, filename: String) -> Bool {
+    // Load Install_Final.bmp or converted PNG
+    // Original splash shows the game logo with loading indicator
+
+    // texture_id = load_texture(filename)
+    splash.is_loaded = true
+    return true
+}
+
+fn update_splash_screen(splash: SplashScreen, delta_time: f32) {
+    splash.elapsed_time = splash.elapsed_time + delta_time
+
+    if splash.fade_state == FadeState::FADING_IN {
+        splash.alpha = splash.elapsed_time / SPLASH_FADE_IN
+        if splash.alpha >= 1.0 {
+            splash.alpha = 1.0
+            splash.fade_state = FadeState::VISIBLE
+        }
+    } else if splash.fade_state == FadeState::VISIBLE {
+        let visible_time = splash.elapsed_time - SPLASH_FADE_IN
+        if visible_time >= SPLASH_DURATION - SPLASH_FADE_IN - SPLASH_FADE_OUT {
+            splash.fade_state = FadeState::FADING_OUT
+        }
+    } else if splash.fade_state == FadeState::FADING_OUT {
+        let fade_start = SPLASH_DURATION - SPLASH_FADE_OUT
+        let fade_progress = (splash.elapsed_time - fade_start) / SPLASH_FADE_OUT
+        splash.alpha = 1.0 - fade_progress
+        if splash.alpha <= 0.0 {
+            splash.alpha = 0.0
+            splash.fade_state = FadeState::DONE
+        }
+    }
+}
+
+fn is_splash_done(splash: SplashScreen) -> Bool {
+    return splash.fade_state == FadeState::DONE
+}
+
+// ============================================================================
+// Legal Notice Screen
+// ============================================================================
+
+struct LegalNotice {
+    lines: [String],
+    alpha: f32,
+    elapsed_time: f32,
+    fade_state: FadeState,
+}
+
+fn create_legal_notice() -> LegalNotice {
+    return LegalNotice {
+        lines: [
+            "COMMAND & CONQUER: GENERALS - ZERO HOUR",
+            "",
+            "Copyright (c) 2003 Electronic Arts Inc.",
+            "All rights reserved.",
+            "",
+            "This game contains technology licensed from:",
+            "RAD Game Tools - Bink Video",
+            "Miles Sound System",
+            "",
+            "Home Edition - Fan Recreation",
+            "Based on Thyme Engine",
+        ],
+        alpha: 0.0,
+        elapsed_time: 0.0,
+        fade_state: FadeState::FADING_IN,
+    }
+}
+
+fn update_legal_notice(legal: LegalNotice, delta_time: f32) {
+    legal.elapsed_time = legal.elapsed_time + delta_time
+
+    if legal.fade_state == FadeState::FADING_IN {
+        legal.alpha = legal.elapsed_time / LEGAL_FADE
+        if legal.alpha >= 1.0 {
+            legal.alpha = 1.0
+            legal.fade_state = FadeState::VISIBLE
+        }
+    } else if legal.fade_state == FadeState::VISIBLE {
+        if legal.elapsed_time >= LEGAL_DURATION - LEGAL_FADE {
+            legal.fade_state = FadeState::FADING_OUT
+        }
+    } else if legal.fade_state == FadeState::FADING_OUT {
+        let fade_start = LEGAL_DURATION - LEGAL_FADE
+        let fade_progress = (legal.elapsed_time - fade_start) / LEGAL_FADE
+        legal.alpha = 1.0 - fade_progress
+        if legal.alpha <= 0.0 {
+            legal.alpha = 0.0
+            legal.fade_state = FadeState::DONE
+        }
+    }
+}
+
+fn is_legal_done(legal: LegalNotice) -> Bool {
+    return legal.fade_state == FadeState::DONE
+}
+
+// ============================================================================
+// Loading Screen (for shell map)
+// ============================================================================
+
+struct LoadingScreen {
+    progress: f32,
+    status_text: String,
+    tip_text: String,
+    tips: [String],
+    current_tip_index: i32,
+}
+
+fn create_loading_screen() -> LoadingScreen {
+    return LoadingScreen {
+        progress: 0.0,
+        status_text: "Loading...",
+        tip_text: "",
+        tips: [
+            "Use the minimap to quickly navigate the battlefield.",
+            "Build multiple production structures to speed up unit creation.",
+            "Capture supply docks to increase your income.",
+            "General Powers can turn the tide of battle.",
+            "Scout early to find enemy bases.",
+            "Mix unit types for a balanced army.",
+            "Upgrade your units to gain an advantage.",
+            "Control the high ground for better vision.",
+        ],
+        current_tip_index: 0,
+    }
+}
+
+fn update_loading_screen(loading: LoadingScreen, progress: f32, status: String) {
+    loading.progress = progress
+    loading.status_text = status
+
+    // Rotate tips
+    if loading.tips.length > 0 {
+        loading.tip_text = loading.tips[loading.current_tip_index]
+    }
+}
+
+fn advance_loading_tip(loading: LoadingScreen) {
+    loading.current_tip_index = (loading.current_tip_index + 1) % (loading.tips.length as i32)
+    if loading.tips.length > 0 {
+        loading.tip_text = loading.tips[loading.current_tip_index]
+    }
+}
+
+// ============================================================================
+// Startup Sequence Manager
+// ============================================================================
+
+struct StartupSequence {
+    phase: StartupPhase,
+    elapsed_time: f32,
+
+    // Components
+    splash: SplashScreen,
+    legal: LegalNotice,
+    ea_logo_player: VideoPlayer,
+    sizzle_player: VideoPlayer,
+    loading: LoadingScreen,
+
+    // Configuration
+    skip_videos: Bool,
+    skip_legal: Bool,
+    skip_splash: Bool,
+
+    // Callbacks
+    on_phase_change: fn(StartupPhase),
+    on_complete: fn(),
+}
+
+fn create_startup_sequence() -> StartupSequence {
+    return StartupSequence {
+        phase: StartupPhase::INITIALIZING,
+        elapsed_time: 0.0,
+        splash: create_splash_screen(),
+        legal: create_legal_notice(),
+        ea_logo_player: create_video_player(),
+        sizzle_player: create_video_player(),
+        loading: create_loading_screen(),
+        skip_videos: false,
+        skip_legal: false,
+        skip_splash: false,
+        on_phase_change: null,
+        on_complete: null,
+    }
+}
+
+fn init_startup_sequence(seq: StartupSequence) {
+    // Load splash screen
+    load_splash_screen(seq.splash, "assets/textures/Install_Final.bmp")
+
+    // Load videos
+    load_bink_video(seq.ea_logo_player, "assets/movies/EALogo.bik")
+    load_bink_video(seq.sizzle_player, "assets/movies/Sizzle.bik")
+
+    // Start the sequence
+    seq.phase = StartupPhase::SPLASH_SCREEN
+    notify_phase_change(seq)
+}
+
+fn update_startup_sequence(seq: StartupSequence, delta_time: f32) {
+    seq.elapsed_time = seq.elapsed_time + delta_time
+
+    if seq.phase == StartupPhase::INITIALIZING {
+        // Wait for init
+        return
+    }
+
+    if seq.phase == StartupPhase::SPLASH_SCREEN {
+        if seq.skip_splash {
+            advance_phase(seq)
+            return
+        }
+        update_splash_screen(seq.splash, delta_time)
+        if is_splash_done(seq.splash) {
+            advance_phase(seq)
+        }
+    } else if seq.phase == StartupPhase::EA_LOGO_VIDEO {
+        if seq.skip_videos {
+            advance_phase(seq)
+            return
+        }
+        update_video(seq.ea_logo_player, delta_time)
+        if is_video_finished(seq.ea_logo_player) {
+            advance_phase(seq)
+        }
+    } else if seq.phase == StartupPhase::SIZZLE_VIDEO {
+        if seq.skip_videos {
+            advance_phase(seq)
+            return
+        }
+        update_video(seq.sizzle_player, delta_time)
+        if is_video_finished(seq.sizzle_player) {
+            advance_phase(seq)
+        }
+    } else if seq.phase == StartupPhase::LEGAL_NOTICE {
+        if seq.skip_legal {
+            advance_phase(seq)
+            return
+        }
+        update_legal_notice(seq.legal, delta_time)
+        if is_legal_done(seq.legal) {
+            advance_phase(seq)
+        }
+    } else if seq.phase == StartupPhase::LOADING_SHELL_MAP {
+        // Simulate loading progress
+        let progress = seq.elapsed_time / SHELL_MAP_LOAD_TIME
+        if progress >= 1.0 {
+            advance_phase(seq)
+        } else {
+            update_loading_screen(seq.loading, progress, "Loading shell map...")
+        }
+    }
+}
+
+fn advance_phase(seq: StartupSequence) {
+    seq.elapsed_time = 0.0
+
+    if seq.phase == StartupPhase::SPLASH_SCREEN {
+        seq.phase = StartupPhase::EA_LOGO_VIDEO
+        play_video(seq.ea_logo_player)
+    } else if seq.phase == StartupPhase::EA_LOGO_VIDEO {
+        seq.phase = StartupPhase::SIZZLE_VIDEO
+        play_video(seq.sizzle_player)
+    } else if seq.phase == StartupPhase::SIZZLE_VIDEO {
+        seq.phase = StartupPhase::LEGAL_NOTICE
+    } else if seq.phase == StartupPhase::LEGAL_NOTICE {
+        seq.phase = StartupPhase::LOADING_SHELL_MAP
+    } else if seq.phase == StartupPhase::LOADING_SHELL_MAP {
+        seq.phase = StartupPhase::MAIN_MENU
+        notify_complete(seq)
+    }
+
+    notify_phase_change(seq)
+}
+
+fn notify_phase_change(seq: StartupSequence) {
+    if seq.on_phase_change != null {
+        seq.on_phase_change(seq.phase)
+    }
+}
+
+fn notify_complete(seq: StartupSequence) {
+    if seq.on_complete != null {
+        seq.on_complete()
+    }
+}
+
+fn skip_to_menu(seq: StartupSequence) {
+    // Skip all startup phases and go directly to main menu
+    stop_video(seq.ea_logo_player)
+    stop_video(seq.sizzle_player)
+
+    seq.phase = StartupPhase::MAIN_MENU
+    notify_phase_change(seq)
+    notify_complete(seq)
+}
+
+fn handle_skip_input(seq: StartupSequence) {
+    // Handle escape/click to skip current phase
+    if seq.phase == StartupPhase::SPLASH_SCREEN {
+        seq.splash.fade_state = FadeState::DONE
+    } else if seq.phase == StartupPhase::EA_LOGO_VIDEO {
+        stop_video(seq.ea_logo_player)
+        advance_phase(seq)
+    } else if seq.phase == StartupPhase::SIZZLE_VIDEO {
+        stop_video(seq.sizzle_player)
+        advance_phase(seq)
+    } else if seq.phase == StartupPhase::LEGAL_NOTICE {
+        seq.legal.fade_state = FadeState::DONE
+    }
+}
+
+fn is_startup_complete(seq: StartupSequence) -> Bool {
+    return seq.phase == StartupPhase::MAIN_MENU || seq.phase == StartupPhase::IN_GAME
+}
+
+fn get_current_phase_name(seq: StartupSequence) -> String {
+    if seq.phase == StartupPhase::INITIALIZING {
+        return "Initializing"
+    } else if seq.phase == StartupPhase::SPLASH_SCREEN {
+        return "Splash Screen"
+    } else if seq.phase == StartupPhase::EA_LOGO_VIDEO {
+        return "EA Logo"
+    } else if seq.phase == StartupPhase::SIZZLE_VIDEO {
+        return "Sizzle Reel"
+    } else if seq.phase == StartupPhase::LEGAL_NOTICE {
+        return "Legal Notice"
+    } else if seq.phase == StartupPhase::LOADING_SHELL_MAP {
+        return "Loading"
+    } else if seq.phase == StartupPhase::MAIN_MENU {
+        return "Main Menu"
+    } else {
+        return "In Game"
+    }
+}
+
+fn destroy_startup_sequence(seq: StartupSequence) {
+    destroy_video_player(seq.ea_logo_player)
+    destroy_video_player(seq.sizzle_player)
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn allocate_bytes(size: i32) -> [u8] {
+    let bytes: [u8] = []
+    for i in 0..size {
+        bytes = bytes + [0]
+    }
+    return bytes
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_video_player() -> Bool {
+    let player = create_video_player()
+
+    load_bink_video(player, "test.bik")
+    assert(player.state == VideoState::STOPPED, "Should start stopped")
+
+    play_video(player)
+    assert(player.state == VideoState::PLAYING, "Should be playing")
+
+    pause_video(player)
+    assert(player.state == VideoState::PAUSED, "Should be paused")
+
+    stop_video(player)
+    assert(player.state == VideoState::STOPPED, "Should be stopped")
+    assert(player.current_frame == 0, "Frame should reset to 0")
+
+    destroy_video_player(player)
+    return true
+}
+
+fn test_splash_screen() -> Bool {
+    let splash = create_splash_screen()
+
+    assert(splash.fade_state == FadeState::FADING_IN, "Should start fading in")
+    assert(splash.alpha == 0.0, "Alpha should start at 0")
+
+    // Simulate fade in
+    for i in 0..10 {
+        update_splash_screen(splash, 0.1)
+    }
+
+    assert(splash.alpha > 0.0, "Alpha should increase")
+
+    return true
+}
+
+fn test_startup_sequence() -> Bool {
+    let seq = create_startup_sequence()
+
+    assert(seq.phase == StartupPhase::INITIALIZING, "Should start initializing")
+
+    init_startup_sequence(seq)
+    assert(seq.phase == StartupPhase::SPLASH_SCREEN, "Should move to splash")
+
+    // Skip to menu
+    skip_to_menu(seq)
+    assert(seq.phase == StartupPhase::MAIN_MENU, "Should be at main menu")
+    assert(is_startup_complete(seq), "Should be complete")
+
+    destroy_startup_sequence(seq)
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_video_player(), "Video player test failed")
+    assert(test_splash_screen(), "Splash screen test failed")
+    assert(test_startup_sequence(), "Startup sequence test failed")
+    return true
+}

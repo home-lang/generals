@@ -1,0 +1,679 @@
+// Shell Map System
+// Implements the animated 3D background for the main menu
+// Based on the original C&C Generals shell map with tanks, helicopters, and explosions
+
+import engine/w3d_loader
+import engine/camera
+import engine/terrain
+
+// ============================================================================
+// Shell Map Configuration
+// ============================================================================
+
+const SHELL_MAP_FILE: String = "maps/shell/ShellMapMD.map"
+const SHELL_MAP_MUSIC: String = "audio/music/Shell.mp3"
+
+// Camera orbit parameters
+const CAMERA_ORBIT_RADIUS: f32 = 500.0
+const CAMERA_ORBIT_SPEED: f32 = 0.05  // Radians per second
+const CAMERA_HEIGHT: f32 = 200.0
+const CAMERA_LOOK_AT_HEIGHT: f32 = 50.0
+
+// ============================================================================
+// Shell Map Entity Types
+// ============================================================================
+
+enum ShellEntityType {
+    TANK,
+    HELICOPTER,
+    INFANTRY,
+    BUILDING,
+    PROP,
+    PARTICLE_EMITTER,
+    LIGHT,
+}
+
+struct ShellEntity {
+    entity_type: ShellEntityType,
+    model_name: String,
+    position: Vec3,
+    rotation: Vec3,
+    scale: f32,
+    animation_name: String,
+    animation_time: f32,
+    animation_speed: f32,
+    is_visible: Bool,
+    path_index: i32,        // For moving entities
+    path_progress: f32,
+}
+
+fn create_shell_entity(etype: ShellEntityType, model: String, pos: Vec3) -> ShellEntity {
+    return ShellEntity {
+        entity_type: etype,
+        model_name: model,
+        position: pos,
+        rotation: vec3(0.0, 0.0, 0.0),
+        scale: 1.0,
+        animation_name: "idle",
+        animation_time: 0.0,
+        animation_speed: 1.0,
+        is_visible: true,
+        path_index: 0,
+        path_progress: 0.0,
+    }
+}
+
+// ============================================================================
+// Animation Path for Moving Entities
+// ============================================================================
+
+struct AnimationPath {
+    points: [Vec3],
+    loop_path: Bool,
+    speed: f32,
+}
+
+fn create_animation_path(points: [Vec3], loop_path: Bool, speed: f32) -> AnimationPath {
+    return AnimationPath {
+        points: points,
+        loop_path: loop_path,
+        speed: speed,
+    }
+}
+
+fn get_path_position(path: AnimationPath, progress: f32) -> Vec3 {
+    if path.points.length < 2 {
+        if path.points.length == 1 {
+            return path.points[0]
+        }
+        return vec3(0.0, 0.0, 0.0)
+    }
+
+    // Clamp or wrap progress
+    let p = progress
+    if path.loop_path {
+        p = fmod(progress, 1.0)
+    } else {
+        p = clamp(progress, 0.0, 1.0)
+    }
+
+    // Find segment
+    let total_segments = path.points.length - 1
+    let segment_progress = p * (total_segments as f32)
+    let segment_index = (segment_progress as i32)
+    let local_t = segment_progress - (segment_index as f32)
+
+    // Clamp segment index
+    let i = min_i32(segment_index, total_segments - 1)
+
+    // Lerp between points
+    let p0 = path.points[i]
+    let p1 = path.points[i + 1]
+
+    return vec3_lerp(p0, p1, local_t)
+}
+
+// ============================================================================
+// Shell Map Particle Effects
+// ============================================================================
+
+struct ShellParticle {
+    position: Vec3,
+    velocity: Vec3,
+    color: Vec4,
+    size: f32,
+    lifetime: f32,
+    max_lifetime: f32,
+    particle_type: ShellParticleType,
+}
+
+enum ShellParticleType {
+    DUST,
+    SMOKE,
+    EXPLOSION,
+    SPARK,
+    DEBRIS,
+}
+
+struct ShellParticleEmitter {
+    position: Vec3,
+    particle_type: ShellParticleType,
+    emission_rate: f32,  // Particles per second
+    emission_accumulator: f32,
+    particles: [ShellParticle],
+    max_particles: i32,
+    is_active: Bool,
+}
+
+fn create_shell_emitter(pos: Vec3, ptype: ShellParticleType, rate: f32) -> ShellParticleEmitter {
+    return ShellParticleEmitter {
+        position: pos,
+        particle_type: ptype,
+        emission_rate: rate,
+        emission_accumulator: 0.0,
+        particles: [],
+        max_particles: 100,
+        is_active: true,
+    }
+}
+
+fn update_shell_emitter(emitter: ShellParticleEmitter, delta_time: f32) {
+    if !emitter.is_active {
+        return
+    }
+
+    // Emit new particles
+    emitter.emission_accumulator = emitter.emission_accumulator + emitter.emission_rate * delta_time
+    while emitter.emission_accumulator >= 1.0 && emitter.particles.length < emitter.max_particles {
+        let particle = spawn_shell_particle(emitter)
+        emitter.particles = emitter.particles + [particle]
+        emitter.emission_accumulator = emitter.emission_accumulator - 1.0
+    }
+
+    // Update existing particles
+    let alive_particles: [ShellParticle] = []
+    for particle in emitter.particles {
+        update_shell_particle(particle, delta_time)
+        if particle.lifetime < particle.max_lifetime {
+            alive_particles = alive_particles + [particle]
+        }
+    }
+    emitter.particles = alive_particles
+}
+
+fn spawn_shell_particle(emitter: ShellParticleEmitter) -> ShellParticle {
+    let particle = ShellParticle {
+        position: emitter.position,
+        velocity: vec3(0.0, 0.0, 0.0),
+        color: vec4(1.0, 1.0, 1.0, 1.0),
+        size: 1.0,
+        lifetime: 0.0,
+        max_lifetime: 2.0,
+        particle_type: emitter.particle_type,
+    }
+
+    // Set type-specific properties
+    if emitter.particle_type == ShellParticleType::DUST {
+        particle.velocity = vec3(random_range(-1.0, 1.0), random_range(0.5, 2.0), random_range(-1.0, 1.0))
+        particle.color = vec4(0.6, 0.5, 0.4, 0.5)
+        particle.size = random_range(2.0, 5.0)
+        particle.max_lifetime = random_range(1.0, 3.0)
+    } else if emitter.particle_type == ShellParticleType::SMOKE {
+        particle.velocity = vec3(random_range(-0.5, 0.5), random_range(1.0, 3.0), random_range(-0.5, 0.5))
+        particle.color = vec4(0.3, 0.3, 0.3, 0.4)
+        particle.size = random_range(5.0, 10.0)
+        particle.max_lifetime = random_range(2.0, 5.0)
+    } else if emitter.particle_type == ShellParticleType::EXPLOSION {
+        let angle = random_range(0.0, 6.28)
+        let speed = random_range(5.0, 15.0)
+        particle.velocity = vec3(cos(angle) * speed, random_range(3.0, 8.0), sin(angle) * speed)
+        particle.color = vec4(1.0, 0.6, 0.2, 1.0)
+        particle.size = random_range(3.0, 8.0)
+        particle.max_lifetime = random_range(0.3, 0.8)
+    }
+
+    return particle
+}
+
+fn update_shell_particle(particle: ShellParticle, delta_time: f32) {
+    particle.lifetime = particle.lifetime + delta_time
+
+    // Apply velocity
+    particle.position = vec3_add(particle.position, vec3_scale(particle.velocity, delta_time))
+
+    // Apply gravity (for some particle types)
+    if particle.particle_type == ShellParticleType::DEBRIS {
+        particle.velocity.y = particle.velocity.y - 9.8 * delta_time
+    }
+
+    // Fade out
+    let life_ratio = particle.lifetime / particle.max_lifetime
+    particle.color.w = 1.0 - life_ratio
+
+    // Expand smoke/dust
+    if particle.particle_type == ShellParticleType::SMOKE || particle.particle_type == ShellParticleType::DUST {
+        particle.size = particle.size + delta_time * 2.0
+    }
+}
+
+// ============================================================================
+// Shell Map Camera
+// ============================================================================
+
+struct ShellCamera {
+    position: Vec3,
+    look_at: Vec3,
+    up: Vec3,
+    fov: f32,
+    near_plane: f32,
+    far_plane: f32,
+
+    // Orbit animation
+    orbit_angle: f32,
+    orbit_radius: f32,
+    orbit_speed: f32,
+    orbit_height: f32,
+    orbit_center: Vec3,
+}
+
+fn create_shell_camera() -> ShellCamera {
+    return ShellCamera {
+        position: vec3(0.0, CAMERA_HEIGHT, CAMERA_ORBIT_RADIUS),
+        look_at: vec3(0.0, CAMERA_LOOK_AT_HEIGHT, 0.0),
+        up: vec3(0.0, 1.0, 0.0),
+        fov: 45.0,
+        near_plane: 1.0,
+        far_plane: 5000.0,
+        orbit_angle: 0.0,
+        orbit_radius: CAMERA_ORBIT_RADIUS,
+        orbit_speed: CAMERA_ORBIT_SPEED,
+        orbit_height: CAMERA_HEIGHT,
+        orbit_center: vec3(0.0, 0.0, 0.0),
+    }
+}
+
+fn update_shell_camera(cam: ShellCamera, delta_time: f32) {
+    // Slowly orbit around the center
+    cam.orbit_angle = cam.orbit_angle + cam.orbit_speed * delta_time
+
+    // Calculate new position
+    let x = cam.orbit_center.x + cos(cam.orbit_angle) * cam.orbit_radius
+    let z = cam.orbit_center.z + sin(cam.orbit_angle) * cam.orbit_radius
+    let y = cam.orbit_center.y + cam.orbit_height
+
+    cam.position = vec3(x, y, z)
+    cam.look_at = vec3(cam.orbit_center.x, CAMERA_LOOK_AT_HEIGHT, cam.orbit_center.z)
+}
+
+// ============================================================================
+// Shell Map Main System
+// ============================================================================
+
+struct ShellMap {
+    is_loaded: Bool,
+    is_visible: Bool,
+
+    // Camera
+    camera: ShellCamera,
+
+    // Entities
+    entities: [ShellEntity],
+
+    // Animation paths
+    paths: [AnimationPath],
+
+    // Particle emitters
+    emitters: [ShellParticleEmitter],
+
+    // Lighting
+    ambient_color: Vec3,
+    sun_direction: Vec3,
+    sun_color: Vec3,
+
+    // Terrain
+    terrain_mesh_id: i32,
+    terrain_texture_id: i32,
+
+    // Timing
+    elapsed_time: f32,
+}
+
+fn create_shell_map() -> ShellMap {
+    return ShellMap {
+        is_loaded: false,
+        is_visible: true,
+        camera: create_shell_camera(),
+        entities: [],
+        paths: [],
+        emitters: [],
+        ambient_color: vec3(0.3, 0.35, 0.4),
+        sun_direction: normalize(vec3(0.5, -0.8, 0.3)),
+        sun_color: vec3(1.0, 0.95, 0.8),
+        terrain_mesh_id: 0,
+        terrain_texture_id: 0,
+        elapsed_time: 0.0,
+    }
+}
+
+fn load_shell_map(map: ShellMap) -> Bool {
+    // Load terrain
+    // terrain_mesh_id = load_terrain_mesh(SHELL_MAP_FILE)
+
+    // Create default shell map content if file not found
+    setup_default_shell_entities(map)
+    setup_default_paths(map)
+    setup_default_emitters(map)
+
+    map.is_loaded = true
+    return true
+}
+
+fn setup_default_shell_entities(map: ShellMap) {
+    // Tanks on the ground
+    map.entities = map.entities + [create_shell_entity(
+        ShellEntityType::TANK,
+        "AVCrusader",
+        vec3(-100.0, 0.0, -50.0)
+    )]
+    map.entities = map.entities + [create_shell_entity(
+        ShellEntityType::TANK,
+        "AVCrusader",
+        vec3(-80.0, 0.0, -30.0)
+    )]
+    map.entities = map.entities + [create_shell_entity(
+        ShellEntityType::TANK,
+        "AVOverlord",
+        vec3(100.0, 0.0, 50.0)
+    )]
+
+    // Helicopters in the air
+    let heli1 = create_shell_entity(
+        ShellEntityType::HELICOPTER,
+        "AVComanche",
+        vec3(0.0, 80.0, 0.0)
+    )
+    heli1.path_index = 0
+    map.entities = map.entities + [heli1]
+
+    let heli2 = create_shell_entity(
+        ShellEntityType::HELICOPTER,
+        "AVChinook",
+        vec3(50.0, 60.0, -30.0)
+    )
+    heli2.path_index = 1
+    map.entities = map.entities + [heli2]
+
+    // Buildings
+    map.entities = map.entities + [create_shell_entity(
+        ShellEntityType::BUILDING,
+        "ABCommandCenter_US",
+        vec3(-200.0, 0.0, -150.0)
+    )]
+    map.entities = map.entities + [create_shell_entity(
+        ShellEntityType::BUILDING,
+        "ABBarracks_US",
+        vec3(-180.0, 0.0, -100.0)
+    )]
+
+    // Infantry
+    for i in 0..5 {
+        let x = -150.0 + (i as f32) * 10.0
+        let z = -80.0 + (i as f32) * 5.0
+        map.entities = map.entities + [create_shell_entity(
+            ShellEntityType::INFANTRY,
+            "AIRanger",
+            vec3(x, 0.0, z)
+        )]
+    }
+}
+
+fn setup_default_paths(map: ShellMap) {
+    // Helicopter patrol path 1
+    let path1 = create_animation_path([
+        vec3(-100.0, 80.0, -100.0),
+        vec3(100.0, 90.0, -50.0),
+        vec3(150.0, 70.0, 100.0),
+        vec3(-50.0, 85.0, 150.0),
+        vec3(-100.0, 80.0, -100.0),
+    ], true, 0.02)
+    map.paths = map.paths + [path1]
+
+    // Helicopter patrol path 2
+    let path2 = create_animation_path([
+        vec3(50.0, 60.0, -30.0),
+        vec3(200.0, 65.0, 50.0),
+        vec3(100.0, 55.0, 200.0),
+        vec3(-100.0, 70.0, 100.0),
+        vec3(50.0, 60.0, -30.0),
+    ], true, 0.015)
+    map.paths = map.paths + [path2]
+}
+
+fn setup_default_emitters(map: ShellMap) {
+    // Dust from tank movement
+    map.emitters = map.emitters + [create_shell_emitter(
+        vec3(-100.0, 0.0, -50.0),
+        ShellParticleType::DUST,
+        5.0
+    )]
+
+    // Smoke from buildings
+    map.emitters = map.emitters + [create_shell_emitter(
+        vec3(-200.0, 20.0, -150.0),
+        ShellParticleType::SMOKE,
+        2.0
+    )]
+}
+
+fn update_shell_map(map: ShellMap, delta_time: f32) {
+    if !map.is_loaded || !map.is_visible {
+        return
+    }
+
+    map.elapsed_time = map.elapsed_time + delta_time
+
+    // Update camera
+    update_shell_camera(map.camera, delta_time)
+
+    // Update entities
+    for entity in map.entities {
+        update_shell_entity(map, entity, delta_time)
+    }
+
+    // Update particle emitters
+    for emitter in map.emitters {
+        update_shell_emitter(emitter, delta_time)
+    }
+}
+
+fn update_shell_entity(map: ShellMap, entity: ShellEntity, delta_time: f32) {
+    // Update animation
+    entity.animation_time = entity.animation_time + delta_time * entity.animation_speed
+
+    // Update path movement for flying entities
+    if entity.path_index >= 0 && entity.path_index < map.paths.length {
+        let path = map.paths[entity.path_index]
+        entity.path_progress = entity.path_progress + path.speed * delta_time
+        if path.loop_path {
+            entity.path_progress = fmod(entity.path_progress, 1.0)
+        }
+
+        let new_pos = get_path_position(path, entity.path_progress)
+
+        // Calculate rotation to face movement direction
+        let dir = vec3_sub(new_pos, entity.position)
+        if vec3_length(dir) > 0.01 {
+            entity.rotation.y = atan2(dir.x, dir.z)
+        }
+
+        entity.position = new_pos
+    }
+}
+
+fn render_shell_map(map: ShellMap) {
+    if !map.is_loaded || !map.is_visible {
+        return
+    }
+
+    // In production:
+    // 1. Set up camera matrices
+    // 2. Render terrain
+    // 3. Render entities (sorted by depth)
+    // 4. Render particles
+    // 5. Apply post-processing (bloom, color grading)
+}
+
+fn show_shell_map(map: ShellMap) {
+    map.is_visible = true
+}
+
+fn hide_shell_map(map: ShellMap) {
+    map.is_visible = false
+}
+
+fn destroy_shell_map(map: ShellMap) {
+    map.entities = []
+    map.paths = []
+    map.emitters = []
+    map.is_loaded = false
+}
+
+// ============================================================================
+// Math Utilities
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn vec4(x: f32, y: f32, z: f32, w: f32) -> Vec4 {
+    return Vec4 { x: x, y: y, z: z, w: w }
+}
+
+fn vec3_add(a: Vec3, b: Vec3) -> Vec3 {
+    return vec3(a.x + b.x, a.y + b.y, a.z + b.z)
+}
+
+fn vec3_sub(a: Vec3, b: Vec3) -> Vec3 {
+    return vec3(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+fn vec3_scale(v: Vec3, s: f32) -> Vec3 {
+    return vec3(v.x * s, v.y * s, v.z * s)
+}
+
+fn vec3_length(v: Vec3) -> f32 {
+    return sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+}
+
+fn vec3_lerp(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    return vec3(
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t
+    )
+}
+
+fn normalize(v: Vec3) -> Vec3 {
+    let len = vec3_length(v)
+    if len > 0.0001 {
+        return vec3_scale(v, 1.0 / len)
+    }
+    return v
+}
+
+fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
+    if x < min_val { return min_val }
+    if x > max_val { return max_val }
+    return x
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+fn fmod(x: f32, y: f32) -> f32 {
+    return x - ((x / y) as i32 as f32) * y
+}
+
+fn random_range(min_val: f32, max_val: f32) -> f32 {
+    // Placeholder - would use proper RNG
+    return min_val + (max_val - min_val) * 0.5
+}
+
+fn cos(x: f32) -> f32 {
+    // Taylor series approximation (would use intrinsic in production)
+    let x2 = x * x
+    return 1.0 - x2 / 2.0 + x2 * x2 / 24.0
+}
+
+fn sin(x: f32) -> f32 {
+    let x2 = x * x
+    return x - x * x2 / 6.0 + x * x2 * x2 / 120.0
+}
+
+fn sqrt(x: f32) -> f32 {
+    // Newton-Raphson approximation
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    let result = guess
+    for i in 0..5 {
+        result = (result + x / result) / 2.0
+    }
+    return result
+}
+
+fn atan2(y: f32, x: f32) -> f32 {
+    // Approximation
+    if x > 0.0 {
+        return y / (x + sqrt(x * x + y * y))
+    }
+    return 3.14159 - y / (-x + sqrt(x * x + y * y))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_shell_map_creation() -> Bool {
+    let map = create_shell_map()
+
+    assert(!map.is_loaded, "Should not be loaded initially")
+    assert(map.is_visible, "Should be visible by default")
+    assert(map.entities.length == 0, "Should have no entities initially")
+
+    return true
+}
+
+fn test_shell_map_loading() -> Bool {
+    let map = create_shell_map()
+
+    load_shell_map(map)
+
+    assert(map.is_loaded, "Should be loaded")
+    assert(map.entities.length > 0, "Should have entities")
+    assert(map.paths.length > 0, "Should have paths")
+    assert(map.emitters.length > 0, "Should have emitters")
+
+    destroy_shell_map(map)
+    return true
+}
+
+fn test_animation_path() -> Bool {
+    let path = create_animation_path([
+        vec3(0.0, 0.0, 0.0),
+        vec3(100.0, 0.0, 0.0),
+    ], false, 1.0)
+
+    let p0 = get_path_position(path, 0.0)
+    assert(p0.x == 0.0, "Start should be at 0")
+
+    let p1 = get_path_position(path, 1.0)
+    assert(p1.x == 100.0, "End should be at 100")
+
+    let p_mid = get_path_position(path, 0.5)
+    assert(p_mid.x == 50.0, "Middle should be at 50")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_shell_map_creation(), "Shell map creation test failed")
+    assert(test_shell_map_loading(), "Shell map loading test failed")
+    assert(test_animation_path(), "Animation path test failed")
+    return true
+}
