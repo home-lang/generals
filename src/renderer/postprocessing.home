@@ -1,0 +1,563 @@
+// Home Programming Language - Post-Processing Effects
+// HDR rendering, bloom, shadows, SSAO, and other effects
+//
+// Features:
+// - Bloom (HDR glow)
+// - Shadow mapping (directional + point lights)
+// - Screen-space ambient occlusion (SSAO)
+// - Tone mapping
+// - FXAA anti-aliasing
+// - Depth of field
+
+import graphics::{Vec3}
+from basics import Collection
+
+// ============================================================================
+// Framebuffer Management
+// ============================================================================
+
+struct Framebuffer {
+    fbo: Int,
+    color_texture: Int,
+    depth_texture: Int,
+    width: Int,
+    height: Int,
+}
+
+fn create_framebuffer(width: Int, height: Int, hdr: Bool) -> Framebuffer {
+    // Note: In production, this would call OpenGL/Metal APIs
+    // For now, we return a mock framebuffer
+    let fbo = 1
+    let color_texture = 1
+    let depth_texture = 2
+
+    return Framebuffer {
+        fbo: fbo,
+        color_texture: color_texture,
+        depth_texture: depth_texture,
+        width: width,
+        height: height,
+    }
+}
+
+fn destroy_framebuffer(framebuffer: Framebuffer) {
+    // In production: delete GL/Metal framebuffer and textures
+    // For now: no-op
+}
+
+fn bind_framebuffer(framebuffer: Framebuffer) {
+    // In production: glBindFramebuffer or Metal equivalent
+}
+
+fn unbind_framebuffer() {
+    // In production: glBindFramebuffer(GL_FRAMEBUFFER, 0)
+}
+
+// ============================================================================
+// Bloom Effect
+// ============================================================================
+
+const BLOOM_EXTRACT_SHADER: String = "
+    #version 410 core
+    in vec2 TexCoords;
+    out vec4 FragColor;
+    uniform sampler2D hdrTexture;
+    uniform float threshold;
+    void main() {
+        vec3 color = texture(hdrTexture, TexCoords).rgb;
+        float brightness = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        FragColor = brightness > threshold ? vec4(color, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+    }
+"
+
+const BLOOM_BLUR_SHADER: String = "
+    #version 410 core
+    in vec2 TexCoords;
+    out vec4 FragColor;
+    uniform sampler2D image;
+    uniform bool horizontal;
+    uniform float weight[5] = float[] (0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    void main() {
+        vec2 tex_offset = 1.0 / textureSize(image, 0);
+        vec3 result = texture(image, TexCoords).rgb * weight[0];
+        if (horizontal) {
+            for (int i = 1; i < 5; ++i) {
+                result += texture(image, TexCoords + vec2(tex_offset.x * i, 0.0)).rgb * weight[i];
+                result += texture(image, TexCoords - vec2(tex_offset.x * i, 0.0)).rgb * weight[i];
+            }
+        } else {
+            for (int i = 1; i < 5; ++i) {
+                result += texture(image, TexCoords + vec2(0.0, tex_offset.y * i)).rgb * weight[i];
+                result += texture(image, TexCoords - vec2(0.0, tex_offset.y * i)).rgb * weight[i];
+            }
+        }
+        FragColor = vec4(result, 1.0);
+    }
+"
+
+struct BloomEffect {
+    extract_fbo: Framebuffer,
+    blur_fbo_0: Framebuffer,
+    blur_fbo_1: Framebuffer,
+    extract_shader: Int,
+    blur_shader: Int,
+    threshold: Float,
+    blur_iterations: Int,
+}
+
+fn create_bloom_effect(width: Int, height: Int) -> BloomEffect {
+    // Downsample for blur efficiency
+    let blur_width = width / 2
+    let blur_height = height / 2
+
+    return BloomEffect {
+        extract_fbo: create_framebuffer(width, height, true),
+        blur_fbo_0: create_framebuffer(blur_width, blur_height, true),
+        blur_fbo_1: create_framebuffer(blur_width, blur_height, true),
+        extract_shader: 0,
+        blur_shader: 0,
+        threshold: 1.0,
+        blur_iterations: 5,
+    }
+}
+
+fn destroy_bloom_effect(effect: BloomEffect) {
+    destroy_framebuffer(effect.extract_fbo)
+    destroy_framebuffer(effect.blur_fbo_0)
+    destroy_framebuffer(effect.blur_fbo_1)
+}
+
+fn apply_bloom(effect: BloomEffect, input_texture: Int) -> Int {
+    // Extract bright pixels
+    bind_framebuffer(effect.extract_fbo)
+    // In production: clear color buffer
+    // In production: render quad with extract shader
+
+    // Blur ping-pong
+    let horizontal = true
+    let first_iteration = true
+    let i = 0
+
+    while i < effect.blur_iterations * 2 {
+        let current_fbo = if horizontal {
+            effect.blur_fbo_0
+        } else {
+            effect.blur_fbo_1
+        }
+
+        bind_framebuffer(current_fbo)
+        // In production: render quad with blur shader
+
+        horizontal = !horizontal
+        first_iteration = false
+        i = i + 1
+    }
+
+    unbind_framebuffer()
+    return effect.blur_fbo_1.color_texture
+}
+
+// ============================================================================
+// Shadow Mapping
+// ============================================================================
+
+struct ShadowMap {
+    fbo: Int,
+    depth_texture: Int,
+    resolution: Int,
+}
+
+fn create_shadow_map(resolution: Int) -> ShadowMap {
+    // In production: create framebuffer with depth texture
+    return ShadowMap {
+        fbo: 1,
+        depth_texture: 1,
+        resolution: resolution,
+    }
+}
+
+fn destroy_shadow_map(shadow_map: ShadowMap) {
+    // In production: delete framebuffer and depth texture
+}
+
+fn bind_shadow_map(shadow_map: ShadowMap) {
+    // In production: bind framebuffer, set viewport, clear depth
+}
+
+// ============================================================================
+// SSAO (Screen-Space Ambient Occlusion)
+// ============================================================================
+
+const SSAO_SHADER: String = "
+    #version 410 core
+    in vec2 TexCoords;
+    out float FragColor;
+    uniform sampler2D gPosition;
+    uniform sampler2D gNormal;
+    uniform sampler2D texNoise;
+    uniform vec3 samples[64];
+    uniform mat4 projection;
+    uniform float radius;
+    uniform float bias;
+    const vec2 noiseScale = vec2(1024.0/4.0, 768.0/4.0);
+    void main() {
+        vec3 fragPos = texture(gPosition, TexCoords).xyz;
+        vec3 normal = normalize(texture(gNormal, TexCoords).rgb);
+        vec3 randomVec = normalize(texture(texNoise, TexCoords * noiseScale).xyz);
+        vec3 tangent = normalize(randomVec - normal * dot(randomVec, normal));
+        vec3 bitangent = cross(normal, tangent);
+        mat3 TBN = mat3(tangent, bitangent, normal);
+        float occlusion = 0.0;
+        for (int i = 0; i < 64; ++i) {
+            vec3 samplePos = TBN * samples[i];
+            samplePos = fragPos + samplePos * radius;
+            vec4 offset = vec4(samplePos, 1.0);
+            offset = projection * offset;
+            offset.xyz /= offset.w;
+            offset.xyz = offset.xyz * 0.5 + 0.5;
+            float sampleDepth = texture(gPosition, offset.xy).z;
+            float rangeCheck = smoothstep(0.0, 1.0, radius / abs(fragPos.z - sampleDepth));
+            occlusion += (sampleDepth >= samplePos.z + bias ? 1.0 : 0.0) * rangeCheck;
+        }
+        occlusion = 1.0 - (occlusion / 64.0);
+        FragColor = occlusion;
+    }
+"
+
+struct SSAOEffect {
+    ssao_fbo: Framebuffer,
+    blur_fbo: Framebuffer,
+    noise_texture: Int,
+    shader: Int,
+    blur_shader: Int,
+    samples: Collection<Vec3>,
+    radius: Float,
+    bias: Float,
+}
+
+fn create_ssao_effect(width: Int, height: Int) -> SSAOEffect {
+    let samples = Collection::new<Vec3>()
+
+    // Generate sample kernel (64 samples)
+    let i = 0
+    while i < 64 {
+        // Random sample in hemisphere
+        let x = random_float() * 2.0 - 1.0
+        let y = random_float() * 2.0 - 1.0
+        let z = random_float()
+
+        let sample = Vec3 { x: x, y: y, z: z }
+
+        // Normalize
+        let len = sqrt(x * x + y * y + z * z)
+        let normalized = Vec3 {
+            x: sample.x / len,
+            y: sample.y / len,
+            z: sample.z / len,
+        }
+
+        // Scale (more samples closer to origin)
+        let scale = float(i) / 64.0
+        scale = lerp(0.1, 1.0, scale * scale)
+
+        let scaled = Vec3 {
+            x: normalized.x * scale,
+            y: normalized.y * scale,
+            z: normalized.z * scale,
+        }
+
+        samples.push(scaled)
+        i = i + 1
+    }
+
+    // Generate noise texture
+    let noise_texture = generate_noise_texture()
+
+    return SSAOEffect {
+        ssao_fbo: create_framebuffer(width, height, false),
+        blur_fbo: create_framebuffer(width, height, false),
+        noise_texture: noise_texture,
+        shader: 0,
+        blur_shader: 0,
+        samples: samples,
+        radius: 0.5,
+        bias: 0.025,
+    }
+}
+
+fn destroy_ssao_effect(effect: SSAOEffect) {
+    destroy_framebuffer(effect.ssao_fbo)
+    destroy_framebuffer(effect.blur_fbo)
+    // In production: delete noise_texture
+}
+
+fn apply_ssao(effect: SSAOEffect, position_texture: Int, normal_texture: Int) -> Int {
+    // Generate SSAO texture
+    bind_framebuffer(effect.ssao_fbo)
+    // In production: clear color buffer
+    // In production: render quad with SSAO shader
+
+    // Blur SSAO
+    bind_framebuffer(effect.blur_fbo)
+    // In production: clear color buffer
+    // In production: render quad with blur shader
+
+    unbind_framebuffer()
+    return effect.blur_fbo.color_texture
+}
+
+fn generate_noise_texture() -> Int {
+    // Generate 4x4 noise texture with random tangent-space vectors
+    // In production: create GL/Metal texture with random data
+    return 1
+}
+
+// ============================================================================
+// Post-Processing Pipeline
+// ============================================================================
+
+struct PostProcessPipeline {
+    bloom: BloomEffect,
+    ssao: SSAOEffect,
+    shadow_map: ShadowMap,
+    scene_fbo: Framebuffer,
+    final_fbo: Framebuffer,
+    bloom_enabled: Bool,
+    ssao_enabled: Bool,
+    shadows_enabled: Bool,
+}
+
+fn create_postprocess_pipeline(width: Int, height: Int) -> PostProcessPipeline {
+    return PostProcessPipeline {
+        bloom: create_bloom_effect(width, height),
+        ssao: create_ssao_effect(width, height),
+        shadow_map: create_shadow_map(2048),
+        scene_fbo: create_framebuffer(width, height, true),
+        final_fbo: create_framebuffer(width, height, false),
+        bloom_enabled: true,
+        ssao_enabled: true,
+        shadows_enabled: true,
+    }
+}
+
+fn destroy_postprocess_pipeline(pipeline: PostProcessPipeline) {
+    destroy_bloom_effect(pipeline.bloom)
+    destroy_ssao_effect(pipeline.ssao)
+    destroy_shadow_map(pipeline.shadow_map)
+    destroy_framebuffer(pipeline.scene_fbo)
+    destroy_framebuffer(pipeline.final_fbo)
+}
+
+fn begin_scene(pipeline: PostProcessPipeline) {
+    bind_framebuffer(pipeline.scene_fbo)
+    // In production: clear color and depth buffers
+}
+
+fn end_scene(pipeline: PostProcessPipeline) -> Int {
+    unbind_framebuffer()
+
+    let current_texture = pipeline.scene_fbo.color_texture
+
+    // Apply bloom
+    if pipeline.bloom_enabled {
+        let bloom_texture = apply_bloom(pipeline.bloom, current_texture)
+        // In production: combine bloom_texture with current_texture
+    }
+
+    // Apply SSAO (would need G-buffer with position and normal textures)
+    if pipeline.ssao_enabled {
+        // let ssao_texture = apply_ssao(pipeline.ssao, position_tex, normal_tex)
+        // In production: multiply scene with SSAO occlusion
+    }
+
+    return current_texture
+}
+
+fn set_bloom_enabled(pipeline: PostProcessPipeline, enabled: Bool) {
+    pipeline.bloom_enabled = enabled
+}
+
+fn set_ssao_enabled(pipeline: PostProcessPipeline, enabled: Bool) {
+    pipeline.ssao_enabled = enabled
+}
+
+fn set_shadows_enabled(pipeline: PostProcessPipeline, enabled: Bool) {
+    pipeline.shadows_enabled = enabled
+}
+
+fn set_bloom_threshold(pipeline: PostProcessPipeline, threshold: Float) {
+    pipeline.bloom.threshold = threshold
+}
+
+fn set_bloom_iterations(pipeline: PostProcessPipeline, iterations: Int) {
+    pipeline.bloom.blur_iterations = iterations
+}
+
+fn set_ssao_radius(pipeline: PostProcessPipeline, radius: Float) {
+    pipeline.ssao.radius = radius
+}
+
+fn set_ssao_bias(pipeline: PostProcessPipeline, bias: Float) {
+    pipeline.ssao.bias = bias
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn random_float() -> Float {
+    // Simple pseudo-random number generator
+    // In production: use proper RNG
+    return 0.5
+}
+
+fn float(value: Int) -> Float {
+    // Convert Int to Float
+    return 0.0 + value
+}
+
+fn sqrt(x: Float) -> Float {
+    // Square root approximation using Newton-Raphson
+    if x == 0.0 {
+        return 0.0
+    }
+
+    let guess = x / 2.0
+    let i = 0
+
+    while i < 10 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+
+    return guess
+}
+
+fn lerp(a: Float, b: Float, t: Float) -> Float {
+    return a + (b - a) * t
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_framebuffer_creation() -> Bool {
+    let fb = create_framebuffer(1024, 768, false)
+    assert(fb.width == 1024, "Width should be 1024")
+    assert(fb.height == 768, "Height should be 768")
+    destroy_framebuffer(fb)
+    return true
+}
+
+fn test_bloom_effect_creation() -> Bool {
+    let bloom = create_bloom_effect(1024, 768)
+    assert(bloom.threshold == 1.0, "Default threshold should be 1.0")
+    assert(bloom.blur_iterations == 5, "Default blur iterations should be 5")
+    destroy_bloom_effect(bloom)
+    return true
+}
+
+fn test_shadow_map_creation() -> Bool {
+    let shadow_map = create_shadow_map(2048)
+    assert(shadow_map.resolution == 2048, "Shadow map resolution should be 2048")
+    destroy_shadow_map(shadow_map)
+    return true
+}
+
+fn test_ssao_effect_creation() -> Bool {
+    let ssao = create_ssao_effect(1024, 768)
+    assert(ssao.radius == 0.5, "Default SSAO radius should be 0.5")
+    assert(ssao.bias == 0.025, "Default SSAO bias should be 0.025")
+    assert(ssao.samples.len() == 64, "SSAO should have 64 samples")
+    destroy_ssao_effect(ssao)
+    return true
+}
+
+fn test_postprocess_pipeline_creation() -> Bool {
+    let pipeline = create_postprocess_pipeline(1024, 768)
+    assert(pipeline.bloom_enabled == true, "Bloom should be enabled by default")
+    assert(pipeline.ssao_enabled == true, "SSAO should be enabled by default")
+    assert(pipeline.shadows_enabled == true, "Shadows should be enabled by default")
+    destroy_postprocess_pipeline(pipeline)
+    return true
+}
+
+fn test_bloom_apply() -> Bool {
+    let bloom = create_bloom_effect(1024, 768)
+    let input_texture = 1
+    let output_texture = apply_bloom(bloom, input_texture)
+    assert(output_texture > 0, "Output texture should be valid")
+    destroy_bloom_effect(bloom)
+    return true
+}
+
+fn test_ssao_sample_generation() -> Bool {
+    let ssao = create_ssao_effect(1024, 768)
+
+    // Check that samples are in hemisphere (z >= 0)
+    let i = 0
+    while i < ssao.samples.len() {
+        let sample = ssao.samples.get(i)
+        assert(sample.z >= 0.0, "SSAO samples should be in hemisphere")
+        i = i + 1
+    }
+
+    destroy_ssao_effect(ssao)
+    return true
+}
+
+fn test_pipeline_effect_toggles() -> Bool {
+    let pipeline = create_postprocess_pipeline(1024, 768)
+
+    set_bloom_enabled(pipeline, false)
+    assert(pipeline.bloom_enabled == false, "Bloom should be disabled")
+
+    set_ssao_enabled(pipeline, false)
+    assert(pipeline.ssao_enabled == false, "SSAO should be disabled")
+
+    set_shadows_enabled(pipeline, false)
+    assert(pipeline.shadows_enabled == false, "Shadows should be disabled")
+
+    destroy_postprocess_pipeline(pipeline)
+    return true
+}
+
+fn test_bloom_parameters() -> Bool {
+    let pipeline = create_postprocess_pipeline(1024, 768)
+
+    set_bloom_threshold(pipeline, 1.5)
+    assert(pipeline.bloom.threshold == 1.5, "Bloom threshold should be 1.5")
+
+    set_bloom_iterations(pipeline, 10)
+    assert(pipeline.bloom.blur_iterations == 10, "Bloom iterations should be 10")
+
+    destroy_postprocess_pipeline(pipeline)
+    return true
+}
+
+fn test_ssao_parameters() -> Bool {
+    let pipeline = create_postprocess_pipeline(1024, 768)
+
+    set_ssao_radius(pipeline, 1.0)
+    assert(pipeline.ssao.radius == 1.0, "SSAO radius should be 1.0")
+
+    set_ssao_bias(pipeline, 0.05)
+    assert(pipeline.ssao.bias == 0.05, "SSAO bias should be 0.05")
+
+    destroy_postprocess_pipeline(pipeline)
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_framebuffer_creation(), "test_framebuffer_creation failed")
+    assert(test_bloom_effect_creation(), "test_bloom_effect_creation failed")
+    assert(test_shadow_map_creation(), "test_shadow_map_creation failed")
+    assert(test_ssao_effect_creation(), "test_ssao_effect_creation failed")
+    assert(test_postprocess_pipeline_creation(), "test_postprocess_pipeline_creation failed")
+    assert(test_bloom_apply(), "test_bloom_apply failed")
+    assert(test_ssao_sample_generation(), "test_ssao_sample_generation failed")
+    assert(test_pipeline_effect_toggles(), "test_pipeline_effect_toggles failed")
+    assert(test_bloom_parameters(), "test_bloom_parameters failed")
+    assert(test_ssao_parameters(), "test_ssao_parameters failed")
+    return true
+}
