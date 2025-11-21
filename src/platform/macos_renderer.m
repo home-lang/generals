@@ -36,9 +36,10 @@ MacOSRenderer macos_renderer_create(void *ns_window) {
         metalLayer.framebufferOnly = YES;
 
         // Get window content view and set the Metal layer
+        // IMPORTANT: setWantsLayer must be called BEFORE setLayer
         NSView *contentView = [window contentView];
-        [contentView setLayer:metalLayer];
         [contentView setWantsLayer:YES];
+        [contentView setLayer:metalLayer];
 
         // Set layer size to match window size
         NSRect frame = [contentView frame];

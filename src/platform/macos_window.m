@@ -28,9 +28,22 @@ typedef struct {
 // Create a window
 MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t height, bool resizable) {
     @autoreleasepool {
-        // Get shared application
+        NSLog(@"macos_window_create: Creating window '%s' (%ux%u)", title, width, height);
+
+        // CRITICAL: For command-line apps to show GUI on macOS
+        // Must transform to regular app BEFORE creating window
         NSApplication *app = [NSApplication sharedApplication];
+
+        // Transform process to foreground app (required for CLI apps)
+        ProcessSerialNumber psn = { 0, kCurrentProcess };
+        TransformProcessType(&psn, kProcessTransformToForegroundApplication);
+
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        // Finish launching immediately
+        if (![app isRunning]) {
+            [app finishLaunching];
+        }
 
         // Create window style mask
         NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
@@ -45,11 +58,24 @@ MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t heig
                                                         backing:NSBackingStoreBuffered
                                                           defer:NO];
 
+        // Prevent the window from being released when closed
+        [window setReleasedWhenClosed:NO];
+
         // Set title
         [window setTitle:[NSString stringWithUTF8String:title]];
 
+        // Set window to accept mouse moved events
+        [window setAcceptsMouseMovedEvents:YES];
+
+        // Make the window opaque and have a shadow
+        [window setOpaque:YES];
+        [window setHasShadow:YES];
+        [window setBackgroundColor:[NSColor blackColor]];
+
         // Center window
         [window center];
+
+        NSLog(@"macos_window_create: Window created at frame: %@", NSStringFromRect([window frame]));
 
         MacOSWindow result;
         result.ns_app = (__bridge_retained void *)app;
@@ -78,9 +104,29 @@ void macos_window_show(MacOSWindow *window) {
         NSWindow *ns_window = (__bridge NSWindow *)window->ns_window;
         NSApplication *app = (__bridge NSApplication *)window->ns_app;
 
+        NSLog(@"macos_window_show: Showing window %@", ns_window);
+
+        // Reset window to normal level (not floating)
+        [ns_window setLevel:NSNormalWindowLevel];
+
+        // Make the window key and bring to front
         [ns_window makeKeyAndOrderFront:nil];
+
+        // Activate the application to bring it to foreground
         [app activateIgnoringOtherApps:YES];
-        [app finishLaunching];
+
+        // Process any pending events immediately
+        NSEvent *event;
+        while ((event = [app nextEventMatchingMask:NSEventMaskAny
+                                         untilDate:[NSDate distantPast]
+                                            inMode:NSDefaultRunLoopMode
+                                           dequeue:YES])) {
+            [app sendEvent:event];
+        }
+
+        // Log window state
+        NSLog(@"macos_window_show: Window visible: %d, key: %d, frame: %@",
+              [ns_window isVisible], [ns_window isKeyWindow], NSStringFromRect([ns_window frame]));
     }
 }
 
@@ -169,7 +215,17 @@ void *macos_window_get_native_handle(MacOSWindow *window) {
 // Get mouse position in window coordinates
 void macos_window_get_mouse_position(MacOSWindow *window, float *x, float *y) {
     @autoreleasepool {
+        if (!window || !window->ns_window) {
+            *x = 0;
+            *y = 0;
+            return;
+        }
         NSWindow *ns_window = (__bridge NSWindow *)window->ns_window;
+        if (!ns_window) {
+            *x = 0;
+            *y = 0;
+            return;
+        }
         NSPoint mouseLocation = [NSEvent mouseLocation];
         NSRect windowFrame = [ns_window frame];
 

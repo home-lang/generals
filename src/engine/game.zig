@@ -110,14 +110,14 @@ pub const Game = struct {
     // Main menu texture
     menu_texture: if (builtin.os.tag == .macos) ?GPUTexture else void,
 
-    // Menu button rects for click detection
+    // Menu button rects for click detection (positioned for 800x600 authentic layout)
     menu_buttons: [6]struct { x: f32, y: f32, width: f32, height: f32, label: []const u8 } = .{
-        .{ .x = 620, .y = 100, .width = 160, .height = 30, .label = "SOLO PLAY" },
-        .{ .x = 620, .y = 140, .width = 160, .height = 30, .label = "MULTIPLAYER" },
-        .{ .x = 620, .y = 180, .width = 160, .height = 30, .label = "LOAD" },
-        .{ .x = 620, .y = 220, .width = 160, .height = 30, .label = "OPTIONS" },
-        .{ .x = 620, .y = 260, .width = 160, .height = 30, .label = "CREDITS" },
-        .{ .x = 620, .y = 300, .width = 160, .height = 30, .label = "EXIT GAME" },
+        .{ .x = 580, .y = 100, .width = 160, .height = 30, .label = "SOLO PLAY" },
+        .{ .x = 580, .y = 140, .width = 160, .height = 30, .label = "MULTIPLAYER" },
+        .{ .x = 580, .y = 180, .width = 160, .height = 30, .label = "LOAD" },
+        .{ .x = 580, .y = 220, .width = 160, .height = 30, .label = "OPTIONS" },
+        .{ .x = 580, .y = 260, .width = 160, .height = 30, .label = "CREDITS" },
+        .{ .x = 580, .y = 300, .width = 160, .height = 30, .label = "EXIT GAME" },
     },
 
     // Target frame rate (30 FPS logic, 60 FPS rendering)
@@ -140,13 +140,13 @@ pub const Game = struct {
             .total_time = 0.0,
             .window = null,
             .renderer = null,
-            .camera = Camera.init(1024, 768),
+            .camera = Camera.init(800, 600),
             .entity_manager = try EntityManager.init(allocator),
             .pathfinder = Pathfinder.init(allocator, 32.0), // 32-unit grid
             .resource_manager = try ResourceManager.init(allocator),
             .player_resources = PlayerResources.init(),
-            .ui_manager = UIManager.init(allocator, 1024, 768),
-            .minimap = Minimap.init(1024, 768, world_width, world_height),
+            .ui_manager = UIManager.init(allocator, 800, 600),
+            .minimap = Minimap.init(800, 600, world_width, world_height),
             .fog_of_war = try FogOfWarManager.init(allocator, num_teams, world_width, world_height, fog_cell_size),
             .player_team = 0, // Player is team 0
             .particle_system = try ParticleSystem.init(allocator, 2000), // Max 2000 particles
@@ -199,9 +199,9 @@ pub const Game = struct {
         std.debug.print("Generals Engine: Initializing...\n", .{});
 
         if (builtin.os.tag == .macos) {
-            // Create window
+            // Create window (authentic title from original game)
             std.debug.print("Creating game window...\n", .{});
-            self.window = try MacOSWindow.init("Command & Conquer: Generals - Home Edition", 1024, 768, false);
+            self.window = try MacOSWindow.init("Command and Conquer Generals Zero Hour", 800, 600, false);
 
             // Create renderer
             std.debug.print("Initializing sprite renderer...\n", .{});
@@ -232,7 +232,9 @@ pub const Game = struct {
 
             // Load main menu background texture
             std.debug.print("Loading main menu background...\n", .{});
+            std.debug.print("  Attempting to load: assets/ui/MainMenuBackground.tga\n", .{});
             if (TextureLoader.loadTGA(self.allocator, "assets/ui/MainMenuBackground.tga")) |menu_tex| {
+                std.debug.print("  TGA loaded: {}x{}\n", .{ menu_tex.width, menu_tex.height });
                 var cpu_menu = menu_tex;
                 defer cpu_menu.deinit();
 
@@ -264,8 +266,8 @@ pub const Game = struct {
 
                 self.menu_texture = try self.renderer.?.createTexture(cpu_menu.width, cpu_menu.height, menu_data);
                 std.debug.print("  Loaded main menu: {}x{}\n", .{ cpu_menu.width, cpu_menu.height });
-            } else |_| {
-                std.debug.print("  Warning: Could not load main menu background\n", .{});
+            } else |err| {
+                std.debug.print("  Warning: Could not load main menu background: {}\n", .{err});
             }
 
             // Setup skirmish mode
@@ -512,7 +514,7 @@ pub const Game = struct {
             .main_menu => {
                 // Handle main menu button clicks
                 if (self.input.mouse_left_clicked) {
-                    const button_x: f32 = 620;
+                    const button_x: f32 = 580;
                     const button_width: f32 = 180;
                     const button_height: f32 = 32;
                     const button_start_y: f32 = 100;
@@ -926,19 +928,19 @@ pub const Game = struct {
     fn renderMainMenu(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
         // Draw main menu background (authentic Zero Hour screenshot)
         if (self.menu_texture) |*menu_tex| {
-            // Scale to fill 1024x768 window (original is 800x600)
-            const scale_x: f32 = 1024.0 / @as(f32, @floatFromInt(menu_tex.width));
-            const scale_y: f32 = 768.0 / @as(f32, @floatFromInt(menu_tex.height));
+            // Scale to fill 800x600 window (original is 800x600)
+            const scale_x: f32 = 800.0 / @as(f32, @floatFromInt(menu_tex.width));
+            const scale_y: f32 = 600.0 / @as(f32, @floatFromInt(menu_tex.height));
             renderer.drawSpriteBatched(ctx, menu_tex, 0, 0, @as(f32, @floatFromInt(menu_tex.width)) * scale_x, @as(f32, @floatFromInt(menu_tex.height)) * scale_y);
         } else {
             // Fallback: Draw dark blue background
-            renderer.drawRect(ctx, 0, 0, 1024, 768, 0.1, 0.15, 0.25, 1.0);
+            renderer.drawRect(ctx, 0, 0, 800, 600, 0.1, 0.15, 0.25, 1.0);
 
             // Draw title text area
-            renderer.drawRect(ctx, 620, 30, 200, 60, 0.2, 0.3, 0.5, 0.8);
+            renderer.drawRect(ctx, 580, 30, 200, 60, 0.2, 0.3, 0.5, 0.8);
 
             // Draw menu buttons with authentic Zero Hour styling
-            const button_x: f32 = 620;
+            const button_x: f32 = 580;
             const button_width: f32 = 180;
             const button_height: f32 = 32;
             const button_start_y: f32 = 100;

@@ -545,9 +545,20 @@ pub const WndParser = struct {
 
 /// Load and parse a WND file
 pub fn loadWndFile(allocator: Allocator, path: []const u8) !WndFile {
-    // Read entire file using std.fs.cwd().readFileAlloc
-    const source = try std.fs.cwd().readFileAlloc(path, allocator, .unlimited);
+    // Read entire file
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const source = try allocator.alloc(u8, file_size);
     defer allocator.free(source);
+
+    var bytes_read: usize = 0;
+    while (bytes_read < file_size) {
+        const n = try file.read(source[bytes_read..]);
+        if (n == 0) break;
+        bytes_read += n;
+    }
 
     var parser = WndParser.init(allocator, source);
     return try parser.parse();
