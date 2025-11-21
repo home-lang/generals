@@ -129,4 +129,28 @@ pub const ResourceManager = struct {
         }
         return null;
     }
+
+    /// Get number of loaded unit definitions
+    pub fn getUnitCount(self: *const ResourceManager) usize {
+        if (self.faction_units) |units| {
+            return units.sections.size();
+        }
+        return 0;
+    }
+
+    /// Get number of loaded building definitions
+    pub fn getBuildingCount(self: *const ResourceManager) usize {
+        if (self.faction_buildings) |buildings| {
+            return buildings.sections.size();
+        }
+        return 0;
+    }
+
+    /// Get number of loaded command definitions
+    pub fn getCommandCount(self: *const ResourceManager) usize {
+        if (self.command_buttons) |buttons| {
+            return buttons.sections.size();
+        }
+        return 0;
+    }
 };

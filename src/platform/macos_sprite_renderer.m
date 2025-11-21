@@ -36,32 +36,47 @@ typedef struct {
 SpriteRenderer sprite_renderer_create(void *ns_window) {
     @autoreleasepool {
         NSWindow *window = (__bridge NSWindow *)ns_window;
+        NSLog(@"Creating sprite renderer for window: %@", window);
 
         // Get Metal device
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) {
-            NSLog(@"Metal is not supported");
+            NSLog(@"ERROR: Metal is not supported on this device");
             SpriteRenderer result = {0};
             return result;
         }
+        NSLog(@"Metal device: %@", device.name);
 
         // Create command queue
         id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        if (!commandQueue) {
+            NSLog(@"ERROR: Failed to create command queue");
+            SpriteRenderer result = {0};
+            return result;
+        }
 
         // Create Metal layer
         CAMetalLayer *metalLayer = [CAMetalLayer layer];
         metalLayer.device = device;
         metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        metalLayer.framebufferOnly = NO; // We need to sample from it
+        metalLayer.framebufferOnly = YES; // Set to YES for better performance (we don't sample from it)
 
-        // Setup window
+        // Setup window - IMPORTANT: setWantsLayer must be called before setLayer
         NSView *contentView = [window contentView];
-        [contentView setLayer:metalLayer];
         [contentView setWantsLayer:YES];
+        [contentView setLayer:metalLayer];
 
+        // Get screen scale factor
+        CGFloat scale = [[NSScreen mainScreen] backingScaleFactor];
+        NSLog(@"Screen scale factor: %f", scale);
+
+        // Set up layer properties
         NSRect frame = [contentView frame];
-        metalLayer.drawableSize = CGSizeMake(frame.size.width, frame.size.height);
-        metalLayer.contentsScale = [[NSScreen mainScreen] backingScaleFactor];
+        metalLayer.frame = contentView.bounds;
+        metalLayer.contentsScale = scale;
+        metalLayer.drawableSize = CGSizeMake(frame.size.width * scale, frame.size.height * scale);
+        NSLog(@"Content view frame: %.0f x %.0f", frame.size.width, frame.size.height);
+        NSLog(@"Drawable size: %.0f x %.0f", metalLayer.drawableSize.width, metalLayer.drawableSize.height);
 
         // Compile shaders from source string (inline shader code)
         NSString *shaderSource = @
@@ -238,48 +253,136 @@ typedef struct {
     void *render_encoder;
 } RenderContext;
 
+// Static frame counter for debug logging
+static int frameCount = 0;
+
 // Begin a new frame
+// NOTE: No autoreleasepool here - we manually retain objects and release them in end_frame
 RenderContext sprite_renderer_begin_frame(SpriteRenderer *renderer) {
     RenderContext ctx = {0};
 
     CAMetalLayer *layer = (__bridge CAMetalLayer *)renderer->metal_layer;
+    if (!layer) {
+        NSLog(@"ERROR: Metal layer is NULL");
+        return ctx;
+    }
+
+    // Log once on first frame
+    if (frameCount == 0) {
+        NSLog(@"First frame - Metal layer: %@", layer);
+        NSLog(@"Layer device: %@", layer.device);
+        NSLog(@"Layer pixel format: %lu", (unsigned long)layer.pixelFormat);
+        NSLog(@"Layer drawable size: %.0f x %.0f", layer.drawableSize.width, layer.drawableSize.height);
+        NSLog(@"Layer frame: %.0f x %.0f", layer.frame.size.width, layer.frame.size.height);
+        NSLog(@"Layer contents scale: %f", layer.contentsScale);
+    }
+
+    // Get drawable size from layer
+    CGSize drawableSize = layer.drawableSize;
+    CGFloat scale = layer.contentsScale;
+    if (scale <= 0) scale = [[NSScreen mainScreen] backingScaleFactor];
+
+    if (drawableSize.width <= 0 || drawableSize.height <= 0) {
+        // Try to get from frame
+        CGSize frameSize = layer.frame.size;
+        if (frameSize.width > 0 && frameSize.height > 0) {
+            layer.drawableSize = CGSizeMake(frameSize.width * scale, frameSize.height * scale);
+            drawableSize = layer.drawableSize;
+            NSLog(@"Fixed drawable size from frame: %.0f x %.0f", drawableSize.width, drawableSize.height);
+        } else {
+            NSLog(@"ERROR: Cannot determine drawable size");
+            return ctx;
+        }
+    }
+
+    renderer->viewport_width = drawableSize.width / scale;
+    renderer->viewport_height = drawableSize.height / scale;
+
     id<CAMetalDrawable> drawable = [layer nextDrawable];
-    if (!drawable) return ctx;
+    if (!drawable) {
+        if (frameCount < 5) {
+            NSLog(@"WARNING: Failed to get drawable on frame %d - layer may not be ready", frameCount);
+        }
+        frameCount++;
+        return ctx;
+    }
 
     id<MTLCommandQueue> commandQueue = (__bridge id<MTLCommandQueue>)renderer->metal_command_queue;
+    if (!commandQueue) {
+        NSLog(@"ERROR: Command queue is NULL");
+        return ctx;
+    }
+
     id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    if (!commandBuffer) {
+        NSLog(@"ERROR: Failed to create command buffer");
+        return ctx;
+    }
 
     MTLRenderPassDescriptor *renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
     renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+    // Desert sand color for background (like original C&C Generals)
+    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.76, 0.66, 0.46, 1.0);
     renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+    if (!renderEncoder) {
+        NSLog(@"ERROR: Failed to create render encoder");
+        return ctx;
+    }
 
-    // Retain all objects for the frame
+    // Log first successful frame
+    if (frameCount == 0) {
+        NSLog(@"First frame rendering successfully - viewport: %.0f x %.0f", renderer->viewport_width, renderer->viewport_height);
+    }
+
+    // Retain all objects for the frame - these will be released in end_frame
+    // Using __bridge_retained transfers ownership to the void* pointer
     ctx.drawable = (__bridge_retained void *)drawable;
     ctx.command_buffer = (__bridge_retained void *)commandBuffer;
     ctx.render_encoder = (__bridge_retained void *)renderEncoder;
 
+    frameCount++;
+
     return ctx;
 }
 
+// Static counter for end frame logging
+static int endFrameCount = 0;
+
 // End frame and present
 void sprite_renderer_end_frame(SpriteRenderer *renderer, RenderContext *ctx) {
-    if (!ctx->render_encoder) return;
+    (void)renderer; // Unused but kept for API consistency
 
-    id<MTLRenderCommandEncoder> renderEncoder = (__bridge_transfer id<MTLRenderCommandEncoder>)ctx->render_encoder;
-    id<MTLCommandBuffer> commandBuffer = (__bridge_transfer id<MTLCommandBuffer>)ctx->command_buffer;
-    id<CAMetalDrawable> drawable = (__bridge_transfer id<CAMetalDrawable>)ctx->drawable;
+    if (!ctx->render_encoder) {
+        if (endFrameCount < 5) {
+            NSLog(@"WARNING: end_frame called with no render encoder on frame %d", endFrameCount);
+        }
+        return;
+    }
 
-    [renderEncoder endEncoding];
-    [commandBuffer presentDrawable:drawable];
-    [commandBuffer commit];
+    @autoreleasepool {
+        id<MTLRenderCommandEncoder> renderEncoder = (__bridge_transfer id<MTLRenderCommandEncoder>)ctx->render_encoder;
+        id<MTLCommandBuffer> commandBuffer = (__bridge_transfer id<MTLCommandBuffer>)ctx->command_buffer;
+        id<CAMetalDrawable> drawable = (__bridge_transfer id<CAMetalDrawable>)ctx->drawable;
 
-    ctx->drawable = NULL;
-    ctx->command_buffer = NULL;
-    ctx->render_encoder = NULL;
+        [renderEncoder endEncoding];
+        [commandBuffer presentDrawable:drawable];
+        [commandBuffer commit];
+
+        // Wait for first few frames to complete to ensure proper presentation
+        if (endFrameCount < 3) {
+            [commandBuffer waitUntilCompleted];
+            NSLog(@"Frame %d completed and presented", endFrameCount);
+        }
+
+        ctx->drawable = NULL;
+        ctx->command_buffer = NULL;
+        ctx->render_encoder = NULL;
+
+        endFrameCount++;
+    }
 }
 
 // Draw a sprite within a render pass

@@ -101,8 +101,17 @@ pub const Texture = struct {
         // Calculate offset to image data (skip header + ID field)
         const image_data_offset: usize = @sizeOf(TGAHeader) + header.id_length;
 
-        if (file_data.len < image_data_offset + image_size) {
-            return error.InvalidTGAFile;
+        // For uncompressed images, check file size
+        // For RLE images, the compressed data can be smaller than image_size
+        if (header.image_type == @intFromEnum(TGAImageType.true_color)) {
+            if (file_data.len < image_data_offset + image_size) {
+                return error.InvalidTGAFile;
+            }
+        } else {
+            // For RLE, just ensure we have at least the header
+            if (file_data.len <= image_data_offset) {
+                return error.InvalidTGAFile;
+            }
         }
 
         // Allocate texture data

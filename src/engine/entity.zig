@@ -359,6 +359,54 @@ pub const EntityManager = struct {
         return null;
     }
 
+    /// Select any entity at world position (units or buildings)
+    pub fn selectEntityAt(self: *EntityManager, world_pos: Vec2, radius: f32) ?EntityId {
+        // First try to select units (smaller click radius)
+        for (self.entities.items) |*entity| {
+            if (!entity.active) continue;
+            if (entity.entity_type != .unit) continue;
+
+            const dx = entity.transform.position.x - world_pos.x;
+            const dy = entity.transform.position.y - world_pos.y;
+            const dist_sq = dx * dx + dy * dy;
+
+            if (dist_sq <= radius * radius) {
+                self.deselectAll();
+                if (entity.unit_data) |*unit_data| {
+                    unit_data.selected = true;
+                }
+                return entity.id;
+            }
+        }
+
+        // Then try buildings (larger click radius for buildings)
+        for (self.entities.items) |*entity| {
+            if (!entity.active) continue;
+            if (entity.entity_type != .building) continue;
+
+            const dx = entity.transform.position.x - world_pos.x;
+            const dy = entity.transform.position.y - world_pos.y;
+            const dist_sq = dx * dx + dy * dy;
+
+            if (dist_sq <= (radius * 2) * (radius * 2)) { // Larger radius for buildings
+                self.deselectAll();
+                return entity.id; // Return building ID (buildings don't have selected flag yet)
+            }
+        }
+
+        self.deselectAll();
+        return null;
+    }
+
+    /// Deselect all entities
+    pub fn deselectAll(self: *EntityManager) void {
+        for (self.entities.items) |*entity| {
+            if (entity.unit_data) |*unit_data| {
+                unit_data.selected = false;
+            }
+        }
+    }
+
     /// Find nearest enemy unit within range
     fn findNearestEnemy(self: *EntityManager, attacker_id: EntityId, attacker_team: TeamId, position: Vec2, max_range: f32) ?EntityId {
         var nearest_id: ?EntityId = null;

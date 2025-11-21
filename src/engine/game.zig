@@ -14,6 +14,7 @@ const GPUTexture = if (builtin.os.tag == .macos) @import("../platform/macos_spri
 const TextureLoader = @import("texture.zig").Texture;
 const Camera = @import("camera.zig").Camera;
 const EntityManager = @import("entity.zig").EntityManager;
+const Entity = @import("entity.zig").Entity;
 const Sprite = @import("entity.zig").Sprite;
 const TeamId = @import("entity.zig").TeamId;
 const Pathfinder = @import("pathfinding.zig").Pathfinder;
@@ -106,6 +107,19 @@ pub const Game = struct {
     // Test texture (temporary)
     test_texture: if (builtin.os.tag == .macos) ?GPUTexture else void,
 
+    // Main menu texture
+    menu_texture: if (builtin.os.tag == .macos) ?GPUTexture else void,
+
+    // Menu button rects for click detection
+    menu_buttons: [6]struct { x: f32, y: f32, width: f32, height: f32, label: []const u8 } = .{
+        .{ .x = 620, .y = 100, .width = 160, .height = 30, .label = "SOLO PLAY" },
+        .{ .x = 620, .y = 140, .width = 160, .height = 30, .label = "MULTIPLAYER" },
+        .{ .x = 620, .y = 180, .width = 160, .height = 30, .label = "LOAD" },
+        .{ .x = 620, .y = 220, .width = 160, .height = 30, .label = "OPTIONS" },
+        .{ .x = 620, .y = 260, .width = 160, .height = 30, .label = "CREDITS" },
+        .{ .x = 620, .y = 300, .width = 160, .height = 30, .label = "EXIT GAME" },
+    },
+
     // Target frame rate (30 FPS logic, 60 FPS rendering)
     const TARGET_LOGIC_FPS: f64 = 30.0;
     const TARGET_LOGIC_TIME: f64 = 1.0 / TARGET_LOGIC_FPS;
@@ -138,6 +152,7 @@ pub const Game = struct {
             .particle_system = try ParticleSystem.init(allocator, 2000), // Max 2000 particles
             .input = .{},
             .test_texture = null,
+            .menu_texture = null,
         };
     }
 
@@ -157,9 +172,13 @@ pub const Game = struct {
         // Clean up particle system
         self.particle_system.deinit();
 
-        // Clean up test texture
+        // Clean up textures
         if (builtin.os.tag == .macos) {
             if (self.test_texture) |*texture| {
+                texture.deinit();
+            }
+
+            if (self.menu_texture) |*texture| {
                 texture.deinit();
             }
 
@@ -211,25 +230,91 @@ pub const Game = struct {
             // Upload to GPU
             self.test_texture = try self.renderer.?.createTexture(cpu_texture.width, cpu_texture.height, texture_data);
 
-            // Create some test units
-            std.debug.print("Creating test units...\n", .{});
-            const sprite = Sprite.init(0, @floatFromInt(cpu_texture.width), @floatFromInt(cpu_texture.height));
+            // Load main menu background texture
+            std.debug.print("Loading main menu background...\n", .{});
+            if (TextureLoader.loadTGA(self.allocator, "assets/ui/MainMenuBackground.tga")) |menu_tex| {
+                var cpu_menu = menu_tex;
+                defer cpu_menu.deinit();
 
-            // Create units in a close pattern to test combat (within 150 unit range)
-            // Team 0 (left side) - 3 units
-            _ = try self.entity_manager.createUnit(-60, 0, "TestUnit1", sprite, 0);
-            _ = try self.entity_manager.createUnit(-60, 80, "TestUnit2", sprite, 0);
-            _ = try self.entity_manager.createUnit(-60, -80, "TestUnit3", sprite, 0);
+                // Allocate BGRA buffer
+                const menu_data = try self.allocator.alloc(u8, cpu_menu.width * cpu_menu.height * 4);
+                defer self.allocator.free(menu_data);
 
-            // Team 1 (right side) - 2 units
-            _ = try self.entity_manager.createUnit(60, 0, "TestUnit4", sprite, 1);
-            _ = try self.entity_manager.createUnit(60, 80, "TestUnit5", sprite, 1);
+                // Convert based on format (menu may be 24-bit or 32-bit)
+                const bytes_per_pixel: usize = cpu_menu.data.len / (cpu_menu.width * cpu_menu.height);
+                var mi: usize = 0;
+                var mj: usize = 0;
+                if (bytes_per_pixel == 3) {
+                    while (mi < cpu_menu.data.len) : (mi += 3) {
+                        menu_data[mj] = cpu_menu.data[mi];         // B
+                        menu_data[mj + 1] = cpu_menu.data[mi + 1]; // G
+                        menu_data[mj + 2] = cpu_menu.data[mi + 2]; // R
+                        menu_data[mj + 3] = 255;                    // A
+                        mj += 4;
+                    }
+                } else {
+                    while (mi < cpu_menu.data.len) : (mi += 4) {
+                        menu_data[mj] = cpu_menu.data[mi];         // B
+                        menu_data[mj + 1] = cpu_menu.data[mi + 1]; // G
+                        menu_data[mj + 2] = cpu_menu.data[mi + 2]; // R
+                        menu_data[mj + 3] = cpu_menu.data[mi + 3]; // A
+                        mj += 4;
+                    }
+                }
 
-            std.debug.print("Created {} entities\n", .{self.entity_manager.getEntityCount()});
+                self.menu_texture = try self.renderer.?.createTexture(cpu_menu.width, cpu_menu.height, menu_data);
+                std.debug.print("  Loaded main menu: {}x{}\n", .{ cpu_menu.width, cpu_menu.height });
+            } else |_| {
+                std.debug.print("  Warning: Could not load main menu background\n", .{});
+            }
 
-            // Test particle effects
-            std.debug.print("Creating test particle effects...\n", .{});
-            try spawnExplosion(&self.particle_system, 100, 100); // Screen space for now
+            // Setup skirmish mode
+            std.debug.print("Setting up Skirmish Mode...\n", .{});
+            const unit_sprite = Sprite.init(0, @floatFromInt(cpu_texture.width / 4), @floatFromInt(cpu_texture.height / 4));
+            const building_sprite = Sprite.init(0, @floatFromInt(cpu_texture.width), @floatFromInt(cpu_texture.height));
+
+            // Create Player base (team 0) - bottom left
+            const player_base_x: f32 = -400.0;
+            const player_base_y: f32 = -400.0;
+
+            // Player Command Center
+            _ = try self.entity_manager.createBuilding(player_base_x, player_base_y, "USA_CommandCenter", building_sprite, 0);
+            // Player Barracks
+            _ = try self.entity_manager.createBuilding(player_base_x + 150, player_base_y, "USA_Barracks", building_sprite, 0);
+            // Player Supply Center
+            _ = try self.entity_manager.createBuilding(player_base_x, player_base_y + 150, "USA_SupplyCenter", building_sprite, 0);
+            // Player starting units
+            _ = try self.entity_manager.createUnit(player_base_x + 80, player_base_y + 80, "USA_Ranger", unit_sprite, 0);
+            _ = try self.entity_manager.createUnit(player_base_x + 100, player_base_y + 80, "USA_Ranger", unit_sprite, 0);
+            _ = try self.entity_manager.createUnit(player_base_x + 120, player_base_y + 80, "USA_Ranger", unit_sprite, 0);
+            _ = try self.entity_manager.createUnit(player_base_x + 50, player_base_y + 100, "USA_Humvee", unit_sprite, 0);
+
+            // Create AI base (team 1) - top right
+            const ai_base_x: f32 = 400.0;
+            const ai_base_y: f32 = 400.0;
+
+            // AI Command Center
+            _ = try self.entity_manager.createBuilding(ai_base_x, ai_base_y, "China_CommandCenter", building_sprite, 1);
+            // AI Barracks
+            _ = try self.entity_manager.createBuilding(ai_base_x - 150, ai_base_y, "China_Barracks", building_sprite, 1);
+            // AI Supply Center
+            _ = try self.entity_manager.createBuilding(ai_base_x, ai_base_y - 150, "China_SupplyCenter", building_sprite, 1);
+            // AI starting units
+            _ = try self.entity_manager.createUnit(ai_base_x - 80, ai_base_y - 80, "China_RedGuard", unit_sprite, 1);
+            _ = try self.entity_manager.createUnit(ai_base_x - 100, ai_base_y - 80, "China_RedGuard", unit_sprite, 1);
+            _ = try self.entity_manager.createUnit(ai_base_x - 120, ai_base_y - 80, "China_RedGuard", unit_sprite, 1);
+            _ = try self.entity_manager.createUnit(ai_base_x - 50, ai_base_y - 100, "China_Battlemaster", unit_sprite, 1);
+
+            // Give starting supplies to player
+            self.player_resources.supplies = 5000.0;
+            self.player_resources.supply_limit = 10000.0;
+            std.debug.print("  Player starting supplies: $5000\n", .{});
+            std.debug.print("  AI starting supplies: $5000\n", .{});
+
+            std.debug.print("Created {} entities (buildings + units)\n", .{self.entity_manager.getEntityCount()});
+
+            // Initialize particle system
+            std.debug.print("Initializing particle system...\n", .{});
             std.debug.print("Particle system initialized with {} max particles\n", .{self.particle_system.max_particles});
 
             // Show window
@@ -281,7 +366,7 @@ pub const Game = struct {
         std.debug.print("\nGame loop ended.\n", .{});
     }
 
-    fn processInput(self: *Game) !void {
+    pub fn processInput(self: *Game) !void {
         if (builtin.os.tag == .macos) {
             if (self.window) |*window| {
                 const still_running = window.pollEvents();
@@ -315,7 +400,7 @@ pub const Game = struct {
         }
     }
 
-    fn update(self: *Game, dt: f64) !void {
+    pub fn update(self: *Game, dt: f64) !void {
         // Update camera movement based on keyboard input
         var dir_x: f32 = 0;
         var dir_y: f32 = 0;
@@ -379,6 +464,9 @@ pub const Game = struct {
         // Update entities
         self.entity_manager.update(dt);
 
+        // Update simple AI (enemy team 1 attacks player team 0)
+        try self.updateSimpleAI(@floatCast(dt));
+
         // Update combat system
         CombatSystem.updateCombat(self.entity_manager.getActiveEntities(), &self.particle_system, @floatCast(dt));
 
@@ -422,7 +510,38 @@ pub const Game = struct {
                 self.state = .main_menu;
             },
             .main_menu => {
-                // Update main menu
+                // Handle main menu button clicks
+                if (self.input.mouse_left_clicked) {
+                    const button_x: f32 = 620;
+                    const button_width: f32 = 180;
+                    const button_height: f32 = 32;
+                    const button_start_y: f32 = 100;
+                    const button_spacing: f32 = 40;
+
+                    // Check each button
+                    for (0..6) |i| {
+                        const button_y: f32 = button_start_y + @as(f32, @floatFromInt(i)) * button_spacing;
+
+                        if (self.input.mouse_x >= button_x and
+                            self.input.mouse_x <= button_x + button_width and
+                            self.input.mouse_y >= button_y and
+                            self.input.mouse_y <= button_y + button_height)
+                        {
+                            if (i == 0) {
+                                // SOLO PLAY - Start game
+                                std.debug.print("Starting Solo Play...\n", .{});
+                                self.state = .in_game;
+                            } else if (i == 5) {
+                                // EXIT GAME
+                                std.debug.print("Exit requested from menu\n", .{});
+                                self.quit();
+                            } else {
+                                std.debug.print("Button {} clicked (not implemented)\n", .{i});
+                            }
+                            break;
+                        }
+                    }
+                }
             },
             .in_game => {
                 // Update game logic
@@ -440,15 +559,28 @@ pub const Game = struct {
         }
     }
 
-    fn render(self: *Game, alpha: f64) !void {
+    pub fn render(self: *Game, alpha: f64) !void {
         _ = alpha;
 
         if (builtin.os.tag == .macos) {
             if (self.renderer) |*renderer| {
+                // Begin frame
+                var ctx = renderer.beginFrame();
+                if (!ctx.isValid()) {
+                    return;
+                }
+
+                // Render based on game state
+                if (self.state == .main_menu) {
+                    // Render main menu
+                    self.renderMainMenu(renderer, &ctx);
+                    renderer.endFrame(&ctx);
+                    return;
+                }
+
                 if (self.test_texture) |*texture| {
-                    // Begin frame
-                    var ctx = renderer.beginFrame();
-                    if (!ctx.isValid()) return;
+                    // Render terrain grid
+                    self.renderTerrain(renderer, &ctx);
 
                     // Render all entities
                     const entities = self.entity_manager.getActiveEntities();
@@ -673,6 +805,182 @@ pub const Game = struct {
             vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Left
         renderer.drawRect(ctx, viewport.x + viewport.width - vp_border, viewport.y, vp_border, viewport.height,
             vp_color[0], vp_color[1], vp_color[2], vp_color[3]); // Right
+    }
+
+    /// Simple AI: Enemy units seek and attack player units
+    fn updateSimpleAI(self: *Game, dt: f32) !void {
+        _ = dt;
+        const entities = self.entity_manager.getActiveEntities();
+
+        // For each enemy unit (team 1), find nearest player unit (team 0) and move toward it
+        for (entities) |*entity| {
+            if (!entity.active) continue;
+            if (entity.entity_type != .unit) continue;
+            if (entity.team != 1) continue; // Only AI team
+
+            // Check if unit has a unit_data component
+            if (entity.unit_data) |*unit_data| {
+                // Only move units that aren't already attacking or have high health
+                if (unit_data.ai_state == .attacking) continue;
+
+                // Find nearest enemy (player team = 0)
+                var nearest_enemy: ?*Entity = null;
+                var nearest_dist_sq: f32 = 9999999.0;
+
+                for (entities) |*potential_target| {
+                    if (!potential_target.active) continue;
+                    if (potential_target.entity_type != .unit) continue;
+                    if (potential_target.team != 0) continue; // Only player units
+
+                    const dx = potential_target.transform.position.x - entity.transform.position.x;
+                    const dy = potential_target.transform.position.y - entity.transform.position.y;
+                    const dist_sq = dx * dx + dy * dy;
+
+                    if (dist_sq < nearest_dist_sq) {
+                        nearest_dist_sq = dist_sq;
+                        nearest_enemy = potential_target;
+                    }
+                }
+
+                // If found an enemy, set as target and move toward it
+                if (nearest_enemy) |target| {
+                    // Only update path occasionally (every second or so based on game tick)
+                    if (entity.movement) |*movement| {
+                        // If not currently moving or far from target
+                        if (!movement.is_moving or nearest_dist_sq > 100 * 100) {
+                            // Create path to target
+                            const path = try self.pathfinder.findPath(entity.transform.position, target.transform.position);
+                            movement.setPath(path);
+                            unit_data.ai_state = .chasing;
+                        }
+                    }
+                    unit_data.target_id = target.id;
+                }
+            }
+        }
+    }
+
+    fn renderTerrain(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
+        // Render a desert-style terrain grid
+        const grid_size: f32 = 128.0;  // Size of each terrain tile
+        const world_size: f32 = 2000.0; // Total world size to render
+
+        // Calculate visible area in world space
+        const camera_x = self.camera.position.x;
+        const camera_y = self.camera.position.y;
+        const half_width = self.camera.viewport_width / 2.0 / self.camera.zoom;
+        const half_height = self.camera.viewport_height / 2.0 / self.camera.zoom;
+
+        // Get grid bounds (with some margin)
+        const start_x = @max(-world_size, camera_x - half_width - grid_size);
+        const end_x = @min(world_size, camera_x + half_width + grid_size);
+        const start_y = @max(-world_size, camera_y - half_height - grid_size);
+        const end_y = @min(world_size, camera_y + half_height + grid_size);
+
+        // Snap to grid
+        var x = @floor(start_x / grid_size) * grid_size;
+        while (x < end_x) : (x += grid_size) {
+            var y = @floor(start_y / grid_size) * grid_size;
+            while (y < end_y) : (y += grid_size) {
+                const world_pos = Vec2.init(x, y);
+                const screen_pos = self.camera.worldToScreen(world_pos);
+
+                // Create checkerboard pattern for visual interest
+                const ix = @as(i32, @intFromFloat(x / grid_size));
+                const iy = @as(i32, @intFromFloat(y / grid_size));
+                const is_light = @mod(ix + iy, 2) == 0;
+
+                // Desert colors
+                const base_r: f32 = if (is_light) 0.76 else 0.72; // Sandy tan
+                const base_g: f32 = if (is_light) 0.66 else 0.62;
+                const base_b: f32 = if (is_light) 0.46 else 0.42;
+
+                const tile_screen_size = grid_size * self.camera.zoom;
+                renderer.drawRect(ctx, screen_pos.x, screen_pos.y, tile_screen_size, tile_screen_size, base_r, base_g, base_b, 1.0);
+            }
+        }
+
+        // Draw grid lines for clarity
+        x = @floor(start_x / grid_size) * grid_size;
+        while (x < end_x) : (x += grid_size) {
+            const world_pos = Vec2.init(x, start_y);
+            const screen_start = self.camera.worldToScreen(world_pos);
+            const screen_end = self.camera.worldToScreen(Vec2.init(x, end_y));
+
+            // Vertical grid line
+            renderer.drawRect(ctx, screen_start.x, screen_start.y, 1.0, screen_end.y - screen_start.y, 0.5, 0.4, 0.3, 0.3);
+        }
+
+        var y = @floor(start_y / grid_size) * grid_size;
+        while (y < end_y) : (y += grid_size) {
+            const world_pos = Vec2.init(start_x, y);
+            const screen_start = self.camera.worldToScreen(world_pos);
+            const screen_end = self.camera.worldToScreen(Vec2.init(end_x, y));
+
+            // Horizontal grid line
+            renderer.drawRect(ctx, screen_start.x, screen_start.y, screen_end.x - screen_start.x, 1.0, 0.5, 0.4, 0.3, 0.3);
+        }
+    }
+
+    /// Render authentic main menu
+    fn renderMainMenu(self: *Game, renderer: *SpriteRenderer, ctx: *RenderContext) void {
+        // Draw main menu background (authentic Zero Hour screenshot)
+        if (self.menu_texture) |*menu_tex| {
+            // Scale to fill 1024x768 window (original is 800x600)
+            const scale_x: f32 = 1024.0 / @as(f32, @floatFromInt(menu_tex.width));
+            const scale_y: f32 = 768.0 / @as(f32, @floatFromInt(menu_tex.height));
+            renderer.drawSpriteBatched(ctx, menu_tex, 0, 0, @as(f32, @floatFromInt(menu_tex.width)) * scale_x, @as(f32, @floatFromInt(menu_tex.height)) * scale_y);
+        } else {
+            // Fallback: Draw dark blue background
+            renderer.drawRect(ctx, 0, 0, 1024, 768, 0.1, 0.15, 0.25, 1.0);
+
+            // Draw title text area
+            renderer.drawRect(ctx, 620, 30, 200, 60, 0.2, 0.3, 0.5, 0.8);
+
+            // Draw menu buttons with authentic Zero Hour styling
+            const button_x: f32 = 620;
+            const button_width: f32 = 180;
+            const button_height: f32 = 32;
+            const button_start_y: f32 = 100;
+            const button_spacing: f32 = 40;
+
+            const button_labels = [_][]const u8{
+                "SOLO PLAY",
+                "MULTIPLAYER",
+                "LOAD",
+                "OPTIONS",
+                "CREDITS",
+                "EXIT GAME",
+            };
+
+            for (button_labels, 0..) |_, i| {
+                const button_y: f32 = button_start_y + @as(f32, @floatFromInt(i)) * button_spacing;
+
+                // Check if mouse is hovering
+                const is_hovered = self.input.mouse_x >= button_x and
+                    self.input.mouse_x <= button_x + button_width and
+                    self.input.mouse_y >= button_y and
+                    self.input.mouse_y <= button_y + button_height;
+
+                // Button background (darker blue with lighter border when hovered)
+                if (is_hovered) {
+                    renderer.drawRect(ctx, button_x - 2, button_y - 2, button_width + 4, button_height + 4, 0.2, 0.4, 0.8, 1.0);
+                }
+                renderer.drawRect(ctx, button_x, button_y, button_width, button_height, 0.1, 0.15, 0.3, 1.0);
+
+                // Button border (blue gradient)
+                renderer.drawRect(ctx, button_x, button_y, button_width, 2, 0.3, 0.5, 0.8, 1.0); // Top
+                renderer.drawRect(ctx, button_x, button_y + button_height - 2, button_width, 2, 0.2, 0.3, 0.5, 1.0); // Bottom
+                renderer.drawRect(ctx, button_x, button_y, 2, button_height, 0.3, 0.5, 0.8, 1.0); // Left
+                renderer.drawRect(ctx, button_x + button_width - 2, button_y, 2, button_height, 0.2, 0.3, 0.5, 1.0); // Right
+            }
+
+            // Draw decorative frame around shell map area
+            renderer.drawRect(ctx, 20, 50, 580, 2, 0.3, 0.5, 0.8, 1.0); // Top
+            renderer.drawRect(ctx, 20, 550, 580, 2, 0.3, 0.5, 0.8, 1.0); // Bottom
+            renderer.drawRect(ctx, 20, 50, 2, 502, 0.3, 0.5, 0.8, 1.0); // Left
+            renderer.drawRect(ctx, 598, 50, 2, 502, 0.3, 0.5, 0.8, 1.0); // Right
+        }
     }
 
     pub fn quit(self: *Game) void {
