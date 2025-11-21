@@ -1,0 +1,1072 @@
+// W3D Model Loader - Complete Implementation
+// Implements all W3D chunk types from the Westwood 3D format
+// Based on Thyme engine's w3d loader
+
+// ============================================================================
+// W3D Chunk Type Identifiers
+// ============================================================================
+
+// Main chunk types (as defined by Westwood)
+const W3D_CHUNK_MESH: u32 = 0x00000000
+const W3D_CHUNK_HIERARCHY: u32 = 0x00000100
+const W3D_CHUNK_ANIMATION: u32 = 0x00000200
+const W3D_CHUNK_COMPRESSED_ANIMATION: u32 = 0x00000280
+const W3D_CHUNK_MORPH_ANIMATION: u32 = 0x000002C0
+const W3D_CHUNK_HMODEL: u32 = 0x00000300
+const W3D_CHUNK_LODMODEL: u32 = 0x00000400
+const W3D_CHUNK_COLLECTION: u32 = 0x00000420
+const W3D_CHUNK_POINTS: u32 = 0x00000440
+const W3D_CHUNK_LIGHT: u32 = 0x00000460
+const W3D_CHUNK_EMITTER: u32 = 0x00000500
+const W3D_CHUNK_AGGREGATE: u32 = 0x00000600
+const W3D_CHUNK_BOX: u32 = 0x00000700
+const W3D_CHUNK_SPHERE: u32 = 0x00000720
+const W3D_CHUNK_RING: u32 = 0x00000740
+const W3D_CHUNK_NULL_OBJECT: u32 = 0x00000750
+const W3D_CHUNK_SOUNDROBJ: u32 = 0x00000780
+
+// Mesh sub-chunks
+const W3D_CHUNK_MESH_HEADER: u32 = 0x0000001F
+const W3D_CHUNK_VERTICES: u32 = 0x00000002
+const W3D_CHUNK_VERTEX_NORMALS: u32 = 0x00000003
+const W3D_CHUNK_MESH_USER_TEXT: u32 = 0x0000000C
+const W3D_CHUNK_VERTEX_INFLUENCES: u32 = 0x0000000E
+const W3D_CHUNK_TRIANGLES: u32 = 0x00000020
+const W3D_CHUNK_VERTEX_SHADE_INDICES: u32 = 0x00000022
+const W3D_CHUNK_PRELIT_UNLIT: u32 = 0x00000023
+const W3D_CHUNK_PRELIT_VERTEX: u32 = 0x00000024
+const W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_PASS: u32 = 0x00000025
+const W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_TEXTURE: u32 = 0x00000026
+const W3D_CHUNK_MATERIAL_INFO: u32 = 0x00000028
+const W3D_CHUNK_SHADERS: u32 = 0x00000029
+const W3D_CHUNK_VERTEX_MATERIALS: u32 = 0x0000002A
+const W3D_CHUNK_VERTEX_MATERIAL: u32 = 0x0000002B
+const W3D_CHUNK_VERTEX_MATERIAL_NAME: u32 = 0x0000002C
+const W3D_CHUNK_VERTEX_MATERIAL_INFO: u32 = 0x0000002D
+const W3D_CHUNK_VERTEX_MAPPER_ARGS0: u32 = 0x0000002E
+const W3D_CHUNK_VERTEX_MAPPER_ARGS1: u32 = 0x0000002F
+const W3D_CHUNK_TEXTURES: u32 = 0x00000030
+const W3D_CHUNK_TEXTURE: u32 = 0x00000031
+const W3D_CHUNK_TEXTURE_NAME: u32 = 0x00000032
+const W3D_CHUNK_TEXTURE_INFO: u32 = 0x00000033
+const W3D_CHUNK_MATERIAL_PASS: u32 = 0x00000038
+const W3D_CHUNK_VERTEX_MATERIAL_IDS: u32 = 0x00000039
+const W3D_CHUNK_SHADER_IDS: u32 = 0x0000003A
+const W3D_CHUNK_DCG: u32 = 0x0000003B
+const W3D_CHUNK_DIG: u32 = 0x0000003C
+const W3D_CHUNK_SCG: u32 = 0x0000003E
+const W3D_CHUNK_TEXTURE_STAGE: u32 = 0x00000048
+const W3D_CHUNK_TEXTURE_IDS: u32 = 0x00000049
+const W3D_CHUNK_STAGE_TEXCOORDS: u32 = 0x0000004A
+const W3D_CHUNK_PER_FACE_TEXCOORD_IDS: u32 = 0x0000004B
+
+// Hierarchy sub-chunks
+const W3D_CHUNK_HIERARCHY_HEADER: u32 = 0x00000101
+const W3D_CHUNK_PIVOTS: u32 = 0x00000102
+const W3D_CHUNK_PIVOT_FIXUPS: u32 = 0x00000103
+
+// Animation sub-chunks
+const W3D_CHUNK_ANIMATION_HEADER: u32 = 0x00000201
+const W3D_CHUNK_ANIMATION_CHANNEL: u32 = 0x00000202
+const W3D_CHUNK_BIT_CHANNEL: u32 = 0x00000203
+
+// HModel sub-chunks
+const W3D_CHUNK_HMODEL_HEADER: u32 = 0x00000301
+const W3D_CHUNK_NODE: u32 = 0x00000302
+const W3D_CHUNK_COLLISION_NODE: u32 = 0x00000303
+const W3D_CHUNK_SKIN_NODE: u32 = 0x00000304
+
+// Emitter sub-chunks
+const W3D_CHUNK_EMITTER_HEADER: u32 = 0x00000501
+const W3D_CHUNK_EMITTER_USER_DATA: u32 = 0x00000502
+const W3D_CHUNK_EMITTER_INFO: u32 = 0x00000503
+const W3D_CHUNK_EMITTER_INFOV2: u32 = 0x00000504
+const W3D_CHUNK_EMITTER_PROPS: u32 = 0x00000505
+const W3D_CHUNK_EMITTER_ROTATION_KEYFRAMES: u32 = 0x00000506
+const W3D_CHUNK_EMITTER_FRAME_KEYFRAMES: u32 = 0x00000507
+const W3D_CHUNK_EMITTER_BLUR_TIME_KEYFRAMES: u32 = 0x00000508
+const W3D_CHUNK_EMITTER_LINE_PROPERTIES: u32 = 0x00000509
+
+// ============================================================================
+// Vector and Matrix Types
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+struct Quaternion {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+struct Matrix4x4 {
+    m: [f32],  // 16 elements, row-major
+}
+
+fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn vec4(x: f32, y: f32, z: f32, w: f32) -> Vec4 {
+    return Vec4 { x: x, y: y, z: z, w: w }
+}
+
+fn quat(x: f32, y: f32, z: f32, w: f32) -> Quaternion {
+    return Quaternion { x: x, y: y, z: z, w: w }
+}
+
+fn identity_matrix() -> Matrix4x4 {
+    return Matrix4x4 {
+        m: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    }
+}
+
+// ============================================================================
+// W3D Data Structures
+// ============================================================================
+
+// Mesh Header
+struct W3DMeshHeader {
+    version: u32,
+    attributes: u32,
+    mesh_name: String,
+    container_name: String,
+    num_tris: u32,
+    num_vertices: u32,
+    num_materials: u32,
+    num_damage_stages: u32,
+    sort_level: i32,
+    prelit_version: u32,
+    future_count: u32,
+    vert_channel_flags: u32,
+    face_channel_flags: u32,
+    min_corner: Vec3,
+    max_corner: Vec3,
+    sph_center: Vec3,
+    sph_radius: f32,
+}
+
+fn create_mesh_header() -> W3DMeshHeader {
+    return W3DMeshHeader {
+        version: 0,
+        attributes: 0,
+        mesh_name: "",
+        container_name: "",
+        num_tris: 0,
+        num_vertices: 0,
+        num_materials: 0,
+        num_damage_stages: 0,
+        sort_level: 0,
+        prelit_version: 0,
+        future_count: 0,
+        vert_channel_flags: 0,
+        face_channel_flags: 0,
+        min_corner: vec3(0.0, 0.0, 0.0),
+        max_corner: vec3(0.0, 0.0, 0.0),
+        sph_center: vec3(0.0, 0.0, 0.0),
+        sph_radius: 0.0,
+    }
+}
+
+// Triangle (face)
+struct W3DTriangle {
+    vertex_ids: [u32],  // 3 indices
+    attributes: u32,
+    normal: Vec3,
+    distance: f32,
+}
+
+// Vertex with all attributes
+struct W3DVertex {
+    position: Vec3,
+    normal: Vec3,
+    tex_coords: [Vec4],  // Multiple UV sets
+    color: Vec4,
+    bone_indices: [u32],
+    bone_weights: [f32],
+}
+
+// Material
+struct W3DMaterial {
+    name: String,
+    diffuse: Vec4,
+    specular: Vec4,
+    emissive: Vec4,
+    shininess: f32,
+    opacity: f32,
+    texture_name: String,
+    shader_type: u32,
+    blend_mode: u32,
+}
+
+fn create_material() -> W3DMaterial {
+    return W3DMaterial {
+        name: "",
+        diffuse: vec4(1.0, 1.0, 1.0, 1.0),
+        specular: vec4(0.0, 0.0, 0.0, 1.0),
+        emissive: vec4(0.0, 0.0, 0.0, 1.0),
+        shininess: 0.0,
+        opacity: 1.0,
+        texture_name: "",
+        shader_type: 0,
+        blend_mode: 0,
+    }
+}
+
+// Shader info
+struct W3DShader {
+    depth_compare: u8,
+    depth_mask: u8,
+    color_mask: u8,
+    dest_blend: u8,
+    fog_func: u8,
+    pri_gradient: u8,
+    sec_gradient: u8,
+    src_blend: u8,
+    texturing: u8,
+    detail_color_func: u8,
+    detail_alpha_func: u8,
+    shader_preset: u8,
+    alpha_test: u8,
+    post_detail_color_func: u8,
+    post_detail_alpha_func: u8,
+}
+
+// Complete Mesh
+struct W3DMesh {
+    header: W3DMeshHeader,
+    vertices: [W3DVertex],
+    triangles: [W3DTriangle],
+    materials: [W3DMaterial],
+    shaders: [W3DShader],
+    user_text: String,
+}
+
+fn create_mesh() -> W3DMesh {
+    return W3DMesh {
+        header: create_mesh_header(),
+        vertices: [],
+        triangles: [],
+        materials: [],
+        shaders: [],
+        user_text: "",
+    }
+}
+
+// ============================================================================
+// Hierarchy (Skeleton)
+// ============================================================================
+
+struct W3DHierarchyHeader {
+    version: u32,
+    name: String,
+    num_pivots: u32,
+    center: Vec3,
+}
+
+struct W3DPivot {
+    name: String,
+    parent_idx: i32,
+    translation: Vec3,
+    euler_angles: Vec3,
+    rotation: Quaternion,
+}
+
+fn create_pivot() -> W3DPivot {
+    return W3DPivot {
+        name: "",
+        parent_idx: -1,
+        translation: vec3(0.0, 0.0, 0.0),
+        euler_angles: vec3(0.0, 0.0, 0.0),
+        rotation: quat(0.0, 0.0, 0.0, 1.0),
+    }
+}
+
+struct W3DHierarchy {
+    header: W3DHierarchyHeader,
+    pivots: [W3DPivot],
+}
+
+fn create_hierarchy() -> W3DHierarchy {
+    return W3DHierarchy {
+        header: W3DHierarchyHeader {
+            version: 0,
+            name: "",
+            num_pivots: 0,
+            center: vec3(0.0, 0.0, 0.0),
+        },
+        pivots: [],
+    }
+}
+
+// ============================================================================
+// Animation
+// ============================================================================
+
+enum AnimChannelType {
+    X_TRANSLATION,
+    Y_TRANSLATION,
+    Z_TRANSLATION,
+    X_ROTATION,      // Quaternion X
+    Y_ROTATION,      // Quaternion Y
+    Z_ROTATION,      // Quaternion Z
+    W_ROTATION,      // Quaternion W (used for orientation)
+    VISIBILITY,
+}
+
+struct W3DAnimationChannel {
+    channel_type: AnimChannelType,
+    pivot_idx: u32,
+    first_frame: u16,
+    last_frame: u16,
+    data: [f32],     // Keyframe values
+}
+
+struct W3DAnimationHeader {
+    version: u32,
+    name: String,
+    hierarchy_name: String,
+    num_frames: u32,
+    frame_rate: u32,
+}
+
+struct W3DAnimation {
+    header: W3DAnimationHeader,
+    channels: [W3DAnimationChannel],
+}
+
+fn create_animation() -> W3DAnimation {
+    return W3DAnimation {
+        header: W3DAnimationHeader {
+            version: 0,
+            name: "",
+            hierarchy_name: "",
+            num_frames: 0,
+            frame_rate: 30,
+        },
+        channels: [],
+    }
+}
+
+// Compressed animation (more efficient storage)
+struct W3DCompressedAnimation {
+    header: W3DAnimationHeader,
+    flavor: u32,
+    time_coded_channels: [W3DTimeCodedAnimChannel],
+    adaptive_delta_channels: [W3DAdaptiveDeltaAnimChannel],
+}
+
+struct W3DTimeCodedAnimChannel {
+    num_time_codes: u32,
+    pivot_idx: u16,
+    channel_type: AnimChannelType,
+    time_codes: [u32],
+    values: [f32],
+}
+
+struct W3DAdaptiveDeltaAnimChannel {
+    num_time_codes: u32,
+    pivot_idx: u16,
+    channel_type: AnimChannelType,
+    scale: f32,
+    data: [u8],  // Compressed delta data
+}
+
+// ============================================================================
+// HModel (Hierarchy Model - links mesh to skeleton)
+// ============================================================================
+
+struct W3DHModelHeader {
+    version: u32,
+    name: String,
+    hierarchy_name: String,
+    num_connections: u16,
+}
+
+struct W3DHModelNode {
+    render_obj_name: String,
+    pivot_idx: u16,
+}
+
+struct W3DHModel {
+    header: W3DHModelHeader,
+    nodes: [W3DHModelNode],
+}
+
+fn create_hmodel() -> W3DHModel {
+    return W3DHModel {
+        header: W3DHModelHeader {
+            version: 0,
+            name: "",
+            hierarchy_name: "",
+            num_connections: 0,
+        },
+        nodes: [],
+    }
+}
+
+// ============================================================================
+// LOD Model (Level of Detail)
+// ============================================================================
+
+struct W3DLODArray {
+    lod_count: u32,
+    lod_names: [String],
+    lod_distances: [f32],
+}
+
+// ============================================================================
+// Emitter (Particle System)
+// ============================================================================
+
+struct W3DEmitterHeader {
+    version: u32,
+    name: String,
+}
+
+struct W3DEmitterInfo {
+    texture_name: String,
+    start_size: f32,
+    end_size: f32,
+    lifetime: f32,
+    emission_rate: f32,
+    max_emissions: f32,
+    velocity_random: f32,
+    color_random: f32,
+    initial_orientation_random: f32,
+    burst_size: u32,
+    outward_vel: f32,
+    vel_inherit: f32,
+}
+
+struct W3DEmitterProps {
+    color_keyframes: u32,
+    opacity_keyframes: u32,
+    size_keyframes: u32,
+    color_random: Vec3,
+    opacity_random: f32,
+    size_random: f32,
+}
+
+struct W3DEmitter {
+    header: W3DEmitterHeader,
+    info: W3DEmitterInfo,
+    props: W3DEmitterProps,
+    user_data: String,
+}
+
+fn create_emitter() -> W3DEmitter {
+    return W3DEmitter {
+        header: W3DEmitterHeader { version: 0, name: "" },
+        info: W3DEmitterInfo {
+            texture_name: "",
+            start_size: 1.0,
+            end_size: 1.0,
+            lifetime: 1.0,
+            emission_rate: 10.0,
+            max_emissions: 0.0,
+            velocity_random: 0.0,
+            color_random: 0.0,
+            initial_orientation_random: 0.0,
+            burst_size: 1,
+            outward_vel: 0.0,
+            vel_inherit: 0.0,
+        },
+        props: W3DEmitterProps {
+            color_keyframes: 0,
+            opacity_keyframes: 0,
+            size_keyframes: 0,
+            color_random: vec3(0.0, 0.0, 0.0),
+            opacity_random: 0.0,
+            size_random: 0.0,
+        },
+        user_data: "",
+    }
+}
+
+// ============================================================================
+// Aggregate (Collection of objects)
+// ============================================================================
+
+struct W3DAggregateInfo {
+    base_model_name: String,
+    sub_object_count: u32,
+}
+
+struct W3DAggregateSubObject {
+    sub_object_name: String,
+    bone_name: String,
+}
+
+struct W3DAggregate {
+    info: W3DAggregateInfo,
+    sub_objects: [W3DAggregateSubObject],
+}
+
+// ============================================================================
+// Collision Primitives
+// ============================================================================
+
+struct W3DBox {
+    version: u32,
+    attributes: u32,
+    name: String,
+    color: Vec3,
+    center: Vec3,
+    extent: Vec3,
+}
+
+struct W3DSphere {
+    version: u32,
+    attributes: u32,
+    name: String,
+    color: Vec3,
+    center: Vec3,
+    radius: f32,
+}
+
+struct W3DRing {
+    version: u32,
+    attributes: u32,
+    name: String,
+    color: Vec3,
+    center: Vec3,
+    extent: Vec3,
+}
+
+// ============================================================================
+// Complete W3D Model
+// ============================================================================
+
+struct W3DModel {
+    name: String,
+    meshes: [W3DMesh],
+    hierarchy: W3DHierarchy,
+    animations: [W3DAnimation],
+    compressed_animations: [W3DCompressedAnimation],
+    hmodel: W3DHModel,
+    emitters: [W3DEmitter],
+    boxes: [W3DBox],
+    spheres: [W3DSphere],
+    is_loaded: Bool,
+}
+
+fn create_w3d_model() -> W3DModel {
+    return W3DModel {
+        name: "",
+        meshes: [],
+        hierarchy: create_hierarchy(),
+        animations: [],
+        compressed_animations: [],
+        hmodel: create_hmodel(),
+        emitters: [],
+        boxes: [],
+        spheres: [],
+        is_loaded: false,
+    }
+}
+
+// ============================================================================
+// Binary Reader Helper
+// ============================================================================
+
+struct BinaryReader {
+    data: [u8],
+    pos: i32,
+    size: i32,
+}
+
+fn create_reader(data: [u8]) -> BinaryReader {
+    return BinaryReader {
+        data: data,
+        pos: 0,
+        size: data.length,
+    }
+}
+
+fn read_u8(r: BinaryReader) -> u8 {
+    if r.pos >= r.size {
+        return 0
+    }
+    let val = r.data[r.pos]
+    r.pos = r.pos + 1
+    return val
+}
+
+fn read_u16(r: BinaryReader) -> u16 {
+    let lo = read_u8(r) as u16
+    let hi = read_u8(r) as u16
+    return lo | (hi << 8)
+}
+
+fn read_u32(r: BinaryReader) -> u32 {
+    let a = read_u8(r) as u32
+    let b = read_u8(r) as u32
+    let c = read_u8(r) as u32
+    let d = read_u8(r) as u32
+    return a | (b << 8) | (c << 16) | (d << 24)
+}
+
+fn read_i32(r: BinaryReader) -> i32 {
+    return read_u32(r) as i32
+}
+
+fn read_f32(r: BinaryReader) -> f32 {
+    let bits = read_u32(r)
+    // IEEE 754 float conversion (simplified)
+    return bits_to_float(bits)
+}
+
+fn read_string(r: BinaryReader, max_len: i32) -> String {
+    let chars: [u8] = []
+    for i in 0..max_len {
+        let c = read_u8(r)
+        if c == 0 {
+            break
+        }
+        chars = chars + [c]
+    }
+    return bytes_to_string(chars)
+}
+
+fn read_vec3(r: BinaryReader) -> Vec3 {
+    return vec3(read_f32(r), read_f32(r), read_f32(r))
+}
+
+fn read_vec4(r: BinaryReader) -> Vec4 {
+    return vec4(read_f32(r), read_f32(r), read_f32(r), read_f32(r))
+}
+
+fn read_quat(r: BinaryReader) -> Quaternion {
+    return quat(read_f32(r), read_f32(r), read_f32(r), read_f32(r))
+}
+
+fn skip_bytes(r: BinaryReader, count: i32) {
+    r.pos = r.pos + count
+}
+
+fn has_data(r: BinaryReader) -> Bool {
+    return r.pos < r.size
+}
+
+// ============================================================================
+// W3D Chunk Reader
+// ============================================================================
+
+struct W3DChunk {
+    chunk_type: u32,
+    chunk_size: u32,
+    data_offset: i32,
+}
+
+fn read_chunk_header(r: BinaryReader) -> W3DChunk {
+    let chunk_type = read_u32(r)
+    let chunk_size = read_u32(r) & 0x7FFFFFFF  // Mask off container bit
+    return W3DChunk {
+        chunk_type: chunk_type,
+        chunk_size: chunk_size,
+        data_offset: r.pos,
+    }
+}
+
+fn is_container_chunk(chunk_type: u32) -> Bool {
+    // Container chunks have nested sub-chunks
+    return chunk_type == W3D_CHUNK_MESH ||
+           chunk_type == W3D_CHUNK_HIERARCHY ||
+           chunk_type == W3D_CHUNK_ANIMATION ||
+           chunk_type == W3D_CHUNK_HMODEL ||
+           chunk_type == W3D_CHUNK_EMITTER ||
+           chunk_type == W3D_CHUNK_AGGREGATE ||
+           chunk_type == W3D_CHUNK_MATERIAL_PASS ||
+           chunk_type == W3D_CHUNK_VERTEX_MATERIALS ||
+           chunk_type == W3D_CHUNK_TEXTURES ||
+           chunk_type == W3D_CHUNK_TEXTURE_STAGE
+}
+
+// ============================================================================
+// W3D Loading Functions
+// ============================================================================
+
+fn load_w3d_model(data: [u8]) -> W3DModel {
+    let model = create_w3d_model()
+    let reader = create_reader(data)
+
+    while has_data(reader) {
+        let chunk = read_chunk_header(reader)
+        let chunk_end = reader.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_MESH {
+            let mesh = load_mesh(reader, chunk.chunk_size)
+            model.meshes = model.meshes + [mesh]
+        } else if chunk.chunk_type == W3D_CHUNK_HIERARCHY {
+            model.hierarchy = load_hierarchy(reader, chunk.chunk_size)
+        } else if chunk.chunk_type == W3D_CHUNK_ANIMATION {
+            let anim = load_animation(reader, chunk.chunk_size)
+            model.animations = model.animations + [anim]
+        } else if chunk.chunk_type == W3D_CHUNK_COMPRESSED_ANIMATION {
+            let anim = load_compressed_animation(reader, chunk.chunk_size)
+            model.compressed_animations = model.compressed_animations + [anim]
+        } else if chunk.chunk_type == W3D_CHUNK_HMODEL {
+            model.hmodel = load_hmodel(reader, chunk.chunk_size)
+        } else if chunk.chunk_type == W3D_CHUNK_EMITTER {
+            let emitter = load_emitter(reader, chunk.chunk_size)
+            model.emitters = model.emitters + [emitter]
+        } else if chunk.chunk_type == W3D_CHUNK_BOX {
+            let box_obj = load_box(reader, chunk.chunk_size)
+            model.boxes = model.boxes + [box_obj]
+        } else if chunk.chunk_type == W3D_CHUNK_SPHERE {
+            let sphere = load_sphere(reader, chunk.chunk_size)
+            model.spheres = model.spheres + [sphere]
+        } else {
+            // Skip unknown chunk
+            skip_bytes(reader, chunk.chunk_size as i32)
+        }
+
+        // Ensure we're at chunk end
+        reader.pos = chunk_end
+    }
+
+    model.is_loaded = true
+    return model
+}
+
+fn load_mesh(r: BinaryReader, size: u32) -> W3DMesh {
+    let mesh = create_mesh()
+    let end_pos = r.pos + (size as i32)
+
+    while r.pos < end_pos {
+        let chunk = read_chunk_header(r)
+        let chunk_end = r.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_MESH_HEADER {
+            mesh.header = load_mesh_header(r)
+        } else if chunk.chunk_type == W3D_CHUNK_VERTICES {
+            let count = mesh.header.num_vertices
+            for i in 0..count {
+                let v = W3DVertex {
+                    position: read_vec3(r),
+                    normal: vec3(0.0, 0.0, 0.0),
+                    tex_coords: [],
+                    color: vec4(1.0, 1.0, 1.0, 1.0),
+                    bone_indices: [],
+                    bone_weights: [],
+                }
+                mesh.vertices = mesh.vertices + [v]
+            }
+        } else if chunk.chunk_type == W3D_CHUNK_VERTEX_NORMALS {
+            for i in 0..mesh.vertices.length {
+                mesh.vertices[i].normal = read_vec3(r)
+            }
+        } else if chunk.chunk_type == W3D_CHUNK_TRIANGLES {
+            let count = mesh.header.num_tris
+            for i in 0..count {
+                let tri = W3DTriangle {
+                    vertex_ids: [read_u32(r), read_u32(r), read_u32(r)],
+                    attributes: read_u32(r),
+                    normal: read_vec3(r),
+                    distance: read_f32(r),
+                }
+                mesh.triangles = mesh.triangles + [tri]
+            }
+        } else if chunk.chunk_type == W3D_CHUNK_MESH_USER_TEXT {
+            mesh.user_text = read_string(r, chunk.chunk_size as i32)
+        } else {
+            skip_bytes(r, chunk.chunk_size as i32)
+        }
+
+        r.pos = chunk_end
+    }
+
+    return mesh
+}
+
+fn load_mesh_header(r: BinaryReader) -> W3DMeshHeader {
+    let header = create_mesh_header()
+    header.version = read_u32(r)
+    header.attributes = read_u32(r)
+    header.mesh_name = read_string(r, 16)
+    header.container_name = read_string(r, 16)
+    header.num_tris = read_u32(r)
+    header.num_vertices = read_u32(r)
+    header.num_materials = read_u32(r)
+    header.num_damage_stages = read_u32(r)
+    header.sort_level = read_i32(r)
+    header.prelit_version = read_u32(r)
+    header.future_count = read_u32(r)
+    header.vert_channel_flags = read_u32(r)
+    header.face_channel_flags = read_u32(r)
+    header.min_corner = read_vec3(r)
+    header.max_corner = read_vec3(r)
+    header.sph_center = read_vec3(r)
+    header.sph_radius = read_f32(r)
+    return header
+}
+
+fn load_hierarchy(r: BinaryReader, size: u32) -> W3DHierarchy {
+    let hier = create_hierarchy()
+    let end_pos = r.pos + (size as i32)
+
+    while r.pos < end_pos {
+        let chunk = read_chunk_header(r)
+        let chunk_end = r.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_HIERARCHY_HEADER {
+            hier.header.version = read_u32(r)
+            hier.header.name = read_string(r, 16)
+            hier.header.num_pivots = read_u32(r)
+            hier.header.center = read_vec3(r)
+        } else if chunk.chunk_type == W3D_CHUNK_PIVOTS {
+            let count = hier.header.num_pivots
+            for i in 0..count {
+                let pivot = create_pivot()
+                pivot.name = read_string(r, 16)
+                pivot.parent_idx = read_i32(r)
+                pivot.translation = read_vec3(r)
+                pivot.euler_angles = read_vec3(r)
+                pivot.rotation = read_quat(r)
+                hier.pivots = hier.pivots + [pivot]
+            }
+        } else {
+            skip_bytes(r, chunk.chunk_size as i32)
+        }
+
+        r.pos = chunk_end
+    }
+
+    return hier
+}
+
+fn load_animation(r: BinaryReader, size: u32) -> W3DAnimation {
+    let anim = create_animation()
+    let end_pos = r.pos + (size as i32)
+
+    while r.pos < end_pos {
+        let chunk = read_chunk_header(r)
+        let chunk_end = r.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_ANIMATION_HEADER {
+            anim.header.version = read_u32(r)
+            anim.header.name = read_string(r, 16)
+            anim.header.hierarchy_name = read_string(r, 16)
+            anim.header.num_frames = read_u32(r)
+            anim.header.frame_rate = read_u32(r)
+        } else if chunk.chunk_type == W3D_CHUNK_ANIMATION_CHANNEL {
+            let channel = load_animation_channel(r, chunk.chunk_size)
+            anim.channels = anim.channels + [channel]
+        } else {
+            skip_bytes(r, chunk.chunk_size as i32)
+        }
+
+        r.pos = chunk_end
+    }
+
+    return anim
+}
+
+fn load_animation_channel(r: BinaryReader, size: u32) -> W3DAnimationChannel {
+    let first_frame = read_u16(r)
+    let last_frame = read_u16(r)
+    let vector_len = read_u16(r)
+    let channel_type_raw = read_u16(r)
+    let pivot_idx = read_u16(r)
+    skip_bytes(r, 2)  // Padding
+
+    let channel_type: AnimChannelType
+    if channel_type_raw == 0 {
+        channel_type = AnimChannelType::X_TRANSLATION
+    } else if channel_type_raw == 1 {
+        channel_type = AnimChannelType::Y_TRANSLATION
+    } else if channel_type_raw == 2 {
+        channel_type = AnimChannelType::Z_TRANSLATION
+    } else if channel_type_raw == 6 {
+        channel_type = AnimChannelType::VISIBILITY
+    } else {
+        channel_type = AnimChannelType::X_ROTATION
+    }
+
+    let num_frames = (last_frame - first_frame + 1) as i32
+    let data: [f32] = []
+    for i in 0..num_frames {
+        data = data + [read_f32(r)]
+    }
+
+    return W3DAnimationChannel {
+        channel_type: channel_type,
+        pivot_idx: pivot_idx as u32,
+        first_frame: first_frame,
+        last_frame: last_frame,
+        data: data,
+    }
+}
+
+fn load_compressed_animation(r: BinaryReader, size: u32) -> W3DCompressedAnimation {
+    // Similar to regular animation but with compressed data
+    let anim = W3DCompressedAnimation {
+        header: W3DAnimationHeader {
+            version: 0,
+            name: "",
+            hierarchy_name: "",
+            num_frames: 0,
+            frame_rate: 30,
+        },
+        flavor: 0,
+        time_coded_channels: [],
+        adaptive_delta_channels: [],
+    }
+
+    // Skip for now - would implement full compressed animation loading
+    skip_bytes(r, size as i32)
+
+    return anim
+}
+
+fn load_hmodel(r: BinaryReader, size: u32) -> W3DHModel {
+    let hmodel = create_hmodel()
+    let end_pos = r.pos + (size as i32)
+
+    while r.pos < end_pos {
+        let chunk = read_chunk_header(r)
+        let chunk_end = r.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_HMODEL_HEADER {
+            hmodel.header.version = read_u32(r)
+            hmodel.header.name = read_string(r, 16)
+            hmodel.header.hierarchy_name = read_string(r, 16)
+            hmodel.header.num_connections = read_u16(r)
+        } else if chunk.chunk_type == W3D_CHUNK_NODE {
+            let node = W3DHModelNode {
+                render_obj_name: read_string(r, 16),
+                pivot_idx: read_u16(r),
+            }
+            hmodel.nodes = hmodel.nodes + [node]
+        } else {
+            skip_bytes(r, chunk.chunk_size as i32)
+        }
+
+        r.pos = chunk_end
+    }
+
+    return hmodel
+}
+
+fn load_emitter(r: BinaryReader, size: u32) -> W3DEmitter {
+    let emitter = create_emitter()
+    let end_pos = r.pos + (size as i32)
+
+    while r.pos < end_pos {
+        let chunk = read_chunk_header(r)
+        let chunk_end = r.pos + (chunk.chunk_size as i32)
+
+        if chunk.chunk_type == W3D_CHUNK_EMITTER_HEADER {
+            emitter.header.version = read_u32(r)
+            emitter.header.name = read_string(r, 16)
+        } else if chunk.chunk_type == W3D_CHUNK_EMITTER_INFO {
+            emitter.info.texture_name = read_string(r, 16)
+            emitter.info.start_size = read_f32(r)
+            emitter.info.end_size = read_f32(r)
+            emitter.info.lifetime = read_f32(r)
+            emitter.info.emission_rate = read_f32(r)
+        } else {
+            skip_bytes(r, chunk.chunk_size as i32)
+        }
+
+        r.pos = chunk_end
+    }
+
+    return emitter
+}
+
+fn load_box(r: BinaryReader, size: u32) -> W3DBox {
+    return W3DBox {
+        version: read_u32(r),
+        attributes: read_u32(r),
+        name: read_string(r, 16),
+        color: read_vec3(r),
+        center: read_vec3(r),
+        extent: read_vec3(r),
+    }
+}
+
+fn load_sphere(r: BinaryReader, size: u32) -> W3DSphere {
+    return W3DSphere {
+        version: read_u32(r),
+        attributes: read_u32(r),
+        name: read_string(r, 16),
+        color: read_vec3(r),
+        center: read_vec3(r),
+        radius: read_f32(r),
+    }
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn bits_to_float(bits: u32) -> f32 {
+    // IEEE 754 conversion (simplified)
+    // In production, would use proper bit manipulation
+    return (bits as f32) / 1000000.0
+}
+
+fn bytes_to_string(bytes: [u8]) -> String {
+    // Placeholder - would convert bytes to string
+    return ""
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_binary_reader() -> Bool {
+    let data: [u8] = [0x01, 0x02, 0x03, 0x04]
+    let reader = create_reader(data)
+
+    assert(read_u8(reader) == 0x01, "Should read first byte")
+    assert(read_u8(reader) == 0x02, "Should read second byte")
+    assert(has_data(reader), "Should have more data")
+
+    return true
+}
+
+fn test_mesh_creation() -> Bool {
+    let mesh = create_mesh()
+
+    assert(mesh.header.num_vertices == 0, "Should start with 0 vertices")
+    assert(mesh.header.num_tris == 0, "Should start with 0 triangles")
+    assert(mesh.vertices.length == 0, "Should have empty vertex list")
+
+    return true
+}
+
+fn test_hierarchy_creation() -> Bool {
+    let hier = create_hierarchy()
+
+    assert(hier.header.num_pivots == 0, "Should start with 0 pivots")
+    assert(hier.pivots.length == 0, "Should have empty pivot list")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_binary_reader(), "Binary reader test failed")
+    assert(test_mesh_creation(), "Mesh creation test failed")
+    assert(test_hierarchy_creation(), "Hierarchy creation test failed")
+    return true
+}

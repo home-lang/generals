@@ -1,0 +1,857 @@
+// Unit System - Complete unit management for C&C Generals
+// Spawning, selection, movement, attack, death, voice responses
+
+import engine/game_definitions
+import engine/pathfinding
+
+// ============================================================================
+// Unit State
+// ============================================================================
+
+enum UnitState {
+    IDLE,
+    MOVING,
+    ATTACKING,
+    GUARDING,
+    GARRISONED,
+    CONSTRUCTING,
+    HARVESTING,
+    DYING,
+    DEAD,
+}
+
+enum UnitCategory {
+    INFANTRY,
+    VEHICLE,
+    AIRCRAFT,
+    STRUCTURE,
+    HERO,
+}
+
+// ============================================================================
+// Unit Definition (Template)
+// ============================================================================
+
+struct UnitDefinition {
+    name: String,
+    display_name: String,
+    category: UnitCategory,
+    faction: FactionId,
+
+    // Combat stats
+    max_health: f32,
+    armor_type: ArmorType,
+    vision_range: f32,
+    stealth_detect_range: f32,
+
+    // Movement
+    speed: f32,
+    turn_rate: f32,
+    can_crush_infantry: Bool,
+    locomotor_type: LocomotorType,
+
+    // Weapons
+    primary_weapon: String,
+    secondary_weapon: String,
+
+    // Production
+    build_cost: i32,
+    build_time: f32,
+    prerequisite: String,
+
+    // Experience
+    experience_value: i32,
+
+    // Audio
+    select_sound: String,
+    move_sound: String,
+    attack_sound: String,
+    death_sound: String,
+
+    // Model
+    model_name: String,
+    portrait_image: String,
+    button_image: String,
+
+    // Special
+    garrison_slots: i32,
+    transport_slots: i32,
+    can_capture: Bool,
+    can_heal: Bool,
+}
+
+fn create_unit_definition(name: String, category: UnitCategory) -> UnitDefinition {
+    return UnitDefinition {
+        name: name,
+        display_name: name,
+        category: category,
+        faction: FactionId::NEUTRAL,
+        max_health: 100.0,
+        armor_type: ArmorType::NONE,
+        vision_range: 150.0,
+        stealth_detect_range: 0.0,
+        speed: 50.0,
+        turn_rate: 180.0,
+        can_crush_infantry: false,
+        locomotor_type: LocomotorType::GROUND,
+        primary_weapon: "",
+        secondary_weapon: "",
+        build_cost: 500,
+        build_time: 10.0,
+        prerequisite: "",
+        experience_value: 50,
+        select_sound: "",
+        move_sound: "",
+        attack_sound: "",
+        death_sound: "",
+        model_name: "",
+        portrait_image: "",
+        button_image: "",
+        garrison_slots: 0,
+        transport_slots: 0,
+        can_capture: false,
+        can_heal: false,
+    }
+}
+
+// ============================================================================
+// Armor Types
+// ============================================================================
+
+enum ArmorType {
+    NONE,
+    INFANTRY,
+    VEHICLE_LIGHT,
+    VEHICLE_HEAVY,
+    AIRCRAFT,
+    BUILDING,
+    STRUCTURE_LIGHT,
+    STRUCTURE_HEAVY,
+    HEROIC,
+}
+
+enum LocomotorType {
+    GROUND,
+    WHEELED,
+    TRACKED,
+    HOVER,
+    AMPHIBIOUS,
+    AIR,
+    STATIONARY,
+}
+
+// ============================================================================
+// Unit Instance (Runtime)
+// ============================================================================
+
+struct Unit {
+    id: i32,
+    definition: UnitDefinition,
+    owner_id: i32,          // Player ID
+
+    // State
+    state: UnitState,
+    current_health: f32,
+    veterancy_level: i32,   // 0=Rookie, 1=Veteran, 2=Elite, 3=Heroic
+
+    // Position/Movement
+    position: Vec3,
+    rotation: f32,
+    target_position: Vec3,
+    path: [Vec3],
+    path_index: i32,
+
+    // Combat
+    target_unit_id: i32,
+    attack_cooldown: f32,
+    special_ability_cooldown: f32,
+
+    // Animation
+    current_animation: String,
+    animation_time: f32,
+
+    // Selection
+    is_selected: Bool,
+
+    // Garrison/Transport
+    garrisoned_in: i32,
+    passengers: [i32],
+
+    // Upgrades applied
+    applied_upgrades: [String],
+
+    // Voice
+    last_voice_time: f32,
+    voice_cooldown: f32,
+}
+
+fn create_unit(id: i32, def: UnitDefinition, owner: i32, pos: Vec3) -> Unit {
+    return Unit {
+        id: id,
+        definition: def,
+        owner_id: owner,
+        state: UnitState::IDLE,
+        current_health: def.max_health,
+        veterancy_level: 0,
+        position: pos,
+        rotation: 0.0,
+        target_position: pos,
+        path: [],
+        path_index: 0,
+        target_unit_id: -1,
+        attack_cooldown: 0.0,
+        special_ability_cooldown: 0.0,
+        current_animation: "idle",
+        animation_time: 0.0,
+        is_selected: false,
+        garrisoned_in: -1,
+        passengers: [],
+        applied_upgrades: [],
+        last_voice_time: 0.0,
+        voice_cooldown: 2.0,
+    }
+}
+
+// ============================================================================
+// Unit Manager
+// ============================================================================
+
+struct UnitManager {
+    units: [Unit],
+    next_unit_id: i32,
+    unit_definitions: [UnitDefinition],
+
+    // Selection
+    selected_units: [i32],
+    selection_box_start: Vec2,
+    selection_box_end: Vec2,
+    is_box_selecting: Bool,
+
+    // Groups (Ctrl+1-9)
+    control_groups: [[i32]],
+}
+
+fn create_unit_manager() -> UnitManager {
+    let groups: [[i32]] = []
+    for i in 0..10 {
+        groups = groups + [[]]
+    }
+
+    return UnitManager {
+        units: [],
+        next_unit_id: 1,
+        unit_definitions: [],
+        selected_units: [],
+        selection_box_start: vec2(0.0, 0.0),
+        selection_box_end: vec2(0.0, 0.0),
+        is_box_selecting: false,
+        control_groups: groups,
+    }
+}
+
+// ============================================================================
+// Unit Spawning
+// ============================================================================
+
+fn spawn_unit(um: UnitManager, def_name: String, owner: i32, position: Vec3) -> i32 {
+    let def = get_unit_definition(um, def_name)
+    if def.name == "" {
+        return -1
+    }
+
+    let unit = create_unit(um.next_unit_id, def, owner, position)
+    um.next_unit_id = um.next_unit_id + 1
+
+    um.units = um.units + [unit]
+
+    // Play spawn sound
+    play_unit_voice(unit, "created")
+
+    return unit.id
+}
+
+fn remove_unit(um: UnitManager, unit_id: i32) {
+    let remaining: [Unit] = []
+    for u in um.units {
+        if u.id != unit_id {
+            remaining = remaining + [u]
+        }
+    }
+    um.units = remaining
+
+    // Remove from selection
+    deselect_unit(um, unit_id)
+}
+
+fn get_unit(um: UnitManager, unit_id: i32) -> Unit {
+    for u in um.units {
+        if u.id == unit_id {
+            return u
+        }
+    }
+    return create_unit(-1, create_unit_definition("", UnitCategory::INFANTRY), -1, vec3(0.0, 0.0, 0.0))
+}
+
+fn get_unit_definition(um: UnitManager, name: String) -> UnitDefinition {
+    for def in um.unit_definitions {
+        if def.name == name {
+            return def
+        }
+    }
+    return create_unit_definition("", UnitCategory::INFANTRY)
+}
+
+// ============================================================================
+// Unit Selection
+// ============================================================================
+
+fn select_unit(um: UnitManager, unit_id: i32, add_to_selection: Bool) {
+    if !add_to_selection {
+        clear_selection(um)
+    }
+
+    // Check if already selected
+    for id in um.selected_units {
+        if id == unit_id {
+            return
+        }
+    }
+
+    let unit = get_unit(um, unit_id)
+    if unit.id != -1 {
+        unit.is_selected = true
+        um.selected_units = um.selected_units + [unit_id]
+        play_unit_voice(unit, "select")
+    }
+}
+
+fn deselect_unit(um: UnitManager, unit_id: i32) {
+    let remaining: [i32] = []
+    for id in um.selected_units {
+        if id != unit_id {
+            remaining = remaining + [id]
+        }
+    }
+    um.selected_units = remaining
+
+    let unit = get_unit(um, unit_id)
+    if unit.id != -1 {
+        unit.is_selected = false
+    }
+}
+
+fn clear_selection(um: UnitManager) {
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 {
+            unit.is_selected = false
+        }
+    }
+    um.selected_units = []
+}
+
+fn select_units_in_box(um: UnitManager, x1: f32, y1: f32, x2: f32, y2: f32, owner: i32) {
+    clear_selection(um)
+
+    let min_x = min(x1, x2)
+    let max_x = max(x1, x2)
+    let min_y = min(y1, y2)
+    let max_y = max(y1, y2)
+
+    for unit in um.units {
+        if unit.owner_id == owner && unit.state != UnitState::DEAD {
+            if unit.position.x >= min_x && unit.position.x <= max_x &&
+               unit.position.z >= min_y && unit.position.z <= max_y {
+                select_unit(um, unit.id, true)
+            }
+        }
+    }
+}
+
+fn select_unit_at_position(um: UnitManager, world_x: f32, world_y: f32, radius: f32) -> i32 {
+    for unit in um.units {
+        if unit.state != UnitState::DEAD {
+            let dx = unit.position.x - world_x
+            let dy = unit.position.z - world_y
+            let dist = sqrt(dx * dx + dy * dy)
+            if dist <= radius {
+                return unit.id
+            }
+        }
+    }
+    return -1
+}
+
+fn select_all_of_type(um: UnitManager, def_name: String, owner: i32) {
+    clear_selection(um)
+    for unit in um.units {
+        if unit.definition.name == def_name && unit.owner_id == owner {
+            select_unit(um, unit.id, true)
+        }
+    }
+}
+
+// ============================================================================
+// Control Groups
+// ============================================================================
+
+fn assign_control_group(um: UnitManager, group_num: i32) {
+    if group_num >= 0 && group_num < 10 {
+        um.control_groups[group_num] = um.selected_units
+    }
+}
+
+fn recall_control_group(um: UnitManager, group_num: i32) {
+    if group_num >= 0 && group_num < 10 {
+        clear_selection(um)
+        for id in um.control_groups[group_num] {
+            let unit = get_unit(um, id)
+            if unit.id != -1 && unit.state != UnitState::DEAD {
+                select_unit(um, id, true)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Unit Movement
+// ============================================================================
+
+fn order_move(um: UnitManager, target_pos: Vec3) {
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 && unit.definition.locomotor_type != LocomotorType::STATIONARY {
+            unit.target_position = target_pos
+            unit.state = UnitState::MOVING
+            unit.target_unit_id = -1
+
+            // Calculate path
+            unit.path = calculate_path(unit.position, target_pos)
+            unit.path_index = 0
+
+            play_unit_voice(unit, "move")
+        }
+    }
+}
+
+fn order_attack_move(um: UnitManager, target_pos: Vec3) {
+    // Move but attack enemies on the way
+    order_move(um, target_pos)
+    // Would add attack-on-move behavior
+}
+
+fn order_stop(um: UnitManager) {
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 {
+            unit.state = UnitState::IDLE
+            unit.target_unit_id = -1
+            unit.path = []
+        }
+    }
+}
+
+fn order_guard(um: UnitManager, target_pos: Vec3) {
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 {
+            unit.target_position = target_pos
+            unit.state = UnitState::GUARDING
+        }
+    }
+}
+
+fn calculate_path(start: Vec3, end: Vec3) -> [Vec3] {
+    // Simplified - would use A* pathfinding
+    return [start, end]
+}
+
+// ============================================================================
+// Unit Combat
+// ============================================================================
+
+fn order_attack(um: UnitManager, target_unit_id: i32) {
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 && unit.definition.primary_weapon != "" {
+            unit.target_unit_id = target_unit_id
+            unit.state = UnitState::ATTACKING
+
+            let target = get_unit(um, target_unit_id)
+            if target.id != -1 {
+                unit.target_position = target.position
+            }
+
+            play_unit_voice(unit, "attack")
+        }
+    }
+}
+
+fn order_force_attack(um: UnitManager, target_pos: Vec3) {
+    // Attack ground/position
+    for id in um.selected_units {
+        let unit = get_unit(um, id)
+        if unit.id != -1 && unit.definition.primary_weapon != "" {
+            unit.target_unit_id = -1
+            unit.target_position = target_pos
+            unit.state = UnitState::ATTACKING
+        }
+    }
+}
+
+fn deal_damage(um: UnitManager, target_id: i32, damage: f32, damage_type: DamageType) {
+    let unit = get_unit(um, target_id)
+    if unit.id == -1 || unit.state == UnitState::DEAD {
+        return
+    }
+
+    // Apply armor modifier
+    let armor_mod = get_armor_modifier(unit.definition.armor_type, damage_type)
+    let actual_damage = damage * armor_mod
+
+    // Apply veterancy reduction
+    let vet_reduction = 1.0 - (unit.veterancy_level as f32) * 0.1
+    actual_damage = actual_damage * vet_reduction
+
+    unit.current_health = unit.current_health - actual_damage
+
+    if unit.current_health <= 0.0 {
+        kill_unit(um, target_id)
+    }
+}
+
+fn heal_unit(um: UnitManager, unit_id: i32, amount: f32) {
+    let unit = get_unit(um, unit_id)
+    if unit.id != -1 && unit.state != UnitState::DEAD {
+        unit.current_health = min(unit.current_health + amount, unit.definition.max_health)
+    }
+}
+
+fn get_armor_modifier(armor: ArmorType, damage: DamageType) -> f32 {
+    // Simplified armor table
+    if armor == ArmorType::INFANTRY {
+        if damage == DamageType::SMALL_ARMS {
+            return 1.0
+        }
+        if damage == DamageType::EXPLOSIVE {
+            return 0.8
+        }
+        if damage == DamageType::FIRE {
+            return 1.5
+        }
+    }
+    if armor == ArmorType::VEHICLE_HEAVY {
+        if damage == DamageType::SMALL_ARMS {
+            return 0.1
+        }
+        if damage == DamageType::ARMOR_PIERCING {
+            return 1.0
+        }
+    }
+    return 1.0
+}
+
+// ============================================================================
+// Unit Death
+// ============================================================================
+
+fn kill_unit(um: UnitManager, unit_id: i32) {
+    let unit = get_unit(um, unit_id)
+    if unit.id == -1 {
+        return
+    }
+
+    unit.state = UnitState::DYING
+    unit.current_animation = "death"
+    unit.animation_time = 0.0
+
+    // Play death sound
+    play_unit_voice(unit, "death")
+
+    // Spawn death effects
+    // spawn_death_effect(unit.position, unit.definition.category)
+
+    // Award experience to killer
+    // award_experience(killer_id, unit.definition.experience_value)
+}
+
+fn cleanup_dead_units(um: UnitManager) {
+    let alive: [Unit] = []
+    for unit in um.units {
+        if unit.state == UnitState::DYING {
+            // Check if death animation complete (2 seconds)
+            if unit.animation_time >= 2.0 {
+                unit.state = UnitState::DEAD
+            }
+        }
+
+        if unit.state != UnitState::DEAD {
+            alive = alive + [unit]
+        }
+    }
+    um.units = alive
+}
+
+// ============================================================================
+// Unit Voices
+// ============================================================================
+
+fn play_unit_voice(unit: Unit, voice_type: String) {
+    // Check cooldown
+    // if current_time - unit.last_voice_time < unit.voice_cooldown {
+    //     return
+    // }
+
+    let sound_name = ""
+    if voice_type == "select" {
+        sound_name = unit.definition.select_sound
+    } else if voice_type == "move" {
+        sound_name = unit.definition.move_sound
+    } else if voice_type == "attack" {
+        sound_name = unit.definition.attack_sound
+    } else if voice_type == "death" {
+        sound_name = unit.definition.death_sound
+    } else if voice_type == "created" {
+        // Unit created voice
+        sound_name = unit.definition.select_sound
+    }
+
+    if sound_name != "" {
+        // play_sound(sound_name)
+        // unit.last_voice_time = current_time
+    }
+}
+
+// ============================================================================
+// Unit Update Loop
+// ============================================================================
+
+fn update_units(um: UnitManager, delta_time: f32) {
+    for unit in um.units {
+        update_unit(um, unit, delta_time)
+    }
+
+    cleanup_dead_units(um)
+}
+
+fn update_unit(um: UnitManager, unit: Unit, delta_time: f32) {
+    if unit.state == UnitState::DEAD {
+        return
+    }
+
+    // Update animation
+    unit.animation_time = unit.animation_time + delta_time
+
+    // Update cooldowns
+    if unit.attack_cooldown > 0.0 {
+        unit.attack_cooldown = unit.attack_cooldown - delta_time
+    }
+    if unit.special_ability_cooldown > 0.0 {
+        unit.special_ability_cooldown = unit.special_ability_cooldown - delta_time
+    }
+
+    if unit.state == UnitState::MOVING {
+        update_unit_movement(unit, delta_time)
+    } else if unit.state == UnitState::ATTACKING {
+        update_unit_attack(um, unit, delta_time)
+    } else if unit.state == UnitState::GUARDING {
+        // Check for nearby enemies
+        // auto_attack_nearby(um, unit)
+    }
+}
+
+fn update_unit_movement(unit: Unit, delta_time: f32) {
+    if unit.path.length == 0 {
+        unit.state = UnitState::IDLE
+        return
+    }
+
+    let target = unit.path[unit.path_index]
+
+    // Move towards target
+    let dx = target.x - unit.position.x
+    let dz = target.z - unit.position.z
+    let dist = sqrt(dx * dx + dz * dz)
+
+    if dist < 5.0 {
+        // Reached waypoint
+        unit.path_index = unit.path_index + 1
+        if unit.path_index >= unit.path.length {
+            unit.state = UnitState::IDLE
+            unit.path = []
+        }
+        return
+    }
+
+    // Calculate movement
+    let move_dist = unit.definition.speed * delta_time
+    let ratio = move_dist / dist
+
+    unit.position.x = unit.position.x + dx * ratio
+    unit.position.z = unit.position.z + dz * ratio
+
+    // Update rotation to face movement direction
+    unit.rotation = atan2(dx, dz)
+
+    unit.current_animation = "walk"
+}
+
+fn update_unit_attack(um: UnitManager, unit: Unit, delta_time: f32) {
+    if unit.target_unit_id == -1 {
+        unit.state = UnitState::IDLE
+        return
+    }
+
+    let target = get_unit(um, unit.target_unit_id)
+    if target.id == -1 || target.state == UnitState::DEAD {
+        unit.state = UnitState::IDLE
+        unit.target_unit_id = -1
+        return
+    }
+
+    // Calculate distance to target
+    let dx = target.position.x - unit.position.x
+    let dz = target.position.z - unit.position.z
+    let dist = sqrt(dx * dx + dz * dz)
+
+    // Get weapon range
+    let weapon = get_weapon_by_name(unit.definition.primary_weapon)
+    let attack_range = weapon.attack_range
+
+    if dist > attack_range {
+        // Move towards target
+        unit.target_position = target.position
+        update_unit_movement(unit, delta_time)
+        return
+    }
+
+    // Rotate to face target
+    unit.rotation = atan2(dx, dz)
+
+    // Attack if cooldown ready
+    if unit.attack_cooldown <= 0.0 {
+        // Fire weapon
+        deal_damage(um, target.id, weapon.damage, weapon.damage_type)
+
+        // Reset cooldown
+        unit.attack_cooldown = 1.0 / weapon.rate_of_fire
+
+        unit.current_animation = "attack"
+        unit.animation_time = 0.0
+    }
+}
+
+fn get_weapon_by_name(name: String) -> WeaponDefinition {
+    // Would lookup from game definitions
+    return create_weapon(name, DamageType::SMALL_ARMS)
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn vec2(x: f32, y: f32) -> Vec2 {
+    return Vec2 { x: x, y: y }
+}
+
+fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn min(a: f32, b: f32) -> f32 {
+    if a < b { return a }
+    return b
+}
+
+fn max(a: f32, b: f32) -> f32 {
+    if a > b { return a }
+    return b
+}
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let r = x / 2.0
+    for i in 0..5 {
+        r = (r + x / r) / 2.0
+    }
+    return r
+}
+
+fn atan2(y: f32, x: f32) -> f32 {
+    // Simplified atan2
+    if x > 0.0 {
+        return y / (x + sqrt(x * x + y * y))
+    }
+    return 3.14159 - y / (-x + sqrt(x * x + y * y))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_unit_spawning() -> Bool {
+    let um = create_unit_manager()
+
+    let def = create_unit_definition("Ranger", UnitCategory::INFANTRY)
+    def.max_health = 100.0
+    um.unit_definitions = [def]
+
+    let unit_id = spawn_unit(um, "Ranger", 0, vec3(100.0, 0.0, 100.0))
+    assert(unit_id > 0, "Should return valid unit ID")
+    assert(um.units.length == 1, "Should have 1 unit")
+
+    return true
+}
+
+fn test_unit_selection() -> Bool {
+    let um = create_unit_manager()
+
+    let def = create_unit_definition("Ranger", UnitCategory::INFANTRY)
+    um.unit_definitions = [def]
+
+    let id = spawn_unit(um, "Ranger", 0, vec3(0.0, 0.0, 0.0))
+
+    select_unit(um, id, false)
+    assert(um.selected_units.length == 1, "Should have 1 selected")
+
+    clear_selection(um)
+    assert(um.selected_units.length == 0, "Should have 0 selected")
+
+    return true
+}
+
+fn test_unit_damage() -> Bool {
+    let um = create_unit_manager()
+
+    let def = create_unit_definition("Ranger", UnitCategory::INFANTRY)
+    def.max_health = 100.0
+    um.unit_definitions = [def]
+
+    let id = spawn_unit(um, "Ranger", 0, vec3(0.0, 0.0, 0.0))
+    let unit = get_unit(um, id)
+
+    deal_damage(um, id, 50.0, DamageType::SMALL_ARMS)
+
+    let unit_after = get_unit(um, id)
+    assert(unit_after.current_health < 100.0, "Health should be reduced")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_unit_spawning(), "Unit spawning test failed")
+    assert(test_unit_selection(), "Unit selection test failed")
+    assert(test_unit_damage(), "Unit damage test failed")
+    return true
+}

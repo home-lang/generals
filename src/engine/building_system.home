@@ -1,0 +1,731 @@
+// Building System - Placement, Construction, Power, Destruction
+// Complete building management for C&C Generals
+
+import engine/game_definitions
+import engine/unit_system
+
+// ============================================================================
+// Building State
+// ============================================================================
+
+enum BuildingState {
+    PLACING,          // Ghost preview during placement
+    CONSTRUCTING,     // Being built
+    ACTIVE,           // Fully operational
+    POWERED_DOWN,     // No power
+    DAMAGED,          // Low health
+    DESTROYED,        // Exploding/collapsed
+    SOLD,             // Being sold
+}
+
+// ============================================================================
+// Building Definition (Template)
+// ============================================================================
+
+struct BuildingDefinition {
+    name: String,
+    display_name: String,
+    description: String,
+    faction: FactionId,
+
+    // Dimensions
+    width: i32,           // Grid cells
+    height: i32,
+    footprint: [Bool],    // Placement mask
+
+    // Stats
+    max_health: f32,
+    armor_type: ArmorType,
+    vision_range: f32,
+
+    // Production
+    build_cost: i32,
+    build_time: f32,
+    power_usage: i32,     // Negative = produces power
+    prerequisite: String,
+
+    // Defense
+    weapon: String,
+    auto_attack: Bool,
+
+    // Production capabilities
+    can_build_units: [String],
+    can_build_upgrades: [String],
+
+    // Special
+    can_garrison: Bool,
+    garrison_slots: i32,
+    provides_radar: Bool,
+    provides_tech_level: i32,
+
+    // Audio/Visual
+    model_name: String,
+    construction_model: String,
+    portrait_image: String,
+    build_sound: String,
+    select_sound: String,
+    destroyed_sound: String,
+
+    // Rally point
+    has_rally_point: Bool,
+}
+
+fn create_building_definition(name: String, faction: FactionId) -> BuildingDefinition {
+    return BuildingDefinition {
+        name: name,
+        display_name: name,
+        description: "",
+        faction: faction,
+        width: 3,
+        height: 3,
+        footprint: [true, true, true, true, true, true, true, true, true],
+        max_health: 1000.0,
+        armor_type: ArmorType::BUILDING,
+        vision_range: 200.0,
+        build_cost: 1000,
+        build_time: 30.0,
+        power_usage: 0,
+        prerequisite: "",
+        weapon: "",
+        auto_attack: false,
+        can_build_units: [],
+        can_build_upgrades: [],
+        can_garrison: false,
+        garrison_slots: 0,
+        provides_radar: false,
+        provides_tech_level: 0,
+        model_name: "",
+        construction_model: "",
+        portrait_image: "",
+        build_sound: "",
+        select_sound: "",
+        destroyed_sound: "",
+        has_rally_point: false,
+    }
+}
+
+// USA Buildings
+fn get_usa_command_center() -> BuildingDefinition {
+    let b = create_building_definition("USACommandCenter", FactionId::USA)
+    b.display_name = "Command Center"
+    b.description = "Main base structure. Builds Dozers."
+    b.max_health = 3000.0
+    b.build_cost = 2000
+    b.build_time = 30.0
+    b.power_usage = 0
+    b.provides_radar = true
+    b.provides_tech_level = 1
+    b.can_build_units = ["USADozer"]
+    b.width = 4
+    b.height = 4
+    return b
+}
+
+fn get_usa_power_plant() -> BuildingDefinition {
+    let b = create_building_definition("USAPowerPlant", FactionId::USA)
+    b.display_name = "Cold Fusion Reactor"
+    b.description = "Provides power to base structures."
+    b.max_health = 1500.0
+    b.build_cost = 800
+    b.build_time = 10.0
+    b.power_usage = -5  // Produces 5 power
+    return b
+}
+
+fn get_usa_barracks() -> BuildingDefinition {
+    let b = create_building_definition("USABarracks", FactionId::USA)
+    b.display_name = "Barracks"
+    b.description = "Trains infantry units."
+    b.max_health = 1000.0
+    b.build_cost = 600
+    b.build_time = 10.0
+    b.power_usage = 1
+    b.prerequisite = "USACommandCenter"
+    b.can_build_units = ["Ranger", "MissileDefender", "Pathfinder"]
+    b.has_rally_point = true
+    return b
+}
+
+fn get_usa_war_factory() -> BuildingDefinition {
+    let b = create_building_definition("USAWarFactory", FactionId::USA)
+    b.display_name = "War Factory"
+    b.description = "Produces vehicles."
+    b.max_health = 2000.0
+    b.build_cost = 2000
+    b.build_time = 20.0
+    b.power_usage = 2
+    b.prerequisite = "USABarracks"
+    b.can_build_units = ["Humvee", "Crusader", "Paladin", "Ambulance", "TomahawkLauncher"]
+    b.width = 4
+    b.height = 4
+    b.has_rally_point = true
+    return b
+}
+
+fn get_usa_airfield() -> BuildingDefinition {
+    let b = create_building_definition("USAAirfield", FactionId::USA)
+    b.display_name = "Airfield"
+    b.description = "Produces aircraft."
+    b.max_health = 1500.0
+    b.build_cost = 1000
+    b.build_time = 15.0
+    b.power_usage = 1
+    b.prerequisite = "USAWarFactory"
+    b.can_build_units = ["Comanche", "Chinook", "Raptor", "StealthFighter", "Aurora"]
+    b.width = 5
+    b.height = 5
+    return b
+}
+
+fn get_usa_patriot_battery() -> BuildingDefinition {
+    let b = create_building_definition("USAPatriotBattery", FactionId::USA)
+    b.display_name = "Patriot Battery"
+    b.description = "Anti-air/ground defense."
+    b.max_health = 800.0
+    b.build_cost = 1000
+    b.build_time = 15.0
+    b.power_usage = 2
+    b.weapon = "PatriotMissile"
+    b.auto_attack = true
+    b.width = 2
+    b.height = 2
+    return b
+}
+
+// ============================================================================
+// Building Instance (Runtime)
+// ============================================================================
+
+struct Building {
+    id: i32,
+    definition: BuildingDefinition,
+    owner_id: i32,
+
+    // State
+    state: BuildingState,
+    current_health: f32,
+    construction_progress: f32,  // 0.0 to 1.0
+
+    // Position
+    grid_x: i32,
+    grid_y: i32,
+    world_position: Vec3,
+
+    // Power
+    is_powered: Bool,
+
+    // Production
+    production_queue: [ProductionItem],
+    current_production: ProductionItem,
+    production_progress: f32,
+
+    // Rally point
+    rally_point: Vec3,
+
+    // Garrison
+    garrisoned_units: [i32],
+
+    // Combat
+    target_unit_id: i32,
+    attack_cooldown: f32,
+
+    // Selection
+    is_selected: Bool,
+}
+
+struct ProductionItem {
+    name: String,
+    item_type: ProductionType,
+    cost: i32,
+    build_time: f32,
+}
+
+enum ProductionType {
+    UNIT,
+    UPGRADE,
+}
+
+fn create_building(id: i32, def: BuildingDefinition, owner: i32, grid_x: i32, grid_y: i32) -> Building {
+    return Building {
+        id: id,
+        definition: def,
+        owner_id: owner,
+        state: BuildingState::CONSTRUCTING,
+        current_health: def.max_health * 0.1,  // Start at 10% health
+        construction_progress: 0.0,
+        grid_x: grid_x,
+        grid_y: grid_y,
+        world_position: grid_to_world(grid_x, grid_y),
+        is_powered: false,
+        production_queue: [],
+        current_production: ProductionItem { name: "", item_type: ProductionType::UNIT, cost: 0, build_time: 0.0 },
+        production_progress: 0.0,
+        rally_point: grid_to_world(grid_x + def.width, grid_y + def.height / 2),
+        garrisoned_units: [],
+        target_unit_id: -1,
+        attack_cooldown: 0.0,
+        is_selected: false,
+    }
+}
+
+// ============================================================================
+// Building Manager
+// ============================================================================
+
+struct BuildingManager {
+    buildings: [Building],
+    next_building_id: i32,
+    building_definitions: [BuildingDefinition],
+
+    // Placement
+    placement_mode: Bool,
+    placement_definition: BuildingDefinition,
+    placement_grid_x: i32,
+    placement_grid_y: i32,
+    placement_valid: Bool,
+
+    // Grid (for placement validation)
+    grid_width: i32,
+    grid_height: i32,
+    grid_occupied: [Bool],  // True = cell is blocked
+}
+
+fn create_building_manager(grid_w: i32, grid_h: i32) -> BuildingManager {
+    let grid_size = grid_w * grid_h
+    let grid: [Bool] = []
+    for i in 0..grid_size {
+        grid = grid + [false]
+    }
+
+    return BuildingManager {
+        buildings: [],
+        next_building_id: 1,
+        building_definitions: [],
+        placement_mode: false,
+        placement_definition: create_building_definition("", FactionId::NEUTRAL),
+        placement_grid_x: 0,
+        placement_grid_y: 0,
+        placement_valid: false,
+        grid_width: grid_w,
+        grid_height: grid_h,
+        grid_occupied: grid,
+    }
+}
+
+// ============================================================================
+// Building Placement
+// ============================================================================
+
+fn start_placement(bm: BuildingManager, def_name: String) {
+    for def in bm.building_definitions {
+        if def.name == def_name {
+            bm.placement_mode = true
+            bm.placement_definition = def
+            bm.placement_valid = false
+            return
+        }
+    }
+}
+
+fn cancel_placement(bm: BuildingManager) {
+    bm.placement_mode = false
+}
+
+fn update_placement_preview(bm: BuildingManager, grid_x: i32, grid_y: i32) {
+    bm.placement_grid_x = grid_x
+    bm.placement_grid_y = grid_y
+    bm.placement_valid = is_placement_valid(bm, grid_x, grid_y)
+}
+
+fn is_placement_valid(bm: BuildingManager, grid_x: i32, grid_y: i32) -> Bool {
+    let def = bm.placement_definition
+
+    // Check bounds
+    if grid_x < 0 || grid_y < 0 {
+        return false
+    }
+    if grid_x + def.width > bm.grid_width || grid_y + def.height > bm.grid_height {
+        return false
+    }
+
+    // Check each cell
+    for dy in 0..def.height {
+        for dx in 0..def.width {
+            let cell_idx = (grid_y + dy) * bm.grid_width + (grid_x + dx)
+            if bm.grid_occupied[cell_idx] {
+                return false
+            }
+        }
+    }
+
+    return true
+}
+
+fn place_building(bm: BuildingManager, owner_id: i32) -> i32 {
+    if !bm.placement_mode || !bm.placement_valid {
+        return -1
+    }
+
+    let building = create_building(
+        bm.next_building_id,
+        bm.placement_definition,
+        owner_id,
+        bm.placement_grid_x,
+        bm.placement_grid_y
+    )
+    bm.next_building_id = bm.next_building_id + 1
+
+    bm.buildings = bm.buildings + [building]
+
+    // Mark grid cells as occupied
+    mark_grid_occupied(bm, bm.placement_grid_x, bm.placement_grid_y, bm.placement_definition, true)
+
+    // End placement mode
+    bm.placement_mode = false
+
+    return building.id
+}
+
+fn mark_grid_occupied(bm: BuildingManager, grid_x: i32, grid_y: i32, def: BuildingDefinition, occupied: Bool) {
+    for dy in 0..def.height {
+        for dx in 0..def.width {
+            let cell_idx = (grid_y + dy) * bm.grid_width + (grid_x + dx)
+            bm.grid_occupied[cell_idx] = occupied
+        }
+    }
+}
+
+// ============================================================================
+// Building Construction
+// ============================================================================
+
+fn update_construction(bm: BuildingManager, building: Building, delta_time: f32) {
+    if building.state != BuildingState::CONSTRUCTING {
+        return
+    }
+
+    // Progress construction
+    let progress_per_second = 1.0 / building.definition.build_time
+    building.construction_progress = building.construction_progress + progress_per_second * delta_time
+
+    // Increase health proportionally
+    let target_health = building.definition.max_health * building.construction_progress
+    building.current_health = min(target_health, building.definition.max_health)
+
+    if building.construction_progress >= 1.0 {
+        building.construction_progress = 1.0
+        building.current_health = building.definition.max_health
+        building.state = BuildingState::ACTIVE
+    }
+}
+
+// ============================================================================
+// Power System
+// ============================================================================
+
+fn calculate_power(bm: BuildingManager, owner_id: i32) -> [i32] {
+    let power_produced = 0
+    let power_consumed = 0
+
+    for b in bm.buildings {
+        if b.owner_id == owner_id && b.state == BuildingState::ACTIVE {
+            if b.definition.power_usage < 0 {
+                // Produces power
+                power_produced = power_produced - b.definition.power_usage
+            } else {
+                // Consumes power
+                power_consumed = power_consumed + b.definition.power_usage
+            }
+        }
+    }
+
+    return [power_produced, power_consumed]
+}
+
+fn update_power_state(bm: BuildingManager, owner_id: i32) {
+    let power = calculate_power(bm, owner_id)
+    let has_power = power[0] >= power[1]
+
+    for b in bm.buildings {
+        if b.owner_id == owner_id && b.state == BuildingState::ACTIVE {
+            b.is_powered = has_power || b.definition.power_usage <= 0
+        }
+    }
+}
+
+// ============================================================================
+// Building Production
+// ============================================================================
+
+fn queue_unit(bm: BuildingManager, building_id: i32, unit_name: String, cost: i32, build_time: f32) {
+    let building = get_building(bm, building_id)
+    if building.id == -1 || building.state != BuildingState::ACTIVE {
+        return
+    }
+
+    let item = ProductionItem {
+        name: unit_name,
+        item_type: ProductionType::UNIT,
+        cost: cost,
+        build_time: build_time,
+    }
+
+    building.production_queue = building.production_queue + [item]
+}
+
+fn queue_upgrade(bm: BuildingManager, building_id: i32, upgrade_name: String, cost: i32, build_time: f32) {
+    let building = get_building(bm, building_id)
+    if building.id == -1 || building.state != BuildingState::ACTIVE {
+        return
+    }
+
+    let item = ProductionItem {
+        name: upgrade_name,
+        item_type: ProductionType::UPGRADE,
+        cost: cost,
+        build_time: build_time,
+    }
+
+    building.production_queue = building.production_queue + [item]
+}
+
+fn cancel_production(bm: BuildingManager, building_id: i32, queue_index: i32) {
+    let building = get_building(bm, building_id)
+    if building.id == -1 {
+        return
+    }
+
+    if queue_index == 0 && building.current_production.name != "" {
+        // Cancel current production - refund partial cost
+        building.current_production = ProductionItem { name: "", item_type: ProductionType::UNIT, cost: 0, build_time: 0.0 }
+        building.production_progress = 0.0
+    } else if queue_index > 0 && queue_index <= building.production_queue.length {
+        // Remove from queue
+        let new_queue: [ProductionItem] = []
+        for i in 0..building.production_queue.length {
+            if i != queue_index - 1 {
+                new_queue = new_queue + [building.production_queue[i]]
+            }
+        }
+        building.production_queue = new_queue
+    }
+}
+
+fn update_production(bm: BuildingManager, building: Building, delta_time: f32) {
+    if building.state != BuildingState::ACTIVE || !building.is_powered {
+        return
+    }
+
+    // Start new production if idle
+    if building.current_production.name == "" && building.production_queue.length > 0 {
+        building.current_production = building.production_queue[0]
+        // Remove from queue
+        let new_queue: [ProductionItem] = []
+        for i in 1..building.production_queue.length {
+            new_queue = new_queue + [building.production_queue[i]]
+        }
+        building.production_queue = new_queue
+        building.production_progress = 0.0
+    }
+
+    // Update current production
+    if building.current_production.name != "" {
+        let progress_per_second = 1.0 / building.current_production.build_time
+        building.production_progress = building.production_progress + progress_per_second * delta_time
+
+        if building.production_progress >= 1.0 {
+            // Production complete
+            complete_production(bm, building)
+        }
+    }
+}
+
+fn complete_production(bm: BuildingManager, building: Building) {
+    let item = building.current_production
+
+    if item.item_type == ProductionType::UNIT {
+        // Spawn unit at rally point
+        // spawn_unit(item.name, building.owner_id, building.rally_point)
+    } else if item.item_type == ProductionType::UPGRADE {
+        // Apply upgrade to player
+        // apply_upgrade(building.owner_id, item.name)
+    }
+
+    building.current_production = ProductionItem { name: "", item_type: ProductionType::UNIT, cost: 0, build_time: 0.0 }
+    building.production_progress = 0.0
+}
+
+// ============================================================================
+// Building Destruction
+// ============================================================================
+
+fn damage_building(bm: BuildingManager, building_id: i32, damage: f32) {
+    let building = get_building(bm, building_id)
+    if building.id == -1 || building.state == BuildingState::DESTROYED {
+        return
+    }
+
+    building.current_health = building.current_health - damage
+
+    if building.current_health <= building.definition.max_health * 0.25 {
+        building.state = BuildingState::DAMAGED
+    }
+
+    if building.current_health <= 0.0 {
+        destroy_building(bm, building_id)
+    }
+}
+
+fn destroy_building(bm: BuildingManager, building_id: i32) {
+    let building = get_building(bm, building_id)
+    if building.id == -1 {
+        return
+    }
+
+    building.state = BuildingState::DESTROYED
+    building.current_health = 0.0
+
+    // Free grid cells
+    mark_grid_occupied(bm, building.grid_x, building.grid_y, building.definition, false)
+
+    // Spawn destruction effects
+    // spawn_building_explosion(building.world_position)
+}
+
+fn sell_building(bm: BuildingManager, building_id: i32) -> i32 {
+    let building = get_building(bm, building_id)
+    if building.id == -1 || building.state != BuildingState::ACTIVE {
+        return 0
+    }
+
+    let refund = (building.definition.build_cost as f32) * 0.5
+    let health_ratio = building.current_health / building.definition.max_health
+    refund = refund * health_ratio
+
+    building.state = BuildingState::SOLD
+
+    // Free grid cells
+    mark_grid_occupied(bm, building.grid_x, building.grid_y, building.definition, false)
+
+    return refund as i32
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn get_building(bm: BuildingManager, building_id: i32) -> Building {
+    for b in bm.buildings {
+        if b.id == building_id {
+            return b
+        }
+    }
+    return create_building(-1, create_building_definition("", FactionId::NEUTRAL), -1, 0, 0)
+}
+
+fn grid_to_world(grid_x: i32, grid_y: i32) -> Vec3 {
+    let cell_size = 50.0
+    return vec3((grid_x as f32) * cell_size, 0.0, (grid_y as f32) * cell_size)
+}
+
+fn world_to_grid(world_x: f32, world_z: f32) -> [i32] {
+    let cell_size = 50.0
+    return [(world_x / cell_size) as i32, (world_z / cell_size) as i32]
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn min(a: f32, b: f32) -> f32 {
+    if a < b { return a }
+    return b
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_buildings(bm: BuildingManager, delta_time: f32) {
+    for building in bm.buildings {
+        if building.state == BuildingState::CONSTRUCTING {
+            update_construction(bm, building, delta_time)
+        } else if building.state == BuildingState::ACTIVE {
+            update_production(bm, building, delta_time)
+
+            // Auto-attack for defensive structures
+            if building.definition.auto_attack && building.is_powered {
+                update_building_combat(bm, building, delta_time)
+            }
+        }
+    }
+}
+
+fn update_building_combat(bm: BuildingManager, building: Building, delta_time: f32) {
+    if building.definition.weapon == "" {
+        return
+    }
+
+    if building.attack_cooldown > 0.0 {
+        building.attack_cooldown = building.attack_cooldown - delta_time
+    }
+
+    // Would check for enemies in range and attack
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_building_placement() -> Bool {
+    let bm = create_building_manager(100, 100)
+
+    let def = get_usa_power_plant()
+    bm.building_definitions = [def]
+
+    start_placement(bm, "USAPowerPlant")
+    assert(bm.placement_mode, "Should be in placement mode")
+
+    update_placement_preview(bm, 10, 10)
+    assert(bm.placement_valid, "Placement should be valid")
+
+    let id = place_building(bm, 0)
+    assert(id > 0, "Should return valid building ID")
+    assert(bm.buildings.length == 1, "Should have 1 building")
+
+    return true
+}
+
+fn test_power_system() -> Bool {
+    let bm = create_building_manager(100, 100)
+
+    let power_def = get_usa_power_plant()
+    let barracks_def = get_usa_barracks()
+    bm.building_definitions = [power_def, barracks_def]
+
+    // Place power plant
+    start_placement(bm, "USAPowerPlant")
+    update_placement_preview(bm, 10, 10)
+    let power_id = place_building(bm, 0)
+
+    // Make it active
+    let power = get_building(bm, power_id)
+    power.state = BuildingState::ACTIVE
+
+    let power_calc = calculate_power(bm, 0)
+    assert(power_calc[0] == 5, "Should produce 5 power")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_building_placement(), "Building placement test failed")
+    assert(test_power_system(), "Power system test failed")
+    return true
+}

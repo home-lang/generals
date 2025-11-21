@@ -1,0 +1,1330 @@
+// Campaign/Mission System - Complete campaign progression, objectives, scripts, cutscenes
+// Implements C&C Generals Zero Hour campaign mechanics
+
+// ============================================================================
+// CAMPAIGN DEFINITIONS
+// ============================================================================
+
+enum CampaignType {
+    USA_CAMPAIGN,
+    CHINA_CAMPAIGN,
+    GLA_CAMPAIGN,
+    GENERALS_CHALLENGE,
+    CUSTOM
+}
+
+enum Difficulty {
+    EASY,
+    NORMAL,
+    HARD,
+    BRUTAL
+}
+
+struct Campaign {
+    campaign_type: CampaignType,
+    name: [u8; 64],
+    description: [u8; 256],
+    faction: i32,               // 0=USA, 1=China, 2=GLA
+    missions: [Mission; 16],
+    mission_count: i32,
+    current_mission: i32,
+    is_completed: bool
+}
+
+struct Mission {
+    id: i32,
+    name: [u8; 64],
+    map_name: [u8; 64],
+    briefing: [u8; 512],
+    intro_video: [u8; 64],
+    outro_video: [u8; 64],
+
+    // Objectives
+    primary_objectives: [Objective; 8],
+    primary_count: i32,
+    secondary_objectives: [Objective; 8],
+    secondary_count: i32,
+    bonus_objectives: [Objective; 4],
+    bonus_count: i32,
+
+    // Mission parameters
+    starting_supplies: i32,
+    starting_power: i32,
+    player_faction: i32,
+    enemy_factions: [i32; 4],
+    enemy_count: i32,
+    time_limit: f32,            // 0 for no limit
+
+    // Scripts
+    script_count: i32,
+    trigger_count: i32,
+
+    // State
+    is_completed: bool,
+    completion_time: f32,
+    score: i32,
+    medal: i32                  // 0=none, 1=bronze, 2=silver, 3=gold
+}
+
+// ============================================================================
+// OBJECTIVE SYSTEM
+// ============================================================================
+
+enum ObjectiveType {
+    DESTROY_ALL,             // Destroy all enemy units/buildings
+    DESTROY_TARGET,          // Destroy specific target(s)
+    CAPTURE_BUILDING,        // Capture specific building
+    PROTECT_TARGET,          // Keep target alive
+    ESCORT,                  // Escort unit to location
+    SURVIVE_TIME,            // Survive for duration
+    COLLECT_RESOURCES,       // Gather X resources
+    BUILD_STRUCTURE,         // Build specific structure
+    RESEARCH_UPGRADE,        // Research specific upgrade
+    REACH_LOCATION,          // Move units to area
+    PREVENT_ESCAPE,          // Stop enemies leaving
+    HOLD_POSITION,           // Control area for duration
+    CUSTOM                   // Script-defined
+}
+
+enum ObjectiveState {
+    HIDDEN,                  // Not yet revealed
+    ACTIVE,                  // Currently active
+    COMPLETED,               // Successfully completed
+    FAILED,                  // Failed objective
+    EXPIRED                  // Time ran out
+}
+
+struct Objective {
+    id: i32,
+    objective_type: ObjectiveType,
+    state: ObjectiveState,
+    name: [u8; 128],
+    description: [u8; 256],
+
+    // Target info
+    target_ids: [i32; 16],
+    target_count: i32,
+    target_position: Vec3,
+    target_radius: f32,
+
+    // Progress
+    current_value: i32,
+    required_value: i32,
+    time_limit: f32,
+    time_remaining: f32,
+
+    // Reward
+    bonus_supplies: i32,
+    bonus_experience: i32,
+    unlocks_unit: [u8; 32],
+
+    // Dependencies
+    requires_objective: i32,    // -1 for none
+    reveals_objective: i32      // -1 for none
+}
+
+fn create_destroy_all_objective(id: i32, name: [u8; 128]) -> Objective {
+    return Objective {
+        id: id,
+        objective_type: ObjectiveType::DESTROY_ALL,
+        state: ObjectiveState::ACTIVE,
+        name: name,
+        description: "Destroy all enemy forces",
+        target_ids: [-1; 16],
+        target_count: 0,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        target_radius: 0.0,
+        current_value: 0,
+        required_value: 1,
+        time_limit: 0.0,
+        time_remaining: 0.0,
+        bonus_supplies: 0,
+        bonus_experience: 0,
+        unlocks_unit: "",
+        requires_objective: -1,
+        reveals_objective: -1
+    }
+}
+
+fn create_destroy_target_objective(id: i32, name: [u8; 128], targets: [i32; 16], count: i32) -> Objective {
+    return Objective {
+        id: id,
+        objective_type: ObjectiveType::DESTROY_TARGET,
+        state: ObjectiveState::ACTIVE,
+        name: name,
+        description: "Destroy the marked targets",
+        target_ids: targets,
+        target_count: count,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        target_radius: 0.0,
+        current_value: 0,
+        required_value: count,
+        time_limit: 0.0,
+        time_remaining: 0.0,
+        bonus_supplies: 0,
+        bonus_experience: 100,
+        unlocks_unit: "",
+        requires_objective: -1,
+        reveals_objective: -1
+    }
+}
+
+fn create_protect_objective(id: i32, name: [u8; 128], target_id: i32, duration: f32) -> Objective {
+    return Objective {
+        id: id,
+        objective_type: ObjectiveType::PROTECT_TARGET,
+        state: ObjectiveState::ACTIVE,
+        name: name,
+        description: "Protect the target",
+        target_ids: [target_id, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+        target_count: 1,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        target_radius: 0.0,
+        current_value: 0,
+        required_value: 1,
+        time_limit: duration,
+        time_remaining: duration,
+        bonus_supplies: 1000,
+        bonus_experience: 200,
+        unlocks_unit: "",
+        requires_objective: -1,
+        reveals_objective: -1
+    }
+}
+
+fn create_reach_location_objective(id: i32, name: [u8; 128], position: Vec3, radius: f32) -> Objective {
+    return Objective {
+        id: id,
+        objective_type: ObjectiveType::REACH_LOCATION,
+        state: ObjectiveState::ACTIVE,
+        name: name,
+        description: "Move forces to the marked area",
+        target_ids: [-1; 16],
+        target_count: 0,
+        target_position: position,
+        target_radius: radius,
+        current_value: 0,
+        required_value: 1,
+        time_limit: 0.0,
+        time_remaining: 0.0,
+        bonus_supplies: 500,
+        bonus_experience: 50,
+        unlocks_unit: "",
+        requires_objective: -1,
+        reveals_objective: -1
+    }
+}
+
+fn update_objective(obj: mut Objective, delta_time: f32) {
+    if obj.state != ObjectiveState::ACTIVE {
+        return
+    }
+
+    // Update time-based objectives
+    if obj.time_limit > 0.0 {
+        obj.time_remaining = obj.time_remaining - delta_time
+        if obj.time_remaining <= 0.0 {
+            if obj.objective_type == ObjectiveType::SURVIVE_TIME or
+               obj.objective_type == ObjectiveType::HOLD_POSITION {
+                // Success on timer expiry
+                obj.state = ObjectiveState::COMPLETED
+            } else {
+                // Failure on timer expiry
+                obj.state = ObjectiveState::FAILED
+            }
+        }
+    }
+
+    // Check completion
+    if obj.current_value >= obj.required_value {
+        obj.state = ObjectiveState::COMPLETED
+    }
+}
+
+fn mark_target_destroyed(obj: mut Objective, target_id: i32) {
+    if obj.objective_type != ObjectiveType::DESTROY_TARGET and
+       obj.objective_type != ObjectiveType::DESTROY_ALL {
+        return
+    }
+
+    for i in 0..obj.target_count {
+        if obj.target_ids[i] == target_id {
+            obj.current_value = obj.current_value + 1
+            obj.target_ids[i] = -1    // Mark as destroyed
+            break
+        }
+    }
+}
+
+fn check_location_reached(obj: mut Objective, unit_position: Vec3) -> bool {
+    if obj.objective_type != ObjectiveType::REACH_LOCATION {
+        return false
+    }
+
+    let dx: f32 = unit_position.x - obj.target_position.x
+    let dy: f32 = unit_position.y - obj.target_position.y
+    let dz: f32 = unit_position.z - obj.target_position.z
+    let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+    if dist <= obj.target_radius {
+        obj.current_value = 1
+        return true
+    }
+    return false
+}
+
+// ============================================================================
+// MISSION SCRIPTING
+// ============================================================================
+
+enum TriggerType {
+    ON_START,                // Mission start
+    ON_TIMER,                // After X seconds
+    ON_UNIT_DESTROYED,       // Specific unit dies
+    ON_BUILDING_DESTROYED,   // Specific building dies
+    ON_AREA_ENTERED,         // Unit enters area
+    ON_AREA_CLEARED,         // All enemies in area dead
+    ON_OBJECTIVE_COMPLETE,   // Objective completed
+    ON_SUPPLIES_REACHED,     // Player has X supplies
+    ON_UNITS_BUILT,          // Player built X units
+    ON_RESEARCH_COMPLETE,    // Upgrade researched
+    ON_PLAYER_DEFEATED,      // Player eliminated
+    ON_CUSTOM               // Script condition
+}
+
+enum ActionType {
+    SPAWN_UNITS,
+    SPAWN_BUILDING,
+    REVEAL_AREA,
+    PLAY_AUDIO,
+    PLAY_VIDEO,
+    DISPLAY_TEXT,
+    ADD_OBJECTIVE,
+    COMPLETE_OBJECTIVE,
+    FAIL_OBJECTIVE,
+    GIVE_SUPPLIES,
+    GIVE_EXPERIENCE,
+    ENABLE_UNIT,
+    DISABLE_UNIT,
+    SET_AI_STATE,
+    TRIGGER_AI_ATTACK,
+    CAMERA_MOVE,
+    CREATE_WAYPOINT,
+    WIN_MISSION,
+    LOSE_MISSION,
+    CUSTOM_SCRIPT
+}
+
+struct Trigger {
+    id: i32,
+    trigger_type: TriggerType,
+    is_active: bool,
+    is_repeatable: bool,
+    times_fired: i32,
+
+    // Condition parameters
+    delay: f32,
+    current_delay: f32,
+    target_id: i32,
+    area_position: Vec3,
+    area_radius: f32,
+    threshold: i32,
+    objective_id: i32,
+
+    // Actions to execute
+    actions: [Action; 8],
+    action_count: i32
+}
+
+struct Action {
+    action_type: ActionType,
+
+    // Parameters (interpretation depends on type)
+    int_param1: i32,
+    int_param2: i32,
+    float_param1: f32,
+    float_param2: f32,
+    position: Vec3,
+    string_param: [u8; 64]
+}
+
+fn create_spawn_action(unit_type: [u8; 64], count: i32, position: Vec3, owner: i32) -> Action {
+    return Action {
+        action_type: ActionType::SPAWN_UNITS,
+        int_param1: count,
+        int_param2: owner,
+        float_param1: 0.0,
+        float_param2: 0.0,
+        position: position,
+        string_param: unit_type
+    }
+}
+
+fn create_reveal_area_action(position: Vec3, radius: f32, player: i32) -> Action {
+    return Action {
+        action_type: ActionType::REVEAL_AREA,
+        int_param1: player,
+        int_param2: 0,
+        float_param1: radius,
+        float_param2: 0.0,
+        position: position,
+        string_param: ""
+    }
+}
+
+fn create_give_supplies_action(amount: i32, player: i32) -> Action {
+    return Action {
+        action_type: ActionType::GIVE_SUPPLIES,
+        int_param1: amount,
+        int_param2: player,
+        float_param1: 0.0,
+        float_param2: 0.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: ""
+    }
+}
+
+fn create_display_text_action(text: [u8; 64], duration: f32) -> Action {
+    return Action {
+        action_type: ActionType::DISPLAY_TEXT,
+        int_param1: 0,
+        int_param2: 0,
+        float_param1: duration,
+        float_param2: 0.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: text
+    }
+}
+
+fn create_win_action() -> Action {
+    return Action {
+        action_type: ActionType::WIN_MISSION,
+        int_param1: 0,
+        int_param2: 0,
+        float_param1: 0.0,
+        float_param2: 0.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: ""
+    }
+}
+
+fn create_lose_action() -> Action {
+    return Action {
+        action_type: ActionType::LOSE_MISSION,
+        int_param1: 0,
+        int_param2: 0,
+        float_param1: 0.0,
+        float_param2: 0.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: ""
+    }
+}
+
+fn check_trigger(trigger: Trigger, context: TriggerContext) -> bool {
+    if not trigger.is_active {
+        return false
+    }
+
+    // Check delay
+    if trigger.current_delay > 0.0 {
+        return false
+    }
+
+    match trigger.trigger_type {
+        TriggerType::ON_START => return context.is_mission_start,
+        TriggerType::ON_TIMER => return context.mission_time >= trigger.delay,
+        TriggerType::ON_UNIT_DESTROYED => return context.last_destroyed_unit == trigger.target_id,
+        TriggerType::ON_BUILDING_DESTROYED => return context.last_destroyed_building == trigger.target_id,
+        TriggerType::ON_OBJECTIVE_COMPLETE => return context.last_completed_objective == trigger.objective_id,
+        TriggerType::ON_SUPPLIES_REACHED => return context.player_supplies >= trigger.threshold,
+        TriggerType::ON_PLAYER_DEFEATED => return context.defeated_player == trigger.target_id,
+        _ => return false
+    }
+}
+
+struct TriggerContext {
+    is_mission_start: bool,
+    mission_time: f32,
+    last_destroyed_unit: i32,
+    last_destroyed_building: i32,
+    last_completed_objective: i32,
+    player_supplies: i32,
+    defeated_player: i32
+}
+
+// ============================================================================
+// CUTSCENE SYSTEM
+// ============================================================================
+
+enum CutsceneType {
+    VIDEO,           // Bink video
+    IN_GAME,         // Scripted camera sequence
+    BRIEFING,        // Static images with audio
+    DIALOG          // In-game dialog boxes
+}
+
+struct CutsceneEvent {
+    time: f32,
+    event_type: CutsceneEventType,
+    int_param: i32,
+    float_param: f32,
+    position: Vec3,
+    string_param: [u8; 128]
+}
+
+enum CutsceneEventType {
+    CAMERA_POSITION,
+    CAMERA_TARGET,
+    CAMERA_ZOOM,
+    PLAY_SOUND,
+    SHOW_SUBTITLE,
+    HIDE_SUBTITLE,
+    SPAWN_EFFECT,
+    FADE_IN,
+    FADE_OUT,
+    END_CUTSCENE
+}
+
+struct Cutscene {
+    id: i32,
+    cutscene_type: CutsceneType,
+    name: [u8; 64],
+    duration: f32,
+    events: [CutsceneEvent; 64],
+    event_count: i32,
+    is_skippable: bool,
+
+    // Playback state
+    is_playing: bool,
+    current_time: f32,
+    next_event_idx: i32
+}
+
+fn create_cutscene(id: i32, name: [u8; 64], duration: f32) -> Cutscene {
+    return Cutscene {
+        id: id,
+        cutscene_type: CutsceneType::IN_GAME,
+        name: name,
+        duration: duration,
+        events: [],
+        event_count: 0,
+        is_skippable: true,
+        is_playing: false,
+        current_time: 0.0,
+        next_event_idx: 0
+    }
+}
+
+fn add_cutscene_event(cs: mut Cutscene, event: CutsceneEvent) {
+    if cs.event_count < 64 {
+        cs.events[cs.event_count] = event
+        cs.event_count = cs.event_count + 1
+    }
+}
+
+fn start_cutscene(cs: mut Cutscene) {
+    cs.is_playing = true
+    cs.current_time = 0.0
+    cs.next_event_idx = 0
+}
+
+fn update_cutscene(cs: mut Cutscene, delta_time: f32) -> [CutsceneEvent; 8] {
+    let mut triggered_events: [CutsceneEvent; 8] = []
+    let mut triggered_count: i32 = 0
+
+    if not cs.is_playing {
+        return triggered_events
+    }
+
+    cs.current_time = cs.current_time + delta_time
+
+    // Check for events to trigger
+    while cs.next_event_idx < cs.event_count {
+        let event: CutsceneEvent = cs.events[cs.next_event_idx]
+        if event.time <= cs.current_time {
+            if triggered_count < 8 {
+                triggered_events[triggered_count] = event
+                triggered_count = triggered_count + 1
+            }
+            cs.next_event_idx = cs.next_event_idx + 1
+
+            // Check for end
+            if event.event_type == CutsceneEventType::END_CUTSCENE {
+                cs.is_playing = false
+                break
+            }
+        } else {
+            break
+        }
+    }
+
+    // Check duration
+    if cs.current_time >= cs.duration {
+        cs.is_playing = false
+    }
+
+    return triggered_events
+}
+
+fn skip_cutscene(cs: mut Cutscene) {
+    if cs.is_skippable {
+        cs.is_playing = false
+    }
+}
+
+// ============================================================================
+// BRIEFING SYSTEM
+// ============================================================================
+
+struct BriefingSlide {
+    image_path: [u8; 64],
+    audio_path: [u8; 64],
+    text: [u8; 512],
+    duration: f32
+}
+
+struct Briefing {
+    slides: [BriefingSlide; 16],
+    slide_count: i32,
+    current_slide: i32,
+    slide_timer: f32,
+    is_playing: bool,
+    faction_voice: [u8; 32]   // EVA, Chinese, GLA voice
+}
+
+fn create_briefing() -> Briefing {
+    return Briefing {
+        slides: [],
+        slide_count: 0,
+        current_slide: 0,
+        slide_timer: 0.0,
+        is_playing: false,
+        faction_voice: "EVA"
+    }
+}
+
+fn add_briefing_slide(briefing: mut Briefing, image: [u8; 64], audio: [u8; 64], text: [u8; 512], duration: f32) {
+    if briefing.slide_count < 16 {
+        briefing.slides[briefing.slide_count] = BriefingSlide {
+            image_path: image,
+            audio_path: audio,
+            text: text,
+            duration: duration
+        }
+        briefing.slide_count = briefing.slide_count + 1
+    }
+}
+
+fn start_briefing(briefing: mut Briefing) {
+    briefing.is_playing = true
+    briefing.current_slide = 0
+    briefing.slide_timer = 0.0
+}
+
+fn update_briefing(briefing: mut Briefing, delta_time: f32) -> bool {
+    // Returns true when briefing ends
+    if not briefing.is_playing or briefing.slide_count == 0 {
+        return true
+    }
+
+    briefing.slide_timer = briefing.slide_timer + delta_time
+
+    let current: BriefingSlide = briefing.slides[briefing.current_slide]
+    if briefing.slide_timer >= current.duration {
+        briefing.current_slide = briefing.current_slide + 1
+        briefing.slide_timer = 0.0
+
+        if briefing.current_slide >= briefing.slide_count {
+            briefing.is_playing = false
+            return true
+        }
+    }
+
+    return false
+}
+
+fn get_current_slide(briefing: Briefing) -> BriefingSlide {
+    if briefing.current_slide < briefing.slide_count {
+        return briefing.slides[briefing.current_slide]
+    }
+    return BriefingSlide {
+        image_path: "",
+        audio_path: "",
+        text: "",
+        duration: 0.0
+    }
+}
+
+// ============================================================================
+// GENERALS CHALLENGE
+// ============================================================================
+
+enum GeneralType {
+    // USA
+    USA_BOSS,            // Generic USA
+    AIR_FORCE,           // Malcolm "Ace" Granger
+    LASER,               // "Pinpoint" Townes
+    SUPERWEAPON,         // Alexis Alexander
+
+    // China
+    CHINA_BOSS,          // Generic China
+    TANK,                // Ta Hun Kwai
+    INFANTRY,            // "Anvil" Shin Fai
+    NUKE,                // Tsing Shi Tao
+
+    // GLA
+    GLA_BOSS,            // Generic GLA
+    TOXIN,               // Dr. Thrax
+    DEMOLITION,          // Rodall "Demo" Juhziz
+    STEALTH             // Prince Kassad
+}
+
+struct GeneralChallenge {
+    general_type: GeneralType,
+    general_name: [u8; 64],
+    portrait: [u8; 64],
+    map_name: [u8; 64],
+    difficulty: i32,            // 1-3 stars
+    taunt_intro: [u8; 256],
+    taunt_winning: [u8; 256],
+    taunt_losing: [u8; 256],
+    special_rules: [u8; 256],
+    is_unlocked: bool,
+    is_defeated: bool,
+    best_time: f32
+}
+
+fn get_all_generals() -> [GeneralChallenge; 12] {
+    let mut generals: [GeneralChallenge; 12] = []
+
+    // USA Generals
+    generals[0] = GeneralChallenge {
+        general_type: GeneralType::AIR_FORCE,
+        general_name: "General Granger",
+        portrait: "Granger.tga",
+        map_name: "GC_AirForce",
+        difficulty: 2,
+        taunt_intro: "My pilots are the best in the world!",
+        taunt_winning: "Air superiority achieved!",
+        taunt_losing: "Impossible! How did you ground my air force?",
+        special_rules: "Specializes in aircraft and King Raptors",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[1] = GeneralChallenge {
+        general_type: GeneralType::LASER,
+        general_name: "General Townes",
+        portrait: "Townes.tga",
+        map_name: "GC_Laser",
+        difficulty: 2,
+        taunt_intro: "Laser technology will burn you to ashes!",
+        taunt_winning: "Target eliminated with precision!",
+        taunt_losing: "My lasers... they failed me...",
+        special_rules: "Laser tanks and Avengers replace standard units",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[2] = GeneralChallenge {
+        general_type: GeneralType::SUPERWEAPON,
+        general_name: "General Alexander",
+        portrait: "Alexander.tga",
+        map_name: "GC_SuperWeapon",
+        difficulty: 3,
+        taunt_intro: "You have no defense against my arsenal!",
+        taunt_winning: "Superweapons win wars!",
+        taunt_losing: "My particle cannons... destroyed...",
+        special_rules: "Faster superweapon charge, EMP Patriots",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    // China Generals
+    generals[3] = GeneralChallenge {
+        general_type: GeneralType::TANK,
+        general_name: "General Kwai",
+        portrait: "Kwai.tga",
+        map_name: "GC_Tank",
+        difficulty: 2,
+        taunt_intro: "My tanks will crush you!",
+        taunt_winning: "Nothing stops Chinese armor!",
+        taunt_losing: "My... my beautiful tanks...",
+        special_rules: "Emperor Overlords and enhanced Battlemasters",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[4] = GeneralChallenge {
+        general_type: GeneralType::INFANTRY,
+        general_name: "General Shin Fai",
+        portrait: "ShinFai.tga",
+        map_name: "GC_Infantry",
+        difficulty: 1,
+        taunt_intro: "The horde will overwhelm you!",
+        taunt_winning: "Numbers always win!",
+        taunt_losing: "How did you defeat my endless troops?",
+        special_rules: "Mini-gunners and Assault Troop Crawlers",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[5] = GeneralChallenge {
+        general_type: GeneralType::NUKE,
+        general_name: "General Tao",
+        portrait: "Tao.tga",
+        map_name: "GC_Nuke",
+        difficulty: 3,
+        taunt_intro: "Nuclear fire will purify you!",
+        taunt_winning: "Radiation spreads victory!",
+        taunt_losing: "My nuclear program... in ruins...",
+        special_rules: "Enhanced nuclear weapons, Nuke Cannons from start",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    // GLA Generals
+    generals[6] = GeneralChallenge {
+        general_type: GeneralType::TOXIN,
+        general_name: "Dr. Thrax",
+        portrait: "Thrax.tga",
+        map_name: "GC_Toxin",
+        difficulty: 2,
+        taunt_intro: "My toxins will melt your forces!",
+        taunt_winning: "Chemical warfare at its finest!",
+        taunt_losing: "My beautiful toxins... neutralized...",
+        special_rules: "Anthrax Gamma and enhanced toxin units",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[7] = GeneralChallenge {
+        general_type: GeneralType::DEMOLITION,
+        general_name: "General Juhziz",
+        portrait: "Juhziz.tga",
+        map_name: "GC_Demo",
+        difficulty: 2,
+        taunt_intro: "Everything will explode!",
+        taunt_winning: "Boom! Another victory!",
+        taunt_losing: "My explosives... they failed...",
+        special_rules: "Enhanced demo traps, Combat Cycles with bombs",
+        is_unlocked: true,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[8] = GeneralChallenge {
+        general_type: GeneralType::STEALTH,
+        general_name: "Prince Kassad",
+        portrait: "Kassad.tga",
+        map_name: "GC_Stealth",
+        difficulty: 3,
+        taunt_intro: "You cannot see what will destroy you!",
+        taunt_winning: "Shadows claim another victim!",
+        taunt_losing: "How did you see through my deception?",
+        special_rules: "All units start stealthed, GPS Scrambler",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    // Boss Generals (unlocked after defeating 3 others)
+    generals[9] = GeneralChallenge {
+        general_type: GeneralType::USA_BOSS,
+        general_name: "USA Commander",
+        portrait: "USABoss.tga",
+        map_name: "GC_USA_Boss",
+        difficulty: 3,
+        taunt_intro: "Welcome to the big leagues!",
+        taunt_winning: "America prevails!",
+        taunt_losing: "This isn't over...",
+        special_rules: "Access to all USA technologies",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[10] = GeneralChallenge {
+        general_type: GeneralType::CHINA_BOSS,
+        general_name: "China Commander",
+        portrait: "ChinaBoss.tga",
+        map_name: "GC_China_Boss",
+        difficulty: 3,
+        taunt_intro: "China's full might awaits you!",
+        taunt_winning: "For the glory of China!",
+        taunt_losing: "You have earned respect...",
+        special_rules: "Access to all China technologies",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    generals[11] = GeneralChallenge {
+        general_type: GeneralType::GLA_BOSS,
+        general_name: "GLA Commander",
+        portrait: "GLABoss.tga",
+        map_name: "GC_GLA_Boss",
+        difficulty: 3,
+        taunt_intro: "The GLA never forgets!",
+        taunt_winning: "Another enemy of the cause falls!",
+        taunt_losing: "This setback is temporary...",
+        special_rules: "Access to all GLA technologies",
+        is_unlocked: false,
+        is_defeated: false,
+        best_time: 0.0
+    }
+
+    return generals
+}
+
+// ============================================================================
+// CAMPAIGN MANAGER
+// ============================================================================
+
+struct CampaignManager {
+    campaigns: [Campaign; 4],
+    campaign_count: i32,
+    active_campaign: i32,
+
+    // Current mission state
+    current_mission: Mission,
+    mission_time: f32,
+    is_mission_active: bool,
+
+    // Objectives
+    objectives: [Objective; 16],
+    objective_count: i32,
+
+    // Triggers
+    triggers: [Trigger; 64],
+    trigger_count: i32,
+
+    // Cutscenes
+    cutscenes: [Cutscene; 8],
+    cutscene_count: i32,
+    active_cutscene: i32,
+
+    // Briefing
+    briefing: Briefing,
+
+    // Generals Challenge
+    generals: [GeneralChallenge; 12],
+    generals_defeated: i32,
+    selected_player_general: GeneralType,
+
+    // Save state
+    difficulty: Difficulty,
+    total_missions_completed: i32,
+    total_play_time: f32
+}
+
+fn create_campaign_manager() -> CampaignManager {
+    return CampaignManager {
+        campaigns: [],
+        campaign_count: 0,
+        active_campaign: -1,
+        current_mission: Mission {
+            id: 0,
+            name: "",
+            map_name: "",
+            briefing: "",
+            intro_video: "",
+            outro_video: "",
+            primary_objectives: [],
+            primary_count: 0,
+            secondary_objectives: [],
+            secondary_count: 0,
+            bonus_objectives: [],
+            bonus_count: 0,
+            starting_supplies: 10000,
+            starting_power: 0,
+            player_faction: 0,
+            enemy_factions: [-1; 4],
+            enemy_count: 0,
+            time_limit: 0.0,
+            script_count: 0,
+            trigger_count: 0,
+            is_completed: false,
+            completion_time: 0.0,
+            score: 0,
+            medal: 0
+        },
+        mission_time: 0.0,
+        is_mission_active: false,
+        objectives: [],
+        objective_count: 0,
+        triggers: [],
+        trigger_count: 0,
+        cutscenes: [],
+        cutscene_count: 0,
+        active_cutscene: -1,
+        briefing: create_briefing(),
+        generals: get_all_generals(),
+        generals_defeated: 0,
+        selected_player_general: GeneralType::USA_BOSS,
+        difficulty: Difficulty::NORMAL,
+        total_missions_completed: 0,
+        total_play_time: 0.0
+    }
+}
+
+fn init_usa_campaign(cm: mut CampaignManager) {
+    let mut usa: Campaign = Campaign {
+        campaign_type: CampaignType::USA_CAMPAIGN,
+        name: "USA Campaign",
+        description: "Lead the United States military against the GLA threat.",
+        faction: 0,
+        missions: [],
+        mission_count: 7,
+        current_mission: 0,
+        is_completed: false
+    }
+
+    // Mission 1: Baghdad
+    usa.missions[0] = Mission {
+        id: 1,
+        name: "Final Justice",
+        map_name: "USA01_Baghdad",
+        briefing: "The GLA has taken control of Baghdad. Lead our forces to liberate the city.",
+        intro_video: "USA01_Intro.bik",
+        outro_video: "USA01_Outro.bik",
+        primary_objectives: [],
+        primary_count: 0,
+        secondary_objectives: [],
+        secondary_count: 0,
+        bonus_objectives: [],
+        bonus_count: 0,
+        starting_supplies: 8000,
+        starting_power: 0,
+        player_faction: 0,
+        enemy_factions: [2, -1, -1, -1],
+        enemy_count: 1,
+        time_limit: 0.0,
+        script_count: 0,
+        trigger_count: 0,
+        is_completed: false,
+        completion_time: 0.0,
+        score: 0,
+        medal: 0
+    }
+
+    // Add more missions...
+    cm.campaigns[cm.campaign_count] = usa
+    cm.campaign_count = cm.campaign_count + 1
+}
+
+fn start_mission(cm: mut CampaignManager, mission_idx: i32) -> bool {
+    if cm.active_campaign < 0 or cm.active_campaign >= cm.campaign_count {
+        return false
+    }
+
+    let campaign: Campaign = cm.campaigns[cm.active_campaign]
+    if mission_idx < 0 or mission_idx >= campaign.mission_count {
+        return false
+    }
+
+    cm.current_mission = campaign.missions[mission_idx]
+    cm.mission_time = 0.0
+    cm.is_mission_active = true
+
+    // Load objectives
+    cm.objective_count = cm.current_mission.primary_count +
+                         cm.current_mission.secondary_count +
+                         cm.current_mission.bonus_count
+
+    return true
+}
+
+fn update_campaign(cm: mut CampaignManager, delta_time: f32, context: TriggerContext) {
+    if not cm.is_mission_active {
+        return
+    }
+
+    cm.mission_time = cm.mission_time + delta_time
+    cm.total_play_time = cm.total_play_time + delta_time
+
+    // Update objectives
+    for i in 0..cm.objective_count {
+        update_objective(cm.objectives[i], delta_time)
+    }
+
+    // Check triggers
+    let mut ctx: TriggerContext = context
+    ctx.mission_time = cm.mission_time
+
+    for i in 0..cm.trigger_count {
+        if check_trigger(cm.triggers[i], ctx) {
+            fire_trigger(cm, i)
+        }
+    }
+
+    // Update cutscene
+    if cm.active_cutscene >= 0 {
+        update_cutscene(cm.cutscenes[cm.active_cutscene], delta_time)
+    }
+
+    // Check win/lose conditions
+    check_mission_end(cm)
+}
+
+fn fire_trigger(cm: mut CampaignManager, trigger_idx: i32) {
+    let mut trigger: Trigger = cm.triggers[trigger_idx]
+
+    if not trigger.is_repeatable {
+        trigger.is_active = false
+    }
+    trigger.times_fired = trigger.times_fired + 1
+
+    // Execute actions
+    for i in 0..trigger.action_count {
+        execute_action(cm, trigger.actions[i])
+    }
+
+    cm.triggers[trigger_idx] = trigger
+}
+
+fn execute_action(cm: mut CampaignManager, action: Action) {
+    match action.action_type {
+        ActionType::WIN_MISSION => {
+            cm.current_mission.is_completed = true
+            cm.current_mission.completion_time = cm.mission_time
+            cm.is_mission_active = false
+            cm.total_missions_completed = cm.total_missions_completed + 1
+        },
+        ActionType::LOSE_MISSION => {
+            cm.is_mission_active = false
+        },
+        ActionType::DISPLAY_TEXT => {
+            // Would display text to player
+            print("Mission Text: " + str(action.string_param))
+        },
+        ActionType::GIVE_SUPPLIES => {
+            // Would add supplies to player
+            print("Bonus supplies: " + str(action.int_param1))
+        },
+        _ => {}
+    }
+}
+
+fn check_mission_end(cm: mut CampaignManager) {
+    // Check if all primary objectives completed
+    let mut all_primary_complete: bool = true
+    let mut any_primary_failed: bool = false
+
+    for i in 0..cm.current_mission.primary_count {
+        let idx: i32 = i
+        if idx < cm.objective_count {
+            if cm.objectives[idx].state != ObjectiveState::COMPLETED {
+                all_primary_complete = false
+            }
+            if cm.objectives[idx].state == ObjectiveState::FAILED {
+                any_primary_failed = true
+            }
+        }
+    }
+
+    if any_primary_failed {
+        cm.is_mission_active = false
+        // Trigger loss
+    } else if all_primary_complete {
+        cm.current_mission.is_completed = true
+        cm.current_mission.completion_time = cm.mission_time
+        calculate_mission_score(cm)
+        cm.is_mission_active = false
+        cm.total_missions_completed = cm.total_missions_completed + 1
+    }
+}
+
+fn calculate_mission_score(cm: mut CampaignManager) {
+    let mut score: i32 = 1000   // Base score
+
+    // Bonus for time
+    let time_bonus: i32 = cast(i32, 5000.0 / (cm.mission_time / 60.0 + 1.0))
+    score = score + time_bonus
+
+    // Bonus for secondary objectives
+    let secondary_start: i32 = cm.current_mission.primary_count
+    let secondary_end: i32 = secondary_start + cm.current_mission.secondary_count
+    for i in secondary_start..secondary_end {
+        if i < cm.objective_count {
+            if cm.objectives[i].state == ObjectiveState::COMPLETED {
+                score = score + 500
+            }
+        }
+    }
+
+    // Bonus for bonus objectives
+    let bonus_start: i32 = secondary_end
+    let bonus_end: i32 = bonus_start + cm.current_mission.bonus_count
+    for i in bonus_start..bonus_end {
+        if i < cm.objective_count {
+            if cm.objectives[i].state == ObjectiveState::COMPLETED {
+                score = score + 1000
+            }
+        }
+    }
+
+    // Difficulty multiplier
+    let diff_mult: f32 = match cm.difficulty {
+        Difficulty::EASY => 0.5,
+        Difficulty::NORMAL => 1.0,
+        Difficulty::HARD => 1.5,
+        Difficulty::BRUTAL => 2.0
+    }
+    score = cast(i32, cast(f32, score) * diff_mult)
+
+    cm.current_mission.score = score
+
+    // Determine medal
+    if score >= 8000 {
+        cm.current_mission.medal = 3   // Gold
+    } else if score >= 5000 {
+        cm.current_mission.medal = 2   // Silver
+    } else if score >= 2000 {
+        cm.current_mission.medal = 1   // Bronze
+    }
+}
+
+fn add_objective(cm: mut CampaignManager, obj: Objective) -> i32 {
+    if cm.objective_count < 16 {
+        let mut new_obj: Objective = obj
+        new_obj.id = cm.objective_count
+        cm.objectives[cm.objective_count] = new_obj
+        cm.objective_count = cm.objective_count + 1
+        return new_obj.id
+    }
+    return -1
+}
+
+fn add_trigger(cm: mut CampaignManager, trigger: Trigger) -> i32 {
+    if cm.trigger_count < 64 {
+        let mut new_trigger: Trigger = trigger
+        new_trigger.id = cm.trigger_count
+        cm.triggers[cm.trigger_count] = new_trigger
+        cm.trigger_count = cm.trigger_count + 1
+        return new_trigger.id
+    }
+    return -1
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess: f32 = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_campaign_system() {
+    print("Testing Campaign System...")
+
+    // Create manager
+    let mut cm: CampaignManager = create_campaign_manager()
+
+    // Initialize USA campaign
+    init_usa_campaign(cm)
+    print("Campaigns: " + str(cm.campaign_count))
+
+    // Test objectives
+    let obj1_id: i32 = add_objective(cm, create_destroy_all_objective(0, "Destroy All Enemies"))
+    let obj2_id: i32 = add_objective(cm, create_protect_objective(1, "Protect HQ", 100, 300.0))
+    let obj3_id: i32 = add_objective(cm, create_reach_location_objective(2, "Reach Extraction",
+        Vec3 { x: 500.0, y: 0.0, z: 500.0 }, 50.0))
+
+    print("Created objectives: " + str(obj1_id) + ", " + str(obj2_id) + ", " + str(obj3_id))
+    print("Total objectives: " + str(cm.objective_count))
+
+    // Test trigger
+    let mut trigger: Trigger = Trigger {
+        id: 0,
+        trigger_type: TriggerType::ON_TIMER,
+        is_active: true,
+        is_repeatable: false,
+        times_fired: 0,
+        delay: 60.0,
+        current_delay: 0.0,
+        target_id: -1,
+        area_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        area_radius: 0.0,
+        threshold: 0,
+        objective_id: -1,
+        actions: [],
+        action_count: 0
+    }
+    trigger.actions[0] = create_display_text_action("Reinforcements arriving!", 5.0)
+    trigger.action_count = 1
+
+    add_trigger(cm, trigger)
+    print("Triggers: " + str(cm.trigger_count))
+
+    // Test cutscene
+    let mut cs: Cutscene = create_cutscene(0, "Intro", 10.0)
+    add_cutscene_event(cs, CutsceneEvent {
+        time: 0.0,
+        event_type: CutsceneEventType::FADE_IN,
+        int_param: 0,
+        float_param: 1.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: ""
+    })
+    add_cutscene_event(cs, CutsceneEvent {
+        time: 2.0,
+        event_type: CutsceneEventType::SHOW_SUBTITLE,
+        int_param: 0,
+        float_param: 3.0,
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        string_param: "Mission briefing begins..."
+    })
+    print("Cutscene events: " + str(cs.event_count))
+
+    // Test briefing
+    let mut brief: Briefing = create_briefing()
+    add_briefing_slide(brief, "slide1.tga", "brief1.wav", "Welcome, Commander.", 5.0)
+    add_briefing_slide(brief, "slide2.tga", "brief2.wav", "Your mission is critical.", 5.0)
+    print("Briefing slides: " + str(brief.slide_count))
+
+    // Test Generals Challenge
+    print("Generals available: 12")
+    for i in 0..3 {
+        let gen: GeneralChallenge = cm.generals[i]
+        print("  " + str(i) + ": " + "General " + str(i))
+    }
+
+    // Simulate mission update
+    let ctx: TriggerContext = TriggerContext {
+        is_mission_start: false,
+        mission_time: 65.0,
+        last_destroyed_unit: -1,
+        last_destroyed_building: -1,
+        last_completed_objective: -1,
+        player_supplies: 5000,
+        defeated_player: -1
+    }
+
+    // Update objectives
+    for i in 0..cm.objective_count {
+        update_objective(cm.objectives[i], 1.0)
+    }
+
+    // Test reach location
+    let reached: bool = check_location_reached(cm.objectives[2], Vec3 { x: 510.0, y: 0.0, z: 510.0 })
+    print("Reached extraction point: " + str(reached))
+
+    print("Campaign System tests complete!")
+}

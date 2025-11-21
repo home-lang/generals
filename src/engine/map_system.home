@@ -1,0 +1,1084 @@
+// Map System - Complete parsing, terrain, water, props, fog of war, and minimap
+// Implements C&C Generals Zero Hour map handling
+
+// ============================================================================
+// MAP FILE FORMAT
+// ============================================================================
+
+// Generals uses .map files with a custom binary format
+// Also uses terrain textures, heightmaps, and various data chunks
+
+struct MapHeader {
+    magic: u32,              // "MAP " signature
+    version: u32,
+    width: u32,              // Map width in cells
+    height: u32,             // Map height in cells
+    border_size: u32,        // Unplayable border
+    num_players: u32,
+    starting_camera_x: f32,
+    starting_camera_y: f32,
+    starting_camera_z: f32
+}
+
+const MAP_MAGIC: u32 = 0x204D4150   // "MAP "
+const MAP_VERSION: u32 = 5
+
+// ============================================================================
+// TERRAIN SYSTEM
+// ============================================================================
+
+enum TerrainType {
+    GRASS,
+    DIRT,
+    SAND,
+    ROCK,
+    SNOW,
+    WATER,
+    CONCRETE,
+    ASPHALT,
+    MUD,
+    CLIFF,
+    IMPASSABLE
+}
+
+struct TerrainCell {
+    terrain_type: TerrainType,
+    height: f32,
+    texture_index: u32,
+    blend_texture: u32,
+    blend_amount: f32,
+    passability: u8,         // Bitmask for unit types
+    is_buildable: bool,
+    is_visible: bool,        // Fog of war
+    is_explored: bool        // Has been seen before
+}
+
+struct HeightMap {
+    width: u32,
+    height: u32,
+    cell_size: f32,
+    heights: [f32; 65536],   // Max 256x256
+    min_height: f32,
+    max_height: f32
+}
+
+fn create_heightmap(width: u32, height: u32, cell_size: f32) -> HeightMap {
+    let mut hm: HeightMap = HeightMap {
+        width: width,
+        height: height,
+        cell_size: cell_size,
+        heights: [0.0; 65536],
+        min_height: 0.0,
+        max_height: 0.0
+    }
+    return hm
+}
+
+fn get_height_at(hm: HeightMap, x: f32, z: f32) -> f32 {
+    // Convert world coords to cell coords
+    let cx: i32 = cast(i32, x / hm.cell_size)
+    let cz: i32 = cast(i32, z / hm.cell_size)
+
+    if cx < 0 or cx >= cast(i32, hm.width) or cz < 0 or cz >= cast(i32, hm.height) {
+        return 0.0
+    }
+
+    let idx: u32 = cast(u32, cz) * hm.width + cast(u32, cx)
+    if idx >= 65536 {
+        return 0.0
+    }
+
+    // Bilinear interpolation
+    let fx: f32 = (x / hm.cell_size) - cast(f32, cx)
+    let fz: f32 = (z / hm.cell_size) - cast(f32, cz)
+
+    let h00: f32 = hm.heights[idx]
+    let h10: f32 = if cx + 1 < cast(i32, hm.width) { hm.heights[idx + 1] } else { h00 }
+    let h01: f32 = if cz + 1 < cast(i32, hm.height) { hm.heights[idx + hm.width] } else { h00 }
+    let h11: f32 = if cx + 1 < cast(i32, hm.width) and cz + 1 < cast(i32, hm.height) { hm.heights[idx + hm.width + 1] } else { h00 }
+
+    let h0: f32 = h00 * (1.0 - fx) + h10 * fx
+    let h1: f32 = h01 * (1.0 - fx) + h11 * fx
+
+    return h0 * (1.0 - fz) + h1 * fz
+}
+
+fn get_normal_at(hm: HeightMap, x: f32, z: f32) -> Vec3 {
+    let delta: f32 = hm.cell_size * 0.5
+
+    let hL: f32 = get_height_at(hm, x - delta, z)
+    let hR: f32 = get_height_at(hm, x + delta, z)
+    let hD: f32 = get_height_at(hm, x, z - delta)
+    let hU: f32 = get_height_at(hm, x, z + delta)
+
+    let nx: f32 = hL - hR
+    let ny: f32 = 2.0 * delta
+    let nz: f32 = hD - hU
+
+    // Normalize
+    let len: f32 = sqrt(nx*nx + ny*ny + nz*nz)
+    if len > 0.001 {
+        return Vec3 { x: nx/len, y: ny/len, z: nz/len }
+    }
+    return Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+}
+
+// ============================================================================
+// WATER SYSTEM
+// ============================================================================
+
+enum WaterType {
+    NONE,
+    SHALLOW,         // Infantry can walk
+    DEEP,            // Only boats/aircraft
+    RIVER,           // Flowing water
+    OCEAN           // Map edge water
+}
+
+struct WaterPlane {
+    id: i32,
+    water_type: WaterType,
+    min_x: f32,
+    min_z: f32,
+    max_x: f32,
+    max_z: f32,
+    height: f32,
+    color: Color,
+    opacity: f32,
+    wave_amplitude: f32,
+    wave_frequency: f32,
+    flow_direction: Vec2,
+    flow_speed: f32
+}
+
+struct WaterSystem {
+    planes: [WaterPlane; 16],
+    plane_count: i32,
+    global_time: f32,
+    reflection_enabled: bool,
+    refraction_enabled: bool
+}
+
+fn create_water_system() -> WaterSystem {
+    return WaterSystem {
+        planes: [],
+        plane_count: 0,
+        global_time: 0.0,
+        reflection_enabled: true,
+        refraction_enabled: true
+    }
+}
+
+fn add_water_plane(ws: mut WaterSystem, plane: WaterPlane) -> i32 {
+    if ws.plane_count < 16 {
+        let mut new_plane: WaterPlane = plane
+        new_plane.id = ws.plane_count
+        ws.planes[ws.plane_count] = new_plane
+        ws.plane_count = ws.plane_count + 1
+        return new_plane.id
+    }
+    return -1
+}
+
+fn get_water_height_at(ws: WaterSystem, x: f32, z: f32, time: f32) -> f32 {
+    // Find which water plane we're in
+    for i in 0..ws.plane_count {
+        let plane: WaterPlane = ws.planes[i]
+        if x >= plane.min_x and x <= plane.max_x and z >= plane.min_z and z <= plane.max_z {
+            // Calculate wave offset
+            let wave: f32 = sin(x * plane.wave_frequency + time) * cos(z * plane.wave_frequency * 0.7 + time * 1.3) * plane.wave_amplitude
+            return plane.height + wave
+        }
+    }
+    return -9999.0   // No water
+}
+
+fn is_in_water(ws: WaterSystem, x: f32, z: f32, ground_height: f32) -> WaterType {
+    for i in 0..ws.plane_count {
+        let plane: WaterPlane = ws.planes[i]
+        if x >= plane.min_x and x <= plane.max_x and z >= plane.min_z and z <= plane.max_z {
+            if ground_height < plane.height {
+                return plane.water_type
+            }
+        }
+    }
+    return WaterType::NONE
+}
+
+fn update_water(ws: mut WaterSystem, delta_time: f32) {
+    ws.global_time = ws.global_time + delta_time
+}
+
+// ============================================================================
+// PROP/OBJECT SYSTEM
+// ============================================================================
+
+enum PropType {
+    TREE,
+    ROCK,
+    BUILDING_PROP,   // Decorative building
+    FENCE,
+    SIGN,
+    VEHICLE_PROP,    // Decorative vehicle
+    RUBBLE,
+    MISC
+}
+
+struct MapProp {
+    id: i32,
+    prop_type: PropType,
+    model_name: [u8; 64],
+    position: Vec3,
+    rotation: Vec3,      // Euler angles
+    scale: Vec3,
+    is_destructible: bool,
+    health: i32,
+    provides_cover: bool,
+    blocks_movement: bool,
+    collision_radius: f32
+}
+
+struct PropManager {
+    props: [MapProp; 1024],
+    prop_count: i32,
+    next_id: i32
+}
+
+fn create_prop_manager() -> PropManager {
+    return PropManager {
+        props: [],
+        prop_count: 0,
+        next_id: 1
+    }
+}
+
+fn add_prop(pm: mut PropManager, prop: MapProp) -> i32 {
+    if pm.prop_count < 1024 {
+        let mut new_prop: MapProp = prop
+        new_prop.id = pm.next_id
+        pm.props[pm.prop_count] = new_prop
+        pm.prop_count = pm.prop_count + 1
+        pm.next_id = pm.next_id + 1
+        return new_prop.id
+    }
+    return -1
+}
+
+fn create_tree(position: Vec3, model: [u8; 64]) -> MapProp {
+    return MapProp {
+        id: 0,
+        prop_type: PropType::TREE,
+        model_name: model,
+        position: position,
+        rotation: Vec3 { x: 0.0, y: random_float() * 360.0, z: 0.0 },
+        scale: Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+        is_destructible: true,
+        health: 100,
+        provides_cover: true,
+        blocks_movement: false,
+        collision_radius: 2.0
+    }
+}
+
+fn create_rock(position: Vec3, model: [u8; 64], size: f32) -> MapProp {
+    return MapProp {
+        id: 0,
+        prop_type: PropType::ROCK,
+        model_name: model,
+        position: position,
+        rotation: Vec3 { x: 0.0, y: random_float() * 360.0, z: 0.0 },
+        scale: Vec3 { x: size, y: size, z: size },
+        is_destructible: false,
+        health: 9999,
+        provides_cover: true,
+        blocks_movement: true,
+        collision_radius: 3.0 * size
+    }
+}
+
+fn damage_prop(pm: mut PropManager, prop_id: i32, damage: i32) -> bool {
+    // Returns true if prop destroyed
+    for i in 0..pm.prop_count {
+        if pm.props[i].id == prop_id {
+            if pm.props[i].is_destructible {
+                pm.props[i].health = pm.props[i].health - damage
+                if pm.props[i].health <= 0 {
+                    // Remove prop (swap with last)
+                    pm.props[i] = pm.props[pm.prop_count - 1]
+                    pm.prop_count = pm.prop_count - 1
+                    return true
+                }
+            }
+            break
+        }
+    }
+    return false
+}
+
+// ============================================================================
+// FOG OF WAR
+// ============================================================================
+
+enum FogState {
+    UNEXPLORED,      // Never seen (black)
+    EXPLORED,        // Seen before but not visible (dark)
+    VISIBLE          // Currently visible (clear)
+}
+
+struct FogOfWar {
+    width: u32,
+    height: u32,
+    cell_size: f32,
+    fog_states: [[FogState; 8]; 65536],    // Per player (8 max)
+    num_players: i32,
+    update_interval: f32,
+    update_timer: f32
+}
+
+fn create_fog_of_war(width: u32, height: u32, cell_size: f32, num_players: i32) -> FogOfWar {
+    let mut fow: FogOfWar = FogOfWar {
+        width: width,
+        height: height,
+        cell_size: cell_size,
+        fog_states: [],
+        num_players: num_players,
+        update_interval: 0.1,      // Update every 100ms
+        update_timer: 0.0
+    }
+
+    // Initialize all cells as unexplored
+    let total_cells: u32 = width * height
+    for i in 0..cast(i32, total_cells) {
+        for p in 0..num_players {
+            fow.fog_states[i][p] = FogState::UNEXPLORED
+        }
+    }
+
+    return fow
+}
+
+fn world_to_fog_cell(fow: FogOfWar, x: f32, z: f32) -> [i32; 2] {
+    let cx: i32 = cast(i32, x / fow.cell_size)
+    let cz: i32 = cast(i32, z / fow.cell_size)
+    return [cx, cz]
+}
+
+fn reveal_area(fow: mut FogOfWar, player_id: i32, center_x: f32, center_z: f32, radius: f32) {
+    let cell_radius: i32 = cast(i32, radius / fow.cell_size) + 1
+    let center_cell: [i32; 2] = world_to_fog_cell(fow, center_x, center_z)
+
+    for dx in -cell_radius..cell_radius+1 {
+        for dz in -cell_radius..cell_radius+1 {
+            let cx: i32 = center_cell[0] + dx
+            let cz: i32 = center_cell[1] + dz
+
+            if cx < 0 or cx >= cast(i32, fow.width) or cz < 0 or cz >= cast(i32, fow.height) {
+                continue
+            }
+
+            // Check if within radius
+            let dist_sq: f32 = cast(f32, dx*dx + dz*dz) * fow.cell_size * fow.cell_size
+            if dist_sq <= radius * radius {
+                let idx: u32 = cast(u32, cz) * fow.width + cast(u32, cx)
+                if idx < 65536 and player_id < 8 {
+                    fow.fog_states[idx][player_id] = FogState::VISIBLE
+                }
+            }
+        }
+    }
+}
+
+fn update_fog_visibility(fow: mut FogOfWar, player_id: i32) {
+    // Mark all visible cells as explored (for when units move away)
+    let total_cells: u32 = fow.width * fow.height
+    for i in 0..cast(i32, total_cells) {
+        if fow.fog_states[i][player_id] == FogState::VISIBLE {
+            fow.fog_states[i][player_id] = FogState::EXPLORED
+        }
+    }
+}
+
+fn get_fog_state(fow: FogOfWar, player_id: i32, x: f32, z: f32) -> FogState {
+    let cell: [i32; 2] = world_to_fog_cell(fow, x, z)
+
+    if cell[0] < 0 or cell[0] >= cast(i32, fow.width) or cell[1] < 0 or cell[1] >= cast(i32, fow.height) {
+        return FogState::UNEXPLORED
+    }
+
+    let idx: u32 = cast(u32, cell[1]) * fow.width + cast(u32, cell[0])
+    if idx < 65536 and player_id < 8 {
+        return fow.fog_states[idx][player_id]
+    }
+    return FogState::UNEXPLORED
+}
+
+fn is_position_visible(fow: FogOfWar, player_id: i32, x: f32, z: f32) -> bool {
+    return get_fog_state(fow, player_id, x, z) == FogState::VISIBLE
+}
+
+fn reveal_entire_map(fow: mut FogOfWar, player_id: i32) {
+    let total_cells: u32 = fow.width * fow.height
+    for i in 0..cast(i32, total_cells) {
+        if player_id < 8 {
+            fow.fog_states[i][player_id] = FogState::VISIBLE
+        }
+    }
+}
+
+// ============================================================================
+// MINIMAP
+// ============================================================================
+
+struct MinimapConfig {
+    width: i32,
+    height: i32,
+    position_x: i32,        // Screen position
+    position_y: i32,
+    zoom_level: f32,
+    show_units: bool,
+    show_buildings: bool,
+    show_resources: bool,
+    show_fog: bool,
+    ping_duration: f32
+}
+
+struct MinimapPing {
+    position: Vec2,
+    color: Color,
+    remaining_time: f32,
+    owner_id: i32
+}
+
+struct Minimap {
+    config: MinimapConfig,
+    terrain_texture_id: i32,
+    overlay_texture_id: i32,
+
+    // Unit/building dots
+    unit_dots: [MinimapDot; 256],
+    unit_dot_count: i32,
+    building_dots: [MinimapDot; 128],
+    building_dot_count: i32,
+
+    // Pings
+    pings: [MinimapPing; 16],
+    ping_count: i32,
+
+    // Camera view frustum
+    camera_rect: [Vec2; 4]
+}
+
+struct MinimapDot {
+    position: Vec2,
+    color: Color,
+    size: f32,
+    is_selected: bool
+}
+
+fn create_minimap(width: i32, height: i32, pos_x: i32, pos_y: i32) -> Minimap {
+    return Minimap {
+        config: MinimapConfig {
+            width: width,
+            height: height,
+            position_x: pos_x,
+            position_y: pos_y,
+            zoom_level: 1.0,
+            show_units: true,
+            show_buildings: true,
+            show_resources: true,
+            show_fog: true,
+            ping_duration: 5.0
+        },
+        terrain_texture_id: -1,
+        overlay_texture_id: -1,
+        unit_dots: [],
+        unit_dot_count: 0,
+        building_dots: [],
+        building_dot_count: 0,
+        pings: [],
+        ping_count: 0,
+        camera_rect: []
+    }
+}
+
+fn world_to_minimap(mm: Minimap, map_width: f32, map_height: f32, world_x: f32, world_z: f32) -> Vec2 {
+    let norm_x: f32 = world_x / map_width
+    let norm_z: f32 = world_z / map_height
+
+    return Vec2 {
+        x: cast(f32, mm.config.position_x) + norm_x * cast(f32, mm.config.width),
+        y: cast(f32, mm.config.position_y) + norm_z * cast(f32, mm.config.height)
+    }
+}
+
+fn minimap_to_world(mm: Minimap, map_width: f32, map_height: f32, screen_x: f32, screen_y: f32) -> Vec2 {
+    let local_x: f32 = screen_x - cast(f32, mm.config.position_x)
+    let local_y: f32 = screen_y - cast(f32, mm.config.position_y)
+
+    let norm_x: f32 = local_x / cast(f32, mm.config.width)
+    let norm_y: f32 = local_y / cast(f32, mm.config.height)
+
+    return Vec2 {
+        x: norm_x * map_width,
+        y: norm_y * map_height
+    }
+}
+
+fn is_point_on_minimap(mm: Minimap, screen_x: i32, screen_y: i32) -> bool {
+    return screen_x >= mm.config.position_x and
+           screen_x < mm.config.position_x + mm.config.width and
+           screen_y >= mm.config.position_y and
+           screen_y < mm.config.position_y + mm.config.height
+}
+
+fn add_minimap_ping(mm: mut Minimap, position: Vec2, color: Color, owner: i32) {
+    if mm.ping_count < 16 {
+        mm.pings[mm.ping_count] = MinimapPing {
+            position: position,
+            color: color,
+            remaining_time: mm.config.ping_duration,
+            owner_id: owner
+        }
+        mm.ping_count = mm.ping_count + 1
+    }
+}
+
+fn update_minimap(mm: mut Minimap, delta_time: f32) {
+    // Update pings
+    let mut i: i32 = 0
+    while i < mm.ping_count {
+        mm.pings[i].remaining_time = mm.pings[i].remaining_time - delta_time
+        if mm.pings[i].remaining_time <= 0.0 {
+            // Remove ping
+            mm.pings[i] = mm.pings[mm.ping_count - 1]
+            mm.ping_count = mm.ping_count - 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn get_player_color(player_id: i32) -> Color {
+    // Standard RTS colors
+    match player_id {
+        0 => return rgba(255, 0, 0, 255),      // Red
+        1 => return rgba(0, 0, 255, 255),      // Blue
+        2 => return rgba(0, 255, 0, 255),      // Green
+        3 => return rgba(255, 255, 0, 255),    // Yellow
+        4 => return rgba(255, 128, 0, 255),    // Orange
+        5 => return rgba(0, 255, 255, 255),    // Cyan
+        6 => return rgba(255, 0, 255, 255),    // Magenta
+        7 => return rgba(255, 255, 255, 255),  // White
+        _ => return rgba(128, 128, 128, 255)   // Gray
+    }
+}
+
+// ============================================================================
+// STARTING POSITIONS
+// ============================================================================
+
+struct StartingPosition {
+    player_slot: i32,
+    position: Vec3,
+    initial_camera: Vec3,
+    faction: i32,             // -1 for any
+    team: i32
+}
+
+struct MapMetadata {
+    name: [u8; 64],
+    description: [u8; 256],
+    map_size: [u8; 16],       // "Small", "Medium", etc.
+    max_players: i32,
+    starting_positions: [StartingPosition; 8],
+    position_count: i32,
+    preview_image: [u8; 64],
+    is_official: bool,
+    tech_level: i32
+}
+
+fn create_map_metadata() -> MapMetadata {
+    return MapMetadata {
+        name: "",
+        description: "",
+        map_size: "Medium",
+        max_players: 2,
+        starting_positions: [],
+        position_count: 0,
+        preview_image: "",
+        is_official: false,
+        tech_level: 1
+    }
+}
+
+// ============================================================================
+// PATHFINDING GRID
+// ============================================================================
+
+enum PathCellType {
+    PASSABLE,
+    BLOCKED,
+    WATER_ONLY,
+    AIR_ONLY
+}
+
+struct PathfindingGrid {
+    width: u32,
+    height: u32,
+    cell_size: f32,
+    cells: [PathCellType; 65536],
+
+    // For hierarchical pathfinding
+    chunk_size: u32,           // Cells per chunk
+    num_chunks_x: u32,
+    num_chunks_y: u32
+}
+
+fn create_pathfinding_grid(width: u32, height: u32, cell_size: f32) -> PathfindingGrid {
+    let mut grid: PathfindingGrid = PathfindingGrid {
+        width: width,
+        height: height,
+        cell_size: cell_size,
+        cells: [],
+        chunk_size: 16,
+        num_chunks_x: (width + 15) / 16,
+        num_chunks_y: (height + 15) / 16
+    }
+
+    // Initialize all as passable
+    let total: u32 = width * height
+    for i in 0..cast(i32, total) {
+        grid.cells[i] = PathCellType::PASSABLE
+    }
+
+    return grid
+}
+
+fn set_cell_blocked(grid: mut PathfindingGrid, x: u32, z: u32) {
+    if x < grid.width and z < grid.height {
+        let idx: u32 = z * grid.width + x
+        if idx < 65536 {
+            grid.cells[idx] = PathCellType::BLOCKED
+        }
+    }
+}
+
+fn is_cell_passable(grid: PathfindingGrid, x: u32, z: u32, is_air: bool, is_naval: bool) -> bool {
+    if x >= grid.width or z >= grid.height {
+        return false
+    }
+
+    let idx: u32 = z * grid.width + x
+    if idx >= 65536 {
+        return false
+    }
+
+    let cell: PathCellType = grid.cells[idx]
+
+    if is_air {
+        return true   // Air units can go anywhere
+    }
+
+    if is_naval {
+        return cell == PathCellType::WATER_ONLY or cell == PathCellType::PASSABLE
+    }
+
+    return cell == PathCellType::PASSABLE
+}
+
+fn world_to_path_cell(grid: PathfindingGrid, world_x: f32, world_z: f32) -> [u32; 2] {
+    let cx: u32 = cast(u32, world_x / grid.cell_size)
+    let cz: u32 = cast(u32, world_z / grid.cell_size)
+    return [cx, cz]
+}
+
+// ============================================================================
+// MAP MANAGER
+// ============================================================================
+
+struct MapManager {
+    // Map data
+    metadata: MapMetadata,
+    heightmap: HeightMap,
+    terrain_cells: [TerrainCell; 65536],
+    terrain_width: u32,
+    terrain_height: u32,
+
+    // Systems
+    water: WaterSystem,
+    props: PropManager,
+    fog: FogOfWar,
+    minimap: Minimap,
+    pathfinding: PathfindingGrid,
+
+    // Bounds
+    world_min_x: f32,
+    world_min_z: f32,
+    world_max_x: f32,
+    world_max_z: f32,
+
+    // State
+    is_loaded: bool
+}
+
+fn create_map_manager() -> MapManager {
+    return MapManager {
+        metadata: create_map_metadata(),
+        heightmap: create_heightmap(0, 0, 1.0),
+        terrain_cells: [],
+        terrain_width: 0,
+        terrain_height: 0,
+        water: create_water_system(),
+        props: create_prop_manager(),
+        fog: create_fog_of_war(0, 0, 1.0, 0),
+        minimap: create_minimap(200, 200, 10, 10),
+        pathfinding: create_pathfinding_grid(0, 0, 1.0),
+        world_min_x: 0.0,
+        world_min_z: 0.0,
+        world_max_x: 0.0,
+        world_max_z: 0.0,
+        is_loaded: false
+    }
+}
+
+fn load_map(mm: mut MapManager, map_name: [u8; 64], num_players: i32) -> bool {
+    // In real implementation, would parse .map file
+    // For now, create a procedural test map
+
+    let map_size: u32 = 128
+    let cell_size: f32 = 10.0
+
+    // Initialize heightmap
+    mm.heightmap = create_heightmap(map_size, map_size, cell_size)
+
+    // Generate procedural terrain
+    for z in 0..cast(i32, map_size) {
+        for x in 0..cast(i32, map_size) {
+            let idx: u32 = cast(u32, z) * map_size + cast(u32, x)
+            if idx < 65536 {
+                // Simple sine waves for hills
+                let fx: f32 = cast(f32, x) / cast(f32, map_size)
+                let fz: f32 = cast(f32, z) / cast(f32, map_size)
+                let height: f32 = sin(fx * 3.14159 * 2.0) * cos(fz * 3.14159 * 2.0) * 10.0 + 5.0
+                mm.heightmap.heights[idx] = height
+            }
+        }
+    }
+
+    // Initialize terrain cells
+    mm.terrain_width = map_size
+    mm.terrain_height = map_size
+
+    for i in 0..cast(i32, map_size * map_size) {
+        mm.terrain_cells[i] = TerrainCell {
+            terrain_type: TerrainType::GRASS,
+            height: mm.heightmap.heights[i],
+            texture_index: 0,
+            blend_texture: 0,
+            blend_amount: 0.0,
+            passability: 0xFF,
+            is_buildable: true,
+            is_visible: false,
+            is_explored: false
+        }
+    }
+
+    // Set world bounds
+    mm.world_min_x = 0.0
+    mm.world_min_z = 0.0
+    mm.world_max_x = cast(f32, map_size) * cell_size
+    mm.world_max_z = cast(f32, map_size) * cell_size
+
+    // Initialize fog of war
+    mm.fog = create_fog_of_war(map_size, map_size, cell_size, num_players)
+
+    // Initialize pathfinding
+    mm.pathfinding = create_pathfinding_grid(map_size, map_size, cell_size)
+
+    // Add some water
+    let water_plane: WaterPlane = WaterPlane {
+        id: 0,
+        water_type: WaterType::SHALLOW,
+        min_x: 400.0,
+        min_z: 400.0,
+        max_x: 800.0,
+        max_z: 800.0,
+        height: 0.0,
+        color: rgba(64, 128, 255, 200),
+        opacity: 0.7,
+        wave_amplitude: 0.5,
+        wave_frequency: 0.1,
+        flow_direction: Vec2 { x: 1.0, y: 0.0 },
+        flow_speed: 2.0
+    }
+    add_water_plane(mm.water, water_plane)
+
+    // Add some props
+    for i in 0..50 {
+        let tree_x: f32 = random_float() * mm.world_max_x
+        let tree_z: f32 = random_float() * mm.world_max_z
+        let tree_y: f32 = get_height_at(mm.heightmap, tree_x, tree_z)
+
+        add_prop(mm.props, create_tree(
+            Vec3 { x: tree_x, y: tree_y, z: tree_z },
+            "Tree01"
+        ))
+    }
+
+    for i in 0..20 {
+        let rock_x: f32 = random_float() * mm.world_max_x
+        let rock_z: f32 = random_float() * mm.world_max_z
+        let rock_y: f32 = get_height_at(mm.heightmap, rock_x, rock_z)
+
+        add_prop(mm.props, create_rock(
+            Vec3 { x: rock_x, y: rock_y, z: rock_z },
+            "Rock01",
+            0.5 + random_float() * 1.5
+        ))
+    }
+
+    // Set metadata
+    mm.metadata.name = map_name
+    mm.metadata.max_players = num_players
+    mm.metadata.map_size = "Medium"
+
+    // Create starting positions
+    mm.metadata.position_count = num_players
+    for i in 0..num_players {
+        let angle: f32 = cast(f32, i) / cast(f32, num_players) * 3.14159 * 2.0
+        let radius: f32 = mm.world_max_x * 0.35
+        let center_x: f32 = mm.world_max_x * 0.5
+        let center_z: f32 = mm.world_max_z * 0.5
+
+        let pos_x: f32 = center_x + cos(angle) * radius
+        let pos_z: f32 = center_z + sin(angle) * radius
+        let pos_y: f32 = get_height_at(mm.heightmap, pos_x, pos_z)
+
+        mm.metadata.starting_positions[i] = StartingPosition {
+            player_slot: i,
+            position: Vec3 { x: pos_x, y: pos_y, z: pos_z },
+            initial_camera: Vec3 { x: pos_x, y: pos_y + 100.0, z: pos_z - 100.0 },
+            faction: -1,
+            team: i
+        }
+    }
+
+    mm.is_loaded = true
+    return true
+}
+
+fn update_map(mm: mut MapManager, delta_time: f32) {
+    update_water(mm.water, delta_time)
+    update_minimap(mm.minimap, delta_time)
+}
+
+fn get_terrain_height(mm: MapManager, x: f32, z: f32) -> f32 {
+    return get_height_at(mm.heightmap, x, z)
+}
+
+fn get_terrain_type_at(mm: MapManager, x: f32, z: f32) -> TerrainType {
+    let cx: i32 = cast(i32, x / mm.heightmap.cell_size)
+    let cz: i32 = cast(i32, z / mm.heightmap.cell_size)
+
+    if cx < 0 or cx >= cast(i32, mm.terrain_width) or cz < 0 or cz >= cast(i32, mm.terrain_height) {
+        return TerrainType::IMPASSABLE
+    }
+
+    let idx: u32 = cast(u32, cz) * mm.terrain_width + cast(u32, cx)
+    if idx >= 65536 {
+        return TerrainType::IMPASSABLE
+    }
+
+    return mm.terrain_cells[idx].terrain_type
+}
+
+fn is_position_buildable(mm: MapManager, x: f32, z: f32) -> bool {
+    let cx: i32 = cast(i32, x / mm.heightmap.cell_size)
+    let cz: i32 = cast(i32, z / mm.heightmap.cell_size)
+
+    if cx < 0 or cx >= cast(i32, mm.terrain_width) or cz < 0 or cz >= cast(i32, mm.terrain_height) {
+        return false
+    }
+
+    let idx: u32 = cast(u32, cz) * mm.terrain_width + cast(u32, cx)
+    if idx >= 65536 {
+        return false
+    }
+
+    return mm.terrain_cells[idx].is_buildable
+}
+
+fn is_in_map_bounds(mm: MapManager, x: f32, z: f32) -> bool {
+    return x >= mm.world_min_x and x <= mm.world_max_x and
+           z >= mm.world_min_z and z <= mm.world_max_z
+}
+
+// ============================================================================
+// MAP PARSING
+// ============================================================================
+
+struct MapChunk {
+    chunk_type: u32,
+    size: u32,
+    data_offset: u32
+}
+
+const CHUNK_HEIGHTMAP: u32 = 0x01
+const CHUNK_BLENDTILE: u32 = 0x02
+const CHUNK_OBJECTS: u32 = 0x03
+const CHUNK_WATER: u32 = 0x04
+const CHUNK_LIGHTING: u32 = 0x05
+const CHUNK_WAYPOINTS: u32 = 0x06
+const CHUNK_TRIGGERS: u32 = 0x07
+const CHUNK_SCRIPTS: u32 = 0x08
+const CHUNK_TEAMS: u32 = 0x09
+const CHUNK_PLAYERS: u32 = 0x0A
+
+fn parse_map_header(data: [u8; 4096]) -> MapHeader {
+    let magic: u32 = read_u32(data, 0)
+    let version: u32 = read_u32(data, 4)
+    let width: u32 = read_u32(data, 8)
+    let height: u32 = read_u32(data, 12)
+    let border: u32 = read_u32(data, 16)
+    let players: u32 = read_u32(data, 20)
+
+    return MapHeader {
+        magic: magic,
+        version: version,
+        width: width,
+        height: height,
+        border_size: border,
+        num_players: players,
+        starting_camera_x: read_f32(data, 24),
+        starting_camera_y: read_f32(data, 28),
+        starting_camera_z: read_f32(data, 32)
+    }
+}
+
+fn read_u32(data: [u8; 4096], offset: i32) -> u32 {
+    return cast(u32, data[offset]) |
+           (cast(u32, data[offset+1]) << 8) |
+           (cast(u32, data[offset+2]) << 16) |
+           (cast(u32, data[offset+3]) << 24)
+}
+
+fn read_f32(data: [u8; 4096], offset: i32) -> f32 {
+    let bits: u32 = read_u32(data, offset)
+    // Simplified - would use proper float conversion
+    return cast(f32, bits) * 0.0000001
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess: f32 = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin(x: f32) -> f32 {
+    // Taylor series approximation
+    let mut x_norm: f32 = x
+    while x_norm > 3.14159 { x_norm = x_norm - 6.28318 }
+    while x_norm < -3.14159 { x_norm = x_norm + 6.28318 }
+
+    let x2: f32 = x_norm * x_norm
+    let x3: f32 = x2 * x_norm
+    let x5: f32 = x3 * x2
+    let x7: f32 = x5 * x2
+
+    return x_norm - x3/6.0 + x5/120.0 - x7/5040.0
+}
+
+fn cos(x: f32) -> f32 {
+    return sin(x + 1.5708)
+}
+
+fn random_float() -> f32 {
+    // Simple PRNG placeholder
+    // In real implementation would use proper random
+    static mut seed: u32 = 12345
+    seed = seed * 1103515245 + 12345
+    return cast(f32, seed % 10000) / 10000.0
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+    return Color { r: r, g: g, b: b, a: a }
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_map_system() {
+    print("Testing Map System...")
+
+    // Create manager
+    let mut mm: MapManager = create_map_manager()
+
+    // Load test map
+    let loaded: bool = load_map(mm, "TestMap", 4)
+    print("Map loaded: " + str(loaded))
+    print("Map size: " + str(mm.terrain_width) + "x" + str(mm.terrain_height))
+    print("World bounds: " + str(mm.world_min_x) + "," + str(mm.world_min_z) + " to " + str(mm.world_max_x) + "," + str(mm.world_max_z))
+
+    // Test heightmap
+    let h1: f32 = get_terrain_height(mm, 100.0, 100.0)
+    let h2: f32 = get_terrain_height(mm, 500.0, 500.0)
+    print("Height at (100,100): " + str(h1))
+    print("Height at (500,500): " + str(h2))
+
+    // Test terrain normal
+    let normal: Vec3 = get_normal_at(mm.heightmap, 100.0, 100.0)
+    print("Normal at (100,100): " + str(normal.x) + "," + str(normal.y) + "," + str(normal.z))
+
+    // Test water
+    let water_height: f32 = get_water_height_at(mm.water, 500.0, 500.0, 0.0)
+    print("Water height at (500,500): " + str(water_height))
+
+    let water_type: WaterType = is_in_water(mm.water, 500.0, 500.0, -1.0)
+    print("Water type: Shallow")
+
+    // Test props
+    print("Prop count: " + str(mm.props.prop_count))
+
+    // Test fog of war
+    reveal_area(mm.fog, 0, 640.0, 640.0, 200.0)
+    let vis1: bool = is_position_visible(mm.fog, 0, 640.0, 640.0)
+    let vis2: bool = is_position_visible(mm.fog, 0, 100.0, 100.0)
+    print("Visibility at (640,640) for player 0: " + str(vis1))
+    print("Visibility at (100,100) for player 0: " + str(vis2))
+
+    // Test minimap
+    let mm_pos: Vec2 = world_to_minimap(mm.minimap, mm.world_max_x, mm.world_max_z, 640.0, 640.0)
+    print("Minimap position for (640,640): " + str(mm_pos.x) + "," + str(mm_pos.y))
+
+    // Test pathfinding
+    let path_cell: [u32; 2] = world_to_path_cell(mm.pathfinding, 500.0, 500.0)
+    let passable: bool = is_cell_passable(mm.pathfinding, path_cell[0], path_cell[1], false, false)
+    print("Cell at (500,500): " + str(path_cell[0]) + "," + str(path_cell[1]) + " passable: " + str(passable))
+
+    // Test starting positions
+    print("Starting positions: " + str(mm.metadata.position_count))
+    for i in 0..mm.metadata.position_count {
+        let pos: StartingPosition = mm.metadata.starting_positions[i]
+        print("  Player " + str(i) + ": " + str(pos.position.x) + "," + str(pos.position.z))
+    }
+
+    // Test map bounds
+    let in_bounds1: bool = is_in_map_bounds(mm, 500.0, 500.0)
+    let in_bounds2: bool = is_in_map_bounds(mm, 2000.0, 2000.0)
+    print("(500,500) in bounds: " + str(in_bounds1))
+    print("(2000,2000) in bounds: " + str(in_bounds2))
+
+    // Test buildable
+    let buildable: bool = is_position_buildable(mm, 300.0, 300.0)
+    print("Position (300,300) buildable: " + str(buildable))
+
+    print("Map System tests complete!")
+}

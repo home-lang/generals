@@ -1,0 +1,1411 @@
+// Combat System - Complete projectiles, damage calculations, armor, AoE, and special powers
+// Implements C&C Generals Zero Hour combat mechanics
+
+// ============================================================================
+// DAMAGE TYPES
+// ============================================================================
+
+enum DamageType {
+    // Basic types
+    SMALL_ARMS,          // Infantry weapons
+    ARMOR_PIERCING,      // Anti-vehicle
+    EXPLOSIVE,           // General explosives
+    HIGH_EXPLOSIVE,      // Bombs, missiles
+    FIRE,                // Dragon tank, etc.
+    RADIATION,           // Nuclear weapons
+    POISON,              // Toxin weapons
+    SNIPER,              // One-shot infantry kill
+    JET_MISSILES,        // Aircraft missiles
+    COMANCHE_VULCAN,     // Comanche chaingun
+    PARTICLE_BEAM,       // Particle cannon
+    MICROWAVE,           // Microwave tank
+    EMP,                 // Electromagnetic pulse
+
+    // Special types
+    CRUSH,               // Overlord crushing
+    SUICIDE,             // Terrorist/bomb truck
+    GATTLING,            // High ROF
+    ROCKET,              // RPG/missile infantry
+    AURORA_BOMB,         // Aurora special
+
+    // Environment
+    GARRISON_CLEAR,      // Clear garrison
+    STRUCTURE_DAMAGE,    // Building specialist
+    UNRESISTABLE        // Ignores armor
+}
+
+// ============================================================================
+// ARMOR TYPES
+// ============================================================================
+
+enum ArmorType {
+    INFANTRY,            // Soft targets
+    INFANTRY_ELITE,      // Heroic infantry
+    LIGHT_VEHICLE,       // Humvee, Technical
+    MEDIUM_VEHICLE,      // Tanks
+    HEAVY_VEHICLE,       // Overlord
+    AIRCRAFT,            // Helicopters, jets
+    STRUCTURE,           // Buildings
+    STRUCTURE_WALL,      // Defensive walls
+    SUPER_WEAPON,        // Superweapons
+    HERO,                // Hero units
+    INVULNERABLE        // Cannot be damaged
+}
+
+// ============================================================================
+// DAMAGE MODIFIERS
+// ============================================================================
+
+struct DamageModifier {
+    damage_type: DamageType,
+    armor_type: ArmorType,
+    modifier: f32           // 0.0 = immune, 1.0 = normal, 2.0 = 2x damage
+}
+
+fn get_damage_modifier(damage_type: DamageType, armor_type: ArmorType) -> f32 {
+    // Small arms effective vs infantry, weak vs vehicles
+    if damage_type == DamageType::SMALL_ARMS {
+        match armor_type {
+            ArmorType::INFANTRY => return 1.0,
+            ArmorType::INFANTRY_ELITE => return 0.75,
+            ArmorType::LIGHT_VEHICLE => return 0.25,
+            ArmorType::MEDIUM_VEHICLE => return 0.1,
+            ArmorType::HEAVY_VEHICLE => return 0.05,
+            ArmorType::AIRCRAFT => return 0.5,
+            ArmorType::STRUCTURE => return 0.1,
+            _ => return 0.5
+        }
+    }
+
+    // AP effective vs vehicles
+    if damage_type == DamageType::ARMOR_PIERCING {
+        match armor_type {
+            ArmorType::INFANTRY => return 0.5,
+            ArmorType::LIGHT_VEHICLE => return 1.5,
+            ArmorType::MEDIUM_VEHICLE => return 1.0,
+            ArmorType::HEAVY_VEHICLE => return 0.75,
+            ArmorType::AIRCRAFT => return 0.5,
+            ArmorType::STRUCTURE => return 0.5,
+            _ => return 1.0
+        }
+    }
+
+    // Explosive good general purpose
+    if damage_type == DamageType::EXPLOSIVE {
+        match armor_type {
+            ArmorType::INFANTRY => return 1.25,
+            ArmorType::LIGHT_VEHICLE => return 1.0,
+            ArmorType::MEDIUM_VEHICLE => return 0.75,
+            ArmorType::HEAVY_VEHICLE => return 0.5,
+            ArmorType::STRUCTURE => return 1.0,
+            _ => return 1.0
+        }
+    }
+
+    // High explosive for buildings
+    if damage_type == DamageType::HIGH_EXPLOSIVE {
+        match armor_type {
+            ArmorType::INFANTRY => return 1.5,
+            ArmorType::LIGHT_VEHICLE => return 1.25,
+            ArmorType::MEDIUM_VEHICLE => return 1.0,
+            ArmorType::HEAVY_VEHICLE => return 0.75,
+            ArmorType::STRUCTURE => return 1.5,
+            _ => return 1.0
+        }
+    }
+
+    // Fire burns infantry, bad vs vehicles
+    if damage_type == DamageType::FIRE {
+        match armor_type {
+            ArmorType::INFANTRY => return 2.0,
+            ArmorType::INFANTRY_ELITE => return 1.5,
+            ArmorType::LIGHT_VEHICLE => return 0.5,
+            ArmorType::MEDIUM_VEHICLE => return 0.25,
+            ArmorType::HEAVY_VEHICLE => return 0.1,
+            ArmorType::STRUCTURE => return 1.25,
+            _ => return 0.5
+        }
+    }
+
+    // Radiation damages everything over time
+    if damage_type == DamageType::RADIATION {
+        match armor_type {
+            ArmorType::INFANTRY => return 2.0,
+            ArmorType::STRUCTURE => return 0.5,
+            ArmorType::INVULNERABLE => return 0.0,
+            _ => return 1.0
+        }
+    }
+
+    // Poison kills infantry, useless vs vehicles
+    if damage_type == DamageType::POISON {
+        match armor_type {
+            ArmorType::INFANTRY => return 2.5,
+            ArmorType::INFANTRY_ELITE => return 2.0,
+            ArmorType::LIGHT_VEHICLE => return 0.0,
+            ArmorType::MEDIUM_VEHICLE => return 0.0,
+            ArmorType::HEAVY_VEHICLE => return 0.0,
+            ArmorType::AIRCRAFT => return 0.0,
+            ArmorType::STRUCTURE => return 0.0,
+            _ => return 0.0
+        }
+    }
+
+    // Sniper one-shots infantry
+    if damage_type == DamageType::SNIPER {
+        match armor_type {
+            ArmorType::INFANTRY => return 10.0,    // Effectively one-shot
+            ArmorType::HERO => return 0.5,         // Less effective vs heroes
+            _ => return 0.0                         // Can't hit vehicles
+        }
+    }
+
+    // EMP disables vehicles
+    if damage_type == DamageType::EMP {
+        match armor_type {
+            ArmorType::INFANTRY => return 0.0,
+            ArmorType::LIGHT_VEHICLE => return 1.0,
+            ArmorType::MEDIUM_VEHICLE => return 1.0,
+            ArmorType::HEAVY_VEHICLE => return 1.0,
+            ArmorType::AIRCRAFT => return 1.5,
+            ArmorType::STRUCTURE => return 0.5,
+            _ => return 0.5
+        }
+    }
+
+    // Crush kills infantry instantly
+    if damage_type == DamageType::CRUSH {
+        match armor_type {
+            ArmorType::INFANTRY => return 100.0,
+            ArmorType::INFANTRY_ELITE => return 100.0,
+            _ => return 0.0
+        }
+    }
+
+    // Default modifier
+    return 1.0
+}
+
+// ============================================================================
+// PROJECTILE TYPES
+// ============================================================================
+
+enum ProjectileType {
+    BULLET,              // Instant hit
+    MISSILE,             // Guided
+    ROCKET,              // Unguided
+    SHELL,               // Ballistic arc
+    GRENADE,             // Arcing projectile
+    BOMB,                // Dropped
+    LASER,               // Instant beam
+    FLAME,               // Short range stream
+    TOXIN,               // Toxin spray
+    PARTICLE,            // Particle beam
+    NUKE,                // Nuclear missile
+    SCUD                // SCUD missile
+}
+
+enum ProjectileState {
+    FLYING,
+    EXPLODING,
+    FINISHED
+}
+
+struct Projectile {
+    id: i32,
+    projectile_type: ProjectileType,
+    state: ProjectileState,
+
+    // Source info
+    owner_id: i32,
+    source_unit_id: i32,
+
+    // Target
+    target_unit_id: i32,
+    target_position: Vec3,
+    is_homing: bool,
+
+    // Position/velocity
+    position: Vec3,
+    velocity: Vec3,
+    speed: f32,
+    max_range: f32,
+    distance_traveled: f32,
+
+    // Damage
+    damage: i32,
+    damage_type: DamageType,
+    aoe_radius: f32,
+    aoe_falloff: f32,        // 0 = full damage at edge, 1 = no damage at edge
+
+    // Visual
+    model_name: [u8; 32],
+    trail_effect: [u8; 32],
+    impact_effect: [u8; 32],
+
+    // Physics
+    gravity: f32,            // For ballistic projectiles
+    turn_rate: f32,          // For homing missiles
+    lifetime: f32,
+    max_lifetime: f32
+}
+
+fn create_bullet(id: i32, owner: i32, source: i32, start: Vec3, target_pos: Vec3, damage: i32) -> Projectile {
+    let dx: f32 = target_pos.x - start.x
+    let dy: f32 = target_pos.y - start.y
+    let dz: f32 = target_pos.z - start.z
+    let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+    return Projectile {
+        id: id,
+        projectile_type: ProjectileType::BULLET,
+        state: ProjectileState::FLYING,
+        owner_id: owner,
+        source_unit_id: source,
+        target_unit_id: -1,
+        target_position: target_pos,
+        is_homing: false,
+        position: start,
+        velocity: Vec3 { x: dx/dist * 500.0, y: dy/dist * 500.0, z: dz/dist * 500.0 },
+        speed: 500.0,
+        max_range: 300.0,
+        distance_traveled: 0.0,
+        damage: damage,
+        damage_type: DamageType::SMALL_ARMS,
+        aoe_radius: 0.0,
+        aoe_falloff: 0.0,
+        model_name: "",
+        trail_effect: "Tracer",
+        impact_effect: "BulletImpact",
+        gravity: 0.0,
+        turn_rate: 0.0,
+        lifetime: 0.0,
+        max_lifetime: 2.0
+    }
+}
+
+fn create_missile(id: i32, owner: i32, source: i32, start: Vec3, target_unit: i32, target_pos: Vec3, damage: i32, aoe: f32) -> Projectile {
+    let dx: f32 = target_pos.x - start.x
+    let dy: f32 = target_pos.y - start.y
+    let dz: f32 = target_pos.z - start.z
+    let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+    return Projectile {
+        id: id,
+        projectile_type: ProjectileType::MISSILE,
+        state: ProjectileState::FLYING,
+        owner_id: owner,
+        source_unit_id: source,
+        target_unit_id: target_unit,
+        target_position: target_pos,
+        is_homing: true,
+        position: start,
+        velocity: Vec3 { x: dx/dist * 150.0, y: dy/dist * 150.0, z: dz/dist * 150.0 },
+        speed: 150.0,
+        max_range: 500.0,
+        distance_traveled: 0.0,
+        damage: damage,
+        damage_type: DamageType::JET_MISSILES,
+        aoe_radius: aoe,
+        aoe_falloff: 0.5,
+        model_name: "Missile",
+        trail_effect: "MissileTrail",
+        impact_effect: "MissileExplosion",
+        gravity: 0.0,
+        turn_rate: 180.0,      // Degrees per second
+        lifetime: 0.0,
+        max_lifetime: 10.0
+    }
+}
+
+fn create_tank_shell(id: i32, owner: i32, source: i32, start: Vec3, target_pos: Vec3, damage: i32) -> Projectile {
+    let dx: f32 = target_pos.x - start.x
+    let dy: f32 = target_pos.y - start.y
+    let dz: f32 = target_pos.z - start.z
+    let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+    // Calculate arc velocity
+    let time_to_target: f32 = dist / 200.0
+    let vy: f32 = (target_pos.y - start.y) / time_to_target + 0.5 * 9.8 * time_to_target
+
+    return Projectile {
+        id: id,
+        projectile_type: ProjectileType::SHELL,
+        state: ProjectileState::FLYING,
+        owner_id: owner,
+        source_unit_id: source,
+        target_unit_id: -1,
+        target_position: target_pos,
+        is_homing: false,
+        position: start,
+        velocity: Vec3 { x: dx/dist * 200.0, y: vy, z: dz/dist * 200.0 },
+        speed: 200.0,
+        max_range: 400.0,
+        distance_traveled: 0.0,
+        damage: damage,
+        damage_type: DamageType::ARMOR_PIERCING,
+        aoe_radius: 5.0,
+        aoe_falloff: 0.75,
+        model_name: "TankShell",
+        trail_effect: "",
+        impact_effect: "ShellExplosion",
+        gravity: 9.8,
+        turn_rate: 0.0,
+        lifetime: 0.0,
+        max_lifetime: 5.0
+    }
+}
+
+fn create_nuke_missile(id: i32, owner: i32, start: Vec3, target_pos: Vec3) -> Projectile {
+    return Projectile {
+        id: id,
+        projectile_type: ProjectileType::NUKE,
+        state: ProjectileState::FLYING,
+        owner_id: owner,
+        source_unit_id: -1,
+        target_unit_id: -1,
+        target_position: target_pos,
+        is_homing: false,
+        position: Vec3 { x: target_pos.x, y: 500.0, z: target_pos.z },  // Comes from sky
+        velocity: Vec3 { x: 0.0, y: -100.0, z: 0.0 },
+        speed: 100.0,
+        max_range: 9999.0,
+        distance_traveled: 0.0,
+        damage: 5000,
+        damage_type: DamageType::RADIATION,
+        aoe_radius: 150.0,
+        aoe_falloff: 0.25,
+        model_name: "NukeMissile",
+        trail_effect: "NukeTrail",
+        impact_effect: "NuclearExplosion",
+        gravity: 0.0,
+        turn_rate: 0.0,
+        lifetime: 0.0,
+        max_lifetime: 15.0
+    }
+}
+
+fn create_scud(id: i32, owner: i32, start: Vec3, target_pos: Vec3, is_toxin: bool) -> Projectile {
+    let damage_type: DamageType = if is_toxin { DamageType::POISON } else { DamageType::HIGH_EXPLOSIVE }
+
+    return Projectile {
+        id: id,
+        projectile_type: ProjectileType::SCUD,
+        state: ProjectileState::FLYING,
+        owner_id: owner,
+        source_unit_id: -1,
+        target_unit_id: -1,
+        target_position: target_pos,
+        is_homing: false,
+        position: start,
+        velocity: Vec3 { x: 0.0, y: 100.0, z: 0.0 },    // Launches up first
+        speed: 150.0,
+        max_range: 600.0,
+        distance_traveled: 0.0,
+        damage: 1000,
+        damage_type: damage_type,
+        aoe_radius: 75.0,
+        aoe_falloff: 0.3,
+        model_name: "SCUDMissile",
+        trail_effect: "SCUDTrail",
+        impact_effect: if is_toxin { "ToxinExplosion" } else { "SCUDExplosion" },
+        gravity: 0.0,
+        turn_rate: 0.0,
+        lifetime: 0.0,
+        max_lifetime: 20.0
+    }
+}
+
+// ============================================================================
+// AREA OF EFFECT
+// ============================================================================
+
+struct AoEDamage {
+    center: Vec3,
+    radius: f32,
+    damage: i32,
+    damage_type: DamageType,
+    falloff: f32,
+    owner_id: i32,
+    affects_friendly: bool,
+    affects_structures: bool
+}
+
+fn calculate_aoe_damage_at_distance(aoe: AoEDamage, distance: f32) -> i32 {
+    if distance >= aoe.radius {
+        return 0
+    }
+
+    let falloff_factor: f32 = 1.0 - (distance / aoe.radius) * aoe.falloff
+    return cast(i32, cast(f32, aoe.damage) * falloff_factor)
+}
+
+fn apply_aoe_damage(aoe: AoEDamage, targets: [CombatTarget; 64], target_count: i32) -> [DamageEvent; 64] {
+    let mut events: [DamageEvent; 64] = []
+    let mut event_count: i32 = 0
+
+    for i in 0..target_count {
+        let target: CombatTarget = targets[i]
+
+        // Skip friendly fire check
+        if not aoe.affects_friendly and target.owner_id == aoe.owner_id {
+            continue
+        }
+
+        // Skip structures if needed
+        if not aoe.affects_structures and target.is_structure {
+            continue
+        }
+
+        // Calculate distance
+        let dx: f32 = target.position.x - aoe.center.x
+        let dy: f32 = target.position.y - aoe.center.y
+        let dz: f32 = target.position.z - aoe.center.z
+        let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+        let damage: i32 = calculate_aoe_damage_at_distance(aoe, dist)
+        if damage > 0 {
+            events[event_count] = DamageEvent {
+                target_id: target.id,
+                damage: damage,
+                damage_type: aoe.damage_type,
+                source_id: -1,
+                position: aoe.center,
+                is_critical: false
+            }
+            event_count = event_count + 1
+        }
+    }
+
+    return events
+}
+
+// ============================================================================
+// DAMAGE EVENTS
+// ============================================================================
+
+struct CombatTarget {
+    id: i32,
+    position: Vec3,
+    health: i32,
+    max_health: i32,
+    armor_type: ArmorType,
+    owner_id: i32,
+    is_structure: bool,
+    is_infantry: bool,
+    is_air: bool
+}
+
+struct DamageEvent {
+    target_id: i32,
+    damage: i32,
+    damage_type: DamageType,
+    source_id: i32,
+    position: Vec3,
+    is_critical: bool
+}
+
+fn calculate_final_damage(base_damage: i32, damage_type: DamageType, armor_type: ArmorType,
+                          veterancy_bonus: f32, target_veterancy_armor: f32) -> i32 {
+    // Get base modifier
+    let modifier: f32 = get_damage_modifier(damage_type, armor_type)
+
+    // Apply veterancy (attacker bonus)
+    let with_veterancy: f32 = cast(f32, base_damage) * modifier * (1.0 + veterancy_bonus)
+
+    // Apply target armor bonus
+    let final_damage: f32 = with_veterancy * (1.0 - target_veterancy_armor)
+
+    // Minimum 1 damage if hit
+    if final_damage < 1.0 and modifier > 0.0 {
+        return 1
+    }
+
+    return cast(i32, final_damage)
+}
+
+// ============================================================================
+// STATUS EFFECTS
+// ============================================================================
+
+enum StatusEffectType {
+    NONE,
+    BURNING,             // Fire DOT
+    POISONED,            // Toxin DOT
+    IRRADIATED,          // Nuke DOT
+    DISABLED,            // EMP
+    SLOWED,              // Flashbang
+    STUNNED,             // Paralyzed
+    INSPIRED,            // Propaganda boost
+    HORDE_BONUS,         // China horde
+    FIREWALL_IMMUNITY,   // Black Lotus
+    CLOAKED,             // Stealth
+    DETECTED             // Revealed stealth
+}
+
+struct StatusEffect {
+    effect_type: StatusEffectType,
+    duration: f32,
+    remaining: f32,
+    strength: f32,           // DOT damage per second, slow %, etc.
+    source_id: i32
+}
+
+fn create_burning_effect(duration: f32, dps: f32) -> StatusEffect {
+    return StatusEffect {
+        effect_type: StatusEffectType::BURNING,
+        duration: duration,
+        remaining: duration,
+        strength: dps,
+        source_id: -1
+    }
+}
+
+fn create_poison_effect(duration: f32, dps: f32) -> StatusEffect {
+    return StatusEffect {
+        effect_type: StatusEffectType::POISONED,
+        duration: duration,
+        remaining: duration,
+        strength: dps,
+        source_id: -1
+    }
+}
+
+fn create_radiation_effect(duration: f32, dps: f32) -> StatusEffect {
+    return StatusEffect {
+        effect_type: StatusEffectType::IRRADIATED,
+        duration: duration,
+        remaining: duration,
+        strength: dps,
+        source_id: -1
+    }
+}
+
+fn create_emp_effect(duration: f32) -> StatusEffect {
+    return StatusEffect {
+        effect_type: StatusEffectType::DISABLED,
+        duration: duration,
+        remaining: duration,
+        strength: 1.0,
+        source_id: -1
+    }
+}
+
+fn update_status_effect(effect: mut StatusEffect, delta_time: f32) -> bool {
+    // Returns true if effect expired
+    effect.remaining = effect.remaining - delta_time
+    return effect.remaining <= 0.0
+}
+
+fn get_dot_damage(effect: StatusEffect, delta_time: f32) -> i32 {
+    match effect.effect_type {
+        StatusEffectType::BURNING | StatusEffectType::POISONED | StatusEffectType::IRRADIATED => {
+            return cast(i32, effect.strength * delta_time)
+        },
+        _ => return 0
+    }
+}
+
+// ============================================================================
+// GENERAL POWERS
+// ============================================================================
+
+enum GeneralPowerType {
+    // USA
+    PALADIN_TANK,
+    PATHFINDER,
+    SPY_DRONE,
+    A10_STRIKE,
+    PARADROP,
+    EMERGENCY_REPAIR,
+    FUEL_AIR_BOMB,
+    SPECTRE_GUNSHIP,
+    PARTICLE_CANNON_POWER,
+
+    // China
+    RED_GUARD_TRAINING,
+    ARTILLERY_TRAINING,
+    CLUSTER_MINES,
+    ARTILLERY_BARRAGE,
+    CASH_HACK,
+    EMP_PULSE,
+    FRENZY,
+    NUKE_CANNON_POWER,
+    NUCLEAR_MISSILE_POWER,
+
+    // GLA
+    TECHNICAL_TRAINING,
+    REBEL_AMBUSH,
+    HIJACKER,
+    CASH_BOUNTY,
+    EMERGENCY_REPAIR_GLA,
+    ANTHRAX_BOMB,
+    SNEAK_ATTACK,
+    GPS_SCRAMBLER,
+    SCUD_STORM_POWER
+}
+
+struct GeneralPower {
+    power_type: GeneralPowerType,
+    name: [u8; 32],
+    science_cost: i32,        // General points
+    cooldown: f32,
+    current_cooldown: f32,
+    radius: f32,              // For targeted powers
+    is_targeted: bool,
+    requires_reveal: bool     // Fog of war requirement
+}
+
+fn create_a10_strike() -> GeneralPower {
+    return GeneralPower {
+        power_type: GeneralPowerType::A10_STRIKE,
+        name: "A-10 Strike",
+        science_cost: 1,
+        cooldown: 240.0,
+        current_cooldown: 0.0,
+        radius: 50.0,
+        is_targeted: true,
+        requires_reveal: true
+    }
+}
+
+fn create_artillery_barrage() -> GeneralPower {
+    return GeneralPower {
+        power_type: GeneralPowerType::ARTILLERY_BARRAGE,
+        name: "Artillery Barrage",
+        science_cost: 1,
+        cooldown: 180.0,
+        current_cooldown: 0.0,
+        radius: 75.0,
+        is_targeted: true,
+        requires_reveal: true
+    }
+}
+
+fn create_rebel_ambush() -> GeneralPower {
+    return GeneralPower {
+        power_type: GeneralPowerType::REBEL_AMBUSH,
+        name: "Rebel Ambush",
+        science_cost: 1,
+        cooldown: 120.0,
+        current_cooldown: 0.0,
+        radius: 30.0,
+        is_targeted: true,
+        requires_reveal: false   // Can deploy anywhere
+    }
+}
+
+fn create_emp_pulse() -> GeneralPower {
+    return GeneralPower {
+        power_type: GeneralPowerType::EMP_PULSE,
+        name: "EMP Pulse",
+        science_cost: 3,
+        cooldown: 360.0,
+        current_cooldown: 0.0,
+        radius: 100.0,
+        is_targeted: true,
+        requires_reveal: true
+    }
+}
+
+fn create_fuel_air_bomb() -> GeneralPower {
+    return GeneralPower {
+        power_type: GeneralPowerType::FUEL_AIR_BOMB,
+        name: "Fuel Air Bomb",
+        science_cost: 3,
+        cooldown: 360.0,
+        current_cooldown: 0.0,
+        radius: 100.0,
+        is_targeted: true,
+        requires_reveal: true
+    }
+}
+
+fn can_use_power(power: GeneralPower) -> bool {
+    return power.current_cooldown <= 0.0
+}
+
+fn use_power(power: mut GeneralPower) {
+    power.current_cooldown = power.cooldown
+}
+
+fn update_power_cooldown(power: mut GeneralPower, delta_time: f32) {
+    if power.current_cooldown > 0.0 {
+        power.current_cooldown = power.current_cooldown - delta_time
+        if power.current_cooldown < 0.0 {
+            power.current_cooldown = 0.0
+        }
+    }
+}
+
+// ============================================================================
+// SUPERWEAPONS
+// ============================================================================
+
+enum SuperweaponType {
+    PARTICLE_CANNON,     // USA
+    NUCLEAR_MISSILE,     // China
+    SCUD_STORM          // GLA
+}
+
+struct Superweapon {
+    weapon_type: SuperweaponType,
+    building_id: i32,
+    owner_id: i32,
+    charge_time: f32,        // Total time to charge
+    current_charge: f32,
+    is_ready: bool,
+    target_position: Vec3,
+    is_firing: bool,
+    fire_duration: f32,
+    fire_timer: f32
+}
+
+fn create_particle_cannon(building_id: i32, owner: i32) -> Superweapon {
+    return Superweapon {
+        weapon_type: SuperweaponType::PARTICLE_CANNON,
+        building_id: building_id,
+        owner_id: owner,
+        charge_time: 240.0,      // 4 minutes
+        current_charge: 0.0,
+        is_ready: false,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        is_firing: false,
+        fire_duration: 10.0,     // Beam lasts 10 seconds
+        fire_timer: 0.0
+    }
+}
+
+fn create_nuclear_missile(building_id: i32, owner: i32) -> Superweapon {
+    return Superweapon {
+        weapon_type: SuperweaponType::NUCLEAR_MISSILE,
+        building_id: building_id,
+        owner_id: owner,
+        charge_time: 360.0,      // 6 minutes
+        current_charge: 0.0,
+        is_ready: false,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        is_firing: false,
+        fire_duration: 3.0,      // Nuke impact sequence
+        fire_timer: 0.0
+    }
+}
+
+fn create_scud_storm(building_id: i32, owner: i32) -> Superweapon {
+    return Superweapon {
+        weapon_type: SuperweaponType::SCUD_STORM,
+        building_id: building_id,
+        owner_id: owner,
+        charge_time: 300.0,      // 5 minutes
+        current_charge: 0.0,
+        is_ready: false,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        is_firing: false,
+        fire_duration: 5.0,      // Multiple missiles
+        fire_timer: 0.0
+    }
+}
+
+fn update_superweapon(sw: mut Superweapon, delta_time: f32, has_power: bool) {
+    if sw.is_firing {
+        sw.fire_timer = sw.fire_timer + delta_time
+        if sw.fire_timer >= sw.fire_duration {
+            sw.is_firing = false
+            sw.fire_timer = 0.0
+            sw.current_charge = 0.0
+            sw.is_ready = false
+        }
+    } else if not sw.is_ready {
+        // Only charge if has power (except GLA)
+        if has_power or sw.weapon_type == SuperweaponType::SCUD_STORM {
+            sw.current_charge = sw.current_charge + delta_time
+            if sw.current_charge >= sw.charge_time {
+                sw.current_charge = sw.charge_time
+                sw.is_ready = true
+            }
+        }
+    }
+}
+
+fn fire_superweapon(sw: mut Superweapon, target: Vec3) -> bool {
+    if not sw.is_ready {
+        return false
+    }
+
+    sw.target_position = target
+    sw.is_firing = true
+    sw.fire_timer = 0.0
+    sw.is_ready = false
+
+    return true
+}
+
+fn get_superweapon_charge_percent(sw: Superweapon) -> f32 {
+    return (sw.current_charge / sw.charge_time) * 100.0
+}
+
+// ============================================================================
+// COMBAT MANAGER
+// ============================================================================
+
+struct CombatManager {
+    // Projectiles
+    projectiles: [Projectile; 256],
+    projectile_count: i32,
+    next_projectile_id: i32,
+
+    // Status effects per unit
+    // (Simplified - would need per-unit tracking)
+
+    // General powers
+    powers: [GeneralPower; 32],
+    power_count: i32,
+
+    // Superweapons
+    superweapons: [Superweapon; 8],
+    superweapon_count: i32,
+
+    // Damage queue
+    pending_damage: [DamageEvent; 256],
+    pending_damage_count: i32
+}
+
+fn create_combat_manager() -> CombatManager {
+    return CombatManager {
+        projectiles: [],
+        projectile_count: 0,
+        next_projectile_id: 1,
+        powers: [],
+        power_count: 0,
+        superweapons: [],
+        superweapon_count: 0,
+        pending_damage: [],
+        pending_damage_count: 0
+    }
+}
+
+fn spawn_projectile(cm: mut CombatManager, projectile: Projectile) -> i32 {
+    if cm.projectile_count >= 256 {
+        return -1
+    }
+
+    let mut new_proj: Projectile = projectile
+    new_proj.id = cm.next_projectile_id
+    cm.projectiles[cm.projectile_count] = new_proj
+    cm.projectile_count = cm.projectile_count + 1
+    cm.next_projectile_id = cm.next_projectile_id + 1
+
+    return new_proj.id
+}
+
+fn update_projectile(proj: mut Projectile, delta_time: f32, targets: [CombatTarget; 64], target_count: i32) -> bool {
+    // Returns true if projectile hit something
+
+    if proj.state != ProjectileState::FLYING {
+        return false
+    }
+
+    proj.lifetime = proj.lifetime + delta_time
+
+    // Check lifetime
+    if proj.lifetime >= proj.max_lifetime {
+        proj.state = ProjectileState::FINISHED
+        return false
+    }
+
+    // Apply gravity for ballistic projectiles
+    if proj.gravity > 0.0 {
+        proj.velocity.y = proj.velocity.y - proj.gravity * delta_time
+    }
+
+    // Update homing missiles
+    if proj.is_homing and proj.target_unit_id != -1 {
+        // Find target position
+        for i in 0..target_count {
+            if targets[i].id == proj.target_unit_id {
+                let target_pos: Vec3 = targets[i].position
+
+                // Calculate desired direction
+                let dx: f32 = target_pos.x - proj.position.x
+                let dy: f32 = target_pos.y - proj.position.y
+                let dz: f32 = target_pos.z - proj.position.z
+                let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+                if dist > 0.1 {
+                    let desired_vx: f32 = dx / dist * proj.speed
+                    let desired_vy: f32 = dy / dist * proj.speed
+                    let desired_vz: f32 = dz / dist * proj.speed
+
+                    // Turn towards target
+                    let turn: f32 = proj.turn_rate * delta_time * 0.0174533  // Deg to rad
+                    proj.velocity.x = proj.velocity.x + (desired_vx - proj.velocity.x) * turn
+                    proj.velocity.y = proj.velocity.y + (desired_vy - proj.velocity.y) * turn
+                    proj.velocity.z = proj.velocity.z + (desired_vz - proj.velocity.z) * turn
+
+                    // Normalize velocity
+                    let v_mag: f32 = sqrt(proj.velocity.x*proj.velocity.x + proj.velocity.y*proj.velocity.y + proj.velocity.z*proj.velocity.z)
+                    if v_mag > 0.1 {
+                        proj.velocity.x = proj.velocity.x / v_mag * proj.speed
+                        proj.velocity.y = proj.velocity.y / v_mag * proj.speed
+                        proj.velocity.z = proj.velocity.z / v_mag * proj.speed
+                    }
+                }
+                break
+            }
+        }
+    }
+
+    // Move projectile
+    let old_pos: Vec3 = proj.position
+    proj.position.x = proj.position.x + proj.velocity.x * delta_time
+    proj.position.y = proj.position.y + proj.velocity.y * delta_time
+    proj.position.z = proj.position.z + proj.velocity.z * delta_time
+
+    // Track distance
+    let dx: f32 = proj.position.x - old_pos.x
+    let dy: f32 = proj.position.y - old_pos.y
+    let dz: f32 = proj.position.z - old_pos.z
+    proj.distance_traveled = proj.distance_traveled + sqrt(dx*dx + dy*dy + dz*dz)
+
+    // Check max range
+    if proj.distance_traveled >= proj.max_range {
+        proj.state = ProjectileState::FINISHED
+        return false
+    }
+
+    // Check for impact with target position
+    let to_target_x: f32 = proj.target_position.x - proj.position.x
+    let to_target_y: f32 = proj.target_position.y - proj.position.y
+    let to_target_z: f32 = proj.target_position.z - proj.position.z
+    let dist_to_target: f32 = sqrt(to_target_x*to_target_x + to_target_y*to_target_y + to_target_z*to_target_z)
+
+    if dist_to_target < 3.0 {
+        proj.state = ProjectileState::EXPLODING
+        return true
+    }
+
+    // Check ground impact (for ballistic)
+    if proj.position.y <= 0.0 {
+        proj.position.y = 0.0
+        proj.state = ProjectileState::EXPLODING
+        return true
+    }
+
+    return false
+}
+
+fn queue_damage(cm: mut CombatManager, event: DamageEvent) {
+    if cm.pending_damage_count < 256 {
+        cm.pending_damage[cm.pending_damage_count] = event
+        cm.pending_damage_count = cm.pending_damage_count + 1
+    }
+}
+
+fn process_pending_damage(cm: mut CombatManager) -> [DamageEvent; 256] {
+    let events: [DamageEvent; 256] = cm.pending_damage
+    let count: i32 = cm.pending_damage_count
+
+    // Clear queue
+    cm.pending_damage_count = 0
+
+    return events
+}
+
+fn update_combat(cm: mut CombatManager, delta_time: f32, targets: [CombatTarget; 64], target_count: i32) {
+    // Update projectiles
+    let mut i: i32 = 0
+    while i < cm.projectile_count {
+        let hit: bool = update_projectile(cm.projectiles[i], delta_time, targets, target_count)
+
+        if hit {
+            let proj: Projectile = cm.projectiles[i]
+
+            // Create AoE damage if applicable
+            if proj.aoe_radius > 0.0 {
+                let aoe: AoEDamage = AoEDamage {
+                    center: proj.position,
+                    radius: proj.aoe_radius,
+                    damage: proj.damage,
+                    damage_type: proj.damage_type,
+                    falloff: proj.aoe_falloff,
+                    owner_id: proj.owner_id,
+                    affects_friendly: false,
+                    affects_structures: true
+                }
+
+                let aoe_events: [DamageEvent; 64] = apply_aoe_damage(aoe, targets, target_count)
+                // Queue all AoE damage events
+                // (Would need to track count from apply_aoe_damage)
+            } else {
+                // Direct hit damage
+                if proj.target_unit_id != -1 {
+                    queue_damage(cm, DamageEvent {
+                        target_id: proj.target_unit_id,
+                        damage: proj.damage,
+                        damage_type: proj.damage_type,
+                        source_id: proj.source_unit_id,
+                        position: proj.position,
+                        is_critical: false
+                    })
+                }
+            }
+        }
+
+        // Remove finished projectiles
+        if cm.projectiles[i].state == ProjectileState::FINISHED {
+            // Swap with last
+            cm.projectiles[i] = cm.projectiles[cm.projectile_count - 1]
+            cm.projectile_count = cm.projectile_count - 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    // Update power cooldowns
+    for j in 0..cm.power_count {
+        update_power_cooldown(cm.powers[j], delta_time)
+    }
+
+    // Update superweapons
+    for j in 0..cm.superweapon_count {
+        update_superweapon(cm.superweapons[j], delta_time, true)  // Assume has power
+    }
+}
+
+fn register_power(cm: mut CombatManager, power: GeneralPower) {
+    if cm.power_count < 32 {
+        cm.powers[cm.power_count] = power
+        cm.power_count = cm.power_count + 1
+    }
+}
+
+fn register_superweapon(cm: mut CombatManager, sw: Superweapon) {
+    if cm.superweapon_count < 8 {
+        cm.superweapons[cm.superweapon_count] = sw
+        cm.superweapon_count = cm.superweapon_count + 1
+    }
+}
+
+// ============================================================================
+// VETERANCY SYSTEM
+// ============================================================================
+
+enum VeterancyLevel {
+    REGULAR,
+    VETERAN,
+    ELITE,
+    HEROIC
+}
+
+struct VeterancyConfig {
+    xp_to_veteran: i32,
+    xp_to_elite: i32,
+    xp_to_heroic: i32,
+
+    veteran_damage_bonus: f32,
+    veteran_armor_bonus: f32,
+    veteran_rate_of_fire_bonus: f32,
+
+    elite_damage_bonus: f32,
+    elite_armor_bonus: f32,
+    elite_rate_of_fire_bonus: f32,
+    elite_range_bonus: f32,
+
+    heroic_damage_bonus: f32,
+    heroic_armor_bonus: f32,
+    heroic_rate_of_fire_bonus: f32,
+    heroic_range_bonus: f32,
+    heroic_self_heal: f32
+}
+
+fn get_default_veterancy_config() -> VeterancyConfig {
+    return VeterancyConfig {
+        xp_to_veteran: 100,
+        xp_to_elite: 300,
+        xp_to_heroic: 600,
+
+        veteran_damage_bonus: 0.15,
+        veteran_armor_bonus: 0.1,
+        veteran_rate_of_fire_bonus: 0.1,
+
+        elite_damage_bonus: 0.25,
+        elite_armor_bonus: 0.2,
+        elite_rate_of_fire_bonus: 0.2,
+        elite_range_bonus: 0.1,
+
+        heroic_damage_bonus: 0.5,
+        heroic_armor_bonus: 0.35,
+        heroic_rate_of_fire_bonus: 0.35,
+        heroic_range_bonus: 0.2,
+        heroic_self_heal: 1.0     // HP per second
+    }
+}
+
+fn get_veterancy_level(xp: i32, config: VeterancyConfig) -> VeterancyLevel {
+    if xp >= config.xp_to_heroic { return VeterancyLevel::HEROIC }
+    if xp >= config.xp_to_elite { return VeterancyLevel::ELITE }
+    if xp >= config.xp_to_veteran { return VeterancyLevel::VETERAN }
+    return VeterancyLevel::REGULAR
+}
+
+fn get_damage_bonus(level: VeterancyLevel, config: VeterancyConfig) -> f32 {
+    match level {
+        VeterancyLevel::REGULAR => return 0.0,
+        VeterancyLevel::VETERAN => return config.veteran_damage_bonus,
+        VeterancyLevel::ELITE => return config.elite_damage_bonus,
+        VeterancyLevel::HEROIC => return config.heroic_damage_bonus
+    }
+}
+
+fn get_armor_bonus(level: VeterancyLevel, config: VeterancyConfig) -> f32 {
+    match level {
+        VeterancyLevel::REGULAR => return 0.0,
+        VeterancyLevel::VETERAN => return config.veteran_armor_bonus,
+        VeterancyLevel::ELITE => return config.elite_armor_bonus,
+        VeterancyLevel::HEROIC => return config.heroic_armor_bonus
+    }
+}
+
+// ============================================================================
+// WEAPON DEFINITIONS
+// ============================================================================
+
+struct WeaponStats {
+    name: [u8; 32],
+    damage: i32,
+    damage_type: DamageType,
+    range: f32,
+    min_range: f32,
+    rate_of_fire: f32,       // Shots per second
+    projectile_type: ProjectileType,
+    aoe_radius: f32,
+    can_target_air: bool,
+    can_target_ground: bool,
+    clip_size: i32,
+    reload_time: f32
+}
+
+fn get_ranger_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "M16",
+        damage: 8,
+        damage_type: DamageType::SMALL_ARMS,
+        range: 150.0,
+        min_range: 0.0,
+        rate_of_fire: 6.0,
+        projectile_type: ProjectileType::BULLET,
+        aoe_radius: 0.0,
+        can_target_air: false,
+        can_target_ground: true,
+        clip_size: 30,
+        reload_time: 2.0
+    }
+}
+
+fn get_crusader_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "120mm Cannon",
+        damage: 100,
+        damage_type: DamageType::ARMOR_PIERCING,
+        range: 200.0,
+        min_range: 0.0,
+        rate_of_fire: 0.5,
+        projectile_type: ProjectileType::SHELL,
+        aoe_radius: 5.0,
+        can_target_air: false,
+        can_target_ground: true,
+        clip_size: 1,
+        reload_time: 0.0
+    }
+}
+
+fn get_patriot_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "Patriot Missile",
+        damage: 80,
+        damage_type: DamageType::JET_MISSILES,
+        range: 300.0,
+        min_range: 0.0,
+        rate_of_fire: 1.0,
+        projectile_type: ProjectileType::MISSILE,
+        aoe_radius: 10.0,
+        can_target_air: true,
+        can_target_ground: false,
+        clip_size: 4,
+        reload_time: 3.0
+    }
+}
+
+fn get_dragon_tank_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "Flamethrower",
+        damage: 25,
+        damage_type: DamageType::FIRE,
+        range: 80.0,
+        min_range: 0.0,
+        rate_of_fire: 10.0,
+        projectile_type: ProjectileType::FLAME,
+        aoe_radius: 15.0,
+        can_target_air: false,
+        can_target_ground: true,
+        clip_size: 100,
+        reload_time: 0.5
+    }
+}
+
+fn get_toxin_tractor_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "Toxin Sprayer",
+        damage: 20,
+        damage_type: DamageType::POISON,
+        range: 100.0,
+        min_range: 0.0,
+        rate_of_fire: 5.0,
+        projectile_type: ProjectileType::TOXIN,
+        aoe_radius: 20.0,
+        can_target_air: false,
+        can_target_ground: true,
+        clip_size: 50,
+        reload_time: 1.0
+    }
+}
+
+fn get_jarmen_kell_weapon() -> WeaponStats {
+    return WeaponStats {
+        name: "Sniper Rifle",
+        damage: 200,
+        damage_type: DamageType::SNIPER,
+        range: 350.0,
+        min_range: 50.0,
+        rate_of_fire: 0.25,
+        projectile_type: ProjectileType::BULLET,
+        aoe_radius: 0.0,
+        can_target_air: false,
+        can_target_ground: true,
+        clip_size: 1,
+        reload_time: 3.0
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess: f32 = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_combat_system() {
+    print("Testing Combat System...")
+
+    // Test damage modifiers
+    let small_arms_vs_infantry: f32 = get_damage_modifier(DamageType::SMALL_ARMS, ArmorType::INFANTRY)
+    let small_arms_vs_heavy: f32 = get_damage_modifier(DamageType::SMALL_ARMS, ArmorType::HEAVY_VEHICLE)
+    print("Small Arms vs Infantry: " + str(small_arms_vs_infantry))
+    print("Small Arms vs Heavy Vehicle: " + str(small_arms_vs_heavy))
+
+    let poison_vs_infantry: f32 = get_damage_modifier(DamageType::POISON, ArmorType::INFANTRY)
+    let poison_vs_vehicle: f32 = get_damage_modifier(DamageType::POISON, ArmorType::MEDIUM_VEHICLE)
+    print("Poison vs Infantry: " + str(poison_vs_infantry))
+    print("Poison vs Vehicle: " + str(poison_vs_vehicle))
+
+    // Test final damage calculation
+    let base_damage: i32 = 100
+    let final_dmg: i32 = calculate_final_damage(base_damage, DamageType::ARMOR_PIERCING, ArmorType::MEDIUM_VEHICLE, 0.25, 0.1)
+    print("AP 100 dmg vs Medium Vehicle (25% vet bonus, 10% armor): " + str(final_dmg))
+
+    // Test combat manager
+    let mut cm: CombatManager = create_combat_manager()
+
+    // Create projectiles
+    let bullet_id: i32 = spawn_projectile(cm, create_bullet(0, 0, 1,
+        Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+        Vec3 { x: 100.0, y: 1.0, z: 0.0 },
+        10))
+    print("Created bullet: " + str(bullet_id))
+
+    let missile_id: i32 = spawn_projectile(cm, create_missile(0, 0, 2,
+        Vec3 { x: 0.0, y: 10.0, z: 0.0 },
+        5,
+        Vec3 { x: 200.0, y: 5.0, z: 0.0 },
+        80, 15.0))
+    print("Created missile: " + str(missile_id))
+
+    let shell_id: i32 = spawn_projectile(cm, create_tank_shell(0, 0, 3,
+        Vec3 { x: 0.0, y: 2.0, z: 0.0 },
+        Vec3 { x: 150.0, y: 0.0, z: 0.0 },
+        100))
+    print("Created tank shell: " + str(shell_id))
+
+    print("Projectile count: " + str(cm.projectile_count))
+
+    // Test superweapons
+    register_superweapon(cm, create_particle_cannon(1, 0))
+    register_superweapon(cm, create_nuclear_missile(2, 1))
+    register_superweapon(cm, create_scud_storm(3, 2))
+    print("Registered " + str(cm.superweapon_count) + " superweapons")
+
+    // Simulate charging
+    for i in 0..cm.superweapon_count {
+        cm.superweapons[i].current_charge = cm.superweapons[i].charge_time * 0.75
+    }
+    print("Particle Cannon charge: " + str(get_superweapon_charge_percent(cm.superweapons[0])) + "%")
+
+    // Test general powers
+    register_power(cm, create_a10_strike())
+    register_power(cm, create_artillery_barrage())
+    register_power(cm, create_emp_pulse())
+    print("Registered " + str(cm.power_count) + " general powers")
+
+    // Test veterancy
+    let vet_config: VeterancyConfig = get_default_veterancy_config()
+    let level1: VeterancyLevel = get_veterancy_level(50, vet_config)
+    let level2: VeterancyLevel = get_veterancy_level(150, vet_config)
+    let level3: VeterancyLevel = get_veterancy_level(400, vet_config)
+    let level4: VeterancyLevel = get_veterancy_level(700, vet_config)
+    print("Veterancy levels: Regular, Veteran, Elite, Heroic")
+
+    let heroic_damage: f32 = get_damage_bonus(VeterancyLevel::HEROIC, vet_config)
+    print("Heroic damage bonus: " + str(heroic_damage * 100.0) + "%")
+
+    // Test weapons
+    let ranger_wpn: WeaponStats = get_ranger_weapon()
+    print("Ranger weapon: " + "M16" + " damage=" + str(ranger_wpn.damage) + " range=" + str(ranger_wpn.range))
+
+    let crusader_wpn: WeaponStats = get_crusader_weapon()
+    print("Crusader weapon: damage=" + str(crusader_wpn.damage) + " range=" + str(crusader_wpn.range))
+
+    // Test status effects
+    let burn: StatusEffect = create_burning_effect(5.0, 10.0)
+    let dot: i32 = get_dot_damage(burn, 1.0)
+    print("Burning DOT per second: " + str(dot))
+
+    let emp: StatusEffect = create_emp_effect(8.0)
+    print("EMP duration: " + str(emp.duration) + "s")
+
+    // Test AoE
+    let aoe: AoEDamage = AoEDamage {
+        center: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        radius: 50.0,
+        damage: 100,
+        damage_type: DamageType::EXPLOSIVE,
+        falloff: 0.5,
+        owner_id: 0,
+        affects_friendly: false,
+        affects_structures: true
+    }
+    let center_damage: i32 = calculate_aoe_damage_at_distance(aoe, 0.0)
+    let edge_damage: i32 = calculate_aoe_damage_at_distance(aoe, 40.0)
+    print("AoE at center: " + str(center_damage) + " at 40m: " + str(edge_damage))
+
+    print("Combat System tests complete!")
+}
