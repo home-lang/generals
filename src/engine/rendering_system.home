@@ -1,0 +1,1335 @@
+// Rendering System - PNG/Texture loading, W3D rendering, performance, QoL
+// Implements C&C Generals Zero Hour rendering pipeline
+
+// ============================================================================
+// PNG LOADING
+// ============================================================================
+
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+
+struct PNGImage {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,       // 0=grayscale, 2=RGB, 3=indexed, 4=gray+alpha, 6=RGBA
+    compression: u8,
+    filter: u8,
+    interlace: u8,
+    pixels: [u8; 4194304],   // Max 2048x2048 RGBA
+    pixel_count: u32,
+    has_alpha: bool
+}
+
+struct PNGChunk {
+    length: u32,
+    chunk_type: [u8; 4],
+    data_offset: u32,
+    crc: u32
+}
+
+fn is_valid_png(data: [u8; 8]) -> bool {
+    for i in 0..8 {
+        if data[i] != PNG_SIGNATURE[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn read_png_header(data: [u8; 256], offset: i32) -> PNGImage {
+    // IHDR chunk
+    let width: u32 = read_be_u32(data, offset)
+    let height: u32 = read_be_u32(data, offset + 4)
+    let bit_depth: u8 = data[offset + 8]
+    let color_type: u8 = data[offset + 9]
+    let compression: u8 = data[offset + 10]
+    let filter: u8 = data[offset + 11]
+    let interlace: u8 = data[offset + 12]
+
+    return PNGImage {
+        width: width,
+        height: height,
+        bit_depth: bit_depth,
+        color_type: color_type,
+        compression: compression,
+        filter: filter,
+        interlace: interlace,
+        pixels: [],
+        pixel_count: 0,
+        has_alpha: color_type == 4 or color_type == 6
+    }
+}
+
+fn read_be_u32(data: [u8; 256], offset: i32) -> u32 {
+    return (cast(u32, data[offset]) << 24) |
+           (cast(u32, data[offset + 1]) << 16) |
+           (cast(u32, data[offset + 2]) << 8) |
+           cast(u32, data[offset + 3])
+}
+
+fn decompress_png_data(compressed: [u8; 262144], size: i32, output: mut [u8; 4194304]) -> i32 {
+    // Inflate decompression (simplified)
+    // Real implementation would use zlib
+    let mut out_size: i32 = 0
+
+    // PNG filter reconstruction
+    // Each scanline has a filter byte followed by pixel data
+
+    return out_size
+}
+
+fn apply_png_filter(scanline: [u8; 8192], filter_type: u8, prev_scanline: [u8; 8192],
+                    bpp: i32, width: i32, output: mut [u8; 8192]) {
+    match filter_type {
+        0 => {
+            // None - copy as-is
+            for i in 0..width {
+                output[i] = scanline[i]
+            }
+        },
+        1 => {
+            // Sub - add left pixel
+            for i in 0..width {
+                let left: u8 = if i >= bpp { output[i - bpp] } else { 0 }
+                output[i] = scanline[i] + left
+            }
+        },
+        2 => {
+            // Up - add pixel above
+            for i in 0..width {
+                output[i] = scanline[i] + prev_scanline[i]
+            }
+        },
+        3 => {
+            // Average
+            for i in 0..width {
+                let left: u8 = if i >= bpp { output[i - bpp] } else { 0 }
+                let up: u8 = prev_scanline[i]
+                output[i] = scanline[i] + cast(u8, (cast(i32, left) + cast(i32, up)) / 2)
+            }
+        },
+        4 => {
+            // Paeth predictor
+            for i in 0..width {
+                let a: i32 = if i >= bpp { cast(i32, output[i - bpp]) } else { 0 }
+                let b: i32 = cast(i32, prev_scanline[i])
+                let c: i32 = if i >= bpp { cast(i32, prev_scanline[i - bpp]) } else { 0 }
+                output[i] = scanline[i] + cast(u8, paeth_predictor(a, b, c))
+            }
+        },
+        _ => {}
+    }
+}
+
+fn paeth_predictor(a: i32, b: i32, c: i32) -> i32 {
+    let p: i32 = a + b - c
+    let pa: i32 = abs(p - a)
+    let pb: i32 = abs(p - b)
+    let pc: i32 = abs(p - c)
+
+    if pa <= pb and pa <= pc { return a }
+    if pb <= pc { return b }
+    return c
+}
+
+fn abs(x: i32) -> i32 {
+    if x < 0 { return -x }
+    return x
+}
+
+// ============================================================================
+// TEXTURE SYSTEM
+// ============================================================================
+
+enum TextureFormat {
+    RGBA8,
+    RGB8,
+    BGRA8,
+    DXT1,
+    DXT3,
+    DXT5,
+    GRAYSCALE,
+    ALPHA
+}
+
+enum TextureFilter {
+    NEAREST,
+    LINEAR,
+    BILINEAR,
+    TRILINEAR,
+    ANISOTROPIC_2X,
+    ANISOTROPIC_4X,
+    ANISOTROPIC_8X,
+    ANISOTROPIC_16X
+}
+
+enum TextureWrap {
+    REPEAT,
+    CLAMP,
+    MIRROR,
+    BORDER
+}
+
+struct TextureDesc {
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+    mipmap_count: i32,
+    filter: TextureFilter,
+    wrap_u: TextureWrap,
+    wrap_v: TextureWrap,
+    is_render_target: bool,
+    is_depth: bool
+}
+
+struct Texture {
+    id: i32,
+    name: [u8; 64],
+    desc: TextureDesc,
+    gpu_handle: u64,         // Metal/OpenGL texture handle
+    is_loaded: bool,
+    is_compressed: bool,
+    memory_size: u32
+}
+
+struct TextureManager {
+    textures: [Texture; 1024],
+    texture_count: i32,
+    next_id: i32,
+
+    // Texture atlas for UI
+    ui_atlas: TextureAtlas,
+
+    // Caching
+    cache_size: u32,
+    max_cache_size: u32,
+
+    // Streaming
+    pending_loads: [i32; 64],
+    pending_count: i32
+}
+
+fn create_texture_manager(max_cache_mb: i32) -> TextureManager {
+    return TextureManager {
+        textures: [],
+        texture_count: 0,
+        next_id: 1,
+        ui_atlas: create_texture_atlas(2048, 2048),
+        cache_size: 0,
+        max_cache_size: cast(u32, max_cache_mb) * 1024 * 1024,
+        pending_loads: [-1; 64],
+        pending_count: 0
+    }
+}
+
+fn load_texture(tm: mut TextureManager, name: [u8; 64], data: [u8; 4194304], size: i32) -> i32 {
+    // Check cache first
+    for i in 0..tm.texture_count {
+        if tm.textures[i].name == name {
+            return tm.textures[i].id
+        }
+    }
+
+    if tm.texture_count >= 1024 {
+        return -1
+    }
+
+    // Parse based on file format
+    let mut tex: Texture = Texture {
+        id: tm.next_id,
+        name: name,
+        desc: TextureDesc {
+            width: 0,
+            height: 0,
+            format: TextureFormat::RGBA8,
+            mipmap_count: 1,
+            filter: TextureFilter::LINEAR,
+            wrap_u: TextureWrap::REPEAT,
+            wrap_v: TextureWrap::REPEAT,
+            is_render_target: false,
+            is_depth: false
+        },
+        gpu_handle: 0,
+        is_loaded: false,
+        is_compressed: false,
+        memory_size: 0
+    }
+
+    // Check for PNG
+    if is_valid_png_data(data) {
+        let png: PNGImage = parse_png(data, size)
+        tex.desc.width = png.width
+        tex.desc.height = png.height
+        tex.desc.format = if png.has_alpha { TextureFormat::RGBA8 } else { TextureFormat::RGB8 }
+        tex.memory_size = png.width * png.height * (if png.has_alpha { 4 } else { 3 })
+    }
+    // Check for DDS
+    else if is_valid_dds_data(data) {
+        let dds: DDSHeader = parse_dds(data)
+        tex.desc.width = dds.width
+        tex.desc.height = dds.height
+        tex.desc.format = dds.format
+        tex.desc.mipmap_count = dds.mipmap_count
+        tex.is_compressed = true
+    }
+    // Check for TGA
+    else if is_valid_tga_data(data) {
+        let tga: TGAImage = parse_tga(data, size)
+        tex.desc.width = tga.width
+        tex.desc.height = tga.height
+        tex.desc.format = if tga.has_alpha { TextureFormat::RGBA8 } else { TextureFormat::RGB8 }
+        tex.memory_size = tga.width * tga.height * (if tga.has_alpha { 4 } else { 3 })
+    }
+
+    tex.is_loaded = true
+
+    tm.textures[tm.texture_count] = tex
+    tm.texture_count = tm.texture_count + 1
+    tm.cache_size = tm.cache_size + tex.memory_size
+    tm.next_id = tm.next_id + 1
+
+    // Evict old textures if over cache limit
+    while tm.cache_size > tm.max_cache_size and tm.texture_count > 1 {
+        evict_lru_texture(tm)
+    }
+
+    return tex.id
+}
+
+fn evict_lru_texture(tm: mut TextureManager) {
+    // Simple LRU - remove first loaded
+    if tm.texture_count > 0 {
+        tm.cache_size = tm.cache_size - tm.textures[0].memory_size
+        for i in 0..(tm.texture_count - 1) {
+            tm.textures[i] = tm.textures[i + 1]
+        }
+        tm.texture_count = tm.texture_count - 1
+    }
+}
+
+fn get_texture(tm: TextureManager, id: i32) -> Texture {
+    for i in 0..tm.texture_count {
+        if tm.textures[i].id == id {
+            return tm.textures[i]
+        }
+    }
+    return Texture {
+        id: -1,
+        name: "",
+        desc: TextureDesc {
+            width: 0,
+            height: 0,
+            format: TextureFormat::RGBA8,
+            mipmap_count: 0,
+            filter: TextureFilter::NEAREST,
+            wrap_u: TextureWrap::CLAMP,
+            wrap_v: TextureWrap::CLAMP,
+            is_render_target: false,
+            is_depth: false
+        },
+        gpu_handle: 0,
+        is_loaded: false,
+        is_compressed: false,
+        memory_size: 0
+    }
+}
+
+fn is_valid_png_data(data: [u8; 4194304]) -> bool {
+    return data[0] == 0x89 and data[1] == 0x50 and data[2] == 0x4E and data[3] == 0x47
+}
+
+fn is_valid_dds_data(data: [u8; 4194304]) -> bool {
+    return data[0] == 0x44 and data[1] == 0x44 and data[2] == 0x53 and data[3] == 0x20
+}
+
+fn is_valid_tga_data(data: [u8; 4194304]) -> bool {
+    // TGA has no magic number, check header validity
+    let color_map_type: u8 = data[1]
+    let image_type: u8 = data[2]
+    return (color_map_type == 0 or color_map_type == 1) and
+           (image_type >= 1 and image_type <= 11)
+}
+
+fn parse_png(data: [u8; 4194304], size: i32) -> PNGImage {
+    // Simplified - would fully parse PNG
+    return PNGImage {
+        width: 256,
+        height: 256,
+        bit_depth: 8,
+        color_type: 6,
+        compression: 0,
+        filter: 0,
+        interlace: 0,
+        pixels: [],
+        pixel_count: 0,
+        has_alpha: true
+    }
+}
+
+// ============================================================================
+// DDS FORMAT
+// ============================================================================
+
+struct DDSHeader {
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+    mipmap_count: i32,
+    is_cubemap: bool
+}
+
+fn parse_dds(data: [u8; 4194304]) -> DDSHeader {
+    // DDS header at offset 4 (after magic)
+    let height: u32 = read_le_u32_large(data, 12)
+    let width: u32 = read_le_u32_large(data, 16)
+    let mip_count: u32 = read_le_u32_large(data, 28)
+
+    // Pixel format at offset 76
+    let fourcc: u32 = read_le_u32_large(data, 84)
+
+    let format: TextureFormat = match fourcc {
+        0x31545844 => TextureFormat::DXT1,   // "DXT1"
+        0x33545844 => TextureFormat::DXT3,   // "DXT3"
+        0x35545844 => TextureFormat::DXT5,   // "DXT5"
+        _ => TextureFormat::RGBA8
+    }
+
+    return DDSHeader {
+        width: width,
+        height: height,
+        format: format,
+        mipmap_count: cast(i32, mip_count),
+        is_cubemap: false
+    }
+}
+
+fn read_le_u32_large(data: [u8; 4194304], offset: i32) -> u32 {
+    return cast(u32, data[offset]) |
+           (cast(u32, data[offset + 1]) << 8) |
+           (cast(u32, data[offset + 2]) << 16) |
+           (cast(u32, data[offset + 3]) << 24)
+}
+
+// ============================================================================
+// TGA FORMAT
+// ============================================================================
+
+struct TGAImage {
+    width: u32,
+    height: u32,
+    bits_per_pixel: u8,
+    has_alpha: bool,
+    is_rle: bool
+}
+
+fn parse_tga(data: [u8; 4194304], size: i32) -> TGAImage {
+    let id_length: u8 = data[0]
+    let color_map_type: u8 = data[1]
+    let image_type: u8 = data[2]
+    let width: u16 = cast(u16, data[12]) | (cast(u16, data[13]) << 8)
+    let height: u16 = cast(u16, data[14]) | (cast(u16, data[15]) << 8)
+    let bpp: u8 = data[16]
+    let descriptor: u8 = data[17]
+
+    let is_rle: bool = image_type == 9 or image_type == 10 or image_type == 11
+
+    return TGAImage {
+        width: cast(u32, width),
+        height: cast(u32, height),
+        bits_per_pixel: bpp,
+        has_alpha: bpp == 32 or (descriptor & 0x0F) > 0,
+        is_rle: is_rle
+    }
+}
+
+// ============================================================================
+// TEXTURE ATLAS
+// ============================================================================
+
+struct AtlasRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    texture_id: i32,
+    name: [u8; 64]
+}
+
+struct TextureAtlas {
+    width: i32,
+    height: i32,
+    rects: [AtlasRect; 256],
+    rect_count: i32,
+    texture_id: i32,
+
+    // Packing state
+    row_height: i32,
+    current_x: i32,
+    current_y: i32
+}
+
+fn create_texture_atlas(width: i32, height: i32) -> TextureAtlas {
+    return TextureAtlas {
+        width: width,
+        height: height,
+        rects: [],
+        rect_count: 0,
+        texture_id: -1,
+        row_height: 0,
+        current_x: 0,
+        current_y: 0
+    }
+}
+
+fn pack_into_atlas(atlas: mut TextureAtlas, name: [u8; 64], tex_id: i32, w: i32, h: i32) -> i32 {
+    // Simple shelf packing
+    if atlas.current_x + w > atlas.width {
+        // Move to next row
+        atlas.current_x = 0
+        atlas.current_y = atlas.current_y + atlas.row_height
+        atlas.row_height = 0
+    }
+
+    if atlas.current_y + h > atlas.height {
+        return -1   // No space
+    }
+
+    if h > atlas.row_height {
+        atlas.row_height = h
+    }
+
+    let rect_idx: i32 = atlas.rect_count
+    atlas.rects[rect_idx] = AtlasRect {
+        x: atlas.current_x,
+        y: atlas.current_y,
+        width: w,
+        height: h,
+        texture_id: tex_id,
+        name: name
+    }
+    atlas.rect_count = atlas.rect_count + 1
+
+    atlas.current_x = atlas.current_x + w
+
+    return rect_idx
+}
+
+fn get_atlas_uv(atlas: TextureAtlas, rect_idx: i32) -> [f32; 4] {
+    if rect_idx < 0 or rect_idx >= atlas.rect_count {
+        return [0.0, 0.0, 1.0, 1.0]
+    }
+
+    let rect: AtlasRect = atlas.rects[rect_idx]
+    return [
+        cast(f32, rect.x) / cast(f32, atlas.width),
+        cast(f32, rect.y) / cast(f32, atlas.height),
+        cast(f32, rect.x + rect.width) / cast(f32, atlas.width),
+        cast(f32, rect.y + rect.height) / cast(f32, atlas.height)
+    ]
+}
+
+// ============================================================================
+// MIPMAPS
+// ============================================================================
+
+fn generate_mipmaps(pixels: [u8; 4194304], width: u32, height: u32, bpp: i32) -> [u8; 5592405] {
+    let mut output: [u8; 5592405] = []
+    let mut out_offset: i32 = 0
+
+    // Copy base level
+    let base_size: i32 = cast(i32, width * height) * bpp
+    for i in 0..base_size {
+        output[out_offset + i] = pixels[i]
+    }
+    out_offset = out_offset + base_size
+
+    // Generate mip levels
+    let mut mip_w: u32 = width / 2
+    let mut mip_h: u32 = height / 2
+    let mut prev_w: u32 = width
+    let mut prev_h: u32 = height
+
+    while mip_w >= 1 and mip_h >= 1 {
+        // Box filter downsample
+        for y in 0..cast(i32, mip_h) {
+            for x in 0..cast(i32, mip_w) {
+                let src_x: i32 = x * 2
+                let src_y: i32 = y * 2
+
+                for c in 0..bpp {
+                    let idx00: i32 = (src_y * cast(i32, prev_w) + src_x) * bpp + c
+                    let idx10: i32 = (src_y * cast(i32, prev_w) + src_x + 1) * bpp + c
+                    let idx01: i32 = ((src_y + 1) * cast(i32, prev_w) + src_x) * bpp + c
+                    let idx11: i32 = ((src_y + 1) * cast(i32, prev_w) + src_x + 1) * bpp + c
+
+                    let avg: i32 = (cast(i32, pixels[idx00]) + cast(i32, pixels[idx10]) +
+                                    cast(i32, pixels[idx01]) + cast(i32, pixels[idx11])) / 4
+
+                    output[out_offset + (y * cast(i32, mip_w) + x) * bpp + c] = cast(u8, avg)
+                }
+            }
+        }
+
+        out_offset = out_offset + cast(i32, mip_w * mip_h) * bpp
+        prev_w = mip_w
+        prev_h = mip_h
+        mip_w = mip_w / 2
+        mip_h = mip_h / 2
+    }
+
+    return output
+}
+
+fn get_mipmap_count(width: u32, height: u32) -> i32 {
+    let max_dim: u32 = if width > height { width } else { height }
+    let mut count: i32 = 1
+    let mut dim: u32 = max_dim
+
+    while dim > 1 {
+        dim = dim / 2
+        count = count + 1
+    }
+
+    return count
+}
+
+// ============================================================================
+// W3D RENDERER
+// ============================================================================
+
+struct W3DRenderState {
+    model_matrix: Mat4,
+    view_matrix: Mat4,
+    projection_matrix: Mat4,
+    mvp_matrix: Mat4,
+
+    // Lighting
+    light_direction: Vec3,
+    light_color: Vec3,
+    ambient_color: Vec3,
+
+    // Material
+    diffuse_texture: i32,
+    normal_texture: i32,
+    specular_power: f32,
+
+    // Animation
+    bone_matrices: [Mat4; 64],
+    bone_count: i32
+}
+
+struct W3DRenderer {
+    state: W3DRenderState,
+
+    // Batching
+    mesh_batches: [MeshBatch; 256],
+    batch_count: i32,
+
+    // Instance data
+    instance_data: [InstanceData; 1024],
+    instance_count: i32,
+
+    // Stats
+    draw_calls: i32,
+    triangles_rendered: i32,
+    vertices_rendered: i32
+}
+
+struct MeshBatch {
+    mesh_id: i32,
+    texture_id: i32,
+    instance_start: i32,
+    instance_count: i32,
+    is_transparent: bool
+}
+
+struct InstanceData {
+    transform: Mat4,
+    color: Vec4,
+    animation_frame: f32
+}
+
+fn create_w3d_renderer() -> W3DRenderer {
+    return W3DRenderer {
+        state: W3DRenderState {
+            model_matrix: identity_mat4(),
+            view_matrix: identity_mat4(),
+            projection_matrix: identity_mat4(),
+            mvp_matrix: identity_mat4(),
+            light_direction: Vec3 { x: 0.5, y: -1.0, z: 0.3 },
+            light_color: Vec3 { x: 1.0, y: 0.95, z: 0.9 },
+            ambient_color: Vec3 { x: 0.3, y: 0.3, z: 0.35 },
+            diffuse_texture: -1,
+            normal_texture: -1,
+            specular_power: 32.0,
+            bone_matrices: [],
+            bone_count: 0
+        },
+        mesh_batches: [],
+        batch_count: 0,
+        instance_data: [],
+        instance_count: 0,
+        draw_calls: 0,
+        triangles_rendered: 0,
+        vertices_rendered: 0
+    }
+}
+
+fn begin_frame(renderer: mut W3DRenderer) {
+    renderer.batch_count = 0
+    renderer.instance_count = 0
+    renderer.draw_calls = 0
+    renderer.triangles_rendered = 0
+    renderer.vertices_rendered = 0
+}
+
+fn set_camera(renderer: mut W3DRenderer, position: Vec3, target: Vec3, up: Vec3, fov: f32, aspect: f32, near: f32, far: f32) {
+    renderer.state.view_matrix = look_at(position, target, up)
+    renderer.state.projection_matrix = perspective(fov, aspect, near, far)
+}
+
+fn queue_mesh(renderer: mut W3DRenderer, mesh_id: i32, texture_id: i32, transform: Mat4, color: Vec4) {
+    // Find or create batch
+    let mut batch_idx: i32 = -1
+    for i in 0..renderer.batch_count {
+        if renderer.mesh_batches[i].mesh_id == mesh_id and
+           renderer.mesh_batches[i].texture_id == texture_id {
+            batch_idx = i
+            break
+        }
+    }
+
+    if batch_idx < 0 {
+        if renderer.batch_count >= 256 {
+            return
+        }
+        batch_idx = renderer.batch_count
+        renderer.mesh_batches[batch_idx] = MeshBatch {
+            mesh_id: mesh_id,
+            texture_id: texture_id,
+            instance_start: renderer.instance_count,
+            instance_count: 0,
+            is_transparent: color.w < 1.0
+        }
+        renderer.batch_count = renderer.batch_count + 1
+    }
+
+    // Add instance
+    if renderer.instance_count < 1024 {
+        renderer.instance_data[renderer.instance_count] = InstanceData {
+            transform: transform,
+            color: color,
+            animation_frame: 0.0
+        }
+        renderer.instance_count = renderer.instance_count + 1
+        renderer.mesh_batches[batch_idx].instance_count = renderer.mesh_batches[batch_idx].instance_count + 1
+    }
+}
+
+fn render_batches(renderer: mut W3DRenderer) {
+    // Sort batches: opaque first, then transparent back-to-front
+    // (Simplified - would do proper sorting)
+
+    for i in 0..renderer.batch_count {
+        let batch: MeshBatch = renderer.mesh_batches[i]
+
+        // Would bind mesh, texture, set uniforms, draw instanced
+        renderer.draw_calls = renderer.draw_calls + 1
+        // triangles/vertices would come from mesh data
+    }
+}
+
+fn end_frame(renderer: mut W3DRenderer) {
+    render_batches(renderer)
+}
+
+// ============================================================================
+// FRUSTUM CULLING
+// ============================================================================
+
+struct Frustum {
+    planes: [Vec4; 6]    // left, right, bottom, top, near, far
+}
+
+struct BoundingSphere {
+    center: Vec3,
+    radius: f32
+}
+
+struct BoundingBox {
+    min: Vec3,
+    max: Vec3
+}
+
+fn extract_frustum(vp_matrix: Mat4) -> Frustum {
+    let mut frustum: Frustum = Frustum { planes: [] }
+
+    // Left plane
+    frustum.planes[0] = Vec4 {
+        x: vp_matrix.m[3] + vp_matrix.m[0],
+        y: vp_matrix.m[7] + vp_matrix.m[4],
+        z: vp_matrix.m[11] + vp_matrix.m[8],
+        w: vp_matrix.m[15] + vp_matrix.m[12]
+    }
+
+    // Right plane
+    frustum.planes[1] = Vec4 {
+        x: vp_matrix.m[3] - vp_matrix.m[0],
+        y: vp_matrix.m[7] - vp_matrix.m[4],
+        z: vp_matrix.m[11] - vp_matrix.m[8],
+        w: vp_matrix.m[15] - vp_matrix.m[12]
+    }
+
+    // Bottom plane
+    frustum.planes[2] = Vec4 {
+        x: vp_matrix.m[3] + vp_matrix.m[1],
+        y: vp_matrix.m[7] + vp_matrix.m[5],
+        z: vp_matrix.m[11] + vp_matrix.m[9],
+        w: vp_matrix.m[15] + vp_matrix.m[13]
+    }
+
+    // Top plane
+    frustum.planes[3] = Vec4 {
+        x: vp_matrix.m[3] - vp_matrix.m[1],
+        y: vp_matrix.m[7] - vp_matrix.m[5],
+        z: vp_matrix.m[11] - vp_matrix.m[9],
+        w: vp_matrix.m[15] - vp_matrix.m[13]
+    }
+
+    // Near plane
+    frustum.planes[4] = Vec4 {
+        x: vp_matrix.m[3] + vp_matrix.m[2],
+        y: vp_matrix.m[7] + vp_matrix.m[6],
+        z: vp_matrix.m[11] + vp_matrix.m[10],
+        w: vp_matrix.m[15] + vp_matrix.m[14]
+    }
+
+    // Far plane
+    frustum.planes[5] = Vec4 {
+        x: vp_matrix.m[3] - vp_matrix.m[2],
+        y: vp_matrix.m[7] - vp_matrix.m[6],
+        z: vp_matrix.m[11] - vp_matrix.m[10],
+        w: vp_matrix.m[15] - vp_matrix.m[14]
+    }
+
+    // Normalize planes
+    for i in 0..6 {
+        let len: f32 = sqrt(frustum.planes[i].x * frustum.planes[i].x +
+                           frustum.planes[i].y * frustum.planes[i].y +
+                           frustum.planes[i].z * frustum.planes[i].z)
+        if len > 0.0001 {
+            frustum.planes[i].x = frustum.planes[i].x / len
+            frustum.planes[i].y = frustum.planes[i].y / len
+            frustum.planes[i].z = frustum.planes[i].z / len
+            frustum.planes[i].w = frustum.planes[i].w / len
+        }
+    }
+
+    return frustum
+}
+
+fn sphere_in_frustum(frustum: Frustum, sphere: BoundingSphere) -> bool {
+    for i in 0..6 {
+        let dist: f32 = frustum.planes[i].x * sphere.center.x +
+                        frustum.planes[i].y * sphere.center.y +
+                        frustum.planes[i].z * sphere.center.z +
+                        frustum.planes[i].w
+
+        if dist < -sphere.radius {
+            return false
+        }
+    }
+    return true
+}
+
+fn box_in_frustum(frustum: Frustum, box: BoundingBox) -> bool {
+    for i in 0..6 {
+        let plane: Vec4 = frustum.planes[i]
+
+        // Find the corner furthest in the direction of the plane normal
+        let px: f32 = if plane.x >= 0.0 { box.max.x } else { box.min.x }
+        let py: f32 = if plane.y >= 0.0 { box.max.y } else { box.min.y }
+        let pz: f32 = if plane.z >= 0.0 { box.max.z } else { box.min.z }
+
+        let dist: f32 = plane.x * px + plane.y * py + plane.z * pz + plane.w
+
+        if dist < 0.0 {
+            return false
+        }
+    }
+    return true
+}
+
+// ============================================================================
+// LOD SYSTEM
+// ============================================================================
+
+struct LODLevel {
+    mesh_id: i32,
+    max_distance: f32,
+    triangle_count: i32
+}
+
+struct LODGroup {
+    levels: [LODLevel; 4],
+    level_count: i32,
+    bounding_sphere: BoundingSphere
+}
+
+fn create_lod_group() -> LODGroup {
+    return LODGroup {
+        levels: [],
+        level_count: 0,
+        bounding_sphere: BoundingSphere { center: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, radius: 1.0 }
+    }
+}
+
+fn add_lod_level(group: mut LODGroup, mesh_id: i32, max_dist: f32, tri_count: i32) {
+    if group.level_count < 4 {
+        group.levels[group.level_count] = LODLevel {
+            mesh_id: mesh_id,
+            max_distance: max_dist,
+            triangle_count: tri_count
+        }
+        group.level_count = group.level_count + 1
+    }
+}
+
+fn select_lod(group: LODGroup, camera_pos: Vec3, object_pos: Vec3) -> i32 {
+    let dx: f32 = camera_pos.x - object_pos.x
+    let dy: f32 = camera_pos.y - object_pos.y
+    let dz: f32 = camera_pos.z - object_pos.z
+    let dist: f32 = sqrt(dx*dx + dy*dy + dz*dz)
+
+    for i in 0..group.level_count {
+        if dist <= group.levels[i].max_distance {
+            return group.levels[i].mesh_id
+        }
+    }
+
+    // Return lowest LOD or -1 for culled
+    if group.level_count > 0 {
+        return group.levels[group.level_count - 1].mesh_id
+    }
+    return -1
+}
+
+// ============================================================================
+// DRAW CALL BATCHING
+// ============================================================================
+
+struct BatchKey {
+    mesh_id: i32,
+    texture_id: i32,
+    shader_id: i32,
+    blend_mode: i32
+}
+
+struct DrawBatch {
+    key: BatchKey,
+    instances: [Mat4; 256],
+    instance_count: i32,
+    vertex_buffer: i32,
+    index_buffer: i32,
+    index_count: i32
+}
+
+fn batch_key_equal(a: BatchKey, b: BatchKey) -> bool {
+    return a.mesh_id == b.mesh_id and
+           a.texture_id == b.texture_id and
+           a.shader_id == b.shader_id and
+           a.blend_mode == b.blend_mode
+}
+
+// ============================================================================
+// SETTINGS PERSISTENCE
+// ============================================================================
+
+struct GraphicsSettings {
+    resolution_width: i32,
+    resolution_height: i32,
+    fullscreen_mode: i32,       // 0=windowed, 1=fullscreen, 2=borderless
+    vsync: bool,
+    texture_quality: i32,       // 0=low, 1=medium, 2=high, 3=ultra
+    shadow_quality: i32,
+    water_quality: i32,
+    particle_quality: i32,
+    view_distance: f32,
+    gamma: f32,
+    brightness: f32,
+    contrast: f32
+}
+
+struct AudioSettings {
+    master_volume: f32,
+    music_volume: f32,
+    sfx_volume: f32,
+    voice_volume: f32,
+    ambient_volume: f32,
+    speaker_mode: i32,          // 0=stereo, 1=surround
+    hardware_acceleration: bool
+}
+
+struct ControlSettings {
+    scroll_speed: f32,
+    mouse_sensitivity: f32,
+    edge_scroll: bool,
+    keyboard_scroll: bool,
+
+    // Keybindings
+    key_select_all: i32,
+    key_attack_move: i32,
+    key_stop: i32,
+    key_guard: i32,
+    key_scatter: i32,
+    key_sell: i32,
+    key_repair: i32,
+    key_groups: [i32; 10]       // Control groups 0-9
+}
+
+struct GameSettings {
+    graphics: GraphicsSettings,
+    audio: AudioSettings,
+    controls: ControlSettings,
+    player_name: [u8; 32],
+    player_color: i32,
+    preferred_faction: i32,
+    show_fps: bool,
+    show_ping: bool,
+    tooltips: bool,
+    confirm_exit: bool
+}
+
+fn get_default_settings() -> GameSettings {
+    return GameSettings {
+        graphics: GraphicsSettings {
+            resolution_width: 1920,
+            resolution_height: 1080,
+            fullscreen_mode: 0,
+            vsync: true,
+            texture_quality: 2,
+            shadow_quality: 2,
+            water_quality: 2,
+            particle_quality: 2,
+            view_distance: 500.0,
+            gamma: 1.0,
+            brightness: 0.5,
+            contrast: 0.5
+        },
+        audio: AudioSettings {
+            master_volume: 1.0,
+            music_volume: 0.7,
+            sfx_volume: 0.8,
+            voice_volume: 1.0,
+            ambient_volume: 0.5,
+            speaker_mode: 0,
+            hardware_acceleration: true
+        },
+        controls: ControlSettings {
+            scroll_speed: 50.0,
+            mouse_sensitivity: 1.0,
+            edge_scroll: true,
+            keyboard_scroll: true,
+            key_select_all: 65,      // A
+            key_attack_move: 65,     // A
+            key_stop: 83,            // S
+            key_guard: 71,           // G
+            key_scatter: 88,         // X
+            key_sell: 90,            // Z
+            key_repair: 82,          // R
+            key_groups: [48, 49, 50, 51, 52, 53, 54, 55, 56, 57]   // 0-9
+        },
+        player_name: "Commander",
+        player_color: 0,
+        preferred_faction: -1,
+        show_fps: false,
+        show_ping: true,
+        tooltips: true,
+        confirm_exit: true
+    }
+}
+
+fn save_settings(settings: GameSettings, path: [u8; 256]) -> bool {
+    // Would serialize to INI/JSON file
+    return true
+}
+
+fn load_settings(path: [u8; 256]) -> GameSettings {
+    // Would deserialize from file
+    return get_default_settings()
+}
+
+// ============================================================================
+// CONTROL REBINDING
+// ============================================================================
+
+struct KeyBinding {
+    action: [u8; 32],
+    primary_key: i32,
+    secondary_key: i32,
+    modifiers: u8            // Shift, Ctrl, Alt flags
+}
+
+fn get_key_name(key_code: i32) -> [u8; 16] {
+    match key_code {
+        27 => return "Escape",
+        32 => return "Space",
+        13 => return "Enter",
+        8 => return "Backspace",
+        9 => return "Tab",
+        48..58 => return "0-9",        // Simplified
+        65..91 => return "A-Z",        // Simplified
+        112..124 => return "F1-F12",   // Simplified
+        _ => return "Unknown"
+    }
+}
+
+fn rebind_key(settings: mut ControlSettings, action: [u8; 32], new_key: i32) {
+    // Check for conflicts
+    // Would scan all bindings
+}
+
+// ============================================================================
+// WIDESCREEN SUPPORT
+// ============================================================================
+
+struct AspectRatio {
+    width: i32,
+    height: i32,
+    ratio: f32,
+    name: [u8; 16]
+}
+
+fn get_common_aspects() -> [AspectRatio; 6] {
+    return [
+        AspectRatio { width: 4, height: 3, ratio: 1.333, name: "4:3" },
+        AspectRatio { width: 16, height: 9, ratio: 1.778, name: "16:9" },
+        AspectRatio { width: 16, height: 10, ratio: 1.6, name: "16:10" },
+        AspectRatio { width: 21, height: 9, ratio: 2.333, name: "21:9" },
+        AspectRatio { width: 32, height: 9, ratio: 3.556, name: "32:9" },
+        AspectRatio { width: 5, height: 4, ratio: 1.25, name: "5:4" }
+    ]
+}
+
+fn calculate_fov_for_aspect(base_fov: f32, base_aspect: f32, target_aspect: f32) -> f32 {
+    // Hor+ FOV scaling
+    if target_aspect > base_aspect {
+        let scale: f32 = target_aspect / base_aspect
+        return atan(tan(base_fov * 0.5 * 0.0174533) * scale) * 2.0 * 57.2958
+    }
+    return base_fov
+}
+
+fn get_ui_safe_area(screen_width: i32, screen_height: i32, aspect: f32) -> [i32; 4] {
+    // For ultrawide, keep UI in center 16:9 portion
+    if aspect > 2.0 {
+        let safe_width: i32 = cast(i32, cast(f32, screen_height) * 1.778)
+        let margin: i32 = (screen_width - safe_width) / 2
+        return [margin, 0, safe_width, screen_height]
+    }
+    return [0, 0, screen_width, screen_height]
+}
+
+// ============================================================================
+// HIDPI SUPPORT
+// ============================================================================
+
+struct DisplayInfo {
+    width: i32,
+    height: i32,
+    scale_factor: f32,       // 1.0 for standard, 2.0 for Retina
+    refresh_rate: i32,
+    is_primary: bool
+}
+
+fn get_scaled_resolution(width: i32, height: i32, scale: f32) -> [i32; 2] {
+    return [cast(i32, cast(f32, width) * scale), cast(i32, cast(f32, height) * scale)]
+}
+
+fn scale_ui_element(base_size: i32, scale_factor: f32) -> i32 {
+    return cast(i32, cast(f32, base_size) * scale_factor)
+}
+
+// ============================================================================
+// MATH HELPERS
+// ============================================================================
+
+struct Mat4 {
+    m: [f32; 16]
+}
+
+fn identity_mat4() -> Mat4 {
+    return Mat4 {
+        m: [1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
+    let zx: f32 = eye.x - target.x
+    let zy: f32 = eye.y - target.y
+    let zz: f32 = eye.z - target.z
+    let z_len: f32 = sqrt(zx*zx + zy*zy + zz*zz)
+    zx = zx / z_len
+    zy = zy / z_len
+    zz = zz / z_len
+
+    let xx: f32 = up.y * zz - up.z * zy
+    let xy: f32 = up.z * zx - up.x * zz
+    let xz: f32 = up.x * zy - up.y * zx
+    let x_len: f32 = sqrt(xx*xx + xy*xy + xz*xz)
+    xx = xx / x_len
+    xy = xy / x_len
+    xz = xz / x_len
+
+    let yx: f32 = zy * xz - zz * xy
+    let yy: f32 = zz * xx - zx * xz
+    let yz: f32 = zx * xy - zy * xx
+
+    return Mat4 {
+        m: [xx, yx, zx, 0.0,
+            xy, yy, zy, 0.0,
+            xz, yz, zz, 0.0,
+            -(xx*eye.x + xy*eye.y + xz*eye.z),
+            -(yx*eye.x + yy*eye.y + yz*eye.z),
+            -(zx*eye.x + zy*eye.y + zz*eye.z),
+            1.0]
+    }
+}
+
+fn perspective(fov_deg: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let f: f32 = 1.0 / tan(fov_deg * 0.5 * 0.0174533)
+    let nf: f32 = 1.0 / (near - far)
+
+    return Mat4 {
+        m: [f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (far + near) * nf, -1.0,
+            0.0, 0.0, 2.0 * far * near * nf, 0.0]
+    }
+}
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess: f32 = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn tan(x: f32) -> f32 {
+    return sin(x) / cos(x)
+}
+
+fn atan(x: f32) -> f32 {
+    // Approximation
+    return x - x*x*x/3.0 + x*x*x*x*x/5.0
+}
+
+fn sin(x: f32) -> f32 {
+    let mut x_norm: f32 = x
+    while x_norm > 3.14159 { x_norm = x_norm - 6.28318 }
+    while x_norm < -3.14159 { x_norm = x_norm + 6.28318 }
+    let x2: f32 = x_norm * x_norm
+    let x3: f32 = x2 * x_norm
+    let x5: f32 = x3 * x2
+    let x7: f32 = x5 * x2
+    return x_norm - x3/6.0 + x5/120.0 - x7/5040.0
+}
+
+fn cos(x: f32) -> f32 {
+    return sin(x + 1.5708)
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_rendering_system() {
+    print("Testing Rendering System...")
+
+    // Test texture manager
+    let mut tm: TextureManager = create_texture_manager(256)
+    print("Texture manager created, max cache: " + str(tm.max_cache_size / 1024 / 1024) + " MB")
+
+    // Test mipmap generation
+    let mip_count: i32 = get_mipmap_count(512, 512)
+    print("Mipmaps for 512x512: " + str(mip_count))
+
+    // Test texture atlas
+    let mut atlas: TextureAtlas = create_texture_atlas(2048, 2048)
+    let rect1: i32 = pack_into_atlas(atlas, "button1", 1, 128, 64)
+    let rect2: i32 = pack_into_atlas(atlas, "button2", 2, 128, 64)
+    let rect3: i32 = pack_into_atlas(atlas, "icon1", 3, 64, 64)
+    print("Atlas packed " + str(atlas.rect_count) + " textures")
+
+    let uv: [f32; 4] = get_atlas_uv(atlas, rect1)
+    print("UV for rect1: " + str(uv[0]) + "," + str(uv[1]) + " to " + str(uv[2]) + "," + str(uv[3]))
+
+    // Test W3D renderer
+    let mut renderer: W3DRenderer = create_w3d_renderer()
+    begin_frame(renderer)
+
+    set_camera(renderer,
+        Vec3 { x: 100.0, y: 50.0, z: 100.0 },
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+        60.0, 1.778, 0.1, 1000.0)
+
+    // Queue some meshes
+    queue_mesh(renderer, 1, 1, identity_mat4(), Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 })
+    queue_mesh(renderer, 1, 1, identity_mat4(), Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 })
+    queue_mesh(renderer, 2, 2, identity_mat4(), Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 0.5 })
+
+    print("Batches: " + str(renderer.batch_count) + ", Instances: " + str(renderer.instance_count))
+
+    end_frame(renderer)
+    print("Draw calls: " + str(renderer.draw_calls))
+
+    // Test frustum culling
+    let vp: Mat4 = identity_mat4()
+    let frustum: Frustum = extract_frustum(vp)
+
+    let sphere1: BoundingSphere = BoundingSphere { center: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, radius: 10.0 }
+    let in_frustum: bool = sphere_in_frustum(frustum, sphere1)
+    print("Sphere in frustum: " + str(in_frustum))
+
+    // Test LOD
+    let mut lod_group: LODGroup = create_lod_group()
+    add_lod_level(lod_group, 1, 100.0, 5000)
+    add_lod_level(lod_group, 2, 200.0, 1000)
+    add_lod_level(lod_group, 3, 500.0, 200)
+    print("LOD levels: " + str(lod_group.level_count))
+
+    let selected_lod: i32 = select_lod(lod_group,
+        Vec3 { x: 0.0, y: 50.0, z: 150.0 },
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 })
+    print("Selected LOD at 150m: mesh " + str(selected_lod))
+
+    // Test settings
+    let settings: GameSettings = get_default_settings()
+    print("Default resolution: " + str(settings.graphics.resolution_width) + "x" + str(settings.graphics.resolution_height))
+    print("Default master volume: " + str(settings.audio.master_volume))
+
+    // Test aspect ratios
+    let aspects: [AspectRatio; 6] = get_common_aspects()
+    print("Supported aspect ratios: 6")
+
+    let ultrawide_fov: f32 = calculate_fov_for_aspect(90.0, 1.778, 2.333)
+    print("21:9 adjusted FOV: " + str(ultrawide_fov))
+
+    let safe_area: [i32; 4] = get_ui_safe_area(3440, 1440, 2.389)
+    print("UI safe area for 3440x1440: " + str(safe_area[0]) + "," + str(safe_area[1]) + " " + str(safe_area[2]) + "x" + str(safe_area[3]))
+
+    // Test HiDPI
+    let scaled: [i32; 2] = get_scaled_resolution(1920, 1080, 2.0)
+    print("Retina resolution: " + str(scaled[0]) + "x" + str(scaled[1]))
+
+    let ui_size: i32 = scale_ui_element(32, 2.0)
+    print("Scaled UI element: " + str(ui_size) + "px")
+
+    print("Rendering System tests complete!")
+}

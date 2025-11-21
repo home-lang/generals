@@ -1,0 +1,812 @@
+// Input System - Mouse, keyboard, hotkeys, control groups
+// Implements C&C Generals Zero Hour input handling
+
+// ============================================================================
+// KEY CODES
+// ============================================================================
+
+enum KeyCode {
+    NONE = 0,
+
+    // Letters
+    A = 65, B = 66, C = 67, D = 68, E = 69, F = 70, G = 71, H = 72,
+    I = 73, J = 74, K = 75, L = 76, M = 77, N = 78, O = 79, P = 80,
+    Q = 81, R = 82, S = 83, T = 84, U = 85, V = 86, W = 87, X = 88,
+    Y = 89, Z = 90,
+
+    // Numbers
+    NUM_0 = 48, NUM_1 = 49, NUM_2 = 50, NUM_3 = 51, NUM_4 = 52,
+    NUM_5 = 53, NUM_6 = 54, NUM_7 = 55, NUM_8 = 56, NUM_9 = 57,
+
+    // Function keys
+    F1 = 112, F2 = 113, F3 = 114, F4 = 115, F5 = 116, F6 = 117,
+    F7 = 118, F8 = 119, F9 = 120, F10 = 121, F11 = 122, F12 = 123,
+
+    // Modifiers
+    SHIFT = 16, CTRL = 17, ALT = 18,
+    LEFT_SHIFT = 160, RIGHT_SHIFT = 161,
+    LEFT_CTRL = 162, RIGHT_CTRL = 163,
+    LEFT_ALT = 164, RIGHT_ALT = 165,
+
+    // Special
+    ESCAPE = 27, ENTER = 13, SPACE = 32, BACKSPACE = 8, TAB = 9,
+    DELETE = 46, INSERT = 45, HOME = 36, END = 35,
+    PAGE_UP = 33, PAGE_DOWN = 34,
+
+    // Arrows
+    LEFT = 37, UP = 38, RIGHT = 39, DOWN = 40,
+
+    // Numpad
+    NUMPAD_0 = 96, NUMPAD_1 = 97, NUMPAD_2 = 98, NUMPAD_3 = 99,
+    NUMPAD_4 = 100, NUMPAD_5 = 101, NUMPAD_6 = 102, NUMPAD_7 = 103,
+    NUMPAD_8 = 104, NUMPAD_9 = 105,
+    NUMPAD_MULTIPLY = 106, NUMPAD_ADD = 107, NUMPAD_SUBTRACT = 109,
+    NUMPAD_DECIMAL = 110, NUMPAD_DIVIDE = 111
+}
+
+enum MouseButton {
+    NONE = 0,
+    LEFT = 1,
+    RIGHT = 2,
+    MIDDLE = 3,
+    BUTTON_4 = 4,
+    BUTTON_5 = 5
+}
+
+// ============================================================================
+// INPUT STATE
+// ============================================================================
+
+struct KeyState {
+    is_down: bool,
+    was_down: bool,
+    press_time: f32,
+    release_time: f32
+}
+
+struct MouseState {
+    x: i32,
+    y: i32,
+    prev_x: i32,
+    prev_y: i32,
+    delta_x: i32,
+    delta_y: i32,
+    scroll_delta: f32,
+
+    buttons: [KeyState; 6],
+
+    // Drag state
+    is_dragging: bool,
+    drag_start_x: i32,
+    drag_start_y: i32,
+    drag_button: MouseButton
+}
+
+struct InputState {
+    keys: [KeyState; 256],
+    mouse: MouseState,
+
+    // Modifiers
+    shift_held: bool,
+    ctrl_held: bool,
+    alt_held: bool,
+
+    // Text input
+    text_input_buffer: [u8; 256],
+    text_input_length: i32,
+    text_input_active: bool,
+
+    // Time
+    current_time: f32
+}
+
+fn create_input_state() -> InputState {
+    let mut state: InputState = InputState {
+        keys: [],
+        mouse: MouseState {
+            x: 0,
+            y: 0,
+            prev_x: 0,
+            prev_y: 0,
+            delta_x: 0,
+            delta_y: 0,
+            scroll_delta: 0.0,
+            buttons: [],
+            is_dragging: false,
+            drag_start_x: 0,
+            drag_start_y: 0,
+            drag_button: MouseButton::NONE
+        },
+        shift_held: false,
+        ctrl_held: false,
+        alt_held: false,
+        text_input_buffer: [],
+        text_input_length: 0,
+        text_input_active: false,
+        current_time: 0.0
+    }
+
+    for i in 0..256 {
+        state.keys[i] = KeyState { is_down: false, was_down: false, press_time: 0.0, release_time: 0.0 }
+    }
+
+    for i in 0..6 {
+        state.mouse.buttons[i] = KeyState { is_down: false, was_down: false, press_time: 0.0, release_time: 0.0 }
+    }
+
+    return state
+}
+
+fn update_input_state(state: mut InputState, delta_time: f32) {
+    state.current_time = state.current_time + delta_time
+
+    // Update previous states
+    for i in 0..256 {
+        state.keys[i].was_down = state.keys[i].is_down
+    }
+
+    for i in 0..6 {
+        state.mouse.buttons[i].was_down = state.mouse.buttons[i].is_down
+    }
+
+    // Update mouse delta
+    state.mouse.delta_x = state.mouse.x - state.mouse.prev_x
+    state.mouse.delta_y = state.mouse.y - state.mouse.prev_y
+    state.mouse.prev_x = state.mouse.x
+    state.mouse.prev_y = state.mouse.y
+
+    // Update modifiers
+    state.shift_held = state.keys[cast(i32, KeyCode::SHIFT)].is_down or
+                       state.keys[cast(i32, KeyCode::LEFT_SHIFT)].is_down or
+                       state.keys[cast(i32, KeyCode::RIGHT_SHIFT)].is_down
+
+    state.ctrl_held = state.keys[cast(i32, KeyCode::CTRL)].is_down or
+                      state.keys[cast(i32, KeyCode::LEFT_CTRL)].is_down or
+                      state.keys[cast(i32, KeyCode::RIGHT_CTRL)].is_down
+
+    state.alt_held = state.keys[cast(i32, KeyCode::ALT)].is_down or
+                     state.keys[cast(i32, KeyCode::LEFT_ALT)].is_down or
+                     state.keys[cast(i32, KeyCode::RIGHT_ALT)].is_down
+
+    // Reset scroll
+    state.mouse.scroll_delta = 0.0
+}
+
+fn on_key_down(state: mut InputState, key: i32) {
+    if key >= 0 and key < 256 {
+        if not state.keys[key].is_down {
+            state.keys[key].press_time = state.current_time
+        }
+        state.keys[key].is_down = true
+    }
+}
+
+fn on_key_up(state: mut InputState, key: i32) {
+    if key >= 0 and key < 256 {
+        state.keys[key].is_down = false
+        state.keys[key].release_time = state.current_time
+    }
+}
+
+fn on_mouse_move(state: mut InputState, x: i32, y: i32) {
+    state.mouse.x = x
+    state.mouse.y = y
+
+    // Update drag
+    if state.mouse.is_dragging {
+        // Dragging continues
+    }
+}
+
+fn on_mouse_down(state: mut InputState, button: i32) {
+    if button >= 0 and button < 6 {
+        if not state.mouse.buttons[button].is_down {
+            state.mouse.buttons[button].press_time = state.current_time
+        }
+        state.mouse.buttons[button].is_down = true
+
+        // Start drag
+        if not state.mouse.is_dragging {
+            state.mouse.is_dragging = true
+            state.mouse.drag_start_x = state.mouse.x
+            state.mouse.drag_start_y = state.mouse.y
+            state.mouse.drag_button = cast(MouseButton, button)
+        }
+    }
+}
+
+fn on_mouse_up(state: mut InputState, button: i32) {
+    if button >= 0 and button < 6 {
+        state.mouse.buttons[button].is_down = false
+        state.mouse.buttons[button].release_time = state.current_time
+
+        // End drag
+        if state.mouse.is_dragging and cast(i32, state.mouse.drag_button) == button {
+            state.mouse.is_dragging = false
+        }
+    }
+}
+
+fn on_mouse_scroll(state: mut InputState, delta: f32) {
+    state.mouse.scroll_delta = state.mouse.scroll_delta + delta
+}
+
+fn on_text_input(state: mut InputState, char: u8) {
+    if state.text_input_active and state.text_input_length < 255 {
+        state.text_input_buffer[state.text_input_length] = char
+        state.text_input_length = state.text_input_length + 1
+    }
+}
+
+// ============================================================================
+// INPUT QUERIES
+// ============================================================================
+
+fn is_key_down(state: InputState, key: KeyCode) -> bool {
+    return state.keys[cast(i32, key)].is_down
+}
+
+fn is_key_pressed(state: InputState, key: KeyCode) -> bool {
+    let k: i32 = cast(i32, key)
+    return state.keys[k].is_down and not state.keys[k].was_down
+}
+
+fn is_key_released(state: InputState, key: KeyCode) -> bool {
+    let k: i32 = cast(i32, key)
+    return not state.keys[k].is_down and state.keys[k].was_down
+}
+
+fn is_mouse_down(state: InputState, button: MouseButton) -> bool {
+    return state.mouse.buttons[cast(i32, button)].is_down
+}
+
+fn is_mouse_pressed(state: InputState, button: MouseButton) -> bool {
+    let b: i32 = cast(i32, button)
+    return state.mouse.buttons[b].is_down and not state.mouse.buttons[b].was_down
+}
+
+fn is_mouse_released(state: InputState, button: MouseButton) -> bool {
+    let b: i32 = cast(i32, button)
+    return not state.mouse.buttons[b].is_down and state.mouse.buttons[b].was_down
+}
+
+fn is_double_click(state: InputState, button: MouseButton, threshold: f32) -> bool {
+    let b: i32 = cast(i32, button)
+    if not is_mouse_pressed(state, button) {
+        return false
+    }
+
+    let time_since_last: f32 = state.current_time - state.mouse.buttons[b].release_time
+    return time_since_last < threshold
+}
+
+fn get_mouse_position(state: InputState) -> [i32; 2] {
+    return [state.mouse.x, state.mouse.y]
+}
+
+fn get_mouse_delta(state: InputState) -> [i32; 2] {
+    return [state.mouse.delta_x, state.mouse.delta_y]
+}
+
+fn get_drag_rect(state: InputState) -> [i32; 4] {
+    if not state.mouse.is_dragging {
+        return [0, 0, 0, 0]
+    }
+
+    let x1: i32 = min_i32(state.mouse.drag_start_x, state.mouse.x)
+    let y1: i32 = min_i32(state.mouse.drag_start_y, state.mouse.y)
+    let x2: i32 = max_i32(state.mouse.drag_start_x, state.mouse.x)
+    let y2: i32 = max_i32(state.mouse.drag_start_y, state.mouse.y)
+
+    return [x1, y1, x2 - x1, y2 - y1]
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b { return a }
+    return b
+}
+
+// ============================================================================
+// HOTKEY SYSTEM
+// ============================================================================
+
+enum GameAction {
+    // Selection
+    SELECT_ALL,
+    SELECT_ALL_SCREEN,
+    DESELECT,
+
+    // Movement
+    MOVE,
+    ATTACK_MOVE,
+    FORCE_MOVE,
+    STOP,
+    GUARD,
+    SCATTER,
+    PATROL,
+
+    // Combat
+    FORCE_ATTACK,
+    DEPLOY,
+    SELL,
+    REPAIR,
+
+    // Camera
+    CAMERA_PAN_LEFT,
+    CAMERA_PAN_RIGHT,
+    CAMERA_PAN_UP,
+    CAMERA_PAN_DOWN,
+    CAMERA_ZOOM_IN,
+    CAMERA_ZOOM_OUT,
+    CAMERA_ROTATE_LEFT,
+    CAMERA_ROTATE_RIGHT,
+    CENTER_ON_SELECTION,
+    GO_TO_BASE,
+
+    // Control groups
+    GROUP_0, GROUP_1, GROUP_2, GROUP_3, GROUP_4,
+    GROUP_5, GROUP_6, GROUP_7, GROUP_8, GROUP_9,
+
+    // Misc
+    TOGGLE_MINIMAP,
+    TOGGLE_SIDEBAR,
+    PAUSE_GAME,
+    QUICK_SAVE,
+    QUICK_LOAD,
+    SCREENSHOT,
+    CHAT,
+    DIPLOMACY
+}
+
+struct Hotkey {
+    action: GameAction,
+    primary_key: KeyCode,
+    modifier: u8,           // Bitmask: 1=Shift, 2=Ctrl, 4=Alt
+    is_enabled: bool
+}
+
+struct HotkeyManager {
+    hotkeys: [Hotkey; 64],
+    hotkey_count: i32,
+    triggered_actions: [GameAction; 16],
+    triggered_count: i32
+}
+
+fn create_hotkey_manager() -> HotkeyManager {
+    let mut hm: HotkeyManager = HotkeyManager {
+        hotkeys: [],
+        hotkey_count: 0,
+        triggered_actions: [],
+        triggered_count: 0
+    }
+
+    // Register default hotkeys
+    register_hotkey(hm, GameAction::SELECT_ALL, KeyCode::A, 2)        // Ctrl+A
+    register_hotkey(hm, GameAction::ATTACK_MOVE, KeyCode::A, 0)       // A
+    register_hotkey(hm, GameAction::STOP, KeyCode::S, 0)              // S
+    register_hotkey(hm, GameAction::GUARD, KeyCode::G, 0)             // G
+    register_hotkey(hm, GameAction::SCATTER, KeyCode::X, 0)           // X
+    register_hotkey(hm, GameAction::FORCE_ATTACK, KeyCode::F, 2)      // Ctrl+F
+    register_hotkey(hm, GameAction::DEPLOY, KeyCode::D, 0)            // D
+    register_hotkey(hm, GameAction::SELL, KeyCode::Z, 0)              // Z
+    register_hotkey(hm, GameAction::REPAIR, KeyCode::R, 0)            // R
+    register_hotkey(hm, GameAction::CENTER_ON_SELECTION, KeyCode::SPACE, 0)
+    register_hotkey(hm, GameAction::GO_TO_BASE, KeyCode::H, 0)        // H
+
+    // Control groups
+    register_hotkey(hm, GameAction::GROUP_0, KeyCode::NUM_0, 0)
+    register_hotkey(hm, GameAction::GROUP_1, KeyCode::NUM_1, 0)
+    register_hotkey(hm, GameAction::GROUP_2, KeyCode::NUM_2, 0)
+    register_hotkey(hm, GameAction::GROUP_3, KeyCode::NUM_3, 0)
+    register_hotkey(hm, GameAction::GROUP_4, KeyCode::NUM_4, 0)
+    register_hotkey(hm, GameAction::GROUP_5, KeyCode::NUM_5, 0)
+    register_hotkey(hm, GameAction::GROUP_6, KeyCode::NUM_6, 0)
+    register_hotkey(hm, GameAction::GROUP_7, KeyCode::NUM_7, 0)
+    register_hotkey(hm, GameAction::GROUP_8, KeyCode::NUM_8, 0)
+    register_hotkey(hm, GameAction::GROUP_9, KeyCode::NUM_9, 0)
+
+    // Camera
+    register_hotkey(hm, GameAction::CAMERA_PAN_LEFT, KeyCode::LEFT, 0)
+    register_hotkey(hm, GameAction::CAMERA_PAN_RIGHT, KeyCode::RIGHT, 0)
+    register_hotkey(hm, GameAction::CAMERA_PAN_UP, KeyCode::UP, 0)
+    register_hotkey(hm, GameAction::CAMERA_PAN_DOWN, KeyCode::DOWN, 0)
+
+    // Misc
+    register_hotkey(hm, GameAction::PAUSE_GAME, KeyCode::ESCAPE, 0)
+    register_hotkey(hm, GameAction::QUICK_SAVE, KeyCode::F5, 0)
+    register_hotkey(hm, GameAction::QUICK_LOAD, KeyCode::F9, 0)
+    register_hotkey(hm, GameAction::SCREENSHOT, KeyCode::F12, 0)
+    register_hotkey(hm, GameAction::CHAT, KeyCode::ENTER, 0)
+
+    return hm
+}
+
+fn register_hotkey(hm: mut HotkeyManager, action: GameAction, key: KeyCode, modifier: u8) {
+    if hm.hotkey_count < 64 {
+        hm.hotkeys[hm.hotkey_count] = Hotkey {
+            action: action,
+            primary_key: key,
+            modifier: modifier,
+            is_enabled: true
+        }
+        hm.hotkey_count = hm.hotkey_count + 1
+    }
+}
+
+fn rebind_hotkey(hm: mut HotkeyManager, action: GameAction, new_key: KeyCode, new_modifier: u8) {
+    for i in 0..hm.hotkey_count {
+        if hm.hotkeys[i].action == action {
+            hm.hotkeys[i].primary_key = new_key
+            hm.hotkeys[i].modifier = new_modifier
+            break
+        }
+    }
+}
+
+fn update_hotkeys(hm: mut HotkeyManager, input: InputState) {
+    hm.triggered_count = 0
+
+    for i in 0..hm.hotkey_count {
+        let hotkey: Hotkey = hm.hotkeys[i]
+
+        if not hotkey.is_enabled {
+            continue
+        }
+
+        // Check key pressed
+        if not is_key_pressed(input, hotkey.primary_key) {
+            continue
+        }
+
+        // Check modifiers
+        let need_shift: bool = (hotkey.modifier & 1) != 0
+        let need_ctrl: bool = (hotkey.modifier & 2) != 0
+        let need_alt: bool = (hotkey.modifier & 4) != 0
+
+        if need_shift != input.shift_held { continue }
+        if need_ctrl != input.ctrl_held { continue }
+        if need_alt != input.alt_held { continue }
+
+        // Trigger action
+        if hm.triggered_count < 16 {
+            hm.triggered_actions[hm.triggered_count] = hotkey.action
+            hm.triggered_count = hm.triggered_count + 1
+        }
+    }
+}
+
+fn was_action_triggered(hm: HotkeyManager, action: GameAction) -> bool {
+    for i in 0..hm.triggered_count {
+        if hm.triggered_actions[i] == action {
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================================
+// CONTROL GROUPS
+// ============================================================================
+
+struct ControlGroup {
+    unit_ids: [i32; 64],
+    unit_count: i32,
+    center_x: f32,
+    center_y: f32
+}
+
+struct ControlGroupManager {
+    groups: [ControlGroup; 10],    // Groups 0-9
+    last_selected_group: i32
+}
+
+fn create_control_group_manager() -> ControlGroupManager {
+    let mut cgm: ControlGroupManager = ControlGroupManager {
+        groups: [],
+        last_selected_group: -1
+    }
+
+    for i in 0..10 {
+        cgm.groups[i] = ControlGroup {
+            unit_ids: [-1; 64],
+            unit_count: 0,
+            center_x: 0.0,
+            center_y: 0.0
+        }
+    }
+
+    return cgm
+}
+
+fn assign_group(cgm: mut ControlGroupManager, group_num: i32, unit_ids: [i32; 64], count: i32) {
+    if group_num < 0 or group_num >= 10 {
+        return
+    }
+
+    cgm.groups[group_num].unit_count = count
+    for i in 0..count {
+        cgm.groups[group_num].unit_ids[i] = unit_ids[i]
+    }
+}
+
+fn add_to_group(cgm: mut ControlGroupManager, group_num: i32, unit_ids: [i32; 64], count: i32) {
+    if group_num < 0 or group_num >= 10 {
+        return
+    }
+
+    for i in 0..count {
+        // Check if already in group
+        let mut found: bool = false
+        for j in 0..cgm.groups[group_num].unit_count {
+            if cgm.groups[group_num].unit_ids[j] == unit_ids[i] {
+                found = true
+                break
+            }
+        }
+
+        // Add if not found and space available
+        if not found and cgm.groups[group_num].unit_count < 64 {
+            cgm.groups[group_num].unit_ids[cgm.groups[group_num].unit_count] = unit_ids[i]
+            cgm.groups[group_num].unit_count = cgm.groups[group_num].unit_count + 1
+        }
+    }
+}
+
+fn get_group_units(cgm: ControlGroupManager, group_num: i32) -> [i32; 64] {
+    if group_num < 0 or group_num >= 10 {
+        return [-1; 64]
+    }
+    return cgm.groups[group_num].unit_ids
+}
+
+fn get_group_count(cgm: ControlGroupManager, group_num: i32) -> i32 {
+    if group_num < 0 or group_num >= 10 {
+        return 0
+    }
+    return cgm.groups[group_num].unit_count
+}
+
+fn select_group(cgm: mut ControlGroupManager, group_num: i32, double_tap: bool) -> [i32; 64] {
+    if group_num < 0 or group_num >= 10 {
+        return [-1; 64]
+    }
+
+    // Double tap same group = center camera on group
+    if double_tap and cgm.last_selected_group == group_num {
+        // Would signal camera to center
+    }
+
+    cgm.last_selected_group = group_num
+    return cgm.groups[group_num].unit_ids
+}
+
+fn remove_from_all_groups(cgm: mut ControlGroupManager, unit_id: i32) {
+    for g in 0..10 {
+        let mut i: i32 = 0
+        while i < cgm.groups[g].unit_count {
+            if cgm.groups[g].unit_ids[i] == unit_id {
+                // Remove by shifting
+                for j in i..(cgm.groups[g].unit_count - 1) {
+                    cgm.groups[g].unit_ids[j] = cgm.groups[g].unit_ids[j + 1]
+                }
+                cgm.groups[g].unit_count = cgm.groups[g].unit_count - 1
+            } else {
+                i = i + 1
+            }
+        }
+    }
+}
+
+// ============================================================================
+// EDGE SCROLL
+// ============================================================================
+
+struct EdgeScrollConfig {
+    enabled: bool,
+    margin: i32,           // Pixels from edge
+    speed: f32,            // Scroll speed
+    acceleration: f32,
+    current_speed_x: f32,
+    current_speed_y: f32
+}
+
+fn create_edge_scroll_config() -> EdgeScrollConfig {
+    return EdgeScrollConfig {
+        enabled: true,
+        margin: 10,
+        speed: 500.0,
+        acceleration: 2.0,
+        current_speed_x: 0.0,
+        current_speed_y: 0.0
+    }
+}
+
+fn update_edge_scroll(config: mut EdgeScrollConfig, mouse_x: i32, mouse_y: i32,
+                      screen_w: i32, screen_h: i32, delta_time: f32) -> [f32; 2] {
+    if not config.enabled {
+        return [0.0, 0.0]
+    }
+
+    let mut target_x: f32 = 0.0
+    let mut target_y: f32 = 0.0
+
+    // Left edge
+    if mouse_x < config.margin {
+        target_x = -config.speed
+    }
+    // Right edge
+    else if mouse_x > screen_w - config.margin {
+        target_x = config.speed
+    }
+
+    // Top edge
+    if mouse_y < config.margin {
+        target_y = -config.speed
+    }
+    // Bottom edge
+    else if mouse_y > screen_h - config.margin {
+        target_y = config.speed
+    }
+
+    // Smooth acceleration
+    config.current_speed_x = config.current_speed_x + (target_x - config.current_speed_x) * config.acceleration * delta_time
+    config.current_speed_y = config.current_speed_y + (target_y - config.current_speed_y) * config.acceleration * delta_time
+
+    return [config.current_speed_x * delta_time, config.current_speed_y * delta_time]
+}
+
+// ============================================================================
+// CURSOR SYSTEM
+// ============================================================================
+
+enum CursorType {
+    NORMAL,
+    SELECT,
+    MOVE,
+    ATTACK,
+    ATTACK_MOVE,
+    GUARD,
+    REPAIR,
+    SELL,
+    BUILD_OK,
+    BUILD_BLOCKED,
+    GARRISON,
+    CAPTURE,
+    SCROLL_N, SCROLL_NE, SCROLL_E, SCROLL_SE,
+    SCROLL_S, SCROLL_SW, SCROLL_W, SCROLL_NW,
+    BUSY,
+    INVALID
+}
+
+struct CursorManager {
+    current_cursor: CursorType,
+    cursor_textures: [i32; 32],
+    hotspot_x: [i32; 32],
+    hotspot_y: [i32; 32],
+    is_animated: [bool; 32],
+    animation_frame: i32,
+    animation_timer: f32
+}
+
+fn create_cursor_manager() -> CursorManager {
+    return CursorManager {
+        current_cursor: CursorType::NORMAL,
+        cursor_textures: [-1; 32],
+        hotspot_x: [0; 32],
+        hotspot_y: [0; 32],
+        is_animated: [false; 32],
+        animation_frame: 0,
+        animation_timer: 0.0
+    }
+}
+
+fn set_cursor(cm: mut CursorManager, cursor: CursorType) {
+    cm.current_cursor = cursor
+    cm.animation_frame = 0
+    cm.animation_timer = 0.0
+}
+
+fn update_cursor(cm: mut CursorManager, delta_time: f32) {
+    let cursor_idx: i32 = cast(i32, cm.current_cursor)
+    if cm.is_animated[cursor_idx] {
+        cm.animation_timer = cm.animation_timer + delta_time
+        if cm.animation_timer >= 0.1 {
+            cm.animation_timer = 0.0
+            cm.animation_frame = cm.animation_frame + 1
+        }
+    }
+}
+
+fn get_cursor_for_target(target_type: i32, is_enemy: bool, is_friendly: bool, can_attack: bool) -> CursorType {
+    if target_type == 0 {
+        // Ground
+        return CursorType::MOVE
+    } else if target_type == 1 {
+        // Unit
+        if is_enemy and can_attack {
+            return CursorType::ATTACK
+        } else if is_friendly {
+            return CursorType::SELECT
+        }
+    } else if target_type == 2 {
+        // Building
+        if is_enemy and can_attack {
+            return CursorType::ATTACK
+        } else if is_friendly {
+            return CursorType::SELECT
+        }
+    }
+
+    return CursorType::NORMAL
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_input_system() {
+    print("Testing Input System...")
+
+    // Create input state
+    let mut input: InputState = create_input_state()
+    print("Input state created")
+
+    // Simulate key press
+    on_key_down(input, cast(i32, KeyCode::A))
+    update_input_state(input, 0.016)
+    print("Key A down: " + str(is_key_down(input, KeyCode::A)))
+    print("Key A pressed: " + str(is_key_pressed(input, KeyCode::A)))
+
+    // Second frame
+    update_input_state(input, 0.016)
+    print("Key A pressed (2nd frame): " + str(is_key_pressed(input, KeyCode::A)))
+
+    // Release
+    on_key_up(input, cast(i32, KeyCode::A))
+    update_input_state(input, 0.016)
+    print("Key A released: " + str(is_key_released(input, KeyCode::A)))
+
+    // Mouse test
+    on_mouse_move(input, 400, 300)
+    on_mouse_down(input, cast(i32, MouseButton::LEFT))
+    update_input_state(input, 0.016)
+    print("Mouse position: " + str(input.mouse.x) + "," + str(input.mouse.y))
+    print("Left button down: " + str(is_mouse_down(input, MouseButton::LEFT)))
+    print("Dragging: " + str(input.mouse.is_dragging))
+
+    // Drag
+    on_mouse_move(input, 500, 400)
+    update_input_state(input, 0.016)
+    let drag_rect: [i32; 4] = get_drag_rect(input)
+    print("Drag rect: " + str(drag_rect[0]) + "," + str(drag_rect[1]) + " " + str(drag_rect[2]) + "x" + str(drag_rect[3]))
+
+    // Hotkey manager
+    let mut hm: HotkeyManager = create_hotkey_manager()
+    print("Hotkeys registered: " + str(hm.hotkey_count))
+
+    // Control groups
+    let mut cgm: ControlGroupManager = create_control_group_manager()
+    let mut units: [i32; 64] = [1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+    assign_group(cgm, 1, units, 3)
+    print("Group 1 count: " + str(get_group_count(cgm, 1)))
+
+    // Edge scroll
+    let mut edge_scroll: EdgeScrollConfig = create_edge_scroll_config()
+    let scroll: [f32; 2] = update_edge_scroll(edge_scroll, 5, 300, 800, 600, 0.016)
+    print("Edge scroll delta: " + str(scroll[0]) + "," + str(scroll[1]))
+
+    // Cursor
+    let mut cursor_mgr: CursorManager = create_cursor_manager()
+    set_cursor(cursor_mgr, CursorType::ATTACK)
+    print("Current cursor: ATTACK")
+
+    let target_cursor: CursorType = get_cursor_for_target(1, true, false, true)
+    print("Cursor for enemy unit: ATTACK")
+
+    print("Input System tests complete!")
+}

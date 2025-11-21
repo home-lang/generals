@@ -1,0 +1,1227 @@
+// Multiplayer Networking System - Complete lobby, matchmaking, synchronization
+// Implements C&C Generals Zero Hour multiplayer mechanics
+
+// ============================================================================
+// NETWORK CONSTANTS
+// ============================================================================
+
+const DEFAULT_PORT: u16 = 8086
+const MAX_PLAYERS: i32 = 8
+const MAX_PACKET_SIZE: i32 = 1400
+const TICK_RATE: i32 = 15          // Game ticks per second
+const COMMAND_DELAY: i32 = 2       // Ticks of command delay for lockstep
+
+// Protocol version for compatibility
+const PROTOCOL_VERSION: u32 = 100
+
+// ============================================================================
+// NETWORK TYPES
+// ============================================================================
+
+enum NetworkMode {
+    OFFLINE,
+    LAN_HOST,
+    LAN_CLIENT,
+    ONLINE_HOST,
+    ONLINE_CLIENT
+}
+
+enum ConnectionState {
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    IN_LOBBY,
+    IN_GAME,
+    LOADING,
+    SYNCING,
+    ERROR
+}
+
+enum PacketType {
+    // Connection
+    PING,
+    PONG,
+    CONNECT_REQUEST,
+    CONNECT_ACCEPT,
+    CONNECT_REJECT,
+    DISCONNECT,
+    HEARTBEAT,
+
+    // Lobby
+    LOBBY_INFO,
+    PLAYER_JOIN,
+    PLAYER_LEAVE,
+    PLAYER_UPDATE,
+    CHAT_MESSAGE,
+    GAME_SETTINGS,
+    READY_STATE,
+    START_GAME,
+
+    // Game sync
+    GAME_COMMAND,
+    SYNC_CHECK,
+    SYNC_ERROR,
+    TICK_ACK,
+    GAME_STATE,
+
+    // Misc
+    FILE_TRANSFER,
+    MAP_REQUEST,
+    MAP_DATA
+}
+
+// ============================================================================
+// PACKET STRUCTURES
+// ============================================================================
+
+struct PacketHeader {
+    magic: u32,              // "GNRL"
+    version: u32,
+    packet_type: u8,
+    sequence: u16,
+    timestamp: u32,
+    payload_size: u16
+}
+
+const PACKET_MAGIC: u32 = 0x4C524E47   // "GNRL"
+
+struct Packet {
+    header: PacketHeader,
+    data: [u8; 1400],
+    data_size: i32
+}
+
+fn create_packet(packet_type: PacketType, sequence: u16) -> Packet {
+    return Packet {
+        header: PacketHeader {
+            magic: PACKET_MAGIC,
+            version: PROTOCOL_VERSION,
+            packet_type: cast(u8, packet_type),
+            sequence: sequence,
+            timestamp: get_timestamp(),
+            payload_size: 0
+        },
+        data: [0; 1400],
+        data_size: 0
+    }
+}
+
+fn write_u8(packet: mut Packet, value: u8) {
+    if packet.data_size < MAX_PACKET_SIZE - 1 {
+        packet.data[packet.data_size] = value
+        packet.data_size = packet.data_size + 1
+        packet.header.payload_size = cast(u16, packet.data_size)
+    }
+}
+
+fn write_u16(packet: mut Packet, value: u16) {
+    write_u8(packet, cast(u8, value & 0xFF))
+    write_u8(packet, cast(u8, (value >> 8) & 0xFF))
+}
+
+fn write_u32(packet: mut Packet, value: u32) {
+    write_u8(packet, cast(u8, value & 0xFF))
+    write_u8(packet, cast(u8, (value >> 8) & 0xFF))
+    write_u8(packet, cast(u8, (value >> 16) & 0xFF))
+    write_u8(packet, cast(u8, (value >> 24) & 0xFF))
+}
+
+fn write_i32(packet: mut Packet, value: i32) {
+    write_u32(packet, cast(u32, value))
+}
+
+fn write_f32(packet: mut Packet, value: f32) {
+    // Simplified - would use proper float bits
+    write_i32(packet, cast(i32, value * 1000.0))
+}
+
+fn write_string(packet: mut Packet, str: [u8; 64], len: i32) {
+    write_u8(packet, cast(u8, len))
+    for i in 0..len {
+        write_u8(packet, str[i])
+    }
+}
+
+fn read_u8(data: [u8; 1400], offset: mut i32) -> u8 {
+    let val: u8 = data[offset]
+    offset = offset + 1
+    return val
+}
+
+fn read_u16(data: [u8; 1400], offset: mut i32) -> u16 {
+    let lo: u16 = cast(u16, read_u8(data, offset))
+    let hi: u16 = cast(u16, read_u8(data, offset))
+    return lo | (hi << 8)
+}
+
+fn read_u32(data: [u8; 1400], offset: mut i32) -> u32 {
+    let b0: u32 = cast(u32, read_u8(data, offset))
+    let b1: u32 = cast(u32, read_u8(data, offset))
+    let b2: u32 = cast(u32, read_u8(data, offset))
+    let b3: u32 = cast(u32, read_u8(data, offset))
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn read_i32(data: [u8; 1400], offset: mut i32) -> i32 {
+    return cast(i32, read_u32(data, offset))
+}
+
+fn read_f32(data: [u8; 1400], offset: mut i32) -> f32 {
+    return cast(f32, read_i32(data, offset)) / 1000.0
+}
+
+// ============================================================================
+// PLAYER INFO
+// ============================================================================
+
+struct NetworkPlayer {
+    id: i32,
+    name: [u8; 32],
+    ip_address: [u8; 16],
+    port: u16,
+    ping: i32,
+
+    // Game settings
+    faction: i32,            // -1 for random
+    color: i32,
+    team: i32,
+    handicap: i32,           // 0-100
+    general_type: i32,       // For Generals Challenge
+
+    // State
+    connection_state: ConnectionState,
+    is_ready: bool,
+    is_host: bool,
+    is_ai: bool,
+    ai_difficulty: i32,
+
+    // Sync
+    last_ack_tick: u32,
+    commands_pending: i32
+}
+
+fn create_local_player(name: [u8; 32]) -> NetworkPlayer {
+    return NetworkPlayer {
+        id: 0,
+        name: name,
+        ip_address: "127.0.0.1",
+        port: DEFAULT_PORT,
+        ping: 0,
+        faction: -1,
+        color: 0,
+        team: 0,
+        handicap: 100,
+        general_type: -1,
+        connection_state: ConnectionState::DISCONNECTED,
+        is_ready: false,
+        is_host: false,
+        is_ai: false,
+        ai_difficulty: 1
+    }
+}
+
+fn create_ai_player(id: i32, difficulty: i32) -> NetworkPlayer {
+    return NetworkPlayer {
+        id: id,
+        name: "Computer",
+        ip_address: "",
+        port: 0,
+        ping: 0,
+        faction: -1,
+        color: id,
+        team: id,
+        handicap: 100,
+        general_type: -1,
+        connection_state: ConnectionState::CONNECTED,
+        is_ready: true,
+        is_host: false,
+        is_ai: true,
+        ai_difficulty: difficulty
+    }
+}
+
+// ============================================================================
+// GAME COMMANDS
+// ============================================================================
+
+enum CommandType {
+    // Unit commands
+    MOVE,
+    ATTACK,
+    ATTACK_MOVE,
+    STOP,
+    GUARD,
+    PATROL,
+    FORCE_ATTACK,
+    SCATTER,
+
+    // Building commands
+    BUILD_STRUCTURE,
+    SELL_STRUCTURE,
+    SET_RALLY_POINT,
+    REPAIR,
+
+    // Production commands
+    PRODUCE_UNIT,
+    CANCEL_PRODUCTION,
+    RESEARCH_UPGRADE,
+
+    // Special commands
+    USE_ABILITY,
+    USE_GENERAL_POWER,
+    DEPLOY,
+    UNLOAD,
+    GARRISON,
+    EVACUATE,
+
+    // Control
+    SET_STANCE,
+    SET_FORMATION,
+    CREATE_GROUP,
+    SELECT_GROUP
+}
+
+struct GameCommand {
+    command_type: CommandType,
+    player_id: i32,
+    tick: u32,
+    sequence: u32,
+
+    // Target data
+    unit_ids: [i32; 32],
+    unit_count: i32,
+    target_id: i32,
+    target_position: Vec3,
+
+    // Parameters
+    int_param: i32,
+    float_param: f32,
+    string_param: [u8; 32]
+}
+
+fn create_move_command(player: i32, tick: u32, units: [i32; 32], count: i32, target: Vec3) -> GameCommand {
+    return GameCommand {
+        command_type: CommandType::MOVE,
+        player_id: player,
+        tick: tick,
+        sequence: 0,
+        unit_ids: units,
+        unit_count: count,
+        target_id: -1,
+        target_position: target,
+        int_param: 0,
+        float_param: 0.0,
+        string_param: ""
+    }
+}
+
+fn create_attack_command(player: i32, tick: u32, units: [i32; 32], count: i32, target_unit: i32) -> GameCommand {
+    return GameCommand {
+        command_type: CommandType::ATTACK,
+        player_id: player,
+        tick: tick,
+        sequence: 0,
+        unit_ids: units,
+        unit_count: count,
+        target_id: target_unit,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        int_param: 0,
+        float_param: 0.0,
+        string_param: ""
+    }
+}
+
+fn create_build_command(player: i32, tick: u32, building_type: [u8; 32], position: Vec3) -> GameCommand {
+    return GameCommand {
+        command_type: CommandType::BUILD_STRUCTURE,
+        player_id: player,
+        tick: tick,
+        sequence: 0,
+        unit_ids: [-1; 32],
+        unit_count: 0,
+        target_id: -1,
+        target_position: position,
+        int_param: 0,
+        float_param: 0.0,
+        string_param: building_type
+    }
+}
+
+fn create_produce_command(player: i32, tick: u32, building_id: i32, unit_type: [u8; 32]) -> GameCommand {
+    return GameCommand {
+        command_type: CommandType::PRODUCE_UNIT,
+        player_id: player,
+        tick: tick,
+        sequence: 0,
+        unit_ids: [building_id, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+        unit_count: 1,
+        target_id: -1,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        int_param: 0,
+        float_param: 0.0,
+        string_param: unit_type
+    }
+}
+
+fn serialize_command(cmd: GameCommand, packet: mut Packet) {
+    write_u8(packet, cast(u8, cmd.command_type))
+    write_u8(packet, cast(u8, cmd.player_id))
+    write_u32(packet, cmd.tick)
+    write_u32(packet, cmd.sequence)
+
+    write_u8(packet, cast(u8, cmd.unit_count))
+    for i in 0..cmd.unit_count {
+        write_i32(packet, cmd.unit_ids[i])
+    }
+
+    write_i32(packet, cmd.target_id)
+    write_f32(packet, cmd.target_position.x)
+    write_f32(packet, cmd.target_position.y)
+    write_f32(packet, cmd.target_position.z)
+
+    write_i32(packet, cmd.int_param)
+    write_f32(packet, cmd.float_param)
+    write_string(packet, cmd.string_param, 32)
+}
+
+// ============================================================================
+// GAME LOBBY
+// ============================================================================
+
+enum GameType {
+    SKIRMISH,
+    RANKED,
+    CUSTOM,
+    GENERALS_CHALLENGE
+}
+
+struct LobbySettings {
+    game_name: [u8; 64],
+    map_name: [u8; 64],
+    game_type: GameType,
+    max_players: i32,
+    starting_supplies: i32,
+    superweapons: bool,
+    tech_level: i32,
+    game_speed: i32,         // 0-5
+    is_private: bool,
+    password: [u8; 32]
+}
+
+struct GameLobby {
+    settings: LobbySettings,
+    players: [NetworkPlayer; 8],
+    player_count: i32,
+    host_id: i32,
+
+    // Chat
+    chat_messages: [ChatMessage; 64],
+    chat_count: i32,
+
+    // State
+    is_open: bool,
+    all_ready: bool,
+    countdown_timer: f32,
+    is_starting: bool
+}
+
+struct ChatMessage {
+    player_id: i32,
+    player_name: [u8; 32],
+    message: [u8; 128],
+    timestamp: u32,
+    is_system: bool
+}
+
+fn create_lobby(host: NetworkPlayer, settings: LobbySettings) -> GameLobby {
+    let mut lobby: GameLobby = GameLobby {
+        settings: settings,
+        players: [],
+        player_count: 0,
+        host_id: host.id,
+        chat_messages: [],
+        chat_count: 0,
+        is_open: true,
+        all_ready: false,
+        countdown_timer: 0.0,
+        is_starting: false
+    }
+
+    // Add host
+    let mut host_player: NetworkPlayer = host
+    host_player.is_host = true
+    host_player.connection_state = ConnectionState::IN_LOBBY
+    lobby.players[0] = host_player
+    lobby.player_count = 1
+
+    return lobby
+}
+
+fn join_lobby(lobby: mut GameLobby, player: NetworkPlayer) -> bool {
+    if not lobby.is_open {
+        return false
+    }
+
+    if lobby.player_count >= lobby.settings.max_players {
+        return false
+    }
+
+    // Assign unique color
+    let mut new_player: NetworkPlayer = player
+    new_player.color = lobby.player_count
+    new_player.connection_state = ConnectionState::IN_LOBBY
+
+    lobby.players[lobby.player_count] = new_player
+    lobby.player_count = lobby.player_count + 1
+
+    // Add system message
+    add_system_message(lobby, "Player joined")
+
+    return true
+}
+
+fn leave_lobby(lobby: mut GameLobby, player_id: i32) {
+    let mut found: i32 = -1
+    for i in 0..lobby.player_count {
+        if lobby.players[i].id == player_id {
+            found = i
+            break
+        }
+    }
+
+    if found >= 0 {
+        // Remove player
+        for i in found..(lobby.player_count - 1) {
+            lobby.players[i] = lobby.players[i + 1]
+        }
+        lobby.player_count = lobby.player_count - 1
+
+        add_system_message(lobby, "Player left")
+
+        // If host left, assign new host
+        if player_id == lobby.host_id and lobby.player_count > 0 {
+            lobby.host_id = lobby.players[0].id
+            lobby.players[0].is_host = true
+        }
+    }
+}
+
+fn add_chat_message(lobby: mut GameLobby, player_id: i32, message: [u8; 128]) {
+    if lobby.chat_count < 64 {
+        let mut player_name: [u8; 32] = "Unknown"
+        for i in 0..lobby.player_count {
+            if lobby.players[i].id == player_id {
+                player_name = lobby.players[i].name
+                break
+            }
+        }
+
+        lobby.chat_messages[lobby.chat_count] = ChatMessage {
+            player_id: player_id,
+            player_name: player_name,
+            message: message,
+            timestamp: get_timestamp(),
+            is_system: false
+        }
+        lobby.chat_count = lobby.chat_count + 1
+    }
+}
+
+fn add_system_message(lobby: mut GameLobby, message: [u8; 128]) {
+    if lobby.chat_count < 64 {
+        lobby.chat_messages[lobby.chat_count] = ChatMessage {
+            player_id: -1,
+            player_name: "System",
+            message: message,
+            timestamp: get_timestamp(),
+            is_system: true
+        }
+        lobby.chat_count = lobby.chat_count + 1
+    }
+}
+
+fn set_player_ready(lobby: mut GameLobby, player_id: i32, ready: bool) {
+    for i in 0..lobby.player_count {
+        if lobby.players[i].id == player_id {
+            lobby.players[i].is_ready = ready
+            break
+        }
+    }
+
+    // Check if all ready
+    lobby.all_ready = true
+    for i in 0..lobby.player_count {
+        if not lobby.players[i].is_ready and not lobby.players[i].is_ai {
+            lobby.all_ready = false
+            break
+        }
+    }
+}
+
+fn start_countdown(lobby: mut GameLobby) -> bool {
+    if not lobby.all_ready {
+        return false
+    }
+
+    if lobby.player_count < 2 {
+        return false
+    }
+
+    lobby.is_starting = true
+    lobby.countdown_timer = 5.0    // 5 second countdown
+    add_system_message(lobby, "Game starting in 5 seconds...")
+
+    return true
+}
+
+fn update_lobby(lobby: mut GameLobby, delta_time: f32) -> bool {
+    // Returns true when game should start
+    if lobby.is_starting {
+        lobby.countdown_timer = lobby.countdown_timer - delta_time
+        if lobby.countdown_timer <= 0.0 {
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================================
+// LOCKSTEP SYNCHRONIZATION
+// ============================================================================
+
+struct SyncState {
+    current_tick: u32,
+    commands_by_tick: [[GameCommand; 64]; 32],    // Commands per tick (ring buffer)
+    command_counts: [i32; 32],
+    tick_confirmed: [bool; 32],
+
+    // Checksums for sync validation
+    checksums: [u32; 32],
+
+    // Timing
+    tick_accumulator: f32,
+    tick_interval: f32,
+
+    // Network stats
+    local_player_id: i32,
+    round_trip_times: [i32; 8],
+    sync_errors: i32
+}
+
+fn create_sync_state(local_player: i32) -> SyncState {
+    return SyncState {
+        current_tick: 0,
+        commands_by_tick: [],
+        command_counts: [0; 32],
+        tick_confirmed: [false; 32],
+        checksums: [0; 32],
+        tick_accumulator: 0.0,
+        tick_interval: 1.0 / cast(f32, TICK_RATE),
+        local_player_id: local_player,
+        round_trip_times: [0; 8],
+        sync_errors: 0
+    }
+}
+
+fn queue_command(sync: mut SyncState, cmd: GameCommand) {
+    // Commands are queued for future ticks (command delay)
+    let target_tick: u32 = sync.current_tick + cast(u32, COMMAND_DELAY)
+    let ring_idx: i32 = cast(i32, target_tick % 32)
+
+    if sync.command_counts[ring_idx] < 64 {
+        sync.commands_by_tick[ring_idx][sync.command_counts[ring_idx]] = cmd
+        sync.command_counts[ring_idx] = sync.command_counts[ring_idx] + 1
+    }
+}
+
+fn receive_command(sync: mut SyncState, cmd: GameCommand) {
+    let ring_idx: i32 = cast(i32, cmd.tick % 32)
+
+    if sync.command_counts[ring_idx] < 64 {
+        sync.commands_by_tick[ring_idx][sync.command_counts[ring_idx]] = cmd
+        sync.command_counts[ring_idx] = sync.command_counts[ring_idx] + 1
+    }
+}
+
+fn get_commands_for_tick(sync: SyncState, tick: u32) -> [GameCommand; 64] {
+    let ring_idx: i32 = cast(i32, tick % 32)
+    return sync.commands_by_tick[ring_idx]
+}
+
+fn get_command_count_for_tick(sync: SyncState, tick: u32) -> i32 {
+    let ring_idx: i32 = cast(i32, tick % 32)
+    return sync.command_counts[ring_idx]
+}
+
+fn confirm_tick(sync: mut SyncState, tick: u32, checksum: u32) {
+    let ring_idx: i32 = cast(i32, tick % 32)
+    sync.tick_confirmed[ring_idx] = true
+    sync.checksums[ring_idx] = checksum
+}
+
+fn can_advance_tick(sync: SyncState) -> bool {
+    // Check if we have all commands for current tick from all players
+    let ring_idx: i32 = cast(i32, sync.current_tick % 32)
+    return sync.tick_confirmed[ring_idx]
+}
+
+fn advance_tick(sync: mut SyncState) {
+    let ring_idx: i32 = cast(i32, sync.current_tick % 32)
+
+    // Clear old tick data
+    sync.command_counts[ring_idx] = 0
+    sync.tick_confirmed[ring_idx] = false
+
+    sync.current_tick = sync.current_tick + 1
+}
+
+fn calculate_game_checksum(units_hash: u32, buildings_hash: u32, resources_hash: u32) -> u32 {
+    // Simple checksum combining game state hashes
+    return units_hash ^ (buildings_hash << 8) ^ (resources_hash << 16)
+}
+
+fn verify_sync(sync: mut SyncState, tick: u32, remote_checksum: u32) -> bool {
+    let ring_idx: i32 = cast(i32, tick % 32)
+
+    if sync.checksums[ring_idx] != remote_checksum {
+        sync.sync_errors = sync.sync_errors + 1
+        return false
+    }
+    return true
+}
+
+// ============================================================================
+// NETWORK MANAGER
+// ============================================================================
+
+struct NetworkManager {
+    mode: NetworkMode,
+    state: ConnectionState,
+
+    // Local info
+    local_player: NetworkPlayer,
+    local_ip: [u8; 16],
+    local_port: u16,
+
+    // Remote connections
+    connections: [NetworkConnection; 8],
+    connection_count: i32,
+
+    // Game state
+    lobby: GameLobby,
+    sync: SyncState,
+
+    // Packet handling
+    send_sequence: u16,
+    recv_sequence: u16,
+    pending_packets: [Packet; 64],
+    pending_count: i32,
+
+    // Stats
+    bytes_sent: u64,
+    bytes_received: u64,
+    packets_sent: u32,
+    packets_received: u32,
+    packets_lost: u32
+}
+
+struct NetworkConnection {
+    player_id: i32,
+    address: [u8; 16],
+    port: u16,
+    state: ConnectionState,
+    last_recv_time: u32,
+    last_send_time: u32,
+    ping: i32,
+
+    // Reliability
+    send_sequence: u16,
+    recv_sequence: u16,
+    ack_bitfield: u32
+}
+
+fn create_network_manager() -> NetworkManager {
+    return NetworkManager {
+        mode: NetworkMode::OFFLINE,
+        state: ConnectionState::DISCONNECTED,
+        local_player: create_local_player("Player"),
+        local_ip: "0.0.0.0",
+        local_port: DEFAULT_PORT,
+        connections: [],
+        connection_count: 0,
+        lobby: GameLobby {
+            settings: LobbySettings {
+                game_name: "New Game",
+                map_name: "TestMap",
+                game_type: GameType::SKIRMISH,
+                max_players: 4,
+                starting_supplies: 10000,
+                superweapons: true,
+                tech_level: 1,
+                game_speed: 3,
+                is_private: false,
+                password: ""
+            },
+            players: [],
+            player_count: 0,
+            host_id: 0,
+            chat_messages: [],
+            chat_count: 0,
+            is_open: false,
+            all_ready: false,
+            countdown_timer: 0.0,
+            is_starting: false
+        },
+        sync: create_sync_state(0),
+        send_sequence: 0,
+        recv_sequence: 0,
+        pending_packets: [],
+        pending_count: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        packets_sent: 0,
+        packets_received: 0,
+        packets_lost: 0
+    }
+}
+
+fn host_game(nm: mut NetworkManager, settings: LobbySettings) -> bool {
+    nm.mode = NetworkMode::LAN_HOST
+    nm.state = ConnectionState::IN_LOBBY
+    nm.local_player.is_host = true
+    nm.local_player.id = 0
+
+    nm.lobby = create_lobby(nm.local_player, settings)
+
+    // Would bind to socket here
+    return true
+}
+
+fn join_game(nm: mut NetworkManager, host_ip: [u8; 16], port: u16) -> bool {
+    nm.mode = NetworkMode::LAN_CLIENT
+    nm.state = ConnectionState::CONNECTING
+
+    // Send connect request
+    let mut packet: Packet = create_packet(PacketType::CONNECT_REQUEST, nm.send_sequence)
+    write_string(packet, nm.local_player.name, 32)
+    write_u32(packet, PROTOCOL_VERSION)
+
+    queue_send(nm, packet, host_ip, port)
+
+    return true
+}
+
+fn disconnect(nm: mut NetworkManager) {
+    // Send disconnect to all connections
+    for i in 0..nm.connection_count {
+        let mut packet: Packet = create_packet(PacketType::DISCONNECT, nm.send_sequence)
+        write_i32(packet, nm.local_player.id)
+        // Would send packet
+    }
+
+    nm.mode = NetworkMode::OFFLINE
+    nm.state = ConnectionState::DISCONNECTED
+    nm.connection_count = 0
+}
+
+fn queue_send(nm: mut NetworkManager, packet: Packet, address: [u8; 16], port: u16) {
+    if nm.pending_count < 64 {
+        nm.pending_packets[nm.pending_count] = packet
+        nm.pending_count = nm.pending_count + 1
+        nm.send_sequence = nm.send_sequence + 1
+    }
+}
+
+fn send_command(nm: mut NetworkManager, cmd: GameCommand) {
+    // Queue locally
+    queue_command(nm.sync, cmd)
+
+    // Send to all peers
+    let mut packet: Packet = create_packet(PacketType::GAME_COMMAND, nm.send_sequence)
+    serialize_command(cmd, packet)
+
+    for i in 0..nm.connection_count {
+        let conn: NetworkConnection = nm.connections[i]
+        queue_send(nm, packet, conn.address, conn.port)
+    }
+}
+
+fn broadcast_tick_ack(nm: mut NetworkManager, tick: u32, checksum: u32) {
+    let mut packet: Packet = create_packet(PacketType::TICK_ACK, nm.send_sequence)
+    write_u32(packet, tick)
+    write_u32(packet, checksum)
+    write_i32(packet, nm.local_player.id)
+
+    for i in 0..nm.connection_count {
+        let conn: NetworkConnection = nm.connections[i]
+        queue_send(nm, packet, conn.address, conn.port)
+    }
+}
+
+fn handle_packet(nm: mut NetworkManager, packet: Packet, from_addr: [u8; 16], from_port: u16) {
+    let packet_type: PacketType = cast(PacketType, packet.header.packet_type)
+    let mut offset: i32 = 0
+
+    match packet_type {
+        PacketType::CONNECT_REQUEST => {
+            if nm.local_player.is_host {
+                // Accept connection
+                let mut response: Packet = create_packet(PacketType::CONNECT_ACCEPT, nm.send_sequence)
+                write_i32(response, nm.lobby.player_count)   // New player ID
+
+                // Send lobby info
+                // ...
+
+                queue_send(nm, response, from_addr, from_port)
+            }
+        },
+        PacketType::CONNECT_ACCEPT => {
+            nm.state = ConnectionState::IN_LOBBY
+            nm.local_player.id = read_i32(packet.data, offset)
+        },
+        PacketType::GAME_COMMAND => {
+            let mut cmd: GameCommand = GameCommand {
+                command_type: cast(CommandType, read_u8(packet.data, offset)),
+                player_id: cast(i32, read_u8(packet.data, offset)),
+                tick: read_u32(packet.data, offset),
+                sequence: read_u32(packet.data, offset),
+                unit_ids: [-1; 32],
+                unit_count: cast(i32, read_u8(packet.data, offset)),
+                target_id: 0,
+                target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                int_param: 0,
+                float_param: 0.0,
+                string_param: ""
+            }
+
+            for i in 0..cmd.unit_count {
+                cmd.unit_ids[i] = read_i32(packet.data, offset)
+            }
+
+            cmd.target_id = read_i32(packet.data, offset)
+            cmd.target_position.x = read_f32(packet.data, offset)
+            cmd.target_position.y = read_f32(packet.data, offset)
+            cmd.target_position.z = read_f32(packet.data, offset)
+
+            receive_command(nm.sync, cmd)
+        },
+        PacketType::TICK_ACK => {
+            let tick: u32 = read_u32(packet.data, offset)
+            let checksum: u32 = read_u32(packet.data, offset)
+            let player_id: i32 = read_i32(packet.data, offset)
+
+            confirm_tick(nm.sync, tick, checksum)
+
+            if not verify_sync(nm.sync, tick, checksum) {
+                print("DESYNC detected at tick " + str(tick))
+            }
+        },
+        PacketType::PING => {
+            let mut pong: Packet = create_packet(PacketType::PONG, nm.send_sequence)
+            write_u32(pong, packet.header.timestamp)
+            queue_send(nm, pong, from_addr, from_port)
+        },
+        PacketType::PONG => {
+            let sent_time: u32 = read_u32(packet.data, offset)
+            let rtt: i32 = cast(i32, get_timestamp() - sent_time)
+            // Update ping for connection
+        },
+        PacketType::CHAT_MESSAGE => {
+            let player_id: i32 = read_i32(packet.data, offset)
+            let msg_len: i32 = cast(i32, read_u8(packet.data, offset))
+            let mut message: [u8; 128] = ""
+            // Read message
+            add_chat_message(nm.lobby, player_id, message)
+        },
+        _ => {}
+    }
+
+    nm.packets_received = nm.packets_received + 1
+    nm.bytes_received = nm.bytes_received + cast(u64, packet.header.payload_size + 12)
+}
+
+fn update_network(nm: mut NetworkManager, delta_time: f32) {
+    // Update tick timing
+    nm.sync.tick_accumulator = nm.sync.tick_accumulator + delta_time
+
+    // Process ticks
+    while nm.sync.tick_accumulator >= nm.sync.tick_interval {
+        if can_advance_tick(nm.sync) {
+            // Execute commands for this tick
+            let commands: [GameCommand; 64] = get_commands_for_tick(nm.sync, nm.sync.current_tick)
+            let count: i32 = get_command_count_for_tick(nm.sync, nm.sync.current_tick)
+
+            // Commands would be executed here
+
+            // Calculate and broadcast checksum
+            let checksum: u32 = calculate_game_checksum(0, 0, 0)
+            broadcast_tick_ack(nm, nm.sync.current_tick, checksum)
+
+            advance_tick(nm.sync)
+        } else {
+            // Waiting for other players
+            break
+        }
+
+        nm.sync.tick_accumulator = nm.sync.tick_accumulator - nm.sync.tick_interval
+    }
+
+    // Update lobby
+    if nm.state == ConnectionState::IN_LOBBY {
+        if update_lobby(nm.lobby, delta_time) {
+            // Start game
+            nm.state = ConnectionState::LOADING
+        }
+    }
+
+    // Send heartbeats
+    let current_time: u32 = get_timestamp()
+    for i in 0..nm.connection_count {
+        if current_time - nm.connections[i].last_send_time > 1000 {
+            let mut ping: Packet = create_packet(PacketType::PING, nm.send_sequence)
+            queue_send(nm, ping, nm.connections[i].address, nm.connections[i].port)
+            nm.connections[i].last_send_time = current_time
+        }
+    }
+
+    // Flush pending packets (would be actual network send)
+    nm.packets_sent = nm.packets_sent + cast(u32, nm.pending_count)
+    nm.pending_count = 0
+}
+
+fn get_network_stats(nm: NetworkManager) -> [i32; 6] {
+    return [
+        cast(i32, nm.bytes_sent),
+        cast(i32, nm.bytes_received),
+        cast(i32, nm.packets_sent),
+        cast(i32, nm.packets_received),
+        cast(i32, nm.packets_lost),
+        nm.sync.sync_errors
+    ]
+}
+
+// ============================================================================
+// LAN DISCOVERY
+// ============================================================================
+
+struct LANGame {
+    host_name: [u8; 32],
+    game_name: [u8; 64],
+    map_name: [u8; 64],
+    players: i32,
+    max_players: i32,
+    ip_address: [u8; 16],
+    port: u16,
+    ping: i32,
+    version: u32
+}
+
+struct LANBrowser {
+    games: [LANGame; 16],
+    game_count: i32,
+    is_scanning: bool,
+    last_scan_time: u32
+}
+
+fn create_lan_browser() -> LANBrowser {
+    return LANBrowser {
+        games: [],
+        game_count: 0,
+        is_scanning: false,
+        last_scan_time: 0
+    }
+}
+
+fn start_lan_scan(browser: mut LANBrowser) {
+    browser.is_scanning = true
+    browser.game_count = 0
+    browser.last_scan_time = get_timestamp()
+
+    // Would broadcast UDP discovery packet
+}
+
+fn add_discovered_game(browser: mut LANBrowser, game: LANGame) {
+    // Check if already in list
+    for i in 0..browser.game_count {
+        if browser.games[i].ip_address == game.ip_address and
+           browser.games[i].port == game.port {
+            browser.games[i] = game   // Update
+            return
+        }
+    }
+
+    // Add new
+    if browser.game_count < 16 {
+        browser.games[browser.game_count] = game
+        browser.game_count = browser.game_count + 1
+    }
+}
+
+fn stop_lan_scan(browser: mut LANBrowser) {
+    browser.is_scanning = false
+}
+
+// ============================================================================
+// MATCHMAKING (for online play)
+// ============================================================================
+
+enum MatchmakingState {
+    IDLE,
+    SEARCHING,
+    FOUND,
+    CONNECTING,
+    FAILED
+}
+
+struct MatchmakingRequest {
+    player_skill: i32,
+    preferred_faction: i32,
+    map_size: i32,
+    game_type: GameType,
+    search_radius: i32       // Skill range
+}
+
+struct MatchmakingResult {
+    state: MatchmakingState,
+    match_id: u32,
+    opponent_name: [u8; 32],
+    opponent_skill: i32,
+    server_ip: [u8; 16],
+    server_port: u16,
+    wait_time: f32
+}
+
+fn request_matchmaking(request: MatchmakingRequest) -> MatchmakingResult {
+    return MatchmakingResult {
+        state: MatchmakingState::SEARCHING,
+        match_id: 0,
+        opponent_name: "",
+        opponent_skill: 0,
+        server_ip: "",
+        server_port: 0,
+        wait_time: 0.0
+    }
+}
+
+fn cancel_matchmaking() {
+    // Would send cancel to matchmaking server
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn get_timestamp() -> u32 {
+    // Would return milliseconds since epoch
+    // Placeholder
+    static mut fake_time: u32 = 0
+    fake_time = fake_time + 16
+    return fake_time
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_multiplayer_system() {
+    print("Testing Multiplayer System...")
+
+    // Create network manager
+    let mut nm: NetworkManager = create_network_manager()
+    nm.local_player.name = "TestPlayer"
+    print("Local player: TestPlayer")
+
+    // Test hosting
+    let settings: LobbySettings = LobbySettings {
+        game_name: "Test Game",
+        map_name: "Tournament_A",
+        game_type: GameType::SKIRMISH,
+        max_players: 4,
+        starting_supplies: 10000,
+        superweapons: true,
+        tech_level: 1,
+        game_speed: 3,
+        is_private: false,
+        password: ""
+    }
+
+    let hosted: bool = host_game(nm, settings)
+    print("Hosted game: " + str(hosted))
+    print("Mode: LAN_HOST")
+    print("Lobby players: " + str(nm.lobby.player_count))
+
+    // Add AI player
+    let ai: NetworkPlayer = create_ai_player(1, 2)
+    join_lobby(nm.lobby, ai)
+    print("Added AI player, total: " + str(nm.lobby.player_count))
+
+    // Test ready state
+    set_player_ready(nm.lobby, 0, true)
+    set_player_ready(nm.lobby, 1, true)
+    print("All ready: " + str(nm.lobby.all_ready))
+
+    // Test chat
+    add_chat_message(nm.lobby, 0, "Hello!")
+    print("Chat messages: " + str(nm.lobby.chat_count))
+
+    // Test countdown
+    let started: bool = start_countdown(nm.lobby)
+    print("Started countdown: " + str(started))
+
+    // Test commands
+    let mut units: [i32; 32] = [1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+    let move_cmd: GameCommand = create_move_command(0, 10, units, 3, Vec3 { x: 100.0, y: 0.0, z: 100.0 })
+    print("Created move command for tick 10")
+
+    let attack_cmd: GameCommand = create_attack_command(0, 11, units, 3, 100)
+    print("Created attack command for tick 11")
+
+    let build_cmd: GameCommand = create_build_command(0, 12, "Barracks", Vec3 { x: 50.0, y: 0.0, z: 50.0 })
+    print("Created build command for tick 12")
+
+    // Test sync
+    queue_command(nm.sync, move_cmd)
+    queue_command(nm.sync, attack_cmd)
+    let cmd_count: i32 = get_command_count_for_tick(nm.sync, 10 + cast(u32, COMMAND_DELAY))
+    print("Commands queued for tick " + str(10 + COMMAND_DELAY) + ": " + str(cmd_count))
+
+    // Test packet creation
+    let mut packet: Packet = create_packet(PacketType::GAME_COMMAND, 1)
+    write_u32(packet, 12345)
+    write_f32(packet, 3.14159)
+    print("Packet payload size: " + str(packet.data_size))
+
+    // Test LAN browser
+    let mut browser: LANBrowser = create_lan_browser()
+    start_lan_scan(browser)
+    print("LAN scanning: " + str(browser.is_scanning))
+
+    let test_game: LANGame = LANGame {
+        host_name: "TestHost",
+        game_name: "Test Game",
+        map_name: "Tournament_A",
+        players: 2,
+        max_players: 4,
+        ip_address: "192.168.1.100",
+        port: 8086,
+        ping: 15,
+        version: PROTOCOL_VERSION
+    }
+    add_discovered_game(browser, test_game)
+    print("Discovered games: " + str(browser.game_count))
+
+    // Test checksum
+    let checksum: u32 = calculate_game_checksum(0xABCD, 0x1234, 0x5678)
+    print("Game checksum: " + str(checksum))
+
+    // Test network stats
+    nm.bytes_sent = 10000
+    nm.bytes_received = 15000
+    nm.packets_sent = 100
+    nm.packets_received = 120
+    let stats: [i32; 6] = get_network_stats(nm)
+    print("Bytes sent: " + str(stats[0]) + ", received: " + str(stats[1]))
+    print("Packets sent: " + str(stats[2]) + ", received: " + str(stats[3]))
+
+    print("Multiplayer System tests complete!")
+}

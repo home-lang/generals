@@ -1,0 +1,686 @@
+// Camera System - RTS camera with pan, zoom, rotate for C&C Generals
+// Implements authentic Generals camera behavior
+
+// ============================================================================
+// CAMERA TYPES
+// ============================================================================
+
+enum CameraMode {
+    FREE,               // Normal gameplay
+    CINEMATIC,          // Cutscene mode
+    LOCKED,             // Fixed position
+    FOLLOW_UNIT,        // Follow selected unit
+    TACTICAL           // Top-down view
+}
+
+struct Camera {
+    // Position
+    position: Vec3,
+    target: Vec3,
+    up: Vec3,
+
+    // Orientation
+    yaw: f32,           // Rotation around Y
+    pitch: f32,         // Tilt angle
+    distance: f32,      // Distance from target
+
+    // Projection
+    fov: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+
+    // Constraints
+    min_pitch: f32,
+    max_pitch: f32,
+    min_distance: f32,
+    max_distance: f32,
+    min_y: f32,
+    max_y: f32,
+
+    // Movement
+    pan_speed: f32,
+    zoom_speed: f32,
+    rotate_speed: f32,
+
+    // State
+    mode: CameraMode,
+    follow_target_id: i32,
+
+    // Smoothing
+    smooth_position: Vec3,
+    smooth_target: Vec3,
+    smooth_factor: f32
+}
+
+fn create_camera() -> Camera {
+    return Camera {
+        position: Vec3 { x: 0.0, y: 100.0, z: 100.0 },
+        target: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        up: Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+
+        yaw: 0.0,
+        pitch: 45.0,        // Generals default angle
+        distance: 150.0,
+
+        fov: 45.0,
+        aspect: 1.333,
+        near: 1.0,
+        far: 2000.0,
+
+        min_pitch: 20.0,
+        max_pitch: 70.0,
+        min_distance: 50.0,
+        max_distance: 400.0,
+        min_y: 0.0,
+        max_y: 500.0,
+
+        pan_speed: 500.0,
+        zoom_speed: 200.0,
+        rotate_speed: 90.0,
+
+        mode: CameraMode::FREE,
+        follow_target_id: -1,
+
+        smooth_position: Vec3 { x: 0.0, y: 100.0, z: 100.0 },
+        smooth_target: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        smooth_factor: 10.0
+    }
+}
+
+fn set_camera_defaults_generals(camera: mut Camera) {
+    // Authentic C&C Generals camera settings
+    camera.pitch = 50.0
+    camera.distance = 175.0
+    camera.fov = 45.0
+    camera.min_pitch = 30.0
+    camera.max_pitch = 65.0
+    camera.min_distance = 80.0
+    camera.max_distance: 350.0
+    camera.pan_speed = 600.0
+    camera.zoom_speed = 300.0
+}
+
+// ============================================================================
+// CAMERA CONTROLS
+// ============================================================================
+
+fn pan_camera(camera: mut Camera, dx: f32, dz: f32, delta_time: f32) {
+    // Calculate forward and right vectors (ignoring Y)
+    let forward_x: f32 = sin(camera.yaw * 0.0174533)
+    let forward_z: f32 = cos(camera.yaw * 0.0174533)
+    let right_x: f32 = cos(camera.yaw * 0.0174533)
+    let right_z: f32 = -sin(camera.yaw * 0.0174533)
+
+    let move_x: f32 = (forward_x * dz + right_x * dx) * camera.pan_speed * delta_time
+    let move_z: f32 = (forward_z * dz + right_z * dx) * camera.pan_speed * delta_time
+
+    camera.target.x = camera.target.x + move_x
+    camera.target.z = camera.target.z + move_z
+
+    update_camera_position(camera)
+}
+
+fn zoom_camera(camera: mut Camera, delta: f32, delta_time: f32) {
+    camera.distance = camera.distance - delta * camera.zoom_speed * delta_time
+
+    // Clamp
+    if camera.distance < camera.min_distance {
+        camera.distance = camera.min_distance
+    }
+    if camera.distance > camera.max_distance {
+        camera.distance = camera.max_distance
+    }
+
+    update_camera_position(camera)
+}
+
+fn rotate_camera(camera: mut Camera, delta_yaw: f32, delta_pitch: f32, delta_time: f32) {
+    camera.yaw = camera.yaw + delta_yaw * camera.rotate_speed * delta_time
+    camera.pitch = camera.pitch + delta_pitch * camera.rotate_speed * delta_time
+
+    // Wrap yaw
+    while camera.yaw > 360.0 { camera.yaw = camera.yaw - 360.0 }
+    while camera.yaw < 0.0 { camera.yaw = camera.yaw + 360.0 }
+
+    // Clamp pitch
+    if camera.pitch < camera.min_pitch {
+        camera.pitch = camera.min_pitch
+    }
+    if camera.pitch > camera.max_pitch {
+        camera.pitch = camera.max_pitch
+    }
+
+    update_camera_position(camera)
+}
+
+fn update_camera_position(camera: mut Camera) {
+    // Calculate position from target, yaw, pitch, distance
+    let pitch_rad: f32 = camera.pitch * 0.0174533
+    let yaw_rad: f32 = camera.yaw * 0.0174533
+
+    let horiz_dist: f32 = camera.distance * cos(pitch_rad)
+    let vert_dist: f32 = camera.distance * sin(pitch_rad)
+
+    camera.position.x = camera.target.x - horiz_dist * sin(yaw_rad)
+    camera.position.y = camera.target.y + vert_dist
+    camera.position.z = camera.target.z - horiz_dist * cos(yaw_rad)
+
+    // Clamp height
+    if camera.position.y < camera.min_y {
+        camera.position.y = camera.min_y
+    }
+    if camera.position.y > camera.max_y {
+        camera.position.y = camera.max_y
+    }
+}
+
+fn center_on_position(camera: mut Camera, x: f32, z: f32) {
+    camera.target.x = x
+    camera.target.z = z
+    update_camera_position(camera)
+}
+
+fn center_on_unit(camera: mut Camera, unit_x: f32, unit_y: f32, unit_z: f32) {
+    camera.target.x = unit_x
+    camera.target.y = unit_y
+    camera.target.z = unit_z
+    update_camera_position(camera)
+}
+
+fn follow_unit(camera: mut Camera, unit_id: i32) {
+    camera.mode = CameraMode::FOLLOW_UNIT
+    camera.follow_target_id = unit_id
+}
+
+fn stop_following(camera: mut Camera) {
+    camera.mode = CameraMode::FREE
+    camera.follow_target_id = -1
+}
+
+// ============================================================================
+// CAMERA UPDATE
+// ============================================================================
+
+fn update_camera(camera: mut Camera, delta_time: f32) {
+    // Smooth interpolation
+    let factor: f32 = camera.smooth_factor * delta_time
+    if factor > 1.0 {
+        camera.smooth_position = camera.position
+        camera.smooth_target = camera.target
+    } else {
+        camera.smooth_position.x = camera.smooth_position.x + (camera.position.x - camera.smooth_position.x) * factor
+        camera.smooth_position.y = camera.smooth_position.y + (camera.position.y - camera.smooth_position.y) * factor
+        camera.smooth_position.z = camera.smooth_position.z + (camera.position.z - camera.smooth_position.z) * factor
+
+        camera.smooth_target.x = camera.smooth_target.x + (camera.target.x - camera.smooth_target.x) * factor
+        camera.smooth_target.y = camera.smooth_target.y + (camera.target.y - camera.smooth_target.y) * factor
+        camera.smooth_target.z = camera.smooth_target.z + (camera.target.z - camera.smooth_target.z) * factor
+    }
+}
+
+fn get_view_matrix(camera: Camera) -> Mat4 {
+    return look_at(camera.smooth_position, camera.smooth_target, camera.up)
+}
+
+fn get_projection_matrix(camera: Camera) -> Mat4 {
+    return perspective(camera.fov, camera.aspect, camera.near, camera.far)
+}
+
+// ============================================================================
+// SCREEN TO WORLD
+// ============================================================================
+
+struct Ray {
+    origin: Vec3,
+    direction: Vec3
+}
+
+fn screen_to_ray(camera: Camera, screen_x: f32, screen_y: f32, screen_w: f32, screen_h: f32) -> Ray {
+    // Convert screen coords to NDC (-1 to 1)
+    let ndc_x: f32 = (2.0 * screen_x / screen_w) - 1.0
+    let ndc_y: f32 = 1.0 - (2.0 * screen_y / screen_h)
+
+    // Convert to view space
+    let tan_fov: f32 = tan(camera.fov * 0.5 * 0.0174533)
+    let ray_x: f32 = ndc_x * tan_fov * camera.aspect
+    let ray_y: f32 = ndc_y * tan_fov
+    let ray_z: f32 = -1.0
+
+    // Transform to world space (simplified - would need inverse view matrix)
+    let yaw_rad: f32 = camera.yaw * 0.0174533
+    let pitch_rad: f32 = camera.pitch * 0.0174533
+
+    // Rotate by camera orientation
+    let rot_x: f32 = ray_x * cos(yaw_rad) - ray_z * sin(yaw_rad)
+    let rot_z: f32 = ray_x * sin(yaw_rad) + ray_z * cos(yaw_rad)
+    let rot_y: f32 = ray_y * cos(pitch_rad) - rot_z * sin(pitch_rad)
+    let rot_z2: f32 = ray_y * sin(pitch_rad) + rot_z * cos(pitch_rad)
+
+    // Normalize
+    let len: f32 = sqrt(rot_x*rot_x + rot_y*rot_y + rot_z2*rot_z2)
+
+    return Ray {
+        origin: camera.smooth_position,
+        direction: Vec3 {
+            x: rot_x / len,
+            y: rot_y / len,
+            z: rot_z2 / len
+        }
+    }
+}
+
+fn ray_ground_intersection(ray: Ray, ground_y: f32) -> Vec3 {
+    // Find where ray intersects ground plane (y = ground_y)
+    if ray.direction.y == 0.0 {
+        // Ray parallel to ground
+        return Vec3 { x: 0.0, y: ground_y, z: 0.0 }
+    }
+
+    let t: f32 = (ground_y - ray.origin.y) / ray.direction.y
+
+    if t < 0.0 {
+        // Intersection behind camera
+        return Vec3 { x: 0.0, y: ground_y, z: 0.0 }
+    }
+
+    return Vec3 {
+        x: ray.origin.x + ray.direction.x * t,
+        y: ground_y,
+        z: ray.origin.z + ray.direction.z * t
+    }
+}
+
+fn screen_to_world(camera: Camera, screen_x: f32, screen_y: f32, screen_w: f32, screen_h: f32, ground_y: f32) -> Vec3 {
+    let ray: Ray = screen_to_ray(camera, screen_x, screen_y, screen_w, screen_h)
+    return ray_ground_intersection(ray, ground_y)
+}
+
+// ============================================================================
+// WORLD TO SCREEN
+// ============================================================================
+
+fn world_to_screen(camera: Camera, world_pos: Vec3, screen_w: f32, screen_h: f32) -> [f32; 3] {
+    // Get matrices
+    let view: Mat4 = get_view_matrix(camera)
+    let proj: Mat4 = get_projection_matrix(camera)
+
+    // Transform to clip space
+    let view_pos: Vec4 = mat4_mul_vec4(view, Vec4 { x: world_pos.x, y: world_pos.y, z: world_pos.z, w: 1.0 })
+    let clip_pos: Vec4 = mat4_mul_vec4(proj, view_pos)
+
+    // Perspective divide
+    if clip_pos.w == 0.0 {
+        return [-1.0, -1.0, -1.0]   // Behind camera
+    }
+
+    let ndc_x: f32 = clip_pos.x / clip_pos.w
+    let ndc_y: f32 = clip_pos.y / clip_pos.w
+    let ndc_z: f32 = clip_pos.z / clip_pos.w
+
+    // Convert to screen coords
+    let screen_x: f32 = (ndc_x + 1.0) * 0.5 * screen_w
+    let screen_y: f32 = (1.0 - ndc_y) * 0.5 * screen_h
+
+    return [screen_x, screen_y, ndc_z]
+}
+
+fn is_on_screen(camera: Camera, world_pos: Vec3, screen_w: f32, screen_h: f32) -> bool {
+    let screen_pos: [f32; 3] = world_to_screen(camera, world_pos, screen_w, screen_h)
+
+    if screen_pos[2] < 0.0 or screen_pos[2] > 1.0 {
+        return false   // Behind camera or too far
+    }
+
+    return screen_pos[0] >= 0.0 and screen_pos[0] < screen_w and
+           screen_pos[1] >= 0.0 and screen_pos[1] < screen_h
+}
+
+// ============================================================================
+// CAMERA BOUNDS
+// ============================================================================
+
+struct CameraBounds {
+    min_x: f32,
+    max_x: f32,
+    min_z: f32,
+    max_z: f32
+}
+
+fn set_camera_bounds(camera: mut Camera, bounds: CameraBounds) {
+    // Would store bounds and clamp camera target
+}
+
+fn clamp_camera_to_bounds(camera: mut Camera, bounds: CameraBounds) {
+    if camera.target.x < bounds.min_x { camera.target.x = bounds.min_x }
+    if camera.target.x > bounds.max_x { camera.target.x = bounds.max_x }
+    if camera.target.z < bounds.min_z { camera.target.z = bounds.min_z }
+    if camera.target.z > bounds.max_z { camera.target.z = bounds.max_z }
+
+    update_camera_position(camera)
+}
+
+// ============================================================================
+// CAMERA SHAKE
+// ============================================================================
+
+struct CameraShake {
+    intensity: f32,
+    duration: f32,
+    remaining: f32,
+    frequency: f32,
+    offset_x: f32,
+    offset_y: f32,
+    offset_z: f32
+}
+
+fn create_camera_shake(intensity: f32, duration: f32) -> CameraShake {
+    return CameraShake {
+        intensity: intensity,
+        duration: duration,
+        remaining: duration,
+        frequency: 10.0,
+        offset_x: 0.0,
+        offset_y: 0.0,
+        offset_z: 0.0
+    }
+}
+
+fn update_camera_shake(shake: mut CameraShake, delta_time: f32, time: f32) {
+    if shake.remaining <= 0.0 {
+        shake.offset_x = 0.0
+        shake.offset_y = 0.0
+        shake.offset_z = 0.0
+        return
+    }
+
+    shake.remaining = shake.remaining - delta_time
+
+    let decay: f32 = shake.remaining / shake.duration
+    let current_intensity: f32 = shake.intensity * decay
+
+    shake.offset_x = sin(time * shake.frequency * 17.0) * current_intensity
+    shake.offset_y = sin(time * shake.frequency * 23.0) * current_intensity * 0.5
+    shake.offset_z = sin(time * shake.frequency * 19.0) * current_intensity
+}
+
+fn apply_shake_to_camera(camera: mut Camera, shake: CameraShake) {
+    camera.smooth_position.x = camera.smooth_position.x + shake.offset_x
+    camera.smooth_position.y = camera.smooth_position.y + shake.offset_y
+    camera.smooth_position.z = camera.smooth_position.z + shake.offset_z
+}
+
+// ============================================================================
+// CINEMATIC CAMERA
+// ============================================================================
+
+struct CameraKeyframe {
+    position: Vec3,
+    target: Vec3,
+    fov: f32,
+    time: f32,
+    ease_type: i32      // 0=linear, 1=ease-in, 2=ease-out, 3=ease-in-out
+}
+
+struct CinematicCamera {
+    keyframes: [CameraKeyframe; 32],
+    keyframe_count: i32,
+    current_time: f32,
+    total_duration: f32,
+    is_playing: bool,
+    is_looping: bool
+}
+
+fn create_cinematic_camera() -> CinematicCamera {
+    return CinematicCamera {
+        keyframes: [],
+        keyframe_count: 0,
+        current_time: 0.0,
+        total_duration: 0.0,
+        is_playing: false,
+        is_looping: false
+    }
+}
+
+fn add_keyframe(cc: mut CinematicCamera, keyframe: CameraKeyframe) {
+    if cc.keyframe_count < 32 {
+        cc.keyframes[cc.keyframe_count] = keyframe
+        cc.keyframe_count = cc.keyframe_count + 1
+
+        if keyframe.time > cc.total_duration {
+            cc.total_duration = keyframe.time
+        }
+    }
+}
+
+fn play_cinematic(cc: mut CinematicCamera) {
+    cc.is_playing = true
+    cc.current_time = 0.0
+}
+
+fn update_cinematic(cc: mut CinematicCamera, camera: mut Camera, delta_time: f32) {
+    if not cc.is_playing or cc.keyframe_count < 2 {
+        return
+    }
+
+    cc.current_time = cc.current_time + delta_time
+
+    if cc.current_time >= cc.total_duration {
+        if cc.is_looping {
+            cc.current_time = 0.0
+        } else {
+            cc.is_playing = false
+            return
+        }
+    }
+
+    // Find surrounding keyframes
+    let mut kf1_idx: i32 = 0
+    let mut kf2_idx: i32 = 1
+
+    for i in 0..(cc.keyframe_count - 1) {
+        if cc.keyframes[i].time <= cc.current_time and cc.keyframes[i + 1].time > cc.current_time {
+            kf1_idx = i
+            kf2_idx = i + 1
+            break
+        }
+    }
+
+    let kf1: CameraKeyframe = cc.keyframes[kf1_idx]
+    let kf2: CameraKeyframe = cc.keyframes[kf2_idx]
+
+    // Calculate interpolation factor
+    let segment_duration: f32 = kf2.time - kf1.time
+    let mut t: f32 = (cc.current_time - kf1.time) / segment_duration
+
+    // Apply easing
+    t = apply_easing(t, kf2.ease_type)
+
+    // Interpolate
+    camera.position.x = kf1.position.x + (kf2.position.x - kf1.position.x) * t
+    camera.position.y = kf1.position.y + (kf2.position.y - kf1.position.y) * t
+    camera.position.z = kf1.position.z + (kf2.position.z - kf1.position.z) * t
+
+    camera.target.x = kf1.target.x + (kf2.target.x - kf1.target.x) * t
+    camera.target.y = kf1.target.y + (kf2.target.y - kf1.target.y) * t
+    camera.target.z = kf1.target.z + (kf2.target.z - kf1.target.z) * t
+
+    camera.fov = kf1.fov + (kf2.fov - kf1.fov) * t
+
+    camera.smooth_position = camera.position
+    camera.smooth_target = camera.target
+}
+
+fn apply_easing(t: f32, ease_type: i32) -> f32 {
+    match ease_type {
+        0 => return t,                                    // Linear
+        1 => return t * t,                               // Ease-in (quadratic)
+        2 => return t * (2.0 - t),                       // Ease-out
+        3 => return t * t * (3.0 - 2.0 * t),            // Ease-in-out (smoothstep)
+        _ => return t
+    }
+}
+
+// ============================================================================
+// MATH HELPERS
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess: f32 = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin(x: f32) -> f32 {
+    let mut x_norm: f32 = x
+    while x_norm > 3.14159 { x_norm = x_norm - 6.28318 }
+    while x_norm < -3.14159 { x_norm = x_norm + 6.28318 }
+    let x2: f32 = x_norm * x_norm
+    let x3: f32 = x2 * x_norm
+    let x5: f32 = x3 * x2
+    let x7: f32 = x5 * x2
+    return x_norm - x3/6.0 + x5/120.0 - x7/5040.0
+}
+
+fn cos(x: f32) -> f32 {
+    return sin(x + 1.5708)
+}
+
+fn tan(x: f32) -> f32 {
+    return sin(x) / cos(x)
+}
+
+fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
+    let zx: f32 = eye.x - target.x
+    let zy: f32 = eye.y - target.y
+    let zz: f32 = eye.z - target.z
+    let z_len: f32 = sqrt(zx*zx + zy*zy + zz*zz)
+    if z_len > 0.0001 {
+        zx = zx / z_len
+        zy = zy / z_len
+        zz = zz / z_len
+    }
+
+    let xx: f32 = up.y * zz - up.z * zy
+    let xy: f32 = up.z * zx - up.x * zz
+    let xz: f32 = up.x * zy - up.y * zx
+    let x_len: f32 = sqrt(xx*xx + xy*xy + xz*xz)
+    if x_len > 0.0001 {
+        xx = xx / x_len
+        xy = xy / x_len
+        xz = xz / x_len
+    }
+
+    let yx: f32 = zy * xz - zz * xy
+    let yy: f32 = zz * xx - zx * xz
+    let yz: f32 = zx * xy - zy * xx
+
+    return Mat4 {
+        m: [xx, yx, zx, 0.0,
+            xy, yy, zy, 0.0,
+            xz, yz, zz, 0.0,
+            -(xx*eye.x + xy*eye.y + xz*eye.z),
+            -(yx*eye.x + yy*eye.y + yz*eye.z),
+            -(zx*eye.x + zy*eye.y + zz*eye.z),
+            1.0]
+    }
+}
+
+fn perspective(fov_deg: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let f: f32 = 1.0 / tan(fov_deg * 0.5 * 0.0174533)
+    let nf: f32 = 1.0 / (near - far)
+
+    return Mat4 {
+        m: [f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (far + near) * nf, -1.0,
+            0.0, 0.0, 2.0 * far * near * nf, 0.0]
+    }
+}
+
+fn mat4_mul_vec4(m: Mat4, v: Vec4) -> Vec4 {
+    return Vec4 {
+        x: m.m[0]*v.x + m.m[4]*v.y + m.m[8]*v.z + m.m[12]*v.w,
+        y: m.m[1]*v.x + m.m[5]*v.y + m.m[9]*v.z + m.m[13]*v.w,
+        z: m.m[2]*v.x + m.m[6]*v.y + m.m[10]*v.z + m.m[14]*v.w,
+        w: m.m[3]*v.x + m.m[7]*v.y + m.m[11]*v.z + m.m[15]*v.w
+    }
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_camera_system() {
+    print("Testing Camera System...")
+
+    // Create camera
+    let mut camera: Camera = create_camera()
+    set_camera_defaults_generals(camera)
+    print("Camera created at: " + str(camera.position.x) + "," + str(camera.position.y) + "," + str(camera.position.z))
+    print("Pitch: " + str(camera.pitch) + ", Yaw: " + str(camera.yaw))
+
+    // Test pan
+    pan_camera(camera, 1.0, 0.0, 0.016)
+    print("After pan right: target=" + str(camera.target.x) + "," + str(camera.target.z))
+
+    // Test zoom
+    zoom_camera(camera, 1.0, 0.016)
+    print("After zoom in: distance=" + str(camera.distance))
+
+    // Test rotate
+    rotate_camera(camera, 1.0, 0.0, 0.016)
+    print("After rotate: yaw=" + str(camera.yaw))
+
+    // Test center
+    center_on_position(camera, 500.0, 500.0)
+    print("Centered on 500,500: target=" + str(camera.target.x) + "," + str(camera.target.z))
+
+    // Test screen to world
+    let world_pos: Vec3 = screen_to_world(camera, 400.0, 300.0, 800.0, 600.0, 0.0)
+    print("Screen center to world: " + str(world_pos.x) + "," + str(world_pos.z))
+
+    // Test world to screen
+    let screen_pos: [f32; 3] = world_to_screen(camera, Vec3 { x: 500.0, y: 0.0, z: 500.0 }, 800.0, 600.0)
+    print("World 500,500 to screen: " + str(screen_pos[0]) + "," + str(screen_pos[1]))
+
+    // Test shake
+    let mut shake: CameraShake = create_camera_shake(5.0, 1.0)
+    update_camera_shake(shake, 0.1, 0.5)
+    print("Shake offset: " + str(shake.offset_x) + "," + str(shake.offset_y))
+
+    // Test cinematic
+    let mut cinematic: CinematicCamera = create_cinematic_camera()
+    add_keyframe(cinematic, CameraKeyframe {
+        position: Vec3 { x: 0.0, y: 100.0, z: 0.0 },
+        target: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        fov: 45.0,
+        time: 0.0,
+        ease_type: 0
+    })
+    add_keyframe(cinematic, CameraKeyframe {
+        position: Vec3 { x: 100.0, y: 50.0, z: 100.0 },
+        target: Vec3 { x: 50.0, y: 0.0, z: 50.0 },
+        fov: 60.0,
+        time: 5.0,
+        ease_type: 3
+    })
+    print("Cinematic keyframes: " + str(cinematic.keyframe_count))
+    print("Cinematic duration: " + str(cinematic.total_duration) + "s")
+
+    // Test bounds
+    let bounds: CameraBounds = CameraBounds {
+        min_x: 0.0,
+        max_x: 1000.0,
+        min_z: 0.0,
+        max_z: 1000.0
+    }
+    camera.target.x = -100.0
+    clamp_camera_to_bounds(camera, bounds)
+    print("After bounds clamp: target.x=" + str(camera.target.x))
+
+    print("Camera System tests complete!")
+}

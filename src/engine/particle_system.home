@@ -1,0 +1,750 @@
+// Particle System - Explosions, smoke, fire, tracers, debris for C&C Generals
+// Implements authentic Generals visual effects
+
+// ============================================================================
+// PARTICLE TYPES
+// ============================================================================
+
+enum ParticleType {
+    SMOKE,
+    FIRE,
+    SPARK,
+    DEBRIS,
+    DUST,
+    EXPLOSION,
+    TRACER,
+    MUZZLE_FLASH,
+    BLOOD,
+    WATER_SPLASH,
+    STEAM,
+    TOXIN,
+    RADIATION,
+    LASER,
+    CONTRAIL
+}
+
+enum BlendMode {
+    ALPHA,
+    ADDITIVE,
+    MULTIPLY,
+    SCREEN
+}
+
+// ============================================================================
+// PARTICLE STRUCTURE
+// ============================================================================
+
+struct Particle {
+    // Position/velocity
+    position: Vec3,
+    velocity: Vec3,
+    acceleration: Vec3,
+
+    // Rotation
+    rotation: f32,
+    rotation_speed: f32,
+
+    // Scale
+    scale: f32,
+    scale_velocity: f32,
+
+    // Color/alpha
+    color: Vec4,
+    start_color: Vec4,
+    end_color: Vec4,
+
+    // Lifetime
+    lifetime: f32,
+    max_lifetime: f32,
+    age_normalized: f32,
+
+    // State
+    is_alive: bool,
+    texture_frame: i32
+}
+
+fn create_particle() -> Particle {
+    return Particle {
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        acceleration: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        rotation: 0.0,
+        rotation_speed: 0.0,
+        scale: 1.0,
+        scale_velocity: 0.0,
+        color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+        start_color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+        end_color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 0.0 },
+        lifetime: 0.0,
+        max_lifetime: 1.0,
+        age_normalized: 0.0,
+        is_alive: false,
+        texture_frame: 0
+    }
+}
+
+fn update_particle(p: mut Particle, delta_time: f32) {
+    if not p.is_alive {
+        return
+    }
+
+    // Update lifetime
+    p.lifetime = p.lifetime + delta_time
+    if p.lifetime >= p.max_lifetime {
+        p.is_alive = false
+        return
+    }
+
+    p.age_normalized = p.lifetime / p.max_lifetime
+
+    // Update velocity
+    p.velocity.x = p.velocity.x + p.acceleration.x * delta_time
+    p.velocity.y = p.velocity.y + p.acceleration.y * delta_time
+    p.velocity.z = p.velocity.z + p.acceleration.z * delta_time
+
+    // Update position
+    p.position.x = p.position.x + p.velocity.x * delta_time
+    p.position.y = p.position.y + p.velocity.y * delta_time
+    p.position.z = p.position.z + p.velocity.z * delta_time
+
+    // Update rotation
+    p.rotation = p.rotation + p.rotation_speed * delta_time
+
+    // Update scale
+    p.scale = p.scale + p.scale_velocity * delta_time
+
+    // Interpolate color
+    let t: f32 = p.age_normalized
+    p.color.x = p.start_color.x + (p.end_color.x - p.start_color.x) * t
+    p.color.y = p.start_color.y + (p.end_color.y - p.start_color.y) * t
+    p.color.z = p.start_color.z + (p.end_color.z - p.start_color.z) * t
+    p.color.w = p.start_color.w + (p.end_color.w - p.start_color.w) * t
+}
+
+// ============================================================================
+// EMITTER CONFIGURATION
+// ============================================================================
+
+struct EmitterConfig {
+    particle_type: ParticleType,
+    texture_id: i32,
+    blend_mode: BlendMode,
+
+    // Spawn
+    spawn_rate: f32,         // Particles per second
+    burst_count: i32,        // Initial burst
+    max_particles: i32,
+
+    // Lifetime
+    lifetime_min: f32,
+    lifetime_max: f32,
+
+    // Position
+    spawn_offset: Vec3,
+    spawn_radius: f32,
+    spawn_cone_angle: f32,
+
+    // Velocity
+    velocity_min: Vec3,
+    velocity_max: Vec3,
+    inherit_velocity: f32,
+
+    // Acceleration
+    gravity: f32,
+    drag: f32,
+
+    // Rotation
+    rotation_min: f32,
+    rotation_max: f32,
+    rotation_speed_min: f32,
+    rotation_speed_max: f32,
+
+    // Scale
+    scale_min: f32,
+    scale_max: f32,
+    scale_over_life: f32,
+
+    // Color
+    start_color: Vec4,
+    end_color: Vec4,
+    color_variance: f32,
+
+    // Animation
+    frame_count: i32,
+    frame_rate: f32,
+    random_start_frame: bool
+}
+
+fn create_smoke_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::SMOKE,
+        texture_id: -1,
+        blend_mode: BlendMode::ALPHA,
+        spawn_rate: 20.0,
+        burst_count: 0,
+        max_particles: 100,
+        lifetime_min: 2.0,
+        lifetime_max: 4.0,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 2.0,
+        spawn_cone_angle: 30.0,
+        velocity_min: Vec3 { x: -5.0, y: 10.0, z: -5.0 },
+        velocity_max: Vec3 { x: 5.0, y: 20.0, z: 5.0 },
+        inherit_velocity: 0.0,
+        gravity: 0.0,
+        drag: 0.5,
+        rotation_min: 0.0,
+        rotation_max: 360.0,
+        rotation_speed_min: -30.0,
+        rotation_speed_max: 30.0,
+        scale_min: 2.0,
+        scale_max: 4.0,
+        scale_over_life: 2.0,
+        start_color: Vec4 { x: 0.3, y: 0.3, z: 0.3, w: 0.8 },
+        end_color: Vec4 { x: 0.5, y: 0.5, z: 0.5, w: 0.0 },
+        color_variance: 0.1,
+        frame_count: 1,
+        frame_rate: 0.0,
+        random_start_frame: false
+    }
+}
+
+fn create_fire_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::FIRE,
+        texture_id: -1,
+        blend_mode: BlendMode::ADDITIVE,
+        spawn_rate: 30.0,
+        burst_count: 0,
+        max_particles: 150,
+        lifetime_min: 0.5,
+        lifetime_max: 1.0,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 1.0,
+        spawn_cone_angle: 15.0,
+        velocity_min: Vec3 { x: -3.0, y: 15.0, z: -3.0 },
+        velocity_max: Vec3 { x: 3.0, y: 25.0, z: 3.0 },
+        inherit_velocity: 0.0,
+        gravity: -5.0,       // Fire rises
+        drag: 1.0,
+        rotation_min: 0.0,
+        rotation_max: 360.0,
+        rotation_speed_min: -90.0,
+        rotation_speed_max: 90.0,
+        scale_min: 1.0,
+        scale_max: 2.0,
+        scale_over_life: -0.5,
+        start_color: Vec4 { x: 1.0, y: 0.8, z: 0.2, w: 1.0 },
+        end_color: Vec4 { x: 1.0, y: 0.2, z: 0.0, w: 0.0 },
+        color_variance: 0.2,
+        frame_count: 4,
+        frame_rate: 15.0,
+        random_start_frame: true
+    }
+}
+
+fn create_explosion_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::EXPLOSION,
+        texture_id: -1,
+        blend_mode: BlendMode::ADDITIVE,
+        spawn_rate: 0.0,     // Burst only
+        burst_count: 50,
+        max_particles: 100,
+        lifetime_min: 0.3,
+        lifetime_max: 0.8,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 3.0,
+        spawn_cone_angle: 180.0,
+        velocity_min: Vec3 { x: -50.0, y: 10.0, z: -50.0 },
+        velocity_max: Vec3 { x: 50.0, y: 80.0, z: 50.0 },
+        inherit_velocity: 0.0,
+        gravity: 50.0,
+        drag: 2.0,
+        rotation_min: 0.0,
+        rotation_max: 360.0,
+        rotation_speed_min: -180.0,
+        rotation_speed_max: 180.0,
+        scale_min: 3.0,
+        scale_max: 8.0,
+        scale_over_life: 5.0,
+        start_color: Vec4 { x: 1.0, y: 0.9, z: 0.5, w: 1.0 },
+        end_color: Vec4 { x: 1.0, y: 0.3, z: 0.1, w: 0.0 },
+        color_variance: 0.3,
+        frame_count: 8,
+        frame_rate: 20.0,
+        random_start_frame: false
+    }
+}
+
+fn create_debris_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::DEBRIS,
+        texture_id: -1,
+        blend_mode: BlendMode::ALPHA,
+        spawn_rate: 0.0,
+        burst_count: 20,
+        max_particles: 50,
+        lifetime_min: 1.0,
+        lifetime_max: 3.0,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 2.0,
+        spawn_cone_angle: 60.0,
+        velocity_min: Vec3 { x: -30.0, y: 20.0, z: -30.0 },
+        velocity_max: Vec3 { x: 30.0, y: 60.0, z: 30.0 },
+        inherit_velocity: 0.0,
+        gravity: 100.0,
+        drag: 0.5,
+        rotation_min: 0.0,
+        rotation_max: 360.0,
+        rotation_speed_min: -360.0,
+        rotation_speed_max: 360.0,
+        scale_min: 0.5,
+        scale_max: 1.5,
+        scale_over_life: 0.0,
+        start_color: Vec4 { x: 0.4, y: 0.3, z: 0.2, w: 1.0 },
+        end_color: Vec4 { x: 0.3, y: 0.2, z: 0.1, w: 1.0 },
+        color_variance: 0.2,
+        frame_count: 1,
+        frame_rate: 0.0,
+        random_start_frame: false
+    }
+}
+
+fn create_tracer_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::TRACER,
+        texture_id: -1,
+        blend_mode: BlendMode::ADDITIVE,
+        spawn_rate: 0.0,
+        burst_count: 1,
+        max_particles: 10,
+        lifetime_min: 0.1,
+        lifetime_max: 0.15,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 0.0,
+        spawn_cone_angle: 0.0,
+        velocity_min: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        velocity_max: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        inherit_velocity: 1.0,
+        gravity: 0.0,
+        drag: 0.0,
+        rotation_min: 0.0,
+        rotation_max: 0.0,
+        rotation_speed_min: 0.0,
+        rotation_speed_max: 0.0,
+        scale_min: 0.2,
+        scale_max: 0.3,
+        scale_over_life: 0.0,
+        start_color: Vec4 { x: 1.0, y: 1.0, z: 0.5, w: 1.0 },
+        end_color: Vec4 { x: 1.0, y: 0.8, z: 0.3, w: 0.0 },
+        color_variance: 0.0,
+        frame_count: 1,
+        frame_rate: 0.0,
+        random_start_frame: false
+    }
+}
+
+fn create_toxin_config() -> EmitterConfig {
+    return EmitterConfig {
+        particle_type: ParticleType::TOXIN,
+        texture_id: -1,
+        blend_mode: BlendMode::ALPHA,
+        spawn_rate: 15.0,
+        burst_count: 0,
+        max_particles: 100,
+        lifetime_min: 3.0,
+        lifetime_max: 5.0,
+        spawn_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spawn_radius: 5.0,
+        spawn_cone_angle: 45.0,
+        velocity_min: Vec3 { x: -2.0, y: 2.0, z: -2.0 },
+        velocity_max: Vec3 { x: 2.0, y: 5.0, z: 2.0 },
+        inherit_velocity: 0.0,
+        gravity: -2.0,
+        drag: 0.3,
+        rotation_min: 0.0,
+        rotation_max: 360.0,
+        rotation_speed_min: -15.0,
+        rotation_speed_max: 15.0,
+        scale_min: 3.0,
+        scale_max: 6.0,
+        scale_over_life: 3.0,
+        start_color: Vec4 { x: 0.2, y: 0.8, z: 0.1, w: 0.6 },
+        end_color: Vec4 { x: 0.1, y: 0.5, z: 0.0, w: 0.0 },
+        color_variance: 0.1,
+        frame_count: 1,
+        frame_rate: 0.0,
+        random_start_frame: false
+    }
+}
+
+// ============================================================================
+// PARTICLE EMITTER
+// ============================================================================
+
+struct ParticleEmitter {
+    id: i32,
+    config: EmitterConfig,
+    particles: [Particle; 256],
+    particle_count: i32,
+    active_count: i32,
+
+    // Position
+    position: Vec3,
+    velocity: Vec3,
+    rotation: f32,
+
+    // State
+    is_active: bool,
+    spawn_accumulator: f32,
+    time_alive: f32,
+    duration: f32,          // 0 = infinite
+
+    // Pool management
+    next_free: i32
+}
+
+fn create_emitter(id: i32, config: EmitterConfig, position: Vec3) -> ParticleEmitter {
+    let mut emitter: ParticleEmitter = ParticleEmitter {
+        id: id,
+        config: config,
+        particles: [],
+        particle_count: 0,
+        active_count: 0,
+        position: position,
+        velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        rotation: 0.0,
+        is_active: true,
+        spawn_accumulator: 0.0,
+        time_alive: 0.0,
+        duration: 0.0,
+        next_free: 0
+    }
+
+    // Initialize particle pool
+    for i in 0..256 {
+        emitter.particles[i] = create_particle()
+    }
+
+    // Initial burst
+    if config.burst_count > 0 {
+        for i in 0..config.burst_count {
+            spawn_particle(emitter)
+        }
+    }
+
+    return emitter
+}
+
+fn spawn_particle(emitter: mut ParticleEmitter) {
+    if emitter.active_count >= emitter.config.max_particles {
+        return
+    }
+
+    // Find free slot
+    let mut slot: i32 = -1
+    for i in 0..256 {
+        if not emitter.particles[i].is_alive {
+            slot = i
+            break
+        }
+    }
+
+    if slot < 0 {
+        return
+    }
+
+    let config: EmitterConfig = emitter.config
+
+    // Initialize particle
+    let mut p: Particle = emitter.particles[slot]
+    p.is_alive = true
+    p.lifetime = 0.0
+    p.max_lifetime = random_range(config.lifetime_min, config.lifetime_max)
+    p.age_normalized = 0.0
+
+    // Position with random offset in cone
+    let angle: f32 = random_float() * 6.28318
+    let radius: f32 = random_float() * config.spawn_radius
+    p.position.x = emitter.position.x + config.spawn_offset.x + cos(angle) * radius
+    p.position.y = emitter.position.y + config.spawn_offset.y
+    p.position.z = emitter.position.z + config.spawn_offset.z + sin(angle) * radius
+
+    // Velocity
+    p.velocity.x = random_range(config.velocity_min.x, config.velocity_max.x)
+    p.velocity.y = random_range(config.velocity_min.y, config.velocity_max.y)
+    p.velocity.z = random_range(config.velocity_min.z, config.velocity_max.z)
+
+    // Inherit emitter velocity
+    p.velocity.x = p.velocity.x + emitter.velocity.x * config.inherit_velocity
+    p.velocity.y = p.velocity.y + emitter.velocity.y * config.inherit_velocity
+    p.velocity.z = p.velocity.z + emitter.velocity.z * config.inherit_velocity
+
+    // Cone direction
+    if config.spawn_cone_angle > 0.0 {
+        let cone_angle: f32 = random_range(0.0, config.spawn_cone_angle) * 0.0174533
+        let cone_rotation: f32 = random_float() * 6.28318
+        // Apply cone rotation to velocity
+    }
+
+    // Acceleration (gravity)
+    p.acceleration = Vec3 { x: 0.0, y: -config.gravity, z: 0.0 }
+
+    // Rotation
+    p.rotation = random_range(config.rotation_min, config.rotation_max)
+    p.rotation_speed = random_range(config.rotation_speed_min, config.rotation_speed_max)
+
+    // Scale
+    p.scale = random_range(config.scale_min, config.scale_max)
+    p.scale_velocity = config.scale_over_life
+
+    // Color with variance
+    let variance: f32 = (random_float() - 0.5) * 2.0 * config.color_variance
+    p.start_color = Vec4 {
+        x: clamp(config.start_color.x + variance, 0.0, 1.0),
+        y: clamp(config.start_color.y + variance, 0.0, 1.0),
+        z: clamp(config.start_color.z + variance, 0.0, 1.0),
+        w: config.start_color.w
+    }
+    p.end_color = config.end_color
+    p.color = p.start_color
+
+    // Animation frame
+    if config.random_start_frame and config.frame_count > 1 {
+        p.texture_frame = cast(i32, random_float() * cast(f32, config.frame_count))
+    } else {
+        p.texture_frame = 0
+    }
+
+    emitter.particles[slot] = p
+    emitter.active_count = emitter.active_count + 1
+}
+
+fn update_emitter(emitter: mut ParticleEmitter, delta_time: f32) {
+    if not emitter.is_active {
+        return
+    }
+
+    emitter.time_alive = emitter.time_alive + delta_time
+
+    // Check duration
+    if emitter.duration > 0.0 and emitter.time_alive >= emitter.duration {
+        emitter.is_active = false
+    }
+
+    // Spawn new particles
+    if emitter.config.spawn_rate > 0.0 and emitter.is_active {
+        emitter.spawn_accumulator = emitter.spawn_accumulator + emitter.config.spawn_rate * delta_time
+
+        while emitter.spawn_accumulator >= 1.0 {
+            spawn_particle(emitter)
+            emitter.spawn_accumulator = emitter.spawn_accumulator - 1.0
+        }
+    }
+
+    // Update particles
+    emitter.active_count = 0
+    for i in 0..256 {
+        if emitter.particles[i].is_alive {
+            // Apply drag
+            let drag: f32 = emitter.config.drag
+            emitter.particles[i].velocity.x = emitter.particles[i].velocity.x * (1.0 - drag * delta_time)
+            emitter.particles[i].velocity.y = emitter.particles[i].velocity.y * (1.0 - drag * delta_time)
+            emitter.particles[i].velocity.z = emitter.particles[i].velocity.z * (1.0 - drag * delta_time)
+
+            update_particle(emitter.particles[i], delta_time)
+
+            if emitter.particles[i].is_alive {
+                emitter.active_count = emitter.active_count + 1
+            }
+        }
+    }
+}
+
+fn stop_emitter(emitter: mut ParticleEmitter) {
+    emitter.is_active = false
+}
+
+fn kill_all_particles(emitter: mut ParticleEmitter) {
+    for i in 0..256 {
+        emitter.particles[i].is_alive = false
+    }
+    emitter.active_count = 0
+}
+
+// ============================================================================
+// PARTICLE SYSTEM MANAGER
+// ============================================================================
+
+struct ParticleSystem {
+    emitters: [ParticleEmitter; 128],
+    emitter_count: i32,
+    next_emitter_id: i32,
+
+    // Stats
+    total_particles: i32,
+    total_draw_calls: i32
+}
+
+fn create_particle_system() -> ParticleSystem {
+    return ParticleSystem {
+        emitters: [],
+        emitter_count: 0,
+        next_emitter_id: 1,
+        total_particles: 0,
+        total_draw_calls: 0
+    }
+}
+
+fn spawn_effect(ps: mut ParticleSystem, effect_type: ParticleType, position: Vec3) -> i32 {
+    if ps.emitter_count >= 128 {
+        return -1
+    }
+
+    let config: EmitterConfig = match effect_type {
+        ParticleType::SMOKE => create_smoke_config(),
+        ParticleType::FIRE => create_fire_config(),
+        ParticleType::EXPLOSION => create_explosion_config(),
+        ParticleType::DEBRIS => create_debris_config(),
+        ParticleType::TRACER => create_tracer_config(),
+        ParticleType::TOXIN => create_toxin_config(),
+        _ => create_smoke_config()
+    }
+
+    let emitter: ParticleEmitter = create_emitter(ps.next_emitter_id, config, position)
+    ps.emitters[ps.emitter_count] = emitter
+    ps.emitter_count = ps.emitter_count + 1
+    ps.next_emitter_id = ps.next_emitter_id + 1
+
+    return emitter.id
+}
+
+fn spawn_explosion(ps: mut ParticleSystem, position: Vec3, size: f32) -> i32 {
+    // Spawn multiple effects for big explosion
+    let explosion_id: i32 = spawn_effect(ps, ParticleType::EXPLOSION, position)
+    spawn_effect(ps, ParticleType::SMOKE, position)
+    spawn_effect(ps, ParticleType::DEBRIS, position)
+
+    return explosion_id
+}
+
+fn update_particle_system(ps: mut ParticleSystem, delta_time: f32) {
+    ps.total_particles = 0
+
+    let mut i: i32 = 0
+    while i < ps.emitter_count {
+        update_emitter(ps.emitters[i], delta_time)
+        ps.total_particles = ps.total_particles + ps.emitters[i].active_count
+
+        // Remove dead emitters with no particles
+        if not ps.emitters[i].is_active and ps.emitters[i].active_count == 0 {
+            // Swap with last
+            ps.emitters[i] = ps.emitters[ps.emitter_count - 1]
+            ps.emitter_count = ps.emitter_count - 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn stop_all_effects(ps: mut ParticleSystem) {
+    for i in 0..ps.emitter_count {
+        stop_emitter(ps.emitters[i])
+    }
+}
+
+fn get_emitter(ps: ParticleSystem, id: i32) -> i32 {
+    for i in 0..ps.emitter_count {
+        if ps.emitters[i].id == id {
+            return i
+        }
+    }
+    return -1
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn random_float() -> f32 {
+    static mut seed: u32 = 12345
+    seed = seed * 1103515245 + 12345
+    return cast(f32, seed % 10000) / 10000.0
+}
+
+fn random_range(min: f32, max: f32) -> f32 {
+    return min + random_float() * (max - min)
+}
+
+fn clamp(x: f32, min: f32, max: f32) -> f32 {
+    if x < min { return min }
+    if x > max { return max }
+    return x
+}
+
+fn sin(x: f32) -> f32 {
+    let mut x_norm: f32 = x
+    while x_norm > 3.14159 { x_norm = x_norm - 6.28318 }
+    while x_norm < -3.14159 { x_norm = x_norm + 6.28318 }
+    let x2: f32 = x_norm * x_norm
+    let x3: f32 = x2 * x_norm
+    let x5: f32 = x3 * x2
+    return x_norm - x3/6.0 + x5/120.0
+}
+
+fn cos(x: f32) -> f32 {
+    return sin(x + 1.5708)
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_particle_system() {
+    print("Testing Particle System...")
+
+    // Create system
+    let mut ps: ParticleSystem = create_particle_system()
+    print("Particle system created")
+
+    // Spawn effects
+    let smoke_id: i32 = spawn_effect(ps, ParticleType::SMOKE, Vec3 { x: 0.0, y: 0.0, z: 0.0 })
+    print("Spawned smoke emitter: " + str(smoke_id))
+
+    let fire_id: i32 = spawn_effect(ps, ParticleType::FIRE, Vec3 { x: 10.0, y: 0.0, z: 0.0 })
+    print("Spawned fire emitter: " + str(fire_id))
+
+    let explosion_id: i32 = spawn_explosion(ps, Vec3 { x: 20.0, y: 0.0, z: 0.0 }, 1.0)
+    print("Spawned explosion: " + str(explosion_id))
+
+    print("Total emitters: " + str(ps.emitter_count))
+
+    // Update
+    for frame in 0..60 {
+        update_particle_system(ps, 0.016)
+    }
+    print("After 1 second: " + str(ps.total_particles) + " particles")
+
+    // Test configs
+    let smoke_config: EmitterConfig = create_smoke_config()
+    print("Smoke lifetime: " + str(smoke_config.lifetime_min) + "-" + str(smoke_config.lifetime_max) + "s")
+
+    let toxin_config: EmitterConfig = create_toxin_config()
+    print("Toxin color: green")
+
+    // Test individual particle
+    let mut p: Particle = create_particle()
+    p.is_alive = true
+    p.max_lifetime = 2.0
+    p.velocity = Vec3 { x: 10.0, y: 20.0, z: 0.0 }
+    p.acceleration = Vec3 { x: 0.0, y: -50.0, z: 0.0 }
+
+    for i in 0..10 {
+        update_particle(p, 0.1)
+    }
+    print("Particle after 1s: pos=" + str(p.position.x) + "," + str(p.position.y))
+    print("Age: " + str(p.age_normalized * 100.0) + "%")
+
+    print("Particle System tests complete!")
+}
