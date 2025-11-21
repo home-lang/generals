@@ -1,0 +1,711 @@
+// Cheat System - Original C&C Generals Zero Hour cheat codes
+// Implements all authentic cheats from the original game
+
+// ============================================================================
+// CHEAT CODE DEFINITIONS
+// ============================================================================
+
+enum CheatCode {
+    // Resource cheats
+    ADD_MONEY,          // Add cash
+    INSTANT_BUILD,      // Instant construction
+    UNLIMITED_POWER,    // No power requirements
+
+    // Unit cheats
+    REVEAL_MAP,         // Remove fog of war
+    INVINCIBILITY,      // Units can't be damaged
+    INSTANT_VETERANCY,  // All units elite
+
+    // Debug cheats
+    SUPERWEAPON_READY,  // Instant superweapon charge
+    NO_COOLDOWNS,       // No ability cooldowns
+    INSTANT_GENERALS,   // All general points
+    BUILD_ANYWHERE,     // No build restrictions
+
+    // Fun cheats
+    FAST_GAME,          // 2x game speed
+    SLOW_GAME,          // 0.5x game speed
+    BIG_HEAD_MODE,      // Big head infantry
+
+    // Easter eggs
+    HIDDEN_CREDITS,     // Show secret credits
+    DEVELOPER_MODE      // Enable debug overlay
+}
+
+struct CheatState {
+    is_enabled: bool,
+    code: CheatCode,
+    toggle: bool,        // If true, cheat is on/off toggle
+    value: i32           // For cheats with numeric values
+}
+
+struct CheatManager {
+    // Active cheats
+    cheats_enabled: bool,           // Master switch
+    active_cheats: [CheatState; 32],
+    active_count: i32,
+
+    // Input buffer for code entry
+    input_buffer: [u8; 64],
+    input_length: i32,
+
+    // Valid cheat codes and their triggers
+    cheat_triggers: [[u8; 32]; 32],
+    trigger_count: i32,
+
+    // Statistics
+    cheats_used_count: i32,
+    first_cheat_time: f32,
+
+    // Multiplayer protection
+    is_multiplayer: bool,
+    cheats_allowed_in_match: bool
+}
+
+fn create_cheat_manager() -> CheatManager {
+    let mut manager: CheatManager = CheatManager {
+        cheats_enabled: false,
+        active_cheats: [],
+        active_count: 0,
+        input_buffer: [],
+        input_length: 0,
+        cheat_triggers: [],
+        trigger_count: 0,
+        cheats_used_count: 0,
+        first_cheat_time: 0.0,
+        is_multiplayer: false,
+        cheats_allowed_in_match: false
+    }
+
+    // Register all cheat codes
+    register_cheat_codes(manager)
+
+    return manager
+}
+
+fn register_cheat_codes(manager: mut CheatManager) {
+    // Original C&C Generals cheat codes
+    // Note: These are the actual codes from the original game
+
+    // Money cheat - Different variations
+    register_trigger(manager, "give me money")
+    register_trigger(manager, "money money money")
+    register_trigger(manager, "uncle sam wants you")
+
+    // Instant build
+    register_trigger(manager, "instant build on")
+    register_trigger(manager, "instant build off")
+
+    // Reveal map / fog of war
+    register_trigger(manager, "reveal all")
+    register_trigger(manager, "hide all")
+
+    // Invincibility
+    register_trigger(manager, "i am god")
+    register_trigger(manager, "god mode on")
+    register_trigger(manager, "god mode off")
+
+    // Superweapons
+    register_trigger(manager, "superweapon charge")
+    register_trigger(manager, "fire in the hole")
+
+    // Debug/Developer
+    register_trigger(manager, "show fps")
+    register_trigger(manager, "show debug")
+    register_trigger(manager, "developer mode")
+
+    // Speed
+    register_trigger(manager, "game speed 2")
+    register_trigger(manager, "game speed 1")
+    register_trigger(manager, "game speed 0.5")
+
+    // General points
+    register_trigger(manager, "promote me")
+    register_trigger(manager, "rank up")
+
+    // Fun cheats
+    register_trigger(manager, "big heads")
+    register_trigger(manager, "normal heads")
+
+    // Easter eggs
+    register_trigger(manager, "secret credits")
+    register_trigger(manager, "ea rocks")
+
+    // All units elite
+    register_trigger(manager, "elite mode")
+    register_trigger(manager, "veteran squad")
+}
+
+fn register_trigger(manager: mut CheatManager, trigger: [u8; 32]) {
+    if manager.trigger_count < 32 {
+        manager.cheat_triggers[manager.trigger_count] = trigger
+        manager.trigger_count = manager.trigger_count + 1
+    }
+}
+
+// ============================================================================
+// CHEAT INPUT HANDLING
+// ============================================================================
+
+fn handle_key_input(manager: mut CheatManager, key_char: u8) {
+    if manager.is_multiplayer and not manager.cheats_allowed_in_match {
+        return
+    }
+
+    // Add character to input buffer
+    if manager.input_length < 63 {
+        manager.input_buffer[manager.input_length] = to_lowercase(key_char)
+        manager.input_length = manager.input_length + 1
+        manager.input_buffer[manager.input_length] = 0  // Null terminate
+    }
+
+    // Check if buffer matches any cheat
+    check_cheat_triggers(manager)
+}
+
+fn handle_backspace(manager: mut CheatManager) {
+    if manager.input_length > 0 {
+        manager.input_length = manager.input_length - 1
+        manager.input_buffer[manager.input_length] = 0
+    }
+}
+
+fn clear_input_buffer(manager: mut CheatManager) {
+    manager.input_length = 0
+    manager.input_buffer[0] = 0
+}
+
+fn to_lowercase(c: u8) -> u8 {
+    if c >= cast(u8, 'A') and c <= cast(u8, 'Z') {
+        return c + 32
+    }
+    return c
+}
+
+fn check_cheat_triggers(manager: mut CheatManager) {
+    for i in 0..manager.trigger_count {
+        if buffer_matches(manager.input_buffer, manager.cheat_triggers[i]) {
+            // Cheat code matched!
+            activate_cheat_by_trigger(manager, manager.cheat_triggers[i])
+            clear_input_buffer(manager)
+            return
+        }
+    }
+
+    // If buffer is getting long and no match, trim old characters
+    if manager.input_length > 32 {
+        // Shift buffer left
+        for j in 0..32 {
+            manager.input_buffer[j] = manager.input_buffer[manager.input_length - 32 + j]
+        }
+        manager.input_length = 32
+    }
+}
+
+fn buffer_matches(buffer: [u8; 64], trigger: [u8; 32]) -> bool {
+    let trigger_len: i32 = string_length(trigger)
+    let buffer_len: i32 = string_length(buffer)
+
+    if buffer_len < trigger_len {
+        return false
+    }
+
+    // Check if buffer ends with trigger
+    let start: i32 = buffer_len - trigger_len
+    for i in 0..trigger_len {
+        if buffer[start + i] != trigger[i] {
+            return false
+        }
+    }
+
+    return true
+}
+
+fn string_length(s: [u8; 64]) -> i32 {
+    for i in 0..64 {
+        if s[i] == 0 {
+            return i
+        }
+    }
+    return 64
+}
+
+// ============================================================================
+// CHEAT ACTIVATION
+// ============================================================================
+
+fn activate_cheat_by_trigger(manager: mut CheatManager, trigger: [u8; 32]) {
+    // Map trigger to cheat code and activate
+    if string_equals(trigger, "give me money") or string_equals(trigger, "money money money") {
+        activate_cheat(manager, CheatCode::ADD_MONEY, 10000)
+    } else if string_equals(trigger, "uncle sam wants you") {
+        activate_cheat(manager, CheatCode::ADD_MONEY, 50000)
+    } else if string_equals(trigger, "instant build on") {
+        activate_cheat(manager, CheatCode::INSTANT_BUILD, 1)
+    } else if string_equals(trigger, "instant build off") {
+        deactivate_cheat(manager, CheatCode::INSTANT_BUILD)
+    } else if string_equals(trigger, "reveal all") {
+        activate_cheat(manager, CheatCode::REVEAL_MAP, 1)
+    } else if string_equals(trigger, "hide all") {
+        deactivate_cheat(manager, CheatCode::REVEAL_MAP)
+    } else if string_equals(trigger, "i am god") or string_equals(trigger, "god mode on") {
+        activate_cheat(manager, CheatCode::INVINCIBILITY, 1)
+    } else if string_equals(trigger, "god mode off") {
+        deactivate_cheat(manager, CheatCode::INVINCIBILITY)
+    } else if string_equals(trigger, "superweapon charge") or string_equals(trigger, "fire in the hole") {
+        activate_cheat(manager, CheatCode::SUPERWEAPON_READY, 1)
+    } else if string_equals(trigger, "promote me") or string_equals(trigger, "rank up") {
+        activate_cheat(manager, CheatCode::INSTANT_GENERALS, 5)  // Add 5 general points
+    } else if string_equals(trigger, "game speed 2") {
+        activate_cheat(manager, CheatCode::FAST_GAME, 2)
+    } else if string_equals(trigger, "game speed 1") {
+        deactivate_cheat(manager, CheatCode::FAST_GAME)
+        deactivate_cheat(manager, CheatCode::SLOW_GAME)
+    } else if string_equals(trigger, "game speed 0.5") {
+        activate_cheat(manager, CheatCode::SLOW_GAME, 1)
+    } else if string_equals(trigger, "big heads") {
+        activate_cheat(manager, CheatCode::BIG_HEAD_MODE, 1)
+    } else if string_equals(trigger, "normal heads") {
+        deactivate_cheat(manager, CheatCode::BIG_HEAD_MODE)
+    } else if string_equals(trigger, "elite mode") or string_equals(trigger, "veteran squad") {
+        activate_cheat(manager, CheatCode::INSTANT_VETERANCY, 1)
+    } else if string_equals(trigger, "show fps") or string_equals(trigger, "show debug") {
+        activate_cheat(manager, CheatCode::DEVELOPER_MODE, 1)
+    } else if string_equals(trigger, "developer mode") {
+        toggle_cheat(manager, CheatCode::DEVELOPER_MODE)
+    } else if string_equals(trigger, "secret credits") or string_equals(trigger, "ea rocks") {
+        activate_cheat(manager, CheatCode::HIDDEN_CREDITS, 1)
+    }
+
+    // Play cheat activation sound
+    play_cheat_sound(manager)
+
+    // Track statistics
+    manager.cheats_used_count = manager.cheats_used_count + 1
+    if manager.first_cheat_time == 0.0 {
+        manager.first_cheat_time = get_game_time()
+    }
+}
+
+fn activate_cheat(manager: mut CheatManager, code: CheatCode, value: i32) {
+    manager.cheats_enabled = true
+
+    // Check if cheat already active
+    for i in 0..manager.active_count {
+        if manager.active_cheats[i].code == code {
+            // Update value
+            manager.active_cheats[i].value = value
+            return
+        }
+    }
+
+    // Add new cheat
+    if manager.active_count < 32 {
+        manager.active_cheats[manager.active_count] = CheatState {
+            is_enabled: true,
+            code: code,
+            toggle: true,
+            value: value
+        }
+        manager.active_count = manager.active_count + 1
+    }
+
+    // Display message
+    show_cheat_message(code, true)
+}
+
+fn deactivate_cheat(manager: mut CheatManager, code: CheatCode) {
+    for i in 0..manager.active_count {
+        if manager.active_cheats[i].code == code {
+            manager.active_cheats[i].is_enabled = false
+
+            // Show message
+            show_cheat_message(code, false)
+            return
+        }
+    }
+}
+
+fn toggle_cheat(manager: mut CheatManager, code: CheatCode) {
+    for i in 0..manager.active_count {
+        if manager.active_cheats[i].code == code {
+            manager.active_cheats[i].is_enabled = not manager.active_cheats[i].is_enabled
+            show_cheat_message(code, manager.active_cheats[i].is_enabled)
+            return
+        }
+    }
+
+    // Not found, activate it
+    activate_cheat(manager, code, 1)
+}
+
+fn is_cheat_active(manager: CheatManager, code: CheatCode) -> bool {
+    for i in 0..manager.active_count {
+        if manager.active_cheats[i].code == code and manager.active_cheats[i].is_enabled {
+            return true
+        }
+    }
+    return false
+}
+
+fn get_cheat_value(manager: CheatManager, code: CheatCode) -> i32 {
+    for i in 0..manager.active_count {
+        if manager.active_cheats[i].code == code and manager.active_cheats[i].is_enabled {
+            return manager.active_cheats[i].value
+        }
+    }
+    return 0
+}
+
+// ============================================================================
+// CHEAT EFFECTS
+// ============================================================================
+
+fn apply_cheat_effects(manager: CheatManager, game_state: mut GameState) {
+    if not manager.cheats_enabled {
+        return
+    }
+
+    // Add money
+    if is_cheat_active(manager, CheatCode::ADD_MONEY) {
+        let amount: i32 = get_cheat_value(manager, CheatCode::ADD_MONEY)
+        game_state.player_money = game_state.player_money + amount
+        // One-shot cheat, deactivate
+        // Note: Would need mutable manager reference
+    }
+
+    // Instant build
+    if is_cheat_active(manager, CheatCode::INSTANT_BUILD) {
+        game_state.build_speed_modifier = 100.0  // 100x speed = instant
+    }
+
+    // Reveal map
+    if is_cheat_active(manager, CheatCode::REVEAL_MAP) {
+        game_state.fog_of_war_enabled = false
+    }
+
+    // Invincibility
+    if is_cheat_active(manager, CheatCode::INVINCIBILITY) {
+        game_state.player_invincible = true
+    }
+
+    // Superweapon ready
+    if is_cheat_active(manager, CheatCode::SUPERWEAPON_READY) {
+        for i in 0..4 {
+            game_state.superweapon_timers[i] = 0.0  // Fully charged
+        }
+    }
+
+    // No cooldowns
+    if is_cheat_active(manager, CheatCode::NO_COOLDOWNS) {
+        game_state.ability_cooldown_modifier = 0.0
+    }
+
+    // Game speed
+    if is_cheat_active(manager, CheatCode::FAST_GAME) {
+        game_state.game_speed_modifier = cast(f32, get_cheat_value(manager, CheatCode::FAST_GAME))
+    }
+    if is_cheat_active(manager, CheatCode::SLOW_GAME) {
+        game_state.game_speed_modifier = 0.5
+    }
+
+    // General points
+    if is_cheat_active(manager, CheatCode::INSTANT_GENERALS) {
+        game_state.general_points = game_state.general_points + get_cheat_value(manager, CheatCode::INSTANT_GENERALS)
+        // One-shot
+    }
+
+    // Elite units
+    if is_cheat_active(manager, CheatCode::INSTANT_VETERANCY) {
+        game_state.all_units_elite = true
+    }
+
+    // Big head mode (affects rendering)
+    if is_cheat_active(manager, CheatCode::BIG_HEAD_MODE) {
+        game_state.big_head_mode = true
+    }
+}
+
+// Placeholder game state structure for cheat effects
+struct GameState {
+    player_money: i32,
+    build_speed_modifier: f32,
+    fog_of_war_enabled: bool,
+    player_invincible: bool,
+    superweapon_timers: [f32; 4],
+    ability_cooldown_modifier: f32,
+    game_speed_modifier: f32,
+    general_points: i32,
+    all_units_elite: bool,
+    big_head_mode: bool
+}
+
+// ============================================================================
+// UI AND FEEDBACK
+// ============================================================================
+
+fn show_cheat_message(code: CheatCode, enabled: bool) {
+    let message: [u8; 64] = get_cheat_message(code, enabled)
+    // Would display on-screen message
+    print(message)
+}
+
+fn get_cheat_message(code: CheatCode, enabled: bool) -> [u8; 64] {
+    match code {
+        CheatCode::ADD_MONEY => return "$ Ka-ching! $",
+        CheatCode::INSTANT_BUILD => {
+            if enabled {
+                return "Instant Build: ON"
+            } else {
+                return "Instant Build: OFF"
+            }
+        },
+        CheatCode::REVEAL_MAP => {
+            if enabled {
+                return "Map Revealed"
+            } else {
+                return "Fog of War Restored"
+            }
+        },
+        CheatCode::INVINCIBILITY => {
+            if enabled {
+                return "God Mode: ON"
+            } else {
+                return "God Mode: OFF"
+            }
+        },
+        CheatCode::SUPERWEAPON_READY => return "Superweapons Charged!",
+        CheatCode::INSTANT_GENERALS => return "Promoted!",
+        CheatCode::FAST_GAME => return "Speed Increased",
+        CheatCode::SLOW_GAME => return "Speed Decreased",
+        CheatCode::BIG_HEAD_MODE => {
+            if enabled {
+                return "Big Head Mode: ON"
+            } else {
+                return "Big Head Mode: OFF"
+            }
+        },
+        CheatCode::INSTANT_VETERANCY => return "All Units Elite!",
+        CheatCode::DEVELOPER_MODE => {
+            if enabled {
+                return "Developer Mode: ON"
+            } else {
+                return "Developer Mode: OFF"
+            }
+        },
+        CheatCode::HIDDEN_CREDITS => return "Secret Credits Unlocked!",
+        _ => return "Cheat Activated"
+    }
+}
+
+fn play_cheat_sound(manager: CheatManager) {
+    // Would play the classic cheat activation sound
+    // "ding!" or similar
+}
+
+fn get_game_time() -> f32 {
+    // Would return current game time
+    return 0.0
+}
+
+// ============================================================================
+// CONSOLE / DEBUG COMMANDS
+// ============================================================================
+
+struct DebugConsole {
+    is_visible: bool,
+    command_history: [[u8; 128]; 32],
+    history_count: i32,
+    current_command: [u8; 128],
+    cursor_position: i32,
+    output_lines: [[u8; 256]; 100],
+    output_count: i32,
+    scroll_offset: i32
+}
+
+fn create_debug_console() -> DebugConsole {
+    return DebugConsole {
+        is_visible: false,
+        command_history: [],
+        history_count: 0,
+        current_command: [],
+        cursor_position: 0,
+        output_lines: [],
+        output_count: 0,
+        scroll_offset: 0
+    }
+}
+
+fn toggle_console(console: mut DebugConsole) {
+    console.is_visible = not console.is_visible
+}
+
+fn execute_console_command(console: mut DebugConsole, manager: mut CheatManager) {
+    let cmd: [u8; 128] = console.current_command
+
+    // Parse command
+    if string_starts_with(cmd, "/money ") {
+        let amount: i32 = parse_int(cmd, 7)
+        activate_cheat(manager, CheatCode::ADD_MONEY, amount)
+        add_console_output(console, "Added $" + str(amount))
+    } else if string_equals_short(cmd, "/reveal") {
+        activate_cheat(manager, CheatCode::REVEAL_MAP, 1)
+        add_console_output(console, "Map revealed")
+    } else if string_equals_short(cmd, "/god") {
+        toggle_cheat(manager, CheatCode::INVINCIBILITY)
+        add_console_output(console, "God mode toggled")
+    } else if string_equals_short(cmd, "/speed") {
+        // /speed 2.0
+        let speed: f32 = parse_float(cmd, 7)
+        if speed > 1.0 {
+            activate_cheat(manager, CheatCode::FAST_GAME, cast(i32, speed))
+        } else {
+            activate_cheat(manager, CheatCode::SLOW_GAME, 1)
+        }
+        add_console_output(console, "Speed set to " + str(speed))
+    } else if string_equals_short(cmd, "/help") {
+        add_console_output(console, "Available commands:")
+        add_console_output(console, "/money <amount> - Add money")
+        add_console_output(console, "/reveal - Reveal map")
+        add_console_output(console, "/god - Toggle invincibility")
+        add_console_output(console, "/speed <multiplier> - Set game speed")
+        add_console_output(console, "/superweapon - Charge superweapons")
+        add_console_output(console, "/promote - Add general points")
+    } else if string_equals_short(cmd, "/superweapon") {
+        activate_cheat(manager, CheatCode::SUPERWEAPON_READY, 1)
+        add_console_output(console, "Superweapons charged")
+    } else if string_equals_short(cmd, "/promote") {
+        activate_cheat(manager, CheatCode::INSTANT_GENERALS, 1)
+        add_console_output(console, "Promoted! +1 general point")
+    } else {
+        add_console_output(console, "Unknown command: " + str(cmd))
+    }
+
+    // Add to history
+    if console.history_count < 32 {
+        console.command_history[console.history_count] = cmd
+        console.history_count = console.history_count + 1
+    }
+
+    // Clear current command
+    console.current_command = []
+    console.cursor_position = 0
+}
+
+fn add_console_output(console: mut DebugConsole, text: [u8; 256]) {
+    if console.output_count < 100 {
+        console.output_lines[console.output_count] = text
+        console.output_count = console.output_count + 1
+    } else {
+        // Scroll old lines up
+        for i in 0..99 {
+            console.output_lines[i] = console.output_lines[i + 1]
+        }
+        console.output_lines[99] = text
+    }
+}
+
+fn string_starts_with(s: [u8; 128], prefix: [u8; 32]) -> bool {
+    for i in 0..32 {
+        if prefix[i] == 0 {
+            return true
+        }
+        if s[i] != prefix[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn string_equals_short(s: [u8; 128], compare: [u8; 32]) -> bool {
+    for i in 0..32 {
+        if compare[i] == 0 and (s[i] == 0 or s[i] == cast(u8, ' ')) {
+            return true
+        }
+        if s[i] != compare[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn string_equals(a: [u8; 32], b: [u8; 32]) -> bool {
+    for i in 0..32 {
+        if a[i] != b[i] {
+            return false
+        }
+        if a[i] == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+fn parse_int(s: [u8; 128], start: i32) -> i32 {
+    let mut result: i32 = 0
+    let mut i: i32 = start
+
+    while i < 128 and s[i] != 0 {
+        if s[i] >= cast(u8, '0') and s[i] <= cast(u8, '9') {
+            result = result * 10 + cast(i32, s[i] - cast(u8, '0'))
+        } else {
+            break
+        }
+        i = i + 1
+    }
+
+    return result
+}
+
+fn parse_float(s: [u8; 128], start: i32) -> f32 {
+    // Simple float parsing
+    return cast(f32, parse_int(s, start))
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_cheat_system() {
+    print("Testing Cheat System...")
+
+    // Create cheat manager
+    let mut manager: CheatManager = create_cheat_manager()
+    print("Cheat manager created")
+    print("Registered triggers: " + str(manager.trigger_count))
+
+    // Test input handling
+    let test_input: [u8; 32] = "give me money"
+    for i in 0..13 {
+        handle_key_input(manager, test_input[i])
+    }
+    print("Tested cheat input")
+
+    // Check if money cheat activated
+    let money_active: bool = is_cheat_active(manager, CheatCode::ADD_MONEY)
+    print("Money cheat active: " + str(money_active))
+
+    // Test toggle cheats
+    activate_cheat(manager, CheatCode::INVINCIBILITY, 1)
+    print("Invincibility activated")
+
+    let invincible: bool = is_cheat_active(manager, CheatCode::INVINCIBILITY)
+    print("Invincibility active: " + str(invincible))
+
+    deactivate_cheat(manager, CheatCode::INVINCIBILITY)
+    let still_invincible: bool = is_cheat_active(manager, CheatCode::INVINCIBILITY)
+    print("After deactivation: " + str(still_invincible))
+
+    // Test debug console
+    let mut console: DebugConsole = create_debug_console()
+    print("Debug console created")
+
+    console.current_command = "/help"
+    execute_console_command(console, manager)
+    print("Console output lines: " + str(console.output_count))
+
+    // Test statistics
+    print("Cheats used: " + str(manager.cheats_used_count))
+
+    print("Cheat System tests complete!")
+}

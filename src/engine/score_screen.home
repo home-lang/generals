@@ -1,0 +1,831 @@
+// Score Screen System - End game statistics and results
+// Implements authentic C&C Generals Zero Hour score screen
+
+// ============================================================================
+// SCORE CATEGORIES
+// ============================================================================
+
+enum ScoreCategory {
+    TOTAL_SCORE,
+    UNITS_BUILT,
+    UNITS_LOST,
+    UNITS_KILLED,
+    BUILDINGS_BUILT,
+    BUILDINGS_LOST,
+    BUILDINGS_DESTROYED,
+    SUPPLIES_COLLECTED,
+    SUPPLIES_SPENT,
+    GENERALS_POINTS_EARNED,
+    ABILITIES_USED,
+    SUPERWEAPONS_LAUNCHED,
+    TIME_PLAYED
+}
+
+enum GameResult {
+    VICTORY,
+    DEFEAT,
+    DISCONNECT,
+    DRAW
+}
+
+// ============================================================================
+// PLAYER STATISTICS
+// ============================================================================
+
+struct PlayerStats {
+    player_id: i32,
+    player_name: [u8; 32],
+    faction: i32,              // 0=USA, 1=China, 2=GLA
+    general: i32,              // General index for Zero Hour
+    color: i32,
+    team: i32,
+    is_ai: bool,
+
+    // Game result
+    result: GameResult,
+    finish_time: f32,          // Time when player was eliminated/won
+
+    // Economy stats
+    supplies_collected: i32,
+    supplies_spent: i32,
+    peak_money: i32,
+
+    // Unit stats
+    units_built: i32,
+    units_lost: i32,
+    units_killed: i32,
+    infantry_built: i32,
+    vehicles_built: i32,
+    aircraft_built: i32,
+
+    // Building stats
+    buildings_built: i32,
+    buildings_lost: i32,
+    buildings_destroyed: i32,
+    buildings_captured: i32,
+
+    // Combat stats
+    total_damage_dealt: i32,
+    total_damage_received: i32,
+    largest_army_size: i32,
+    longest_kill_streak: i32,
+
+    // Tech stats
+    upgrades_researched: i32,
+    general_points_earned: i32,
+    general_abilities_used: i32,
+    superweapons_launched: i32,
+
+    // APM (Actions Per Minute)
+    total_commands: i32,
+    average_apm: f32,
+    peak_apm: f32,
+
+    // Time stats
+    time_at_max_tech: f32,
+    first_attack_time: f32,
+
+    // Score calculation
+    total_score: i32
+}
+
+fn create_player_stats(player_id: i32, name: [u8; 32], faction: i32) -> PlayerStats {
+    return PlayerStats {
+        player_id: player_id,
+        player_name: name,
+        faction: faction,
+        general: -1,
+        color: player_id,
+        team: 0,
+        is_ai: false,
+        result: GameResult::DEFEAT,
+        finish_time: 0.0,
+        supplies_collected: 0,
+        supplies_spent: 0,
+        peak_money: 0,
+        units_built: 0,
+        units_lost: 0,
+        units_killed: 0,
+        infantry_built: 0,
+        vehicles_built: 0,
+        aircraft_built: 0,
+        buildings_built: 0,
+        buildings_lost: 0,
+        buildings_destroyed: 0,
+        buildings_captured: 0,
+        total_damage_dealt: 0,
+        total_damage_received: 0,
+        largest_army_size: 0,
+        longest_kill_streak: 0,
+        upgrades_researched: 0,
+        general_points_earned: 0,
+        general_abilities_used: 0,
+        superweapons_launched: 0,
+        total_commands: 0,
+        average_apm: 0.0,
+        peak_apm: 0.0,
+        time_at_max_tech: 0.0,
+        first_attack_time: 0.0,
+        total_score: 0
+    }
+}
+
+fn calculate_total_score(stats: mut PlayerStats) {
+    let mut score: i32 = 0
+
+    // Economy score (20% weight)
+    score = score + stats.supplies_collected / 100
+    score = score + stats.supplies_spent / 200
+
+    // Combat score (40% weight)
+    score = score + stats.units_killed * 10
+    score = score + stats.buildings_destroyed * 50
+    score = score - stats.units_lost * 5
+    score = score - stats.buildings_lost * 25
+
+    // Tech score (20% weight)
+    score = score + stats.upgrades_researched * 25
+    score = score + stats.general_abilities_used * 15
+    score = score + stats.superweapons_launched * 100
+
+    // Victory bonus (20% weight)
+    if stats.result == GameResult::VICTORY {
+        score = score + 500
+    }
+
+    // Ensure non-negative
+    if score < 0 {
+        score = 0
+    }
+
+    stats.total_score = score
+}
+
+// ============================================================================
+// GAME STATISTICS TRACKER
+// ============================================================================
+
+struct GameStats {
+    // Game info
+    game_mode: i32,            // 0=Skirmish, 1=Campaign, 2=Multiplayer
+    map_name: [u8; 128],
+    game_time: f32,
+    game_speed: f32,
+
+    // Players
+    player_count: i32,
+    player_stats: [PlayerStats; 8],
+
+    // Global stats
+    total_units_built: i32,
+    total_units_destroyed: i32,
+    total_buildings_built: i32,
+    total_buildings_destroyed: i32,
+    total_resources_collected: i32,
+
+    // Time tracking
+    start_time: u64,
+    end_time: u64,
+
+    // Winner
+    winning_player: i32,
+    winning_team: i32
+}
+
+fn create_game_stats() -> GameStats {
+    return GameStats {
+        game_mode: 0,
+        map_name: "",
+        game_time: 0.0,
+        game_speed: 1.0,
+        player_count: 0,
+        player_stats: [],
+        total_units_built: 0,
+        total_units_destroyed: 0,
+        total_buildings_built: 0,
+        total_buildings_destroyed: 0,
+        total_resources_collected: 0,
+        start_time: 0,
+        end_time: 0,
+        winning_player: -1,
+        winning_team: -1
+    }
+}
+
+fn add_player_to_stats(game: mut GameStats, player_id: i32, name: [u8; 32],
+                       faction: i32, general: i32, color: i32, team: i32, is_ai: bool) {
+    if game.player_count < 8 {
+        game.player_stats[game.player_count] = create_player_stats(player_id, name, faction)
+        game.player_stats[game.player_count].general = general
+        game.player_stats[game.player_count].color = color
+        game.player_stats[game.player_count].team = team
+        game.player_stats[game.player_count].is_ai = is_ai
+        game.player_count = game.player_count + 1
+    }
+}
+
+fn record_unit_built(game: mut GameStats, player_id: i32, unit_type: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].units_built = game.player_stats[i].units_built + 1
+
+            // Track unit type
+            match unit_type {
+                0 => game.player_stats[i].infantry_built = game.player_stats[i].infantry_built + 1,
+                1 => game.player_stats[i].vehicles_built = game.player_stats[i].vehicles_built + 1,
+                2 => game.player_stats[i].aircraft_built = game.player_stats[i].aircraft_built + 1,
+                _ => {}
+            }
+
+            game.total_units_built = game.total_units_built + 1
+            return
+        }
+    }
+}
+
+fn record_unit_killed(game: mut GameStats, killer_id: i32, victim_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == killer_id {
+            game.player_stats[i].units_killed = game.player_stats[i].units_killed + 1
+        }
+        if game.player_stats[i].player_id == victim_id {
+            game.player_stats[i].units_lost = game.player_stats[i].units_lost + 1
+        }
+    }
+    game.total_units_destroyed = game.total_units_destroyed + 1
+}
+
+fn record_building_built(game: mut GameStats, player_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].buildings_built = game.player_stats[i].buildings_built + 1
+            game.total_buildings_built = game.total_buildings_built + 1
+            return
+        }
+    }
+}
+
+fn record_building_destroyed(game: mut GameStats, destroyer_id: i32, owner_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == destroyer_id {
+            game.player_stats[i].buildings_destroyed = game.player_stats[i].buildings_destroyed + 1
+        }
+        if game.player_stats[i].player_id == owner_id {
+            game.player_stats[i].buildings_lost = game.player_stats[i].buildings_lost + 1
+        }
+    }
+    game.total_buildings_destroyed = game.total_buildings_destroyed + 1
+}
+
+fn record_supplies_collected(game: mut GameStats, player_id: i32, amount: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].supplies_collected =
+                game.player_stats[i].supplies_collected + amount
+            game.total_resources_collected = game.total_resources_collected + amount
+            return
+        }
+    }
+}
+
+fn record_supplies_spent(game: mut GameStats, player_id: i32, amount: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].supplies_spent = game.player_stats[i].supplies_spent + amount
+            return
+        }
+    }
+}
+
+fn record_ability_used(game: mut GameStats, player_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].general_abilities_used =
+                game.player_stats[i].general_abilities_used + 1
+            return
+        }
+    }
+}
+
+fn record_superweapon_launched(game: mut GameStats, player_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].superweapons_launched =
+                game.player_stats[i].superweapons_launched + 1
+            return
+        }
+    }
+}
+
+fn record_command(game: mut GameStats, player_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].total_commands = game.player_stats[i].total_commands + 1
+            return
+        }
+    }
+}
+
+fn record_player_eliminated(game: mut GameStats, player_id: i32) {
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].result = GameResult::DEFEAT
+            game.player_stats[i].finish_time = game.game_time
+            return
+        }
+    }
+}
+
+fn record_victory(game: mut GameStats, player_id: i32) {
+    game.winning_player = player_id
+
+    for i in 0..game.player_count {
+        if game.player_stats[i].player_id == player_id {
+            game.player_stats[i].result = GameResult::VICTORY
+            game.player_stats[i].finish_time = game.game_time
+            game.winning_team = game.player_stats[i].team
+        }
+    }
+
+    // Mark teammates as victors too
+    for i in 0..game.player_count {
+        if game.player_stats[i].team == game.winning_team and game.winning_team >= 0 {
+            game.player_stats[i].result = GameResult::VICTORY
+        }
+    }
+}
+
+fn finalize_game_stats(game: mut GameStats) {
+    game.end_time = get_timestamp()
+
+    // Calculate APM for each player
+    for i in 0..game.player_count {
+        let minutes: f32 = game.game_time / 60.0
+        if minutes > 0.0 {
+            game.player_stats[i].average_apm =
+                cast(f32, game.player_stats[i].total_commands) / minutes
+        }
+
+        // Calculate total scores
+        calculate_total_score(game.player_stats[i])
+    }
+}
+
+fn get_timestamp() -> u64 {
+    return 0  // Would return actual timestamp
+}
+
+// ============================================================================
+// SCORE SCREEN UI
+// ============================================================================
+
+enum ScoreTab {
+    SUMMARY,
+    ECONOMY,
+    UNITS,
+    BUILDINGS,
+    TIMELINE,
+    AWARDS
+}
+
+struct ScoreScreenUI {
+    is_visible: bool,
+    current_tab: ScoreTab,
+    selected_player: i32,
+
+    // Animation
+    reveal_progress: f32,
+    score_counter_target: i32,
+    score_counter_current: i32,
+
+    // Layout
+    panel_x: i32,
+    panel_y: i32,
+    panel_width: i32,
+    panel_height: i32,
+
+    // Tab positions
+    tab_x: [i32; 6],
+    tab_width: i32,
+
+    // Graph data for timeline
+    graph_points: [[f32; 600]; 8],  // 8 players, 600 data points (10 minutes at 1/sec)
+    graph_point_count: i32
+}
+
+fn create_score_screen_ui() -> ScoreScreenUI {
+    return ScoreScreenUI {
+        is_visible: false,
+        current_tab: ScoreTab::SUMMARY,
+        selected_player: 0,
+        reveal_progress: 0.0,
+        score_counter_target: 0,
+        score_counter_current: 0,
+        panel_x: 100,
+        panel_y: 50,
+        panel_width: 600,
+        panel_height: 500,
+        tab_x: [100, 200, 300, 400, 500, 600],
+        tab_width: 80,
+        graph_points: [],
+        graph_point_count: 0
+    }
+}
+
+fn show_score_screen(ui: mut ScoreScreenUI, game: GameStats) {
+    ui.is_visible = true
+    ui.reveal_progress = 0.0
+    ui.current_tab = ScoreTab::SUMMARY
+    ui.selected_player = game.winning_player
+}
+
+fn hide_score_screen(ui: mut ScoreScreenUI) {
+    ui.is_visible = false
+}
+
+fn update_score_screen(ui: mut ScoreScreenUI, delta_time: f32) {
+    if not ui.is_visible {
+        return
+    }
+
+    // Animate reveal
+    if ui.reveal_progress < 1.0 {
+        ui.reveal_progress = ui.reveal_progress + delta_time * 2.0
+        if ui.reveal_progress > 1.0 {
+            ui.reveal_progress = 1.0
+        }
+    }
+
+    // Animate score counter
+    if ui.score_counter_current < ui.score_counter_target {
+        let diff: i32 = ui.score_counter_target - ui.score_counter_current
+        let increment: i32 = cast(i32, cast(f32, diff) * delta_time * 5.0)
+        if increment < 1 {
+            increment = 1
+        }
+        ui.score_counter_current = ui.score_counter_current + increment
+        if ui.score_counter_current > ui.score_counter_target {
+            ui.score_counter_current = ui.score_counter_target
+        }
+    }
+}
+
+fn set_score_tab(ui: mut ScoreScreenUI, tab: ScoreTab) {
+    ui.current_tab = tab
+}
+
+fn select_player(ui: mut ScoreScreenUI, player_id: i32) {
+    ui.selected_player = player_id
+}
+
+// ============================================================================
+// SCORE SCREEN RENDERING
+// ============================================================================
+
+fn render_score_screen(ui: ScoreScreenUI, game: GameStats) {
+    if not ui.is_visible {
+        return
+    }
+
+    // Draw background panel
+    render_score_background(ui)
+
+    // Draw tabs
+    render_score_tabs(ui)
+
+    // Draw content based on current tab
+    match ui.current_tab {
+        ScoreTab::SUMMARY => render_summary_tab(ui, game),
+        ScoreTab::ECONOMY => render_economy_tab(ui, game),
+        ScoreTab::UNITS => render_units_tab(ui, game),
+        ScoreTab::BUILDINGS => render_buildings_tab(ui, game),
+        ScoreTab::TIMELINE => render_timeline_tab(ui, game),
+        ScoreTab::AWARDS => render_awards_tab(ui, game)
+    }
+
+    // Draw player list sidebar
+    render_player_list(ui, game)
+
+    // Draw buttons (Continue, Save Replay, etc.)
+    render_score_buttons(ui)
+}
+
+fn render_score_background(ui: ScoreScreenUI) {
+    // Draw semi-transparent black background
+    // Draw panel frame
+    // Draw title based on result ("VICTORY" or "DEFEAT")
+}
+
+fn render_score_tabs(ui: ScoreScreenUI) {
+    // Draw tab buttons
+    let tabs: [[u8; 16]; 6] = ["Summary", "Economy", "Units", "Buildings", "Timeline", "Awards"]
+
+    for i in 0..6 {
+        // Draw tab button
+        // Highlight current tab
+    }
+}
+
+fn render_summary_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Show overall game statistics
+    // Winner announcement
+    // Game duration
+    // Total units/buildings
+
+    // Draw comparison bars for key stats
+    render_stat_comparison_bar(game, "Units Killed", ScoreCategory::UNITS_KILLED)
+    render_stat_comparison_bar(game, "Buildings Destroyed", ScoreCategory::BUILDINGS_DESTROYED)
+    render_stat_comparison_bar(game, "Resources Collected", ScoreCategory::SUPPLIES_COLLECTED)
+    render_stat_comparison_bar(game, "Total Score", ScoreCategory::TOTAL_SCORE)
+}
+
+fn render_economy_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Detailed economy stats
+    // Resources over time graph
+    // Income/spending breakdown
+
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+        // Draw player row:
+        // - Player name + color
+        // - Supplies collected
+        // - Supplies spent
+        // - Peak money
+    }
+}
+
+fn render_units_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Unit production breakdown
+    // Infantry/Vehicles/Aircraft pie chart
+    // Kill/death ratio
+
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+        // Draw:
+        // - Units built (infantry/vehicles/aircraft breakdown)
+        // - Units killed
+        // - Units lost
+        // - K/D ratio
+    }
+}
+
+fn render_buildings_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Building stats
+    // Construction timeline
+
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+        // Draw:
+        // - Buildings built
+        // - Buildings destroyed
+        // - Buildings lost
+        // - Buildings captured
+    }
+}
+
+fn render_timeline_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Graph showing army value / score over time
+    // Key events marked on timeline
+
+    // Draw graph axes
+    // Draw graph lines for each player (different colors)
+    // Draw event markers (first attack, superweapon, elimination)
+}
+
+fn render_awards_tab(ui: ScoreScreenUI, game: GameStats) {
+    // Fun awards/achievements
+    let awards: [[u8; 64]; 8] = []
+
+    // Determine awards
+    let mut highest_kills: i32 = 0
+    let mut highest_kills_player: i32 = -1
+    let mut highest_economy: i32 = 0
+    let mut highest_economy_player: i32 = -1
+    let mut highest_apm: f32 = 0.0
+    let mut highest_apm_player: i32 = -1
+
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+
+        if stats.units_killed > highest_kills {
+            highest_kills = stats.units_killed
+            highest_kills_player = i
+        }
+
+        if stats.supplies_collected > highest_economy {
+            highest_economy = stats.supplies_collected
+            highest_economy_player = i
+        }
+
+        if stats.average_apm > highest_apm {
+            highest_apm = stats.average_apm
+            highest_apm_player = i
+        }
+    }
+
+    // Display awards
+    // - "Destroyer" - Most units killed
+    // - "Economist" - Most resources collected
+    // - "Commander" - Highest APM
+    // - "Architect" - Most buildings built
+    // - "General" - Most abilities used
+    // - "Nuclear Launch Detected" - Used superweapon
+}
+
+fn render_stat_comparison_bar(game: GameStats, label: [u8; 32], category: ScoreCategory) {
+    // Draw horizontal bar chart comparing all players
+    let mut max_value: i32 = 1
+
+    // Find max value
+    for i in 0..game.player_count {
+        let value: i32 = get_stat_value(game.player_stats[i], category)
+        if value > max_value {
+            max_value = value
+        }
+    }
+
+    // Draw bars
+    for i in 0..game.player_count {
+        let value: i32 = get_stat_value(game.player_stats[i], category)
+        let bar_width: f32 = cast(f32, value) / cast(f32, max_value) * 200.0
+        // Draw bar with player color
+    }
+}
+
+fn get_stat_value(stats: PlayerStats, category: ScoreCategory) -> i32 {
+    match category {
+        ScoreCategory::TOTAL_SCORE => return stats.total_score,
+        ScoreCategory::UNITS_BUILT => return stats.units_built,
+        ScoreCategory::UNITS_LOST => return stats.units_lost,
+        ScoreCategory::UNITS_KILLED => return stats.units_killed,
+        ScoreCategory::BUILDINGS_BUILT => return stats.buildings_built,
+        ScoreCategory::BUILDINGS_LOST => return stats.buildings_lost,
+        ScoreCategory::BUILDINGS_DESTROYED => return stats.buildings_destroyed,
+        ScoreCategory::SUPPLIES_COLLECTED => return stats.supplies_collected,
+        ScoreCategory::SUPPLIES_SPENT => return stats.supplies_spent,
+        ScoreCategory::GENERALS_POINTS_EARNED => return stats.general_points_earned,
+        ScoreCategory::ABILITIES_USED => return stats.general_abilities_used,
+        ScoreCategory::SUPERWEAPONS_LAUNCHED => return stats.superweapons_launched,
+        _ => return 0
+    }
+}
+
+fn render_player_list(ui: ScoreScreenUI, game: GameStats) {
+    // Draw player list on side
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+
+        // Draw player entry:
+        // - Color swatch
+        // - Player name
+        // - Faction icon
+        // - Result (Victory/Defeat)
+        // - Total score
+
+        // Highlight selected player
+    }
+}
+
+fn render_score_buttons(ui: ScoreScreenUI) {
+    // Draw buttons at bottom:
+    // - "Continue" (return to menu)
+    // - "Save Replay"
+    // - "Watch Replay"
+    // - "Play Again" (skirmish only)
+}
+
+// ============================================================================
+// GAME TIME FORMATTING
+// ============================================================================
+
+fn format_game_time(seconds: f32) -> [u8; 16] {
+    let total_seconds: i32 = cast(i32, seconds)
+    let hours: i32 = total_seconds / 3600
+    let minutes: i32 = (total_seconds % 3600) / 60
+    let secs: i32 = total_seconds % 60
+
+    if hours > 0 {
+        // Format: H:MM:SS
+        return str(hours) + ":" + pad_zero(minutes) + ":" + pad_zero(secs)
+    } else {
+        // Format: MM:SS
+        return str(minutes) + ":" + pad_zero(secs)
+    }
+}
+
+fn pad_zero(value: i32) -> [u8; 4] {
+    if value < 10 {
+        return "0" + str(value)
+    }
+    return str(value)
+}
+
+fn format_number_with_commas(value: i32) -> [u8; 16] {
+    if value < 1000 {
+        return str(value)
+    } else if value < 1000000 {
+        return str(value / 1000) + "," + pad_three(value % 1000)
+    } else {
+        let millions: i32 = value / 1000000
+        let thousands: i32 = (value % 1000000) / 1000
+        let ones: i32 = value % 1000
+        return str(millions) + "," + pad_three(thousands) + "," + pad_three(ones)
+    }
+}
+
+fn pad_three(value: i32) -> [u8; 4] {
+    if value < 10 {
+        return "00" + str(value)
+    } else if value < 100 {
+        return "0" + str(value)
+    }
+    return str(value)
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_score_screen() {
+    print("Testing Score Screen System...")
+
+    // Create game stats
+    let mut game: GameStats = create_game_stats()
+    game.map_name = "Tournament City"
+    game.game_mode = 0  // Skirmish
+
+    // Add players
+    add_player_to_stats(game, 0, "Player1", 0, 0, 1, 0, false)  // USA
+    add_player_to_stats(game, 1, "AI Enemy", 1, 0, 2, 1, true)   // China AI
+
+    print("Players added: " + str(game.player_count))
+
+    // Simulate game events
+    for i in 0..50 {
+        record_unit_built(game, 0, 0)      // Player builds infantry
+        record_unit_built(game, 1, 1)      // AI builds vehicle
+        record_supplies_collected(game, 0, 300)
+        record_supplies_collected(game, 1, 250)
+        record_command(game, 0)
+        record_command(game, 0)
+        record_command(game, 1)
+    }
+
+    // Record some combat
+    for i in 0..20 {
+        record_unit_killed(game, 0, 1)  // Player kills AI unit
+    }
+    for i in 0..10 {
+        record_unit_killed(game, 1, 0)  // AI kills player unit
+    }
+
+    // Record buildings
+    record_building_built(game, 0)
+    record_building_built(game, 0)
+    record_building_built(game, 1)
+    record_building_destroyed(game, 0, 1)
+
+    // Record abilities
+    record_ability_used(game, 0)
+    record_ability_used(game, 0)
+    record_superweapon_launched(game, 0)
+
+    // Set game time and finalize
+    game.game_time = 900.0  // 15 minutes
+    record_victory(game, 0)
+    finalize_game_stats(game)
+
+    // Print results
+    print("Game Duration: " + str(format_game_time(game.game_time)))
+
+    for i in 0..game.player_count {
+        let stats: PlayerStats = game.player_stats[i]
+        print("---")
+        print("Player: " + str(stats.player_name))
+        print("Result: " + str(stats.result == GameResult::VICTORY))
+        print("Units Built: " + str(stats.units_built))
+        print("Units Killed: " + str(stats.units_killed))
+        print("Units Lost: " + str(stats.units_lost))
+        print("Buildings Built: " + str(stats.buildings_built))
+        print("Supplies Collected: " + str(stats.supplies_collected))
+        print("APM: " + str(stats.average_apm))
+        print("Total Score: " + str(stats.total_score))
+    }
+
+    // Test UI
+    let mut ui: ScoreScreenUI = create_score_screen_ui()
+    show_score_screen(ui, game)
+    print("Score screen UI created and shown")
+
+    // Test tabs
+    set_score_tab(ui, ScoreTab::ECONOMY)
+    print("Switched to Economy tab")
+
+    set_score_tab(ui, ScoreTab::AWARDS)
+    print("Switched to Awards tab")
+
+    // Test number formatting
+    print("Formatted 1234567: " + str(format_number_with_commas(1234567)))
+
+    print("Score Screen System tests complete!")
+}

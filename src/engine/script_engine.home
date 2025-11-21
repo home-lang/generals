@@ -1,0 +1,1005 @@
+// Script Engine - Map scripting and triggers
+// Implements authentic C&C Generals Zero Hour map script system
+
+// ============================================================================
+// SCRIPT SYSTEM OVERVIEW
+// ============================================================================
+// The script engine handles:
+// - Map triggers (events that fire when conditions are met)
+// - Script actions (what happens when triggers fire)
+// - Team behaviors (AI team scripting)
+// - Mission objectives
+// - Cutscene scripting
+
+// ============================================================================
+// CONDITION TYPES
+// ============================================================================
+
+enum ConditionType {
+    // Timer conditions
+    TIMER_EXPIRED,
+    TIME_ELAPSED,
+    COUNTER_EQUALS,
+    COUNTER_LESS_THAN,
+    COUNTER_GREATER_THAN,
+
+    // Player conditions
+    PLAYER_HAS_CREDITS,
+    PLAYER_HAS_POWER,
+    PLAYER_HAS_NO_POWER,
+    PLAYER_ALL_DESTROYED,
+    PLAYER_OWNS_UNIT_TYPE,
+    PLAYER_UNIT_COUNT,
+    PLAYER_BUILDING_COUNT,
+
+    // Unit conditions
+    UNIT_ENTERED_AREA,
+    UNIT_EXITED_AREA,
+    UNIT_DESTROYED,
+    UNIT_HEALTH_BELOW,
+    UNIT_IDLE,
+    UNIT_IS_SELECTED,
+    SPECIFIC_UNIT_EXISTS,
+
+    // Building conditions
+    BUILDING_CONSTRUCTED,
+    BUILDING_DESTROYED,
+    BUILDING_CAPTURED,
+    BUILDING_UNDER_CONSTRUCTION,
+
+    // Area conditions
+    AREA_CONTAINS_UNIT,
+    AREA_EMPTY,
+    AREA_ENTERED_BY,
+    TEAM_IN_AREA,
+
+    // Combat conditions
+    ATTACKED_BY_FACTION,
+    UNIT_TOOK_DAMAGE,
+    SUPERWEAPON_READY,
+    SUPERWEAPON_LAUNCHED,
+
+    // Objective conditions
+    OBJECTIVE_COMPLETE,
+    OBJECTIVE_FAILED,
+    ALL_OBJECTIVES_COMPLETE,
+
+    // Game conditions
+    SKIRMISH_SPECIAL_POWER_READY,
+    MULTIPLAYER_ALLIED,
+    DIFFICULTY_EQUALS,
+    GAME_TIME_IS,
+
+    // Boolean operations
+    AND,
+    OR,
+    NOT,
+
+    // Script state
+    FLAG_SET,
+    FLAG_CLEAR,
+    SCRIPT_COMPLETED
+}
+
+// ============================================================================
+// ACTION TYPES
+// ============================================================================
+
+enum ActionType {
+    // Unit actions
+    CREATE_UNIT,
+    CREATE_UNIT_AT_WAYPOINT,
+    DESTROY_UNIT,
+    MOVE_UNIT_TO,
+    ATTACK_UNIT,
+    GUARD_UNIT,
+    STOP_UNIT,
+    TELEPORT_UNIT,
+    CHANGE_UNIT_OWNER,
+    SET_UNIT_HEALTH,
+    SET_UNIT_INVINCIBLE,
+    SET_UNIT_VETERANCY,
+    HIDE_UNIT,
+    SHOW_UNIT,
+
+    // Building actions
+    CREATE_BUILDING,
+    DESTROY_BUILDING,
+    SELL_BUILDING,
+    DISABLE_BUILDING,
+    ENABLE_BUILDING,
+    START_BUILDING_UPGRADE,
+    CAPTURE_BUILDING,
+
+    // Player actions
+    GIVE_CREDITS,
+    TAKE_CREDITS,
+    SET_CREDITS,
+    GIVE_SCIENCE,
+    GIVE_EXPERIENCE,
+    DEFEAT_PLAYER,
+    ALLY_PLAYERS,
+    UNALLY_PLAYERS,
+    ENABLE_PLAYER_BUILDING,
+    DISABLE_PLAYER_BUILDING,
+    SET_PLAYER_COLOR,
+
+    // Camera actions
+    MOVE_CAMERA_TO,
+    MOVE_CAMERA_TO_UNIT,
+    MOVE_CAMERA_TO_WAYPOINT,
+    ZOOM_CAMERA,
+    ROTATE_CAMERA,
+    CAMERA_FOLLOW_UNIT,
+    CAMERA_STOP_FOLLOW,
+    LETTERBOX_ON,
+    LETTERBOX_OFF,
+
+    // Audio actions
+    PLAY_SOUND,
+    PLAY_MUSIC,
+    STOP_MUSIC,
+    PLAY_EVA,
+    PLAY_DIALOGUE,
+
+    // Visual effects
+    PLAY_EFFECT,
+    SCREEN_SHAKE,
+    FLASH_SCREEN,
+    WEATHER_SET,
+    SET_TIME_OF_DAY,
+    CREATE_PARTICLE,
+
+    // Script control
+    SET_FLAG,
+    CLEAR_FLAG,
+    INCREMENT_COUNTER,
+    DECREMENT_COUNTER,
+    SET_COUNTER,
+    START_TIMER,
+    STOP_TIMER,
+    PAUSE_TIMER,
+    ENABLE_SCRIPT,
+    DISABLE_SCRIPT,
+    CALL_SCRIPT,
+    DELAY_ACTION,
+
+    // Objective actions
+    SET_OBJECTIVE,
+    COMPLETE_OBJECTIVE,
+    FAIL_OBJECTIVE,
+    SHOW_OBJECTIVE_TEXT,
+    UPDATE_OBJECTIVE_TEXT,
+
+    // UI actions
+    SHOW_MESSAGE,
+    SHOW_BRIEFING,
+    SHOW_COUNTDOWN,
+    HIDE_UI,
+    SHOW_UI,
+    SET_UI_ELEMENT_VISIBLE,
+
+    // Map actions
+    REVEAL_MAP_AREA,
+    SHROUD_MAP_AREA,
+    ENABLE_FOG_OF_WAR,
+    DISABLE_FOG_OF_WAR,
+    SET_PASSABILITY,
+
+    // Team actions
+    CREATE_TEAM,
+    DELETE_TEAM,
+    ADD_TO_TEAM,
+    REMOVE_FROM_TEAM,
+    TEAM_ATTACK,
+    TEAM_MOVE,
+    TEAM_GUARD,
+    SET_TEAM_BEHAVIOR,
+
+    // Game actions
+    END_MISSION_VICTORY,
+    END_MISSION_DEFEAT,
+    LOAD_MAP,
+    PAUSE_GAME,
+    UNPAUSE_GAME,
+    SET_GAME_SPEED,
+
+    // Debug actions
+    LOG_MESSAGE,
+    BREAK_SCRIPT
+}
+
+// ============================================================================
+// SCRIPT STRUCTURES
+// ============================================================================
+
+struct ScriptCondition {
+    condition_type: ConditionType,
+
+    // Parameters (interpretation depends on type)
+    param_int1: i32,
+    param_int2: i32,
+    param_float1: f32,
+    param_float2: f32,
+    param_string: [u8; 128],
+
+    // Position/Area
+    position_x: f32,
+    position_y: f32,
+    position_z: f32,
+    radius: f32,
+
+    // Target references
+    player_id: i32,
+    unit_id: u32,
+    team_name: [u8; 64],
+    waypoint_name: [u8; 64],
+
+    // Sub-conditions for AND/OR/NOT
+    sub_conditions: [i32; 4],  // Indices to other conditions
+    sub_condition_count: i32
+}
+
+struct ScriptAction {
+    action_type: ActionType,
+
+    // Parameters
+    param_int1: i32,
+    param_int2: i32,
+    param_float1: f32,
+    param_float2: f32,
+    param_string: [u8; 128],
+
+    // Position
+    position_x: f32,
+    position_y: f32,
+    position_z: f32,
+
+    // Targets
+    player_id: i32,
+    unit_id: u32,
+    building_type: u32,
+    unit_type: u32,
+    team_name: [u8; 64],
+    waypoint_name: [u8; 64],
+
+    // Timing
+    delay: f32,            // Delay before executing
+    duration: f32          // Duration for continuous actions
+}
+
+struct Script {
+    name: [u8; 128],
+    is_enabled: bool,
+    is_one_shot: bool,      // Only fires once
+    has_fired: bool,
+    evaluation_interval: f32,
+    last_evaluation: f32,
+
+    // Conditions
+    conditions: [ScriptCondition; 16],
+    condition_count: i32,
+
+    // Actions
+    actions: [ScriptAction; 32],
+    action_count: i32,
+
+    // Execution state
+    current_action: i32,
+    action_timer: f32,
+    is_executing: bool
+}
+
+struct Waypoint {
+    name: [u8; 64],
+    position_x: f32,
+    position_y: f32,
+    position_z: f32,
+    waypoint_type: i32,     // 0 = normal, 1 = spawn, 2 = path node
+    linked_waypoints: [[u8; 64]; 4],
+    linked_count: i32
+}
+
+struct ScriptTeam {
+    name: [u8; 64],
+    player_owner: i32,
+    members: [u32; 64],     // Unit IDs
+    member_count: i32,
+
+    // Team AI
+    behavior: i32,          // 0 = guard, 1 = aggressive, 2 = defensive
+    target_waypoint: [u8; 64],
+    is_active: bool
+}
+
+// ============================================================================
+// SCRIPT ENGINE
+// ============================================================================
+
+struct ScriptEngine {
+    scripts: [Script; 256],
+    script_count: i32,
+
+    waypoints: [Waypoint; 512],
+    waypoint_count: i32,
+
+    teams: [ScriptTeam; 64],
+    team_count: i32,
+
+    // Flags and counters
+    flags: [bool; 256],
+    counters: [i32; 64],
+    timers: [f32; 32],
+    timer_active: [bool; 32],
+
+    // Execution
+    game_time: f32,
+    is_paused: bool,
+
+    // Action queue for delayed actions
+    pending_actions: [ScriptAction; 64],
+    pending_count: i32,
+    pending_delays: [f32; 64]
+}
+
+fn create_script_engine() -> ScriptEngine {
+    return ScriptEngine {
+        scripts: [],
+        script_count: 0,
+        waypoints: [],
+        waypoint_count: 0,
+        teams: [],
+        team_count: 0,
+        flags: [false; 256],
+        counters: [0; 64],
+        timers: [0.0; 32],
+        timer_active: [false; 32],
+        game_time: 0.0,
+        is_paused: false,
+        pending_actions: [],
+        pending_count: 0,
+        pending_delays: []
+    }
+}
+
+fn add_script(engine: mut ScriptEngine, script: Script) -> i32 {
+    if engine.script_count >= 256 {
+        return -1
+    }
+
+    engine.scripts[engine.script_count] = script
+    let idx: i32 = engine.script_count
+    engine.script_count = engine.script_count + 1
+
+    return idx
+}
+
+fn add_waypoint(engine: mut ScriptEngine, waypoint: Waypoint) -> i32 {
+    if engine.waypoint_count >= 512 {
+        return -1
+    }
+
+    engine.waypoints[engine.waypoint_count] = waypoint
+    let idx: i32 = engine.waypoint_count
+    engine.waypoint_count = engine.waypoint_count + 1
+
+    return idx
+}
+
+fn get_waypoint_position(engine: ScriptEngine, name: [u8; 64]) -> [f32; 3] {
+    for i in 0..engine.waypoint_count {
+        if string_equals_64(engine.waypoints[i].name, name) {
+            return [engine.waypoints[i].position_x,
+                    engine.waypoints[i].position_y,
+                    engine.waypoints[i].position_z]
+        }
+    }
+    return [0.0, 0.0, 0.0]
+}
+
+fn update_script_engine(engine: mut ScriptEngine, delta_time: f32) {
+    if engine.is_paused {
+        return
+    }
+
+    engine.game_time = engine.game_time + delta_time
+
+    // Update timers
+    for i in 0..32 {
+        if engine.timer_active[i] {
+            engine.timers[i] = engine.timers[i] + delta_time
+        }
+    }
+
+    // Update pending actions
+    update_pending_actions(engine, delta_time)
+
+    // Evaluate scripts
+    for i in 0..engine.script_count {
+        let mut script: Script = engine.scripts[i]
+
+        if not script.is_enabled {
+            continue
+        }
+
+        if script.is_one_shot and script.has_fired {
+            continue
+        }
+
+        // Check evaluation interval
+        if engine.game_time - script.last_evaluation < script.evaluation_interval {
+            continue
+        }
+
+        script.last_evaluation = engine.game_time
+
+        // Evaluate conditions
+        if evaluate_script_conditions(engine, script) {
+            // Execute actions
+            execute_script_actions(engine, script)
+
+            script.has_fired = true
+            if script.is_one_shot {
+                script.is_enabled = false
+            }
+        }
+
+        engine.scripts[i] = script
+    }
+}
+
+fn evaluate_script_conditions(engine: ScriptEngine, script: Script) -> bool {
+    // All conditions must be true (implicit AND)
+    for i in 0..script.condition_count {
+        if not evaluate_condition(engine, script.conditions[i]) {
+            return false
+        }
+    }
+
+    return script.condition_count > 0
+}
+
+fn evaluate_condition(engine: ScriptEngine, condition: ScriptCondition) -> bool {
+    match condition.condition_type {
+        ConditionType::TIMER_EXPIRED => {
+            let timer_idx: i32 = condition.param_int1
+            if timer_idx >= 0 and timer_idx < 32 {
+                return engine.timers[timer_idx] >= condition.param_float1
+            }
+        },
+
+        ConditionType::TIME_ELAPSED => {
+            return engine.game_time >= condition.param_float1
+        },
+
+        ConditionType::COUNTER_EQUALS => {
+            let counter_idx: i32 = condition.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                return engine.counters[counter_idx] == condition.param_int2
+            }
+        },
+
+        ConditionType::COUNTER_LESS_THAN => {
+            let counter_idx: i32 = condition.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                return engine.counters[counter_idx] < condition.param_int2
+            }
+        },
+
+        ConditionType::COUNTER_GREATER_THAN => {
+            let counter_idx: i32 = condition.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                return engine.counters[counter_idx] > condition.param_int2
+            }
+        },
+
+        ConditionType::FLAG_SET => {
+            let flag_idx: i32 = condition.param_int1
+            if flag_idx >= 0 and flag_idx < 256 {
+                return engine.flags[flag_idx]
+            }
+        },
+
+        ConditionType::FLAG_CLEAR => {
+            let flag_idx: i32 = condition.param_int1
+            if flag_idx >= 0 and flag_idx < 256 {
+                return not engine.flags[flag_idx]
+            }
+        },
+
+        ConditionType::AND => {
+            for i in 0..condition.sub_condition_count {
+                // Would need to evaluate sub-conditions
+            }
+        },
+
+        ConditionType::OR => {
+            for i in 0..condition.sub_condition_count {
+                // Return true if any sub-condition is true
+            }
+        },
+
+        ConditionType::NOT => {
+            if condition.sub_condition_count > 0 {
+                // Invert first sub-condition
+            }
+        },
+
+        // Game state conditions would check actual game state
+        ConditionType::UNIT_ENTERED_AREA => {
+            // Would check if any unit is within radius of position
+            return check_unit_in_area(condition.player_id, condition.position_x,
+                                     condition.position_y, condition.radius)
+        },
+
+        ConditionType::AREA_EMPTY => {
+            return not check_area_has_units(condition.position_x, condition.position_y,
+                                           condition.radius)
+        },
+
+        _ => return false
+    }
+
+    return false
+}
+
+fn execute_script_actions(engine: mut ScriptEngine, script: mut Script) {
+    for i in 0..script.action_count {
+        let action: ScriptAction = script.actions[i]
+
+        if action.delay > 0.0 {
+            // Add to pending queue
+            queue_pending_action(engine, action)
+        } else {
+            execute_action(engine, action)
+        }
+    }
+}
+
+fn execute_action(engine: mut ScriptEngine, action: ScriptAction) {
+    match action.action_type {
+        ActionType::SET_FLAG => {
+            let flag_idx: i32 = action.param_int1
+            if flag_idx >= 0 and flag_idx < 256 {
+                engine.flags[flag_idx] = true
+            }
+        },
+
+        ActionType::CLEAR_FLAG => {
+            let flag_idx: i32 = action.param_int1
+            if flag_idx >= 0 and flag_idx < 256 {
+                engine.flags[flag_idx] = false
+            }
+        },
+
+        ActionType::INCREMENT_COUNTER => {
+            let counter_idx: i32 = action.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                engine.counters[counter_idx] = engine.counters[counter_idx] + 1
+            }
+        },
+
+        ActionType::DECREMENT_COUNTER => {
+            let counter_idx: i32 = action.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                engine.counters[counter_idx] = engine.counters[counter_idx] - 1
+            }
+        },
+
+        ActionType::SET_COUNTER => {
+            let counter_idx: i32 = action.param_int1
+            if counter_idx >= 0 and counter_idx < 64 {
+                engine.counters[counter_idx] = action.param_int2
+            }
+        },
+
+        ActionType::START_TIMER => {
+            let timer_idx: i32 = action.param_int1
+            if timer_idx >= 0 and timer_idx < 32 {
+                engine.timers[timer_idx] = 0.0
+                engine.timer_active[timer_idx] = true
+            }
+        },
+
+        ActionType::STOP_TIMER => {
+            let timer_idx: i32 = action.param_int1
+            if timer_idx >= 0 and timer_idx < 32 {
+                engine.timer_active[timer_idx] = false
+            }
+        },
+
+        ActionType::PAUSE_TIMER => {
+            let timer_idx: i32 = action.param_int1
+            if timer_idx >= 0 and timer_idx < 32 {
+                engine.timer_active[timer_idx] = false
+            }
+        },
+
+        ActionType::ENABLE_SCRIPT => {
+            enable_script_by_name(engine, action.param_string)
+        },
+
+        ActionType::DISABLE_SCRIPT => {
+            disable_script_by_name(engine, action.param_string)
+        },
+
+        // Unit actions would call game logic
+        ActionType::CREATE_UNIT => {
+            create_unit_at_position(action.player_id, action.unit_type,
+                                   action.position_x, action.position_y, action.position_z)
+        },
+
+        ActionType::CREATE_UNIT_AT_WAYPOINT => {
+            let pos: [f32; 3] = get_waypoint_position(engine, action.waypoint_name)
+            create_unit_at_position(action.player_id, action.unit_type,
+                                   pos[0], pos[1], pos[2])
+        },
+
+        ActionType::MOVE_UNIT_TO => {
+            move_unit(action.unit_id, action.position_x, action.position_y)
+        },
+
+        ActionType::DESTROY_UNIT => {
+            destroy_unit(action.unit_id)
+        },
+
+        // Camera actions
+        ActionType::MOVE_CAMERA_TO => {
+            move_camera(action.position_x, action.position_y, action.position_z, action.duration)
+        },
+
+        ActionType::MOVE_CAMERA_TO_WAYPOINT => {
+            let pos: [f32; 3] = get_waypoint_position(engine, action.waypoint_name)
+            move_camera(pos[0], pos[1], pos[2], action.duration)
+        },
+
+        ActionType::LETTERBOX_ON => {
+            enable_letterbox(true)
+        },
+
+        ActionType::LETTERBOX_OFF => {
+            enable_letterbox(false)
+        },
+
+        // Audio actions
+        ActionType::PLAY_SOUND => {
+            play_sound_effect(action.param_string)
+        },
+
+        ActionType::PLAY_MUSIC => {
+            play_music_track(action.param_string)
+        },
+
+        ActionType::PLAY_EVA => {
+            play_eva_announcement(action.param_int1)
+        },
+
+        // Visual effects
+        ActionType::SCREEN_SHAKE => {
+            screen_shake(action.param_float1, action.duration)
+        },
+
+        ActionType::FLASH_SCREEN => {
+            flash_screen(action.param_int1, action.duration)  // Color, duration
+        },
+
+        // Objective actions
+        ActionType::SET_OBJECTIVE => {
+            set_mission_objective(action.param_int1, action.param_string, action.param_int2)
+        },
+
+        ActionType::COMPLETE_OBJECTIVE => {
+            complete_objective(action.param_int1)
+        },
+
+        ActionType::FAIL_OBJECTIVE => {
+            fail_objective(action.param_int1)
+        },
+
+        // UI actions
+        ActionType::SHOW_MESSAGE => {
+            show_screen_message(action.param_string, action.duration)
+        },
+
+        // Game actions
+        ActionType::END_MISSION_VICTORY => {
+            end_mission(true)
+        },
+
+        ActionType::END_MISSION_DEFEAT => {
+            end_mission(false)
+        },
+
+        ActionType::GIVE_CREDITS => {
+            give_player_credits(action.player_id, action.param_int1)
+        },
+
+        ActionType::REVEAL_MAP_AREA => {
+            reveal_map_area(action.position_x, action.position_y, action.radius)
+        },
+
+        _ => {}
+    }
+}
+
+fn queue_pending_action(engine: mut ScriptEngine, action: ScriptAction) {
+    if engine.pending_count < 64 {
+        engine.pending_actions[engine.pending_count] = action
+        engine.pending_delays[engine.pending_count] = action.delay
+        engine.pending_count = engine.pending_count + 1
+    }
+}
+
+fn update_pending_actions(engine: mut ScriptEngine, delta_time: f32) {
+    let mut i: i32 = 0
+    while i < engine.pending_count {
+        engine.pending_delays[i] = engine.pending_delays[i] - delta_time
+
+        if engine.pending_delays[i] <= 0.0 {
+            // Execute the action
+            execute_action(engine, engine.pending_actions[i])
+
+            // Remove from queue
+            for j in i..(engine.pending_count - 1) {
+                engine.pending_actions[j] = engine.pending_actions[j + 1]
+                engine.pending_delays[j] = engine.pending_delays[j + 1]
+            }
+            engine.pending_count = engine.pending_count - 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn enable_script_by_name(engine: mut ScriptEngine, name: [u8; 128]) {
+    for i in 0..engine.script_count {
+        if string_equals_128(engine.scripts[i].name, name) {
+            engine.scripts[i].is_enabled = true
+            return
+        }
+    }
+}
+
+fn disable_script_by_name(engine: mut ScriptEngine, name: [u8; 128]) {
+    for i in 0..engine.script_count {
+        if string_equals_128(engine.scripts[i].name, name) {
+            engine.scripts[i].is_enabled = false
+            return
+        }
+    }
+}
+
+// ============================================================================
+// STUB FUNCTIONS (Would connect to game systems)
+// ============================================================================
+
+fn check_unit_in_area(player: i32, x: f32, y: f32, radius: f32) -> bool {
+    // Would check game state
+    return false
+}
+
+fn check_area_has_units(x: f32, y: f32, radius: f32) -> bool {
+    return false
+}
+
+fn create_unit_at_position(player: i32, unit_type: u32, x: f32, y: f32, z: f32) {
+    // Would create unit in game
+}
+
+fn move_unit(unit_id: u32, x: f32, y: f32) {
+    // Would issue move command
+}
+
+fn destroy_unit(unit_id: u32) {
+    // Would destroy unit
+}
+
+fn move_camera(x: f32, y: f32, z: f32, duration: f32) {
+    // Would animate camera
+}
+
+fn enable_letterbox(enabled: bool) {
+    // Would toggle letterbox mode
+}
+
+fn play_sound_effect(name: [u8; 128]) {
+    // Would play sound
+}
+
+fn play_music_track(name: [u8; 128]) {
+    // Would play music
+}
+
+fn play_eva_announcement(event_id: i32) {
+    // Would trigger EVA
+}
+
+fn screen_shake(intensity: f32, duration: f32) {
+    // Would shake screen
+}
+
+fn flash_screen(color: i32, duration: f32) {
+    // Would flash screen
+}
+
+fn set_mission_objective(idx: i32, text: [u8; 128], is_primary: i32) {
+    // Would set objective
+}
+
+fn complete_objective(idx: i32) {
+    // Would complete objective
+}
+
+fn fail_objective(idx: i32) {
+    // Would fail objective
+}
+
+fn show_screen_message(text: [u8; 128], duration: f32) {
+    // Would show message
+}
+
+fn end_mission(victory: bool) {
+    // Would end mission
+}
+
+fn give_player_credits(player: i32, amount: i32) {
+    // Would give credits
+}
+
+fn reveal_map_area(x: f32, y: f32, radius: f32) {
+    // Would reveal fog of war
+}
+
+fn string_equals_64(a: [u8; 64], b: [u8; 64]) -> bool {
+    for i in 0..64 {
+        if a[i] != b[i] {
+            return false
+        }
+        if a[i] == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+fn string_equals_128(a: [u8; 128], b: [u8; 128]) -> bool {
+    for i in 0..128 {
+        if a[i] != b[i] {
+            return false
+        }
+        if a[i] == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_script_engine() {
+    print("Testing Script Engine...")
+
+    // Create engine
+    let mut engine: ScriptEngine = create_script_engine()
+    print("Script engine created")
+
+    // Add a test waypoint
+    let wp: Waypoint = Waypoint {
+        name: "StartPoint",
+        position_x: 100.0,
+        position_y: 200.0,
+        position_z: 0.0,
+        waypoint_type: 1,
+        linked_waypoints: [],
+        linked_count: 0
+    }
+    add_waypoint(engine, wp)
+    print("Waypoint added")
+
+    // Create a test script
+    let mut script: Script = Script {
+        name: "TestScript",
+        is_enabled: true,
+        is_one_shot: true,
+        has_fired: false,
+        evaluation_interval: 0.5,
+        last_evaluation: 0.0,
+        conditions: [],
+        condition_count: 1,
+        actions: [],
+        action_count: 2,
+        current_action: 0,
+        action_timer: 0.0,
+        is_executing: false
+    }
+
+    // Add condition: time elapsed 5 seconds
+    script.conditions[0] = ScriptCondition {
+        condition_type: ConditionType::TIME_ELAPSED,
+        param_int1: 0,
+        param_int2: 0,
+        param_float1: 5.0,
+        param_float2: 0.0,
+        param_string: "",
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        radius: 0.0,
+        player_id: 0,
+        unit_id: 0,
+        team_name: "",
+        waypoint_name: "",
+        sub_conditions: [],
+        sub_condition_count: 0
+    }
+
+    // Add actions
+    script.actions[0] = ScriptAction {
+        action_type: ActionType::SET_FLAG,
+        param_int1: 0,
+        param_int2: 0,
+        param_float1: 0.0,
+        param_float2: 0.0,
+        param_string: "",
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        player_id: 0,
+        unit_id: 0,
+        building_type: 0,
+        unit_type: 0,
+        team_name: "",
+        waypoint_name: "",
+        delay: 0.0,
+        duration: 0.0
+    }
+
+    script.actions[1] = ScriptAction {
+        action_type: ActionType::SHOW_MESSAGE,
+        param_int1: 0,
+        param_int2: 0,
+        param_float1: 0.0,
+        param_float2: 0.0,
+        param_string: "Script triggered!",
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        player_id: 0,
+        unit_id: 0,
+        building_type: 0,
+        unit_type: 0,
+        team_name: "",
+        waypoint_name: "",
+        delay: 0.0,
+        duration: 3.0
+    }
+
+    add_script(engine, script)
+    print("Script added")
+
+    // Test flag operations
+    engine.flags[0] = false
+    print("Flag 0 initial: " + str(engine.flags[0]))
+
+    // Simulate time passing
+    for i in 0..100 {
+        update_script_engine(engine, 0.1)  // 100ms per frame
+    }
+
+    print("After 10 seconds simulation:")
+    print("Flag 0: " + str(engine.flags[0]))
+    print("Script has_fired: " + str(engine.scripts[0].has_fired))
+
+    // Test counters
+    engine.counters[0] = 5
+    print("Counter 0: " + str(engine.counters[0]))
+
+    // Test timer
+    engine.timer_active[0] = true
+    update_script_engine(engine, 1.0)
+    print("Timer 0 after 1 second: " + str(engine.timers[0]))
+
+    print("Script Engine tests complete!")
+}

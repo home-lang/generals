@@ -1,0 +1,688 @@
+// BIG Archive Reader - Pure Home Implementation
+// Reads EA's .big archive format used by C&C Generals Zero Hour
+//
+// BIG File Format:
+// - Magic: "BIGF" or "BIG4" (4 bytes)
+// - Archive size: u32 little-endian
+// - File count: u32 big-endian
+// - Reserved: 4 bytes
+// - File entries (at offset 16):
+//   - Position: u32 big-endian
+//   - Size: u32 big-endian
+//   - Name: null-terminated string
+//
+// Reference: thyme/src/platform/w3dengine/common/win32bigfilesystem.cpp
+
+from basics import Collection, Map
+
+// BIG archive magic constants
+const BIG_MAGIC_BIGF: Int = 0x46474942  // "BIGF" as little-endian u32
+const BIG_MAGIC_BIG4: Int = 0x34474942  // "BIG4" as little-endian u32
+const BIG_PATH_MAX: Int = 260
+
+// Error types
+enum BigError {
+    None,
+    InvalidMagic,
+    InvalidHeader,
+    FileNotFound,
+    ReadError,
+    OutOfMemory,
+    PathTooLong,
+    ArchiveNotOpen,
+}
+
+// Information about a file within the archive
+struct ArchivedFileInfo {
+    name: String,         // Full path within archive (normalized)
+    base_name: String,    // Just the filename (after last /)
+    position: Int,        // Offset in the BIG file
+    size: Int,            // File size in bytes
+
+    fn init(name: String, position: Int, size: Int) -> ArchivedFileInfo {
+        // Find base name (after last /)
+        let base_start = 0
+        for i in 0..name.len() {
+            if name.char_at(i) == '/' {
+                base_start = i + 1
+            }
+        }
+        let base_name = name.substring(base_start, name.len())
+
+        let info = ArchivedFileInfo {
+            name: name,
+            base_name: base_name,
+            position: position,
+            size: size,
+        }
+        return info
+    }
+}
+
+// Binary reader for parsing archive data
+struct BigReader {
+    data: Collection<Int>,  // Raw byte array
+    position: Int,          // Current read position
+
+    fn init(data: Collection<Int>) -> BigReader {
+        let reader = BigReader {
+            data: data,
+            position: 0,
+        }
+        return reader
+    }
+
+    fn read_u8(self) -> Int {
+        if self.position >= self.data.len() {
+            return 0
+        }
+        let value = self.data.get(self.position)
+        self.position = self.position + 1
+        return value
+    }
+
+    // Read u32 little-endian (archive size)
+    fn read_u32_le(self) -> Int {
+        let b0 = self.read_u8()
+        let b1 = self.read_u8()
+        let b2 = self.read_u8()
+        let b3 = self.read_u8()
+        return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+    }
+
+    // Read u32 big-endian (file count, positions, sizes)
+    fn read_u32_be(self) -> Int {
+        let b0 = self.read_u8()
+        let b1 = self.read_u8()
+        let b2 = self.read_u8()
+        let b3 = self.read_u8()
+        return (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+    }
+
+    // Read null-terminated string
+    fn read_string_null_terminated(self, max_len: Int) -> String {
+        let result = ""
+        let count = 0
+        while count < max_len {
+            let byte = self.read_u8()
+            if byte == 0 {
+                break
+            }
+            result = result + String::from_char(byte)
+            count = count + 1
+        }
+        return result
+    }
+
+    // Read fixed-length byte array
+    fn read_bytes(self, count: Int) -> Collection<Int> {
+        let bytes = Collection::init()
+        for i in 0..count {
+            bytes.add(self.read_u8())
+        }
+        return bytes
+    }
+
+    fn seek(self, position: Int) {
+        self.position = position
+    }
+
+    fn get_position(self) -> Int {
+        return self.position
+    }
+
+    fn remaining(self) -> Int {
+        return self.data.len() - self.position
+    }
+}
+
+// A single BIG archive file
+struct BigArchive {
+    file_path: String,
+    archive_size: Int,
+    file_count: Int,
+    files: Map<String, ArchivedFileInfo>,  // Map of normalized path -> info
+    raw_data: Collection<Int>,             // Entire archive in memory
+    is_open: Bool,
+    last_error: BigError,
+
+    fn init() -> BigArchive {
+        let archive = BigArchive {
+            file_path: "",
+            archive_size: 0,
+            file_count: 0,
+            files: Map::init(),
+            raw_data: Collection::init(),
+            is_open: false,
+            last_error: BigError::None,
+        }
+        return archive
+    }
+
+    // Open and parse a BIG archive file
+    fn open(self, path: String) -> Bool {
+        self.file_path = path
+
+        // Read entire file into memory
+        let file_data = File::read_bytes(path)
+        if file_data == null {
+            self.last_error = BigError::ReadError
+            return false
+        }
+
+        self.raw_data = file_data
+
+        // Parse the header
+        if !self.parse_header() {
+            return false
+        }
+
+        self.is_open = true
+        return true
+    }
+
+    // Parse the BIG file header and build file index
+    fn parse_header(self) -> Bool {
+        if self.raw_data.len() < 16 {
+            self.last_error = BigError::InvalidHeader
+            return false
+        }
+
+        let reader = BigReader::init(self.raw_data)
+
+        // Read and verify magic (4 bytes)
+        let magic = reader.read_u32_le()
+        if magic != BIG_MAGIC_BIGF and magic != BIG_MAGIC_BIG4 {
+            self.last_error = BigError::InvalidMagic
+            return false
+        }
+
+        // Read archive size (little-endian)
+        self.archive_size = reader.read_u32_le()
+
+        // Read file count (big-endian)
+        self.file_count = reader.read_u32_be()
+
+        // Skip 4 reserved bytes, seek to offset 16 for file entries
+        reader.seek(16)
+
+        // Parse file entries
+        for i in 0..self.file_count {
+            // Read position and size (big-endian)
+            let position = reader.read_u32_be()
+            let size = reader.read_u32_be()
+
+            // Read null-terminated filename
+            let name = reader.read_string_null_terminated(BIG_PATH_MAX)
+
+            if name.len() >= BIG_PATH_MAX {
+                self.last_error = BigError::PathTooLong
+                return false
+            }
+
+            // Normalize path: replace backslash with forward slash, lowercase
+            let normalized = self.normalize_path(name)
+
+            // Create file info and add to map
+            let info = ArchivedFileInfo::init(normalized, position, size)
+            self.files.set(normalized, info)
+        }
+
+        return true
+    }
+
+    // Normalize a path: replace \ with /, convert to lowercase
+    fn normalize_path(self, path: String) -> String {
+        let result = ""
+        for i in 0..path.len() {
+            let c = path.char_at(i)
+            if c == '\\' {
+                result = result + "/"
+            } else if c >= 'A' and c <= 'Z' {
+                // Convert to lowercase
+                result = result + String::from_char(c + 32)
+            } else {
+                result = result + String::from_char(c)
+            }
+        }
+        return result
+    }
+
+    // Check if a file exists in the archive
+    fn file_exists(self, path: String) -> Bool {
+        let normalized = self.normalize_path(path)
+        return self.files.contains(normalized)
+    }
+
+    // Get file info for a path
+    fn get_file_info(self, path: String) -> ArchivedFileInfo? {
+        let normalized = self.normalize_path(path)
+        return self.files.get(normalized)
+    }
+
+    // Read a file from the archive into memory
+    fn read_file(self, path: String) -> Collection<Int>? {
+        let info = self.get_file_info(path)
+        if info == null {
+            self.last_error = BigError::FileNotFound
+            return null
+        }
+        return self.read_file_by_info(info)
+    }
+
+    // Read a file using its info struct
+    fn read_file_by_info(self, info: ArchivedFileInfo) -> Collection<Int>? {
+        if !self.is_open {
+            self.last_error = BigError::ArchiveNotOpen
+            return null
+        }
+
+        let buffer = Collection::init()
+        let start = info.position
+        let end = start + info.size
+
+        // Bounds check
+        if end > self.raw_data.len() {
+            self.last_error = BigError::ReadError
+            return null
+        }
+
+        // Copy file data
+        for i in start..end {
+            buffer.add(self.raw_data.get(i))
+        }
+
+        return buffer
+    }
+
+    // Read file as string (for text files like INI)
+    fn read_file_as_string(self, path: String) -> String? {
+        let data = self.read_file(path)
+        if data == null {
+            return null
+        }
+
+        let result = ""
+        for i in 0..data.len() {
+            result = result + String::from_char(data.get(i))
+        }
+        return result
+    }
+
+    // Get a list of all files in the archive
+    fn list_files(self) -> Collection<String> {
+        let list = Collection::init()
+        for entry in self.files.entries() {
+            list.add(entry.key)
+        }
+        return list
+    }
+
+    // Get files matching a pattern (e.g., "*.ini", "data/art/*.tga")
+    fn find_files(self, pattern: String) -> Collection<String> {
+        let list = Collection::init()
+        for entry in self.files.entries() {
+            if match_pattern(entry.key, pattern) {
+                list.add(entry.key)
+            }
+        }
+        return list
+    }
+
+    // Get files by extension
+    fn find_files_by_extension(self, ext: String) -> Collection<String> {
+        let pattern = "*." + ext
+        return self.find_files(pattern)
+    }
+
+    // Get number of files in archive
+    fn get_file_count(self) -> Int {
+        return self.file_count
+    }
+
+    // Get total archive size
+    fn get_archive_size(self) -> Int {
+        return self.archive_size
+    }
+
+    // Close the archive
+    fn close(self) {
+        self.raw_data.clear()
+        self.files.clear()
+        self.is_open = false
+        self.file_path = ""
+        self.archive_size = 0
+        self.file_count = 0
+    }
+}
+
+// Simple wildcard pattern matching (* and ?)
+fn match_pattern(str: String, pattern: String) -> Bool {
+    let s = 0
+    let p = 0
+    let star_idx: Int? = null
+    let match_idx = 0
+
+    while s < str.len() {
+        if p < pattern.len() {
+            let pc = pattern.char_at(p)
+            let sc = str.char_at(s)
+
+            if pc == '?' or to_lower(pc) == to_lower(sc) {
+                s = s + 1
+                p = p + 1
+                continue
+            }
+
+            if pc == '*' {
+                star_idx = p
+                match_idx = s
+                p = p + 1
+                continue
+            }
+        }
+
+        if star_idx != null {
+            p = star_idx + 1
+            match_idx = match_idx + 1
+            s = match_idx
+        } else {
+            return false
+        }
+    }
+
+    // Skip trailing wildcards
+    while p < pattern.len() and pattern.char_at(p) == '*' {
+        p = p + 1
+    }
+
+    return p == pattern.len()
+}
+
+fn to_lower(c: Int) -> Int {
+    if c >= 65 and c <= 90 {  // 'A' to 'Z'
+        return c + 32
+    }
+    return c
+}
+
+// Archive file system - manages multiple BIG archives
+struct BigFileSystem {
+    archives: Collection<BigArchive>,
+    search_paths: Collection<String>,
+
+    fn init() -> BigFileSystem {
+        let fs = BigFileSystem {
+            archives: Collection::init(),
+            search_paths: Collection::init(),
+        }
+        return fs
+    }
+
+    // Add a search path for finding BIG files
+    fn add_search_path(self, path: String) {
+        self.search_paths.add(path)
+    }
+
+    // Load all .big files from a directory
+    fn load_directory(self, dir_path: String) -> Int {
+        let count = 0
+        let entries = Directory::list(dir_path)
+
+        if entries == null {
+            return 0
+        }
+
+        for entry in entries {
+            if entry.is_file and entry.name.ends_with(".big") {
+                let full_path = dir_path + "/" + entry.name
+                if self.load_archive(full_path) {
+                    count = count + 1
+                }
+            }
+        }
+
+        return count
+    }
+
+    // Load a single archive
+    fn load_archive(self, path: String) -> Bool {
+        let archive = BigArchive::init()
+        if archive.open(path) {
+            self.archives.add(archive)
+            return true
+        }
+        return false
+    }
+
+    // Check if a file exists in any loaded archive
+    fn file_exists(self, path: String) -> Bool {
+        for archive in self.archives {
+            if archive.file_exists(path) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Read a file from any loaded archive (first match wins)
+    fn read_file(self, path: String) -> Collection<Int>? {
+        for archive in self.archives {
+            let info = archive.get_file_info(path)
+            if info != null {
+                return archive.read_file_by_info(info)
+            }
+        }
+        return null
+    }
+
+    // Read a file as string
+    fn read_file_as_string(self, path: String) -> String? {
+        for archive in self.archives {
+            let info = archive.get_file_info(path)
+            if info != null {
+                let data = archive.read_file_by_info(info)
+                if data != null {
+                    let result = ""
+                    for i in 0..data.len() {
+                        result = result + String::from_char(data.get(i))
+                    }
+                    return result
+                }
+            }
+        }
+        return null
+    }
+
+    // Find files matching pattern across all archives
+    fn find_files(self, pattern: String) -> Collection<String> {
+        let results = Collection::init()
+        let seen = Map::init()  // Avoid duplicates
+
+        for archive in self.archives {
+            let matches = archive.find_files(pattern)
+            for file in matches {
+                if !seen.contains(file) {
+                    seen.set(file, true)
+                    results.add(file)
+                }
+            }
+        }
+
+        return results
+    }
+
+    // Get total number of files across all archives
+    fn get_total_file_count(self) -> Int {
+        let count = 0
+        for archive in self.archives {
+            count = count + archive.get_file_count()
+        }
+        return count
+    }
+
+    // Get number of loaded archives
+    fn get_archive_count(self) -> Int {
+        return self.archives.len()
+    }
+
+    // Close all archives
+    fn close_all(self) {
+        for archive in self.archives {
+            archive.close()
+        }
+        self.archives.clear()
+    }
+}
+
+// ============================================================================
+// C&C Generals specific archive loading
+// ============================================================================
+
+// Standard BIG files in C&C Generals Zero Hour
+const GENERALS_BIG_FILES: Collection<String> = [
+    "INIZH.big",      // Zero Hour INI files
+    "INI.big",        // Base game INI files
+    "Speech.big",     // Voice audio
+    "SpeechZH.big",   // Zero Hour voices
+    "Audio.big",      // Sound effects
+    "AudioZH.big",    // Zero Hour sounds
+    "W3D.big",        // 3D models
+    "W3DZH.big",      // Zero Hour models
+    "Textures.big",   // Textures
+    "TexturesZH.big", // Zero Hour textures
+    "Maps.big",       // Single player maps
+    "MapsZH.big",     // Zero Hour maps
+    "Window.big",     // UI definitions
+    "WindowZH.big",   // Zero Hour UI
+    "Terrain.big",    // Terrain data
+    "TerrainZH.big",  // Zero Hour terrain
+    "English.big",    // Localized strings
+    "EnglishZH.big",  // Zero Hour strings
+]
+
+// Load all standard game archives
+fn load_game_archives(game_path: String) -> BigFileSystem {
+    let fs = BigFileSystem::init()
+
+    // Add the game directory as search path
+    fs.add_search_path(game_path)
+
+    // Try to load each standard archive
+    for big_file in GENERALS_BIG_FILES {
+        let full_path = game_path + "/" + big_file
+        fs.load_archive(full_path)
+    }
+
+    // Also load any other .big files in the directory
+    fs.load_directory(game_path)
+
+    return fs
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+fn test_pattern_matching() -> Bool {
+    assert(match_pattern("test.ini", "*.ini"), "Match *.ini")
+    assert(match_pattern("data/ini/test.ini", "*.ini"), "Match nested *.ini")
+    assert(!match_pattern("test.tga", "*.ini"), "No match *.ini on .tga")
+    assert(match_pattern("test.ini", "test.???"), "Match test.???")
+    assert(match_pattern("TEST.INI", "*.ini"), "Case insensitive match")
+    assert(match_pattern("a", "*"), "Match single char with *")
+    assert(match_pattern("abc", "a*c"), "Match a*c")
+    assert(match_pattern("data/ini/gamedata.ini", "data/ini/*.ini"), "Match path pattern")
+    return true
+}
+
+fn test_path_normalization() -> Bool {
+    let archive = BigArchive::init()
+
+    let p1 = archive.normalize_path("Data\\INI\\GameData.ini")
+    assert(p1 == "data/ini/gamedata.ini", "Normalize backslash and case")
+
+    let p2 = archive.normalize_path("already/lowercase/path.txt")
+    assert(p2 == "already/lowercase/path.txt", "Already normalized path")
+
+    return true
+}
+
+fn test_archived_file_info() -> Bool {
+    let info = ArchivedFileInfo::init("data/ini/gamedata.ini", 1000, 5000)
+
+    assert(info.name == "data/ini/gamedata.ini", "Full name")
+    assert(info.base_name == "gamedata.ini", "Base name")
+    assert(info.position == 1000, "Position")
+    assert(info.size == 5000, "Size")
+
+    return true
+}
+
+fn test_big_archive_init() -> Bool {
+    let archive = BigArchive::init()
+
+    assert(archive.file_path == "", "Empty path on init")
+    assert(archive.is_open == false, "Not open on init")
+    assert(archive.file_count == 0, "Zero file count on init")
+
+    return true
+}
+
+fn test_big_file_system_init() -> Bool {
+    let fs = BigFileSystem::init()
+
+    assert(fs.get_archive_count() == 0, "No archives on init")
+    assert(fs.get_total_file_count() == 0, "No files on init")
+
+    return true
+}
+
+fn test_big_reader() -> Bool {
+    let data = Collection::init()
+    // Add test bytes: 0x12 0x34 0x56 0x78
+    data.add(0x12)
+    data.add(0x34)
+    data.add(0x56)
+    data.add(0x78)
+
+    let reader = BigReader::init(data)
+
+    // Test little-endian read
+    let le = reader.read_u32_le()
+    assert(le == 0x78563412, "Little-endian u32")
+
+    // Reset and test big-endian read
+    reader.seek(0)
+    let be = reader.read_u32_be()
+    assert(be == 0x12345678, "Big-endian u32")
+
+    return true
+}
+
+fn test_magic_validation() -> Bool {
+    // Test BIGF magic (0x42 0x49 0x47 0x46 = "BIGF")
+    let data = Collection::init()
+    data.add(0x42)  // B
+    data.add(0x49)  // I
+    data.add(0x47)  // G
+    data.add(0x46)  // F
+
+    let reader = BigReader::init(data)
+    let magic = reader.read_u32_le()
+
+    assert(magic == BIG_MAGIC_BIGF, "BIGF magic validated")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_pattern_matching(), "Test 1: Pattern matching")
+    assert(test_path_normalization(), "Test 2: Path normalization")
+    assert(test_archived_file_info(), "Test 3: Archived file info")
+    assert(test_big_archive_init(), "Test 4: BigArchive init")
+    assert(test_big_file_system_init(), "Test 5: BigFileSystem init")
+    assert(test_big_reader(), "Test 6: BigReader")
+    assert(test_magic_validation(), "Test 7: Magic validation")
+    return true
+}
