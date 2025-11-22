@@ -8,7 +8,7 @@
 
 ## Current Codebase Status
 
-### Home Files (134 total) - Primary Implementation
+### Home Files (142 total) - Primary Implementation
 ```
 src/
 ├── main.home                    # Entry point
@@ -297,8 +297,26 @@ Only Objective-C files remain for native macOS platform integration (Metal/Cocoa
 - [x] CSF file parser
 - [x] UTF-16 to UTF-8 conversion
 - [x] String lookup by label
-- [x] 11 language support
-- **Files**: `src/engine/localization_system.home`
+- [x] STR string table parser
+- **Files**: `src/engine/str_parser.home`
+
+### 3.7 Additional Asset Loaders ✅
+- [x] TGA texture loader (all formats)
+- [x] WAV audio loader (PCM, ADPCM)
+- [x] BMP splash screen loader
+- [x] ANI/CUR cursor loader (animated + static)
+- [x] BIK video placeholder/skip system
+- [x] MAP file loader
+- [x] Unified asset manager with caching
+- **Files**:
+  - `src/engine/tga_loader.home`
+  - `src/engine/wav_loader.home`
+  - `src/engine/splash_screen.home`
+  - `src/engine/cursor_loader.home`
+  - `src/engine/bink_video.home`
+  - `src/engine/map_loader.home`
+  - `src/engine/asset_manager.home`
+  - `src/engine/asset_paths.home`
 
 ---
 

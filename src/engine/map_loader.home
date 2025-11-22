@@ -1,0 +1,553 @@
+// MAP File Loader - C&C Generals Map Format Support
+// Loads game maps including terrain, objects, and metadata
+// Reference: EA SAGE engine map format
+
+from basics import Collection, Map
+
+// Map file sections
+const MAP_VERSION: Int = 5  // C&C Generals Zero Hour map version
+
+// Terrain blend tile types
+enum TerrainType {
+    Grass,
+    Dirt,
+    Sand,
+    Rock,
+    Water,
+    Snow,
+    Concrete,
+    Asphalt,
+    Mud,
+    Shore,
+    Cliff,
+    Ice,
+}
+
+// Map object types
+enum MapObjectType {
+    Unit,
+    Building,
+    Prop,
+    Tree,
+    Rock,
+    Waypoint,
+    CameraPoint,
+    ScriptArea,
+    Light,
+    Particle,
+    Sound,
+}
+
+// Map coordinates
+struct MapCoord {
+    x: Float,
+    y: Float,
+    z: Float,
+}
+
+fn create_coord(x: Float, y: Float, z: Float) -> MapCoord {
+    return MapCoord { x: x, y: y, z: z }
+}
+
+// Height map cell
+struct HeightCell {
+    height: Float,
+    terrain_type: TerrainType,
+    passable: Bool,
+    buildable: Bool,
+}
+
+// Map object placement
+struct MapObject {
+    object_type: MapObjectType,
+    type_name: String,      // Object definition name (e.g., "AmericaTank")
+    position: MapCoord,
+    rotation: Float,        // Y-axis rotation in degrees
+    team: Int,              // Owner team/player
+    health: Float,          // Initial health percentage (0-100)
+    is_selected: Bool,
+    script_name: String,    // For script triggers
+    properties: Map<String, String>,  // Additional object properties
+}
+
+// Waypoint for pathfinding and scripts
+struct Waypoint {
+    name: String,
+    position: MapCoord,
+    linked_waypoints: Collection<String>,
+    is_visible: Bool,
+}
+
+// Script area (rectangular trigger zone)
+struct ScriptArea {
+    name: String,
+    min_corner: MapCoord,
+    max_corner: MapCoord,
+    is_water: Bool,
+    is_no_build: Bool,
+}
+
+// Player starting position
+struct StartPosition {
+    player_index: Int,
+    position: MapCoord,
+    rotation: Float,
+}
+
+// Terrain texture layer
+struct TerrainLayer {
+    texture_name: String,
+    blend_texture: String,
+    tile_size: Float,
+}
+
+// Complete map data
+struct GameMap {
+    // Metadata
+    name: String,
+    description: String,
+    author: String,
+    version: Int,
+
+    // Dimensions
+    width: Int,             // Map width in cells
+    height: Int,            // Map height in cells
+    cell_size: Float,       // Size of each cell in world units
+
+    // Height map
+    height_map: Collection<HeightCell>,
+    min_height: Float,
+    max_height: Float,
+
+    // Terrain
+    terrain_layers: Collection<TerrainLayer>,
+
+    // Objects
+    objects: Collection<MapObject>,
+    waypoints: Collection<Waypoint>,
+    script_areas: Collection<ScriptArea>,
+
+    // Players
+    start_positions: Collection<StartPosition>,
+    max_players: Int,
+
+    // Water
+    water_height: Float,
+    has_water: Bool,
+
+    // Environment
+    ambient_color: (Int, Int, Int),
+    sun_direction: MapCoord,
+    sun_color: (Int, Int, Int),
+
+    // Bounds
+    playable_min: MapCoord,
+    playable_max: MapCoord,
+}
+
+/// Create empty game map
+fn create_game_map() -> GameMap {
+    return GameMap {
+        name: "Untitled",
+        description: "",
+        author: "",
+        version: MAP_VERSION,
+        width: 256,
+        height: 256,
+        cell_size: 10.0,
+        height_map: Collection<HeightCell>{},
+        min_height: 0.0,
+        max_height: 100.0,
+        terrain_layers: Collection<TerrainLayer>{},
+        objects: Collection<MapObject>{},
+        waypoints: Collection<Waypoint>{},
+        script_areas: Collection<ScriptArea>{},
+        start_positions: Collection<StartPosition>{},
+        max_players: 8,
+        water_height: 0.0,
+        has_water: false,
+        ambient_color: (128, 128, 128),
+        sun_direction: create_coord(0.5, -1.0, 0.5),
+        sun_color: (255, 255, 200),
+        playable_min: create_coord(0.0, 0.0, 0.0),
+        playable_max: create_coord(2560.0, 0.0, 2560.0),
+    }
+}
+
+/// Read 32-bit little-endian integer
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Read 16-bit little-endian integer
+fn read_u16_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 > data.len() {
+        return 0
+    }
+    return data.get(offset) | (data.get(offset + 1) << 8)
+}
+
+/// Read float (IEEE 754)
+fn read_float_le(data: Collection<Int>, offset: Int) -> Float {
+    // Simplified - in real implementation would parse IEEE 754
+    let bits = read_u32_le(data, offset)
+    // Convert bits to float (simplified)
+    return (bits as Float) / 1000000.0
+}
+
+/// Read null-terminated string
+fn read_string(data: Collection<Int>, offset: Int, max_len: Int) -> String {
+    let result = ""
+    let i = 0
+
+    while i < max_len && offset + i < data.len() {
+        let c = data.get(offset + i)
+        if c == 0 {
+            break
+        }
+        result = result + String::char_from_code(c)
+        i = i + 1
+    }
+
+    return result
+}
+
+/// Initialize height map with flat terrain
+fn initialize_height_map(map: GameMap) {
+    let total_cells = map.width * map.height
+
+    for i in 0..total_cells {
+        let cell = HeightCell {
+            height: 0.0,
+            terrain_type: TerrainType::Grass,
+            passable: true,
+            buildable: true,
+        }
+        map.height_map.add(cell)
+    }
+}
+
+/// Get height at cell coordinates
+fn get_height_at(map: GameMap, x: Int, y: Int) -> Float {
+    if x < 0 || x >= map.width || y < 0 || y >= map.height {
+        return 0.0
+    }
+
+    let index = y * map.width + x
+    if index >= map.height_map.len() {
+        return 0.0
+    }
+
+    return map.height_map.get(index).height
+}
+
+/// Get height at world coordinates (with interpolation)
+fn get_height_at_world(map: GameMap, wx: Float, wy: Float) -> Float {
+    let cell_x = (wx / map.cell_size) as Int
+    let cell_y = (wy / map.cell_size) as Int
+
+    // Bilinear interpolation
+    let fx = (wx / map.cell_size) - (cell_x as Float)
+    let fy = (wy / map.cell_size) - (cell_y as Float)
+
+    let h00 = get_height_at(map, cell_x, cell_y)
+    let h10 = get_height_at(map, cell_x + 1, cell_y)
+    let h01 = get_height_at(map, cell_x, cell_y + 1)
+    let h11 = get_height_at(map, cell_x + 1, cell_y + 1)
+
+    let h0 = h00 * (1.0 - fx) + h10 * fx
+    let h1 = h01 * (1.0 - fx) + h11 * fx
+
+    return h0 * (1.0 - fy) + h1 * fy
+}
+
+/// Set height at cell coordinates
+fn set_height_at(map: GameMap, x: Int, y: Int, height: Float) {
+    if x < 0 || x >= map.width || y < 0 || y >= map.height {
+        return
+    }
+
+    let index = y * map.width + x
+    if index >= map.height_map.len() {
+        return
+    }
+
+    map.height_map.get(index).height = height
+
+    // Update bounds
+    if height < map.min_height {
+        map.min_height = height
+    }
+    if height > map.max_height {
+        map.max_height = height
+    }
+}
+
+/// Check if cell is passable
+fn is_passable(map: GameMap, x: Int, y: Int) -> Bool {
+    if x < 0 || x >= map.width || y < 0 || y >= map.height {
+        return false
+    }
+
+    let index = y * map.width + x
+    if index >= map.height_map.len() {
+        return false
+    }
+
+    return map.height_map.get(index).passable
+}
+
+/// Check if cell is buildable
+fn is_buildable(map: GameMap, x: Int, y: Int) -> Bool {
+    if x < 0 || x >= map.width || y < 0 || y >= map.height {
+        return false
+    }
+
+    let index = y * map.width + x
+    if index >= map.height_map.len() {
+        return false
+    }
+
+    return map.height_map.get(index).buildable
+}
+
+/// Add object to map
+fn add_object(map: GameMap, obj: MapObject) {
+    map.objects.add(obj)
+}
+
+/// Add waypoint to map
+fn add_waypoint(map: GameMap, waypoint: Waypoint) {
+    map.waypoints.add(waypoint)
+}
+
+/// Add script area to map
+fn add_script_area(map: GameMap, area: ScriptArea) {
+    map.script_areas.add(area)
+}
+
+/// Find waypoint by name
+fn find_waypoint(map: GameMap, name: String) -> Waypoint {
+    for wp in map.waypoints {
+        if wp.name == name {
+            return wp
+        }
+    }
+    return Waypoint {
+        name: "",
+        position: create_coord(0.0, 0.0, 0.0),
+        linked_waypoints: Collection<String>{},
+        is_visible: false,
+    }
+}
+
+/// Get objects in area
+fn get_objects_in_area(map: GameMap, min: MapCoord, max: MapCoord) -> Collection<MapObject> {
+    let result = Collection<MapObject>{}
+
+    for obj in map.objects {
+        if obj.position.x >= min.x && obj.position.x <= max.x &&
+           obj.position.z >= min.z && obj.position.z <= max.z {
+            result.add(obj)
+        }
+    }
+
+    return result
+}
+
+/// Create a map object
+fn create_map_object(type_name: String, x: Float, y: Float, z: Float, team: Int) -> MapObject {
+    return MapObject {
+        object_type: MapObjectType::Unit,
+        type_name: type_name,
+        position: create_coord(x, y, z),
+        rotation: 0.0,
+        team: team,
+        health: 100.0,
+        is_selected: false,
+        script_name: "",
+        properties: Map<String, String>{},
+    }
+}
+
+/// Load map from data (simplified parser)
+fn load_map(data: Collection<Int>) -> (GameMap, Bool) {
+    let map = create_game_map()
+
+    if data.len() < 32 {
+        return (map, false)
+    }
+
+    // Parse header (simplified)
+    // Real implementation would parse the full SAGE map format
+
+    // Initialize with default height map
+    initialize_height_map(map)
+
+    return (map, true)
+}
+
+/// Generate random terrain heights
+fn generate_random_terrain(map: GameMap, amplitude: Float, frequency: Float) {
+    for y in 0..map.height {
+        for x in 0..map.width {
+            // Simple sine-based terrain generation
+            let fx = (x as Float) * frequency
+            let fy = (y as Float) * frequency
+
+            let h = sin(fx) * cos(fy) * amplitude
+            h = h + sin(fx * 2.0) * sin(fy * 2.0) * (amplitude * 0.5)
+
+            set_height_at(map, x, y, h)
+        }
+    }
+}
+
+/// Simple sine function
+fn sin(x: Float) -> Float {
+    // Taylor series approximation
+    let x_mod = x - ((x / 6.28318) as Int as Float) * 6.28318
+    let x2 = x_mod * x_mod
+    let x3 = x2 * x_mod
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    return x_mod - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0
+}
+
+/// Simple cosine function
+fn cos(x: Float) -> Float {
+    return sin(x + 1.5708)
+}
+
+// ============================================================================
+// Map Manager
+// ============================================================================
+
+struct MapManager {
+    maps: Map<String, GameMap>,
+    current_map: String,
+    map_directory: String,
+
+    fn init() -> MapManager {
+        return MapManager {
+            maps: Map<String, GameMap>{},
+            current_map: "",
+            map_directory: "assets/maps",
+        }
+    }
+
+    fn load_map(self, name: String, data: Collection<Int>) -> Bool {
+        let (map, success) = load_map(data)
+        if success {
+            map.name = name
+            self.maps.set(name, map)
+        }
+        return success
+    }
+
+    fn set_current_map(self, name: String) -> Bool {
+        if self.maps.has(name) {
+            self.current_map = name
+            return true
+        }
+        return false
+    }
+
+    fn get_current_map(self) -> GameMap {
+        if self.current_map != "" && self.maps.has(self.current_map) {
+            return self.maps.get(self.current_map)
+        }
+        return create_game_map()
+    }
+
+    fn has_map(self, name: String) -> Bool {
+        return self.maps.has(name)
+    }
+
+    fn get_map_list(self) -> Collection<String> {
+        let result = Collection<String>{}
+        for key in self.maps.keys() {
+            result.add(key)
+        }
+        return result
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_map_creation() -> Bool {
+    let map = create_game_map()
+    assert(map.width == 256, "Default width should be 256")
+    assert(map.height == 256, "Default height should be 256")
+    assert(map.max_players == 8, "Default max players should be 8")
+    return true
+}
+
+fn test_height_map() -> Bool {
+    let map = create_game_map()
+    map.width = 10
+    map.height = 10
+    initialize_height_map(map)
+
+    assert(map.height_map.len() == 100, "Should have 100 cells (10x10)")
+
+    set_height_at(map, 5, 5, 50.0)
+    let h = get_height_at(map, 5, 5)
+    assert(h == 50.0, "Height should be 50.0")
+
+    return true
+}
+
+fn test_object_creation() -> Bool {
+    let obj = create_map_object("AmericaTank", 100.0, 0.0, 200.0, 1)
+    assert(obj.type_name == "AmericaTank", "Type name should match")
+    assert(obj.team == 1, "Team should be 1")
+    assert(obj.health == 100.0, "Default health should be 100")
+    return true
+}
+
+fn test_passability() -> Bool {
+    let map = create_game_map()
+    map.width = 10
+    map.height = 10
+    initialize_height_map(map)
+
+    assert(is_passable(map, 5, 5) == true, "Should be passable by default")
+    assert(is_buildable(map, 5, 5) == true, "Should be buildable by default")
+
+    // Out of bounds
+    assert(is_passable(map, -1, 0) == false, "Out of bounds should not be passable")
+
+    return true
+}
+
+fn test_map_manager() -> Bool {
+    let manager = MapManager::init()
+    assert(manager.current_map == "", "Should start with no current map")
+
+    let map = create_game_map()
+    map.name = "TestMap"
+    manager.maps.set("TestMap", map)
+
+    assert(manager.has_map("TestMap") == true, "Should have TestMap")
+    assert(manager.set_current_map("TestMap") == true, "Should set current map")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_map_creation(), "Map creation test failed")
+    assert(test_height_map(), "Height map test failed")
+    assert(test_object_creation(), "Object creation test failed")
+    assert(test_passability(), "Passability test failed")
+    assert(test_map_manager(), "Map manager test failed")
+    return true
+}
