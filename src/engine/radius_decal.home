@@ -1,0 +1,611 @@
+// Radius Decal - Ability range indicators and area markers
+// Handles circle rendering, pulse animation, and range visualization
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct RadiusDecalConfig {
+    default_segments: i32 = 64,               // Circle smoothness
+    outline_width: f32 = 0.5,                 // Ring outline thickness
+    fill_alpha: f32 = 0.15,                   // Fill transparency
+    outline_alpha: f32 = 0.8,                 // Outline transparency
+    pulse_speed: f32 = 2.0,                   // Pulse animation speed
+    pulse_intensity: f32 = 0.3,               // Pulse brightness variation
+    expand_speed: f32 = 50.0,                 // Radius expansion speed
+    fade_duration: f32 = 0.5,                 // Fade in/out duration
+    max_decals: i32 = 32,
+}
+
+// ============================================================================
+// Decal Types
+// ============================================================================
+
+enum DecalType {
+    Range,                                    // Weapon/ability range
+    Area,                                     // Area of effect
+    Damage,                                   // Damage radius
+    Heal,                                     // Heal radius
+    Capture,                                  // Capture zone
+    Rally,                                    // Rally point
+    Waypoint,                                 // Movement waypoint
+    Invalid,                                  // Invalid placement
+    Power,                                    // Special power targeting
+    Radar,                                    // Radar scan range
+}
+
+enum DecalState {
+    Inactive,
+    FadingIn,
+    Active,
+    Pulsing,
+    Expanding,
+    FadingOut,
+}
+
+// ============================================================================
+// Decal Colors
+// ============================================================================
+
+struct DecalColors {
+    range: Vec4,
+    area: Vec4,
+    damage: Vec4,
+    heal: Vec4,
+    capture: Vec4,
+    rally: Vec4,
+    waypoint: Vec4,
+    invalid: Vec4,
+    power: Vec4,
+    radar: Vec4,
+}
+
+fn create_default_decal_colors() -> DecalColors {
+    return DecalColors {
+        range: Vec4 { x: 0.2, y: 0.8, z: 0.2, w: 1.0 },      // Green
+        area: Vec4 { x: 0.9, y: 0.6, z: 0.1, w: 1.0 },       // Orange
+        damage: Vec4 { x: 0.9, y: 0.2, z: 0.2, w: 1.0 },     // Red
+        heal: Vec4 { x: 0.2, y: 0.8, z: 0.9, w: 1.0 },       // Cyan
+        capture: Vec4 { x: 0.8, y: 0.8, z: 0.2, w: 1.0 },    // Yellow
+        rally: Vec4 { x: 0.2, y: 0.5, z: 0.9, w: 1.0 },      // Blue
+        waypoint: Vec4 { x: 0.5, y: 0.5, z: 0.9, w: 1.0 },   // Light blue
+        invalid: Vec4 { x: 0.9, y: 0.1, z: 0.1, w: 1.0 },    // Bright red
+        power: Vec4 { x: 0.9, y: 0.2, z: 0.9, w: 1.0 },      // Magenta
+        radar: Vec4 { x: 0.2, y: 0.9, z: 0.2, w: 1.0 },      // Bright green
+    };
+}
+
+fn get_decal_color(colors: &DecalColors, decal_type: DecalType) -> Vec4 {
+    match decal_type {
+        DecalType.Range => colors.range,
+        DecalType.Area => colors.area,
+        DecalType.Damage => colors.damage,
+        DecalType.Heal => colors.heal,
+        DecalType.Capture => colors.capture,
+        DecalType.Rally => colors.rally,
+        DecalType.Waypoint => colors.waypoint,
+        DecalType.Invalid => colors.invalid,
+        DecalType.Power => colors.power,
+        DecalType.Radar => colors.radar,
+    }
+}
+
+// ============================================================================
+// Radius Decal Instance
+// ============================================================================
+
+struct RadiusDecal {
+    decal_id: u64,
+    decal_type: DecalType,
+    state: DecalState,
+    position: Vec3,
+    inner_radius: f32,
+    outer_radius: f32,
+    target_radius: f32,                       // For expanding effect
+    rotation: f32,
+    color: Vec4,
+    alpha: f32,
+    pulse_phase: f32,
+    state_time: f32,
+    lifetime: f32,                            // 0 = infinite
+    age: f32,
+    show_fill: bool,
+    show_outline: bool,
+    dashed_outline: bool,
+    dash_count: i32,
+    dash_speed: f32,
+    is_valid: bool,
+    segments: i32,
+}
+
+fn create_radius_decal(decal_id: u64, decal_type: DecalType, position: Vec3, radius: f32) -> RadiusDecal {
+    return RadiusDecal {
+        decal_id: decal_id,
+        decal_type: decal_type,
+        state: DecalState.FadingIn,
+        position: position,
+        inner_radius: 0.0,
+        outer_radius: radius,
+        target_radius: radius,
+        rotation: 0.0,
+        color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+        alpha: 0.0,
+        pulse_phase: 0.0,
+        state_time: 0.0,
+        lifetime: 0.0,
+        age: 0.0,
+        show_fill: true,
+        show_outline: true,
+        dashed_outline: false,
+        dash_count: 16,
+        dash_speed: 1.0,
+        is_valid: true,
+        segments: 64,
+    };
+}
+
+// ============================================================================
+// Decal Manager
+// ============================================================================
+
+struct RadiusDecalManager {
+    config: RadiusDecalConfig,
+    colors: DecalColors,
+    decals: [RadiusDecal; 32],
+    decal_count: i32,
+    next_decal_id: u64,
+    current_time: f32,
+}
+
+fn create_radius_decal_manager(config: RadiusDecalConfig) -> RadiusDecalManager {
+    return RadiusDecalManager {
+        config: config,
+        colors: create_default_decal_colors(),
+        decals: [create_radius_decal(0, DecalType.Range, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.0); 32],
+        decal_count: 0,
+        next_decal_id: 1,
+        current_time: 0.0,
+    };
+}
+
+// ============================================================================
+// Decal Management
+// ============================================================================
+
+fn add_decal(manager: &mut RadiusDecalManager, decal_type: DecalType, position: Vec3, radius: f32) -> u64 {
+    if manager.decal_count >= manager.config.max_decals {
+        return 0;
+    }
+
+    let decal_id = manager.next_decal_id;
+    manager.next_decal_id += 1;
+
+    let mut decal = create_radius_decal(decal_id, decal_type, position, radius);
+    decal.color = get_decal_color(&manager.colors, decal_type);
+    decal.segments = manager.config.default_segments;
+
+    manager.decals[manager.decal_count] = decal;
+    manager.decal_count += 1;
+
+    return decal_id;
+}
+
+fn add_range_decal(manager: &mut RadiusDecalManager, position: Vec3, inner_radius: f32, outer_radius: f32) -> u64 {
+    let decal_id = add_decal(manager, DecalType.Range, position, outer_radius);
+
+    // Find and configure the decal
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].inner_radius = inner_radius;
+            manager.decals[i].show_fill = false;
+            manager.decals[i].dashed_outline = true;
+            break;
+        }
+    }
+
+    return decal_id;
+}
+
+fn add_area_decal(manager: &mut RadiusDecalManager, position: Vec3, radius: f32, lifetime: f32) -> u64 {
+    let decal_id = add_decal(manager, DecalType.Area, position, radius);
+
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].lifetime = lifetime;
+            manager.decals[i].show_fill = true;
+            break;
+        }
+    }
+
+    return decal_id;
+}
+
+fn add_expanding_decal(manager: &mut RadiusDecalManager, position: Vec3, start_radius: f32, end_radius: f32, duration: f32) -> u64 {
+    let decal_id = add_decal(manager, DecalType.Area, position, start_radius);
+
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].target_radius = end_radius;
+            manager.decals[i].state = DecalState.Expanding;
+            manager.decals[i].lifetime = duration;
+            break;
+        }
+    }
+
+    return decal_id;
+}
+
+fn remove_decal(manager: &mut RadiusDecalManager, decal_id: u64) {
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            // Start fade out
+            manager.decals[i].state = DecalState.FadingOut;
+            manager.decals[i].state_time = 0.0;
+            break;
+        }
+    }
+}
+
+fn remove_decal_immediate(manager: &mut RadiusDecalManager, decal_id: u64) {
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            // Shift remaining decals
+            for j in i..(manager.decal_count - 1) {
+                manager.decals[j] = manager.decals[j + 1];
+            }
+            manager.decal_count -= 1;
+            break;
+        }
+    }
+}
+
+fn update_decal_position(manager: &mut RadiusDecalManager, decal_id: u64, position: Vec3) {
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].position = position;
+            break;
+        }
+    }
+}
+
+fn update_decal_radius(manager: &mut RadiusDecalManager, decal_id: u64, radius: f32) {
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].outer_radius = radius;
+            break;
+        }
+    }
+}
+
+fn set_decal_valid(manager: &mut RadiusDecalManager, decal_id: u64, valid: bool) {
+    for i in 0..manager.decal_count {
+        if manager.decals[i].decal_id == decal_id {
+            manager.decals[i].is_valid = valid;
+            if !valid {
+                manager.decals[i].color = get_decal_color(&manager.colors, DecalType.Invalid);
+            } else {
+                manager.decals[i].color = get_decal_color(&manager.colors, manager.decals[i].decal_type);
+            }
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_decal_manager(manager: &mut RadiusDecalManager, delta_time: f32) {
+    manager.current_time += delta_time;
+
+    let mut i: i32 = 0;
+    while i < manager.decal_count {
+        let decal = &mut manager.decals[i];
+
+        decal.age += delta_time;
+        decal.state_time += delta_time;
+        decal.pulse_phase += manager.config.pulse_speed * delta_time;
+
+        match decal.state {
+            DecalState.Inactive => {
+                // Remove inactive decals
+                remove_decal_immediate(manager, decal.decal_id);
+                continue;  // Don't increment i
+            },
+            DecalState.FadingIn => {
+                decal.alpha = decal.state_time / manager.config.fade_duration;
+                if decal.alpha >= 1.0 {
+                    decal.alpha = 1.0;
+                    decal.state = DecalState.Active;
+                    decal.state_time = 0.0;
+                }
+            },
+            DecalState.Active => {
+                // Check lifetime
+                if decal.lifetime > 0.0 && decal.age >= decal.lifetime {
+                    decal.state = DecalState.FadingOut;
+                    decal.state_time = 0.0;
+                }
+            },
+            DecalState.Pulsing => {
+                let pulse = sin_approx(decal.pulse_phase);
+                decal.alpha = 0.7 + pulse * manager.config.pulse_intensity;
+
+                if decal.lifetime > 0.0 && decal.age >= decal.lifetime {
+                    decal.state = DecalState.FadingOut;
+                    decal.state_time = 0.0;
+                }
+            },
+            DecalState.Expanding => {
+                // Expand radius
+                let expand_speed = (decal.target_radius - decal.outer_radius) / max_f32(decal.lifetime - decal.age, 0.1);
+                decal.outer_radius += expand_speed * delta_time;
+
+                if decal.outer_radius >= decal.target_radius {
+                    decal.outer_radius = decal.target_radius;
+                    decal.state = DecalState.FadingOut;
+                    decal.state_time = 0.0;
+                }
+
+                // Fade during expansion
+                decal.alpha = 1.0 - (decal.outer_radius / decal.target_radius) * 0.5;
+            },
+            DecalState.FadingOut => {
+                decal.alpha = 1.0 - decal.state_time / manager.config.fade_duration;
+                if decal.alpha <= 0.0 {
+                    decal.alpha = 0.0;
+                    decal.state = DecalState.Inactive;
+                }
+            },
+        }
+
+        // Update rotation for dashed decals
+        if decal.dashed_outline {
+            decal.rotation += decal.dash_speed * delta_time;
+        }
+
+        i += 1;
+    }
+}
+
+// ============================================================================
+// Rendering
+// ============================================================================
+
+struct DecalVertex {
+    position: Vec3,
+    uv: Vec2,
+    distance: f32,                            // Distance from center (0-1)
+    angle: f32,
+}
+
+fn generate_decal_vertices(decal: &RadiusDecal) -> DecalMesh {
+    let mut mesh = DecalMesh {
+        vertices: [DecalVertex {
+            position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            uv: Vec2 { x: 0.0, y: 0.0 },
+            distance: 0.0,
+            angle: 0.0,
+        }; 256],
+        vertex_count: 0,
+        indices: [0; 768],
+        index_count: 0,
+    };
+
+    let segments = decal.segments;
+    let inner_ratio = decal.inner_radius / decal.outer_radius;
+
+    // Generate ring vertices
+    for i in 0..segments {
+        let angle = (i as f32 / segments as f32) * 6.28318 + decal.rotation;
+        let cos_a = cos_approx(angle);
+        let sin_a = sin_approx(angle);
+
+        // Inner vertex
+        let inner_idx = mesh.vertex_count;
+        mesh.vertices[mesh.vertex_count] = DecalVertex {
+            position: Vec3 {
+                x: decal.position.x + cos_a * decal.inner_radius,
+                y: decal.position.y + sin_a * decal.inner_radius,
+                z: decal.position.z + 0.1,
+            },
+            uv: Vec2 { x: (cos_a + 1.0) * 0.5, y: (sin_a + 1.0) * 0.5 },
+            distance: inner_ratio,
+            angle: angle,
+        };
+        mesh.vertex_count += 1;
+
+        // Outer vertex
+        let outer_idx = mesh.vertex_count;
+        mesh.vertices[mesh.vertex_count] = DecalVertex {
+            position: Vec3 {
+                x: decal.position.x + cos_a * decal.outer_radius,
+                y: decal.position.y + sin_a * decal.outer_radius,
+                z: decal.position.z + 0.1,
+            },
+            uv: Vec2 { x: (cos_a + 1.0) * 0.5, y: (sin_a + 1.0) * 0.5 },
+            distance: 1.0,
+            angle: angle,
+        };
+        mesh.vertex_count += 1;
+
+        // Generate indices for quad (two triangles)
+        if i > 0 {
+            let prev_inner = inner_idx - 2;
+            let prev_outer = outer_idx - 2;
+
+            // Triangle 1
+            mesh.indices[mesh.index_count] = prev_inner;
+            mesh.indices[mesh.index_count + 1] = prev_outer;
+            mesh.indices[mesh.index_count + 2] = inner_idx;
+            mesh.index_count += 3;
+
+            // Triangle 2
+            mesh.indices[mesh.index_count] = prev_outer;
+            mesh.indices[mesh.index_count + 1] = outer_idx;
+            mesh.indices[mesh.index_count + 2] = inner_idx;
+            mesh.index_count += 3;
+        }
+    }
+
+    // Close the ring
+    if segments > 2 {
+        let last_inner = mesh.vertex_count - 2;
+        let last_outer = mesh.vertex_count - 1;
+
+        mesh.indices[mesh.index_count] = last_inner;
+        mesh.indices[mesh.index_count + 1] = last_outer;
+        mesh.indices[mesh.index_count + 2] = 0;
+        mesh.index_count += 3;
+
+        mesh.indices[mesh.index_count] = last_outer;
+        mesh.indices[mesh.index_count + 1] = 1;
+        mesh.indices[mesh.index_count + 2] = 0;
+        mesh.index_count += 3;
+    }
+
+    return mesh;
+}
+
+struct DecalMesh {
+    vertices: [DecalVertex; 256],
+    vertex_count: i32,
+    indices: [i32; 768],
+    index_count: i32,
+}
+
+fn decal_fragment_shader(vertex: &DecalVertex, decal: &RadiusDecal, config: &RadiusDecalConfig) -> Vec4 {
+    let mut color = decal.color;
+
+    // Apply alpha
+    color.w *= decal.alpha;
+
+    // Dashed outline
+    if decal.dashed_outline {
+        let dash_pattern = sin_approx(vertex.angle * decal.dash_count as f32);
+        if dash_pattern < 0.0 {
+            color.w *= 0.2;  // Gaps are semi-transparent
+        }
+    }
+
+    // Outline vs fill
+    if decal.show_outline && !decal.show_fill {
+        // Ring only - fade based on distance from edge
+        let inner_ratio = decal.inner_radius / decal.outer_radius;
+        let edge_dist = abs_f32(vertex.distance - 1.0);
+        let inner_edge = abs_f32(vertex.distance - inner_ratio);
+        let outline_factor = smoothstep(config.outline_width, 0.0, min_f32(edge_dist, inner_edge) * decal.outer_radius);
+        color.w *= outline_factor * config.outline_alpha;
+    } else if decal.show_fill && decal.show_outline {
+        // Fill with outline
+        let edge_dist = 1.0 - vertex.distance;
+        let outline_blend = smoothstep(config.outline_width, 0.0, edge_dist * decal.outer_radius);
+        color.w *= config.fill_alpha + outline_blend * (config.outline_alpha - config.fill_alpha);
+    } else if decal.show_fill {
+        // Fill only
+        color.w *= config.fill_alpha;
+    }
+
+    // Pulse effect
+    let pulse = sin_approx(vertex.angle * 4.0 + decal.pulse_phase);
+    color.w *= 0.9 + pulse * 0.1;
+
+    // Invalid placement makes it red and pulsing
+    if !decal.is_valid {
+        let warning_pulse = sin_approx(decal.pulse_phase * 3.0);
+        color.w *= 0.8 + warning_pulse * 0.2;
+    }
+
+    return color;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sin_approx(x: f32) -> f32 {
+    let mut x2 = x;
+    while x2 > 3.14159 { x2 -= 6.28318; }
+    while x2 < -3.14159 { x2 += 6.28318; }
+    let x3 = x2 * x2 * x2;
+    let x5 = x3 * x2 * x2;
+    return x2 - x3 / 6.0 + x5 / 120.0;
+}
+
+fn cos_approx(x: f32) -> f32 {
+    return sin_approx(x + 1.5708);
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
+    if x < min_val { return min_val; }
+    if x > max_val { return max_val; }
+    return x;
+}
+
+fn abs_f32(x: f32) -> f32 {
+    if x < 0.0 { return -x; }
+    return x;
+}
+
+fn min_f32(a: f32, b: f32) -> f32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a > b { return a; }
+    return b;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_radius_decal() {
+    print("Testing Radius Decal...");
+
+    // Create manager
+    let config = RadiusDecalConfig {};
+    let mut manager = create_radius_decal_manager(config);
+    print("  Created decal manager");
+
+    // Add range decal
+    let range_id = add_range_decal(&mut manager, Vec3 { x: 100.0, y: 100.0, z: 0.0 }, 10.0, 50.0);
+    print("  Added range decal: " + range_id as string);
+
+    // Add area decal with lifetime
+    let area_id = add_area_decal(&mut manager, Vec3 { x: 200.0, y: 200.0, z: 0.0 }, 30.0, 3.0);
+    print("  Added area decal: " + area_id as string);
+
+    // Add expanding decal
+    let expand_id = add_expanding_decal(&mut manager, Vec3 { x: 300.0, y: 300.0, z: 0.0 }, 10.0, 100.0, 2.0);
+    print("  Added expanding decal: " + expand_id as string);
+
+    // Update for a few frames
+    for _ in 0..10 {
+        update_decal_manager(&mut manager, 0.1);
+    }
+    print("  Decal count after updates: " + manager.decal_count as string);
+
+    // Test validation
+    set_decal_valid(&mut manager, range_id, false);
+    print("  Set decal invalid");
+
+    // Generate mesh
+    for i in 0..manager.decal_count {
+        let mesh = generate_decal_vertices(&manager.decals[i]);
+        print("  Decal " + i as string + " mesh: " + mesh.vertex_count as string + " vertices");
+    }
+
+    // Remove decal
+    remove_decal(&mut manager, range_id);
+    update_decal_manager(&mut manager, 0.6);  // Complete fade out
+    print("  Decal count after removal: " + manager.decal_count as string);
+
+    print("Radius Decal tests complete!");
+}

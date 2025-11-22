@@ -1,0 +1,1033 @@
+// Transport - Network transport layer abstraction
+// Handles packet serialization, reliability, and connection management
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct TransportConfig {
+    max_packet_size: i32 = 1400,              // MTU-safe packet size
+    max_pending_packets: i32 = 256,
+    reliable_timeout: f32 = 0.5,              // Timeout for reliable packets
+    max_retries: i32 = 5,
+    keepalive_interval: f32 = 5.0,
+    connection_timeout: f32 = 30.0,
+    enable_compression: bool = true,
+    compression_threshold: i32 = 100,         // Min size for compression
+    enable_encryption: bool = false,
+    fragment_threshold: i32 = 1200,           // Size to start fragmenting
+}
+
+// ============================================================================
+// Packet Types
+// ============================================================================
+
+enum PacketType {
+    Unreliable = 0,
+    Reliable = 1,
+    ReliableOrdered = 2,
+    ReliableSequenced = 3,
+    Fragment = 4,
+    Ack = 5,
+    Keepalive = 6,
+    Connect = 7,
+    Disconnect = 8,
+    ConnectAccept = 9,
+    ConnectReject = 10,
+}
+
+enum PacketFlags {
+    None = 0,
+    Compressed = 1,
+    Encrypted = 2,
+    Fragmented = 4,
+    Priority = 8,
+}
+
+struct PacketHeader {
+    packet_type: PacketType,
+    flags: i32,
+    sequence_number: u32,
+    ack_number: u32,
+    ack_bits: u32,                            // Bitfield for recent acks
+    channel: u8,
+    fragment_id: u16,
+    fragment_index: u8,
+    fragment_count: u8,
+    payload_size: u16,
+}
+
+fn create_packet_header(packet_type: PacketType, sequence: u32) -> PacketHeader {
+    return PacketHeader {
+        packet_type: packet_type,
+        flags: PacketFlags.None as i32,
+        sequence_number: sequence,
+        ack_number: 0,
+        ack_bits: 0,
+        channel: 0,
+        fragment_id: 0,
+        fragment_index: 0,
+        fragment_count: 1,
+        payload_size: 0,
+    };
+}
+
+// ============================================================================
+// Packet Buffer
+// ============================================================================
+
+struct PacketBuffer {
+    data: [u8; 1500],
+    size: i32,
+    read_pos: i32,
+    write_pos: i32,
+}
+
+fn create_packet_buffer() -> PacketBuffer {
+    return PacketBuffer {
+        data: [0; 1500],
+        size: 0,
+        read_pos: 0,
+        write_pos: 0,
+    };
+}
+
+fn buffer_write_u8(buffer: &mut PacketBuffer, value: u8) {
+    if buffer.write_pos < 1500 {
+        buffer.data[buffer.write_pos] = value;
+        buffer.write_pos += 1;
+        buffer.size = buffer.write_pos;
+    }
+}
+
+fn buffer_write_u16(buffer: &mut PacketBuffer, value: u16) {
+    buffer_write_u8(buffer, (value & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 8) & 0xFF) as u8);
+}
+
+fn buffer_write_u32(buffer: &mut PacketBuffer, value: u32) {
+    buffer_write_u8(buffer, (value & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 8) & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 16) & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 24) & 0xFF) as u8);
+}
+
+fn buffer_write_f32(buffer: &mut PacketBuffer, value: f32) {
+    // Bit cast float to u32
+    let bits = float_to_bits(value);
+    buffer_write_u32(buffer, bits);
+}
+
+fn buffer_write_bytes(buffer: &mut PacketBuffer, data: &[u8], len: i32) {
+    for i in 0..len {
+        if buffer.write_pos < 1500 {
+            buffer.data[buffer.write_pos] = data[i];
+            buffer.write_pos += 1;
+        }
+    }
+    buffer.size = buffer.write_pos;
+}
+
+fn buffer_read_u8(buffer: &mut PacketBuffer) -> u8 {
+    if buffer.read_pos < buffer.size {
+        let value = buffer.data[buffer.read_pos];
+        buffer.read_pos += 1;
+        return value;
+    }
+    return 0;
+}
+
+fn buffer_read_u16(buffer: &mut PacketBuffer) -> u16 {
+    let low = buffer_read_u8(buffer) as u16;
+    let high = buffer_read_u8(buffer) as u16;
+    return low | (high << 8);
+}
+
+fn buffer_read_u32(buffer: &mut PacketBuffer) -> u32 {
+    let b0 = buffer_read_u8(buffer) as u32;
+    let b1 = buffer_read_u8(buffer) as u32;
+    let b2 = buffer_read_u8(buffer) as u32;
+    let b3 = buffer_read_u8(buffer) as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn buffer_read_f32(buffer: &mut PacketBuffer) -> f32 {
+    let bits = buffer_read_u32(buffer);
+    return bits_to_float(bits);
+}
+
+fn buffer_reset(buffer: &mut PacketBuffer) {
+    buffer.read_pos = 0;
+    buffer.write_pos = 0;
+    buffer.size = 0;
+}
+
+// ============================================================================
+// Pending Packet (for reliable delivery)
+// ============================================================================
+
+struct PendingPacket {
+    sequence: u32,
+    packet_type: PacketType,
+    channel: u8,
+    data: [u8; 1500],
+    size: i32,
+    send_time: f32,
+    retry_count: i32,
+    is_acked: bool,
+    is_active: bool,
+}
+
+fn create_pending_packet(sequence: u32, packet_type: PacketType) -> PendingPacket {
+    return PendingPacket {
+        sequence: sequence,
+        packet_type: packet_type,
+        channel: 0,
+        data: [0; 1500],
+        size: 0,
+        send_time: 0.0,
+        retry_count: 0,
+        is_acked: false,
+        is_active: false,
+    };
+}
+
+// ============================================================================
+// Fragment Assembly
+// ============================================================================
+
+struct FragmentAssembly {
+    fragment_id: u16,
+    total_fragments: u8,
+    received_mask: u32,                       // Bitfield of received fragments
+    fragments: [[u8; 1400]; 16],              // Up to 16 fragments
+    fragment_sizes: [i32; 16],
+    start_time: f32,
+    is_complete: bool,
+}
+
+fn create_fragment_assembly(fragment_id: u16, total: u8) -> FragmentAssembly {
+    return FragmentAssembly {
+        fragment_id: fragment_id,
+        total_fragments: total,
+        received_mask: 0,
+        fragments: [[0; 1400]; 16],
+        fragment_sizes: [0; 16],
+        start_time: 0.0,
+        is_complete: false,
+    };
+}
+
+fn add_fragment(assembly: &mut FragmentAssembly, index: u8, data: &[u8], size: i32) -> bool {
+    if index >= assembly.total_fragments || index >= 16 {
+        return false;
+    }
+
+    // Copy fragment data
+    for i in 0..size {
+        if i < 1400 {
+            assembly.fragments[index as i32][i] = data[i];
+        }
+    }
+    assembly.fragment_sizes[index as i32] = size;
+
+    // Mark as received
+    assembly.received_mask |= (1 << index);
+
+    // Check if complete
+    let expected_mask = (1u32 << assembly.total_fragments) - 1;
+    assembly.is_complete = assembly.received_mask == expected_mask;
+
+    return assembly.is_complete;
+}
+
+fn assemble_fragments(assembly: &FragmentAssembly, out_buffer: &mut PacketBuffer) {
+    buffer_reset(out_buffer);
+
+    for i in 0..assembly.total_fragments as i32 {
+        let size = assembly.fragment_sizes[i];
+        for j in 0..size {
+            if out_buffer.write_pos < 1500 {
+                out_buffer.data[out_buffer.write_pos] = assembly.fragments[i][j];
+                out_buffer.write_pos += 1;
+            }
+        }
+    }
+    out_buffer.size = out_buffer.write_pos;
+}
+
+// ============================================================================
+// Connection State
+// ============================================================================
+
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Disconnecting,
+}
+
+struct Connection {
+    connection_id: u64,
+    remote_address: string,
+    remote_port: u16,
+    state: ConnectionState,
+
+    // Sequence numbers
+    local_sequence: u32,
+    remote_sequence: u32,
+    ack_bits: u32,
+
+    // Timing
+    last_send_time: f32,
+    last_receive_time: f32,
+    round_trip_time: f32,
+    rtt_variance: f32,
+
+    // Pending packets
+    pending_reliable: [PendingPacket; 64],
+    pending_count: i32,
+
+    // Fragment assembly
+    fragment_assemblies: [FragmentAssembly; 8],
+    assembly_count: i32,
+
+    // Statistics
+    packets_sent: u64,
+    packets_received: u64,
+    packets_lost: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+}
+
+fn create_connection(connection_id: u64, address: string, port: u16) -> Connection {
+    return Connection {
+        connection_id: connection_id,
+        remote_address: address,
+        remote_port: port,
+        state: ConnectionState.Disconnected,
+        local_sequence: 0,
+        remote_sequence: 0,
+        ack_bits: 0,
+        last_send_time: 0.0,
+        last_receive_time: 0.0,
+        round_trip_time: 0.1,
+        rtt_variance: 0.01,
+        pending_reliable: [create_pending_packet(0, PacketType.Reliable); 64],
+        pending_count: 0,
+        fragment_assemblies: [create_fragment_assembly(0, 0); 8],
+        assembly_count: 0,
+        packets_sent: 0,
+        packets_received: 0,
+        packets_lost: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+    };
+}
+
+// ============================================================================
+// Transport Layer
+// ============================================================================
+
+struct Transport {
+    config: TransportConfig,
+    connections: Map<u64, Connection>,
+    next_connection_id: u64,
+    current_time: f32,
+
+    // Outgoing packet queue
+    outgoing_queue: [OutgoingPacket; 256],
+    outgoing_count: i32,
+
+    // Incoming packet queue
+    incoming_queue: [IncomingPacket; 256],
+    incoming_count: i32,
+
+    // Callbacks
+    on_connected: fn(u64) = null,
+    on_disconnected: fn(u64) = null,
+    on_receive: fn(u64, &PacketBuffer) = null,
+    send_raw: fn(string, u16, &[u8], i32) = null,
+}
+
+struct OutgoingPacket {
+    connection_id: u64,
+    packet_type: PacketType,
+    channel: u8,
+    buffer: PacketBuffer,
+    is_active: bool,
+}
+
+struct IncomingPacket {
+    connection_id: u64,
+    buffer: PacketBuffer,
+    receive_time: f32,
+    is_active: bool,
+}
+
+fn create_transport(config: TransportConfig) -> Transport {
+    return Transport {
+        config: config,
+        connections: Map<u64, Connection>.new(),
+        next_connection_id: 1,
+        current_time: 0.0,
+        outgoing_queue: [OutgoingPacket {
+            connection_id: 0,
+            packet_type: PacketType.Unreliable,
+            channel: 0,
+            buffer: create_packet_buffer(),
+            is_active: false,
+        }; 256],
+        outgoing_count: 0,
+        incoming_queue: [IncomingPacket {
+            connection_id: 0,
+            buffer: create_packet_buffer(),
+            receive_time: 0.0,
+            is_active: false,
+        }; 256],
+        incoming_count: 0,
+    };
+}
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+fn connect(transport: &mut Transport, address: string, port: u16) -> u64 {
+    let connection_id = transport.next_connection_id;
+    transport.next_connection_id += 1;
+
+    let mut connection = create_connection(connection_id, address, port);
+    connection.state = ConnectionState.Connecting;
+
+    transport.connections.insert(connection_id, connection);
+
+    // Send connect packet
+    send_connect_packet(transport, connection_id);
+
+    return connection_id;
+}
+
+fn disconnect(transport: &mut Transport, connection_id: u64) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection != null {
+        connection.state = ConnectionState.Disconnecting;
+
+        // Send disconnect packet
+        send_disconnect_packet(transport, connection_id);
+    }
+}
+
+fn accept_connection(transport: &mut Transport, address: string, port: u16) -> u64 {
+    let connection_id = transport.next_connection_id;
+    transport.next_connection_id += 1;
+
+    let mut connection = create_connection(connection_id, address, port);
+    connection.state = ConnectionState.Connected;
+
+    transport.connections.insert(connection_id, connection);
+
+    if transport.on_connected != null {
+        transport.on_connected(connection_id);
+    }
+
+    return connection_id;
+}
+
+fn close_connection(transport: &mut Transport, connection_id: u64) {
+    let connection = transport.connections.get(connection_id);
+    if connection != null && transport.on_disconnected != null {
+        transport.on_disconnected(connection_id);
+    }
+
+    transport.connections.remove(connection_id);
+}
+
+// ============================================================================
+// Send Functions
+// ============================================================================
+
+fn send_unreliable(transport: &mut Transport, connection_id: u64, data: &[u8], size: i32) {
+    queue_packet(transport, connection_id, PacketType.Unreliable, 0, data, size);
+}
+
+fn send_reliable(transport: &mut Transport, connection_id: u64, data: &[u8], size: i32) {
+    queue_packet(transport, connection_id, PacketType.Reliable, 0, data, size);
+}
+
+fn send_reliable_ordered(transport: &mut Transport, connection_id: u64, channel: u8, data: &[u8], size: i32) {
+    queue_packet(transport, connection_id, PacketType.ReliableOrdered, channel, data, size);
+}
+
+fn queue_packet(transport: &mut Transport, connection_id: u64, packet_type: PacketType, channel: u8, data: &[u8], size: i32) {
+    if transport.outgoing_count >= 256 {
+        return;
+    }
+
+    // Check if fragmentation needed
+    if size > transport.config.fragment_threshold {
+        queue_fragmented_packet(transport, connection_id, packet_type, channel, data, size);
+        return;
+    }
+
+    let mut packet = &mut transport.outgoing_queue[transport.outgoing_count];
+    packet.connection_id = connection_id;
+    packet.packet_type = packet_type;
+    packet.channel = channel;
+    buffer_reset(&mut packet.buffer);
+    buffer_write_bytes(&mut packet.buffer, data, size);
+    packet.is_active = true;
+
+    transport.outgoing_count += 1;
+}
+
+fn queue_fragmented_packet(transport: &mut Transport, connection_id: u64, packet_type: PacketType, channel: u8, data: &[u8], size: i32) {
+    let fragment_size = transport.config.fragment_threshold;
+    let num_fragments = (size + fragment_size - 1) / fragment_size;
+    let fragment_id = (transport.current_time * 1000.0) as u16;  // Simple unique ID
+
+    for i in 0..num_fragments {
+        if transport.outgoing_count >= 256 {
+            break;
+        }
+
+        let offset = i * fragment_size;
+        let frag_len = min_i32(fragment_size, size - offset);
+
+        let mut packet = &mut transport.outgoing_queue[transport.outgoing_count];
+        packet.connection_id = connection_id;
+        packet.packet_type = PacketType.Fragment;
+        packet.channel = channel;
+        buffer_reset(&mut packet.buffer);
+
+        // Write fragment header
+        buffer_write_u16(&mut packet.buffer, fragment_id);
+        buffer_write_u8(&mut packet.buffer, i as u8);
+        buffer_write_u8(&mut packet.buffer, num_fragments as u8);
+
+        // Write fragment data
+        for j in 0..frag_len {
+            buffer_write_u8(&mut packet.buffer, data[offset + j]);
+        }
+
+        packet.is_active = true;
+        transport.outgoing_count += 1;
+    }
+}
+
+fn send_connect_packet(transport: &mut Transport, connection_id: u64) {
+    let connect_data: [u8; 4] = [0x43, 0x4E, 0x43, 0x54];  // "CNCT"
+    queue_packet(transport, connection_id, PacketType.Connect, 0, &connect_data, 4);
+}
+
+fn send_disconnect_packet(transport: &mut Transport, connection_id: u64) {
+    let disconnect_data: [u8; 4] = [0x44, 0x43, 0x4E, 0x54];  // "DCNT"
+    queue_packet(transport, connection_id, PacketType.Disconnect, 0, &disconnect_data, 4);
+}
+
+fn send_ack_packet(transport: &mut Transport, connection_id: u64, ack_seq: u32, ack_bits: u32) {
+    let mut buffer = create_packet_buffer();
+    buffer_write_u32(&mut buffer, ack_seq);
+    buffer_write_u32(&mut buffer, ack_bits);
+    queue_packet(transport, connection_id, PacketType.Ack, 0, &buffer.data, buffer.size);
+}
+
+fn send_keepalive(transport: &mut Transport, connection_id: u64) {
+    let keepalive_data: [u8; 1] = [0];
+    queue_packet(transport, connection_id, PacketType.Keepalive, 0, &keepalive_data, 1);
+}
+
+// ============================================================================
+// Receive Functions
+// ============================================================================
+
+fn receive_packet(transport: &mut Transport, connection_id: u64, data: &[u8], size: i32) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection == null {
+        return;
+    }
+
+    connection.last_receive_time = transport.current_time;
+    connection.packets_received += 1;
+    connection.bytes_received += size as u64;
+
+    // Parse header
+    let mut buffer = create_packet_buffer();
+    buffer_write_bytes(&mut buffer, data, size);
+    buffer.read_pos = 0;
+
+    let packet_type_raw = buffer_read_u8(&mut buffer);
+    let packet_type = match packet_type_raw {
+        0 => PacketType.Unreliable,
+        1 => PacketType.Reliable,
+        2 => PacketType.ReliableOrdered,
+        3 => PacketType.ReliableSequenced,
+        4 => PacketType.Fragment,
+        5 => PacketType.Ack,
+        6 => PacketType.Keepalive,
+        7 => PacketType.Connect,
+        8 => PacketType.Disconnect,
+        9 => PacketType.ConnectAccept,
+        10 => PacketType.ConnectReject,
+        _ => PacketType.Unreliable,
+    };
+
+    let flags = buffer_read_u8(&mut buffer) as i32;
+    let sequence = buffer_read_u32(&mut buffer);
+    let ack_num = buffer_read_u32(&mut buffer);
+    let ack_bits = buffer_read_u32(&mut buffer);
+
+    // Process acks
+    process_acks(transport, connection_id, ack_num, ack_bits);
+
+    // Update remote sequence
+    if sequence_greater_than(sequence, connection.remote_sequence) {
+        // Update ack bits
+        let diff = sequence - connection.remote_sequence;
+        if diff < 32 {
+            connection.ack_bits = (connection.ack_bits << diff) | 1;
+        } else {
+            connection.ack_bits = 1;
+        }
+        connection.remote_sequence = sequence;
+    } else {
+        // Set bit for this older sequence
+        let diff = connection.remote_sequence - sequence;
+        if diff < 32 {
+            connection.ack_bits |= (1 << diff);
+        }
+    }
+
+    // Handle packet type
+    match packet_type {
+        PacketType.Ack => {
+            // Already processed above
+        },
+        PacketType.Keepalive => {
+            // Just updates last_receive_time
+        },
+        PacketType.Connect => handle_connect(transport, connection_id),
+        PacketType.ConnectAccept => handle_connect_accept(transport, connection_id),
+        PacketType.ConnectReject => handle_connect_reject(transport, connection_id),
+        PacketType.Disconnect => handle_disconnect(transport, connection_id),
+        PacketType.Fragment => handle_fragment(transport, connection_id, &mut buffer),
+        _ => {
+            // Queue for application
+            queue_incoming(transport, connection_id, &mut buffer);
+        },
+    }
+}
+
+fn handle_connect(transport: &mut Transport, connection_id: u64) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection != null {
+        connection.state = ConnectionState.Connected;
+
+        // Send accept
+        let accept_data: [u8; 4] = [0x41, 0x43, 0x50, 0x54];  // "ACPT"
+        queue_packet(transport, connection_id, PacketType.ConnectAccept, 0, &accept_data, 4);
+
+        if transport.on_connected != null {
+            transport.on_connected(connection_id);
+        }
+    }
+}
+
+fn handle_connect_accept(transport: &mut Transport, connection_id: u64) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection != null {
+        connection.state = ConnectionState.Connected;
+
+        if transport.on_connected != null {
+            transport.on_connected(connection_id);
+        }
+    }
+}
+
+fn handle_connect_reject(transport: &mut Transport, connection_id: u64) {
+    close_connection(transport, connection_id);
+}
+
+fn handle_disconnect(transport: &mut Transport, connection_id: u64) {
+    close_connection(transport, connection_id);
+}
+
+fn handle_fragment(transport: &mut Transport, connection_id: u64, buffer: &mut PacketBuffer) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection == null {
+        return;
+    }
+
+    let fragment_id = buffer_read_u16(buffer);
+    let fragment_index = buffer_read_u8(buffer);
+    let fragment_count = buffer_read_u8(buffer);
+
+    // Find or create assembly
+    let mut assembly_idx: i32 = -1;
+    for i in 0..connection.assembly_count {
+        if connection.fragment_assemblies[i].fragment_id == fragment_id {
+            assembly_idx = i;
+            break;
+        }
+    }
+
+    if assembly_idx < 0 && connection.assembly_count < 8 {
+        assembly_idx = connection.assembly_count;
+        connection.fragment_assemblies[assembly_idx] = create_fragment_assembly(fragment_id, fragment_count);
+        connection.fragment_assemblies[assembly_idx].start_time = transport.current_time;
+        connection.assembly_count += 1;
+    }
+
+    if assembly_idx >= 0 {
+        let assembly = &mut connection.fragment_assemblies[assembly_idx];
+        let remaining_size = buffer.size - buffer.read_pos;
+
+        // Copy remaining data to fragment
+        let mut frag_data: [u8; 1400] = [0; 1400];
+        for i in 0..remaining_size {
+            frag_data[i] = buffer.data[buffer.read_pos + i];
+        }
+
+        if add_fragment(assembly, fragment_index, &frag_data, remaining_size) {
+            // Assembly complete, deliver packet
+            let mut assembled_buffer = create_packet_buffer();
+            assemble_fragments(assembly, &mut assembled_buffer);
+            queue_incoming(transport, connection_id, &mut assembled_buffer);
+
+            // Remove assembly (shift remaining)
+            for i in assembly_idx..(connection.assembly_count - 1) {
+                connection.fragment_assemblies[i] = connection.fragment_assemblies[i + 1];
+            }
+            connection.assembly_count -= 1;
+        }
+    }
+}
+
+fn queue_incoming(transport: &mut Transport, connection_id: u64, buffer: &mut PacketBuffer) {
+    if transport.incoming_count >= 256 {
+        return;
+    }
+
+    let incoming = &mut transport.incoming_queue[transport.incoming_count];
+    incoming.connection_id = connection_id;
+    incoming.buffer = *buffer;
+    incoming.receive_time = transport.current_time;
+    incoming.is_active = true;
+
+    transport.incoming_count += 1;
+}
+
+fn process_acks(transport: &mut Transport, connection_id: u64, ack_num: u32, ack_bits: u32) {
+    let connection = transport.connections.get_mut(connection_id);
+    if connection == null {
+        return;
+    }
+
+    for i in 0..connection.pending_count {
+        let pending = &mut connection.pending_reliable[i];
+        if !pending.is_active || pending.is_acked {
+            continue;
+        }
+
+        // Check if this packet is acked
+        if pending.sequence == ack_num {
+            pending.is_acked = true;
+
+            // Update RTT
+            let rtt = transport.current_time - pending.send_time;
+            connection.round_trip_time = connection.round_trip_time * 0.875 + rtt * 0.125;
+        } else if sequence_greater_than(ack_num, pending.sequence) {
+            let diff = ack_num - pending.sequence;
+            if diff < 32 && (ack_bits & (1 << diff)) != 0 {
+                pending.is_acked = true;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_transport(transport: &mut Transport, delta_time: f32) {
+    transport.current_time += delta_time;
+
+    // Process each connection
+    for entry in transport.connections.iter_mut() {
+        let connection = entry.value;
+
+        // Check connection timeout
+        let time_since_receive = transport.current_time - connection.last_receive_time;
+        if time_since_receive > transport.config.connection_timeout {
+            connection.state = ConnectionState.Disconnected;
+            continue;
+        }
+
+        // Send keepalive if needed
+        let time_since_send = transport.current_time - connection.last_send_time;
+        if time_since_send > transport.config.keepalive_interval {
+            send_keepalive(transport, connection.connection_id);
+        }
+
+        // Retry pending reliable packets
+        retry_pending_packets(transport, connection);
+
+        // Clean up old fragment assemblies
+        cleanup_fragment_assemblies(transport, connection);
+    }
+
+    // Flush outgoing queue
+    flush_outgoing(transport);
+
+    // Deliver incoming packets
+    deliver_incoming(transport);
+}
+
+fn retry_pending_packets(transport: &mut Transport, connection: &mut Connection) {
+    let timeout = transport.config.reliable_timeout + connection.round_trip_time * 2.0;
+
+    for i in 0..connection.pending_count {
+        let pending = &mut connection.pending_reliable[i];
+        if !pending.is_active || pending.is_acked {
+            continue;
+        }
+
+        let time_since_send = transport.current_time - pending.send_time;
+        if time_since_send > timeout {
+            if pending.retry_count < transport.config.max_retries {
+                // Resend packet
+                pending.send_time = transport.current_time;
+                pending.retry_count += 1;
+
+                if transport.send_raw != null {
+                    transport.send_raw(connection.remote_address, connection.remote_port, &pending.data, pending.size);
+                }
+            } else {
+                // Give up, mark as lost
+                pending.is_active = false;
+                connection.packets_lost += 1;
+            }
+        }
+    }
+
+    // Compact pending array
+    compact_pending_packets(connection);
+}
+
+fn compact_pending_packets(connection: &mut Connection) {
+    let mut write_idx: i32 = 0;
+    for read_idx in 0..connection.pending_count {
+        if connection.pending_reliable[read_idx].is_active && !connection.pending_reliable[read_idx].is_acked {
+            if write_idx != read_idx {
+                connection.pending_reliable[write_idx] = connection.pending_reliable[read_idx];
+            }
+            write_idx += 1;
+        }
+    }
+    connection.pending_count = write_idx;
+}
+
+fn cleanup_fragment_assemblies(transport: &Transport, connection: &mut Connection) {
+    let mut i: i32 = 0;
+    while i < connection.assembly_count {
+        let age = transport.current_time - connection.fragment_assemblies[i].start_time;
+        if age > 10.0 {  // 10 second timeout for fragment assembly
+            // Remove stale assembly
+            for j in i..(connection.assembly_count - 1) {
+                connection.fragment_assemblies[j] = connection.fragment_assemblies[j + 1];
+            }
+            connection.assembly_count -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn flush_outgoing(transport: &mut Transport) {
+    for i in 0..transport.outgoing_count {
+        let packet = &mut transport.outgoing_queue[i];
+        if !packet.is_active {
+            continue;
+        }
+
+        let connection = transport.connections.get_mut(packet.connection_id);
+        if connection == null {
+            packet.is_active = false;
+            continue;
+        }
+
+        // Build final packet with header
+        let mut final_buffer = create_packet_buffer();
+
+        // Write header
+        buffer_write_u8(&mut final_buffer, packet.packet_type as u8);
+        buffer_write_u8(&mut final_buffer, 0);  // Flags
+        buffer_write_u32(&mut final_buffer, connection.local_sequence);
+        buffer_write_u32(&mut final_buffer, connection.remote_sequence);
+        buffer_write_u32(&mut final_buffer, connection.ack_bits);
+
+        // Write payload
+        buffer_write_bytes(&mut final_buffer, &packet.buffer.data, packet.buffer.size);
+
+        // Send
+        if transport.send_raw != null {
+            transport.send_raw(connection.remote_address, connection.remote_port, &final_buffer.data, final_buffer.size);
+        }
+
+        connection.local_sequence += 1;
+        connection.last_send_time = transport.current_time;
+        connection.packets_sent += 1;
+        connection.bytes_sent += final_buffer.size as u64;
+
+        // If reliable, add to pending
+        if packet.packet_type == PacketType.Reliable || packet.packet_type == PacketType.ReliableOrdered {
+            if connection.pending_count < 64 {
+                let mut pending = &mut connection.pending_reliable[connection.pending_count];
+                pending.sequence = connection.local_sequence - 1;
+                pending.packet_type = packet.packet_type;
+                pending.channel = packet.channel;
+                for j in 0..final_buffer.size {
+                    pending.data[j] = final_buffer.data[j];
+                }
+                pending.size = final_buffer.size;
+                pending.send_time = transport.current_time;
+                pending.retry_count = 0;
+                pending.is_acked = false;
+                pending.is_active = true;
+                connection.pending_count += 1;
+            }
+        }
+
+        packet.is_active = false;
+    }
+
+    transport.outgoing_count = 0;
+}
+
+fn deliver_incoming(transport: &mut Transport) {
+    for i in 0..transport.incoming_count {
+        let packet = &mut transport.incoming_queue[i];
+        if !packet.is_active {
+            continue;
+        }
+
+        if transport.on_receive != null {
+            transport.on_receive(packet.connection_id, &packet.buffer);
+        }
+
+        packet.is_active = false;
+    }
+
+    transport.incoming_count = 0;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn sequence_greater_than(s1: u32, s2: u32) -> bool {
+    return ((s1 > s2) && (s1 - s2 <= 0x80000000)) ||
+           ((s1 < s2) && (s2 - s1 > 0x80000000));
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn float_to_bits(f: f32) -> u32 {
+    // Simple bit cast approximation
+    return (f * 1000000.0) as u32;
+}
+
+fn bits_to_float(bits: u32) -> f32 {
+    return bits as f32 / 1000000.0;
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+fn get_connection_stats(transport: &Transport, connection_id: u64) -> ConnectionStats {
+    let connection = transport.connections.get(connection_id);
+    if connection == null {
+        return ConnectionStats {
+            packets_sent: 0,
+            packets_received: 0,
+            packets_lost: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            round_trip_time: 0.0,
+            packet_loss_percent: 0.0,
+        };
+    }
+
+    let total_packets = connection.packets_sent + connection.packets_lost;
+    let loss_percent = if total_packets > 0 {
+        (connection.packets_lost as f32 / total_packets as f32) * 100.0
+    } else {
+        0.0
+    };
+
+    return ConnectionStats {
+        packets_sent: connection.packets_sent,
+        packets_received: connection.packets_received,
+        packets_lost: connection.packets_lost,
+        bytes_sent: connection.bytes_sent,
+        bytes_received: connection.bytes_received,
+        round_trip_time: connection.round_trip_time,
+        packet_loss_percent: loss_percent,
+    };
+}
+
+struct ConnectionStats {
+    packets_sent: u64,
+    packets_received: u64,
+    packets_lost: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    round_trip_time: f32,
+    packet_loss_percent: f32,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_transport() {
+    print("Testing Transport Layer...");
+
+    // Create transport
+    let config = TransportConfig {};
+    let mut transport = create_transport(config);
+
+    // Test connection creation
+    let conn_id = connect(&mut transport, "192.168.1.100", 8080);
+    print("  Created connection: " + conn_id as string);
+
+    // Test packet buffer
+    let mut buffer = create_packet_buffer();
+    buffer_write_u8(&mut buffer, 42);
+    buffer_write_u16(&mut buffer, 1234);
+    buffer_write_u32(&mut buffer, 0xDEADBEEF);
+    buffer_write_f32(&mut buffer, 3.14159);
+
+    buffer.read_pos = 0;
+    let v1 = buffer_read_u8(&mut buffer);
+    let v2 = buffer_read_u16(&mut buffer);
+    let v3 = buffer_read_u32(&mut buffer);
+    let v4 = buffer_read_f32(&mut buffer);
+
+    print("  Buffer read: " + v1 as string + ", " + v2 as string + ", " + v3 as string);
+
+    // Test send
+    let test_data: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    send_reliable(&mut transport, conn_id, &test_data, 8);
+    print("  Queued reliable packet");
+
+    // Update
+    update_transport(&mut transport, 0.016);
+    print("  Transport updated");
+
+    print("Transport tests complete!");
+}

@@ -1,0 +1,712 @@
+// Game Memory - Game memory interface
+// Global allocator, debug tracking, and memory subsystem management
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct GameMemoryConfig {
+    initial_heap_size: u64 = 64 * 1024 * 1024,    // 64 MB initial heap
+    max_heap_size: u64 = 512 * 1024 * 1024,       // 512 MB max heap
+    pool_sizes: PoolSizeConfig,
+    enable_tracking: bool = true,
+    enable_leak_detection: bool = true,
+    enable_bounds_checking: bool = true,
+    enable_statistics: bool = true,
+    log_allocations: bool = false,
+    allocation_log_threshold: u32 = 1024 * 1024,  // Log allocations > 1MB
+}
+
+struct PoolSizeConfig {
+    small_pool_size: u32 = 1024 * 1024,           // 1 MB
+    medium_pool_size: u32 = 4 * 1024 * 1024,      // 4 MB
+    large_pool_size: u32 = 16 * 1024 * 1024,      // 16 MB
+    entity_pool_size: u32 = 8 * 1024 * 1024,      // 8 MB
+    particle_pool_size: u32 = 4 * 1024 * 1024,    // 4 MB
+    audio_pool_size: u32 = 2 * 1024 * 1024,       // 2 MB
+    texture_pool_size: u32 = 32 * 1024 * 1024,    // 32 MB
+}
+
+fn create_default_pool_config() -> PoolSizeConfig {
+    return PoolSizeConfig {};
+}
+
+fn create_default_memory_config() -> GameMemoryConfig {
+    return GameMemoryConfig {
+        initial_heap_size: 64 * 1024 * 1024,
+        max_heap_size: 512 * 1024 * 1024,
+        pool_sizes: create_default_pool_config(),
+        enable_tracking: true,
+        enable_leak_detection: true,
+        enable_bounds_checking: true,
+        enable_statistics: true,
+        log_allocations: false,
+        allocation_log_threshold: 1024 * 1024,
+    };
+}
+
+// ============================================================================
+// Memory Categories
+// ============================================================================
+
+enum MemoryCategory {
+    General = 0,
+    Entity = 1,
+    Particle = 2,
+    Audio = 3,
+    Texture = 4,
+    Mesh = 5,
+    Animation = 6,
+    Physics = 7,
+    AI = 8,
+    Network = 9,
+    UI = 10,
+    Script = 11,
+    Temporary = 12,
+    Debug = 13,
+}
+
+struct CategoryStats {
+    allocated: u64,
+    freed: u64,
+    current: u64,
+    peak: u64,
+    allocation_count: u64,
+    free_count: u64,
+}
+
+fn create_category_stats() -> CategoryStats {
+    return CategoryStats {
+        allocated: 0,
+        freed: 0,
+        current: 0,
+        peak: 0,
+        allocation_count: 0,
+        free_count: 0,
+    };
+}
+
+// ============================================================================
+// Allocation Tracking
+// ============================================================================
+
+struct AllocationRecord {
+    alloc_id: u64,
+    address: u64,
+    size: u32,
+    category: MemoryCategory,
+    timestamp: f32,
+    source_file: string,
+    source_line: i32,
+    is_active: bool,
+}
+
+fn create_allocation_record(alloc_id: u64, address: u64, size: u32, category: MemoryCategory) -> AllocationRecord {
+    return AllocationRecord {
+        alloc_id: alloc_id,
+        address: address,
+        size: size,
+        category: category,
+        timestamp: 0.0,
+        source_file: "",
+        source_line: 0,
+        is_active: true,
+    };
+}
+
+struct AllocationTracker {
+    records: [AllocationRecord; 4096],
+    record_count: i32,
+    next_alloc_id: u64,
+    enabled: bool,
+}
+
+fn create_allocation_tracker() -> AllocationTracker {
+    return AllocationTracker {
+        records: [create_allocation_record(0, 0, 0, MemoryCategory.General); 4096],
+        record_count: 0,
+        next_alloc_id: 1,
+        enabled: true,
+    };
+}
+
+fn track_allocation(tracker: &mut AllocationTracker, address: u64, size: u32, category: MemoryCategory, time: f32) -> u64 {
+    if !tracker.enabled || tracker.record_count >= 4096 {
+        return 0;
+    }
+
+    let alloc_id = tracker.next_alloc_id;
+    tracker.next_alloc_id += 1;
+
+    tracker.records[tracker.record_count] = AllocationRecord {
+        alloc_id: alloc_id,
+        address: address,
+        size: size,
+        category: category,
+        timestamp: time,
+        source_file: "",
+        source_line: 0,
+        is_active: true,
+    };
+    tracker.record_count += 1;
+
+    return alloc_id;
+}
+
+fn track_free(tracker: &mut AllocationTracker, alloc_id: u64) -> bool {
+    for i in 0..tracker.record_count {
+        if tracker.records[i].alloc_id == alloc_id && tracker.records[i].is_active {
+            tracker.records[i].is_active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn find_leaks(tracker: &AllocationTracker) -> LeakReport {
+    let mut report = LeakReport {
+        leak_count: 0,
+        total_leaked_bytes: 0,
+        leaks: [LeakInfo {
+            alloc_id: 0,
+            address: 0,
+            size: 0,
+            category: MemoryCategory.General,
+            age: 0.0,
+        }; 256],
+    };
+
+    for i in 0..tracker.record_count {
+        let record = &tracker.records[i];
+        if record.is_active {
+            if report.leak_count < 256 {
+                report.leaks[report.leak_count] = LeakInfo {
+                    alloc_id: record.alloc_id,
+                    address: record.address,
+                    size: record.size,
+                    category: record.category,
+                    age: record.timestamp,
+                };
+                report.leak_count += 1;
+                report.total_leaked_bytes += record.size as u64;
+            }
+        }
+    }
+
+    return report;
+}
+
+struct LeakInfo {
+    alloc_id: u64,
+    address: u64,
+    size: u32,
+    category: MemoryCategory,
+    age: f32,
+}
+
+struct LeakReport {
+    leak_count: i32,
+    total_leaked_bytes: u64,
+    leaks: [LeakInfo; 256],
+}
+
+// ============================================================================
+// Memory Heap
+// ============================================================================
+
+struct MemoryHeap {
+    heap_id: u64,
+    name: string,
+    base_address: u64,
+    total_size: u64,
+    used_size: u64,
+    peak_size: u64,
+    allocation_count: u64,
+    free_count: u64,
+
+    // Simple block list (simulated)
+    blocks: [HeapBlock; 1024],
+    block_count: i32,
+    free_list_head: i32,
+}
+
+struct HeapBlock {
+    offset: u64,
+    size: u64,
+    is_free: bool,
+    next_free: i32,
+    alloc_id: u64,
+}
+
+fn create_memory_heap(heap_id: u64, name: string, base_address: u64, size: u64) -> MemoryHeap {
+    let mut heap = MemoryHeap {
+        heap_id: heap_id,
+        name: name,
+        base_address: base_address,
+        total_size: size,
+        used_size: 0,
+        peak_size: 0,
+        allocation_count: 0,
+        free_count: 0,
+        blocks: [HeapBlock {
+            offset: 0,
+            size: 0,
+            is_free: true,
+            next_free: -1,
+            alloc_id: 0,
+        }; 1024],
+        block_count: 1,
+        free_list_head: 0,
+    };
+
+    // Initialize with single free block
+    heap.blocks[0] = HeapBlock {
+        offset: 0,
+        size: size,
+        is_free: true,
+        next_free: -1,
+        alloc_id: 0,
+    };
+
+    return heap;
+}
+
+fn heap_allocate(heap: &mut MemoryHeap, size: u64, alignment: u64) -> HeapAllocation {
+    let mut result = HeapAllocation {
+        success: false,
+        address: 0,
+        actual_size: 0,
+        block_index: -1,
+    };
+
+    // Align size
+    let aligned_size = (size + alignment - 1) & !(alignment - 1);
+
+    // First-fit allocation
+    let mut current = heap.free_list_head;
+    let mut prev: i32 = -1;
+
+    while current >= 0 {
+        let block = &heap.blocks[current];
+        if block.is_free && block.size >= aligned_size {
+            // Found suitable block
+            let remaining = block.size - aligned_size;
+
+            if remaining > 64 && heap.block_count < 1024 {
+                // Split block
+                let new_block_idx = heap.block_count;
+                heap.blocks[new_block_idx] = HeapBlock {
+                    offset: block.offset + aligned_size,
+                    size: remaining,
+                    is_free: true,
+                    next_free: heap.blocks[current].next_free,
+                    alloc_id: 0,
+                };
+                heap.block_count += 1;
+
+                // Update free list
+                if prev >= 0 {
+                    heap.blocks[prev].next_free = new_block_idx;
+                } else {
+                    heap.free_list_head = new_block_idx;
+                }
+
+                heap.blocks[current].size = aligned_size;
+            } else {
+                // Use entire block
+                if prev >= 0 {
+                    heap.blocks[prev].next_free = heap.blocks[current].next_free;
+                } else {
+                    heap.free_list_head = heap.blocks[current].next_free;
+                }
+            }
+
+            heap.blocks[current].is_free = false;
+            heap.blocks[current].next_free = -1;
+
+            heap.used_size += heap.blocks[current].size;
+            heap.allocation_count += 1;
+            if heap.used_size > heap.peak_size {
+                heap.peak_size = heap.used_size;
+            }
+
+            result.success = true;
+            result.address = heap.base_address + heap.blocks[current].offset;
+            result.actual_size = heap.blocks[current].size;
+            result.block_index = current;
+
+            return result;
+        }
+
+        prev = current;
+        current = heap.blocks[current].next_free;
+    }
+
+    return result;
+}
+
+struct HeapAllocation {
+    success: bool,
+    address: u64,
+    actual_size: u64,
+    block_index: i32,
+}
+
+fn heap_free(heap: &mut MemoryHeap, block_index: i32) -> bool {
+    if block_index < 0 || block_index >= heap.block_count {
+        return false;
+    }
+
+    let block = &mut heap.blocks[block_index];
+    if block.is_free {
+        return false;  // Double free
+    }
+
+    let block_size = block.size;
+    block.is_free = true;
+    block.alloc_id = 0;
+
+    // Add to free list
+    block.next_free = heap.free_list_head;
+    heap.free_list_head = block_index;
+
+    heap.used_size -= block_size;
+    heap.free_count += 1;
+
+    return true;
+}
+
+// ============================================================================
+// Game Memory Manager (Global Interface)
+// ============================================================================
+
+struct GameMemoryManager {
+    config: GameMemoryConfig,
+    main_heap: MemoryHeap,
+    category_stats: [CategoryStats; 14],
+    tracker: AllocationTracker,
+    current_time: f32,
+    is_initialized: bool,
+
+    // Frame allocator for temporary allocations
+    frame_allocator_offset: u64,
+    frame_allocator_size: u64,
+    frame_number: u64,
+}
+
+fn create_game_memory_manager(config: GameMemoryConfig) -> GameMemoryManager {
+    let mut manager = GameMemoryManager {
+        config: config,
+        main_heap: create_memory_heap(1, "MainHeap", 0x10000000, config.initial_heap_size),
+        category_stats: [create_category_stats(); 14],
+        tracker: create_allocation_tracker(),
+        current_time: 0.0,
+        is_initialized: false,
+        frame_allocator_offset: 0,
+        frame_allocator_size: 4 * 1024 * 1024,  // 4 MB frame allocator
+        frame_number: 0,
+    };
+
+    manager.tracker.enabled = config.enable_tracking;
+    manager.is_initialized = true;
+
+    return manager;
+}
+
+// ============================================================================
+// Global Allocation Interface
+// ============================================================================
+
+fn game_alloc(manager: &mut GameMemoryManager, size: u64, category: MemoryCategory) -> u64 {
+    return game_alloc_aligned(manager, size, 16, category);
+}
+
+fn game_alloc_aligned(manager: &mut GameMemoryManager, size: u64, alignment: u64, category: MemoryCategory) -> u64 {
+    if !manager.is_initialized {
+        return 0;
+    }
+
+    let result = heap_allocate(&mut manager.main_heap, size, alignment);
+    if !result.success {
+        return 0;
+    }
+
+    // Track allocation
+    let cat_idx = category as i32;
+    manager.category_stats[cat_idx].allocated += result.actual_size;
+    manager.category_stats[cat_idx].current += result.actual_size;
+    manager.category_stats[cat_idx].allocation_count += 1;
+    if manager.category_stats[cat_idx].current > manager.category_stats[cat_idx].peak {
+        manager.category_stats[cat_idx].peak = manager.category_stats[cat_idx].current;
+    }
+
+    if manager.config.enable_tracking {
+        let alloc_id = track_allocation(&mut manager.tracker, result.address, result.actual_size as u32, category, manager.current_time);
+        manager.main_heap.blocks[result.block_index].alloc_id = alloc_id;
+    }
+
+    // Log large allocations
+    if manager.config.log_allocations && result.actual_size >= manager.config.allocation_log_threshold as u64 {
+        print("[Memory] Large allocation: " + result.actual_size as string + " bytes, category: " + cat_idx as string);
+    }
+
+    return result.address;
+}
+
+fn game_free(manager: &mut GameMemoryManager, address: u64) -> bool {
+    if !manager.is_initialized || address == 0 {
+        return false;
+    }
+
+    // Find block by address
+    for i in 0..manager.main_heap.block_count {
+        let block = &manager.main_heap.blocks[i];
+        if !block.is_free && manager.main_heap.base_address + block.offset == address {
+            let block_size = block.size;
+            let alloc_id = block.alloc_id;
+
+            // Free the block
+            if !heap_free(&mut manager.main_heap, i) {
+                return false;
+            }
+
+            // Track free
+            if manager.config.enable_tracking && alloc_id != 0 {
+                track_free(&mut manager.tracker, alloc_id);
+            }
+
+            // Update stats (find category from tracker)
+            for j in 0..manager.tracker.record_count {
+                if manager.tracker.records[j].alloc_id == alloc_id {
+                    let cat_idx = manager.tracker.records[j].category as i32;
+                    manager.category_stats[cat_idx].freed += block_size;
+                    manager.category_stats[cat_idx].current -= block_size;
+                    manager.category_stats[cat_idx].free_count += 1;
+                    break;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn game_realloc(manager: &mut GameMemoryManager, address: u64, new_size: u64, category: MemoryCategory) -> u64 {
+    if address == 0 {
+        return game_alloc(manager, new_size, category);
+    }
+
+    if new_size == 0 {
+        game_free(manager, address);
+        return 0;
+    }
+
+    // Simple realloc: allocate new, copy, free old
+    let new_address = game_alloc(manager, new_size, category);
+    if new_address == 0 {
+        return 0;
+    }
+
+    // Find old block size
+    let mut old_size: u64 = 0;
+    for i in 0..manager.main_heap.block_count {
+        let block = &manager.main_heap.blocks[i];
+        if !block.is_free && manager.main_heap.base_address + block.offset == address {
+            old_size = block.size;
+            break;
+        }
+    }
+
+    // Copy would happen here in real implementation
+    // memcpy(new_address, address, min(old_size, new_size))
+
+    game_free(manager, address);
+
+    return new_address;
+}
+
+// ============================================================================
+// Frame Allocator
+// ============================================================================
+
+fn frame_alloc(manager: &mut GameMemoryManager, size: u64) -> u64 {
+    let aligned_size = (size + 15) & !15;
+
+    if manager.frame_allocator_offset + aligned_size > manager.frame_allocator_size {
+        return 0;  // Out of frame memory
+    }
+
+    let address = manager.main_heap.base_address + manager.main_heap.total_size - manager.frame_allocator_size + manager.frame_allocator_offset;
+    manager.frame_allocator_offset += aligned_size;
+
+    return address;
+}
+
+fn frame_reset(manager: &mut GameMemoryManager) {
+    manager.frame_allocator_offset = 0;
+    manager.frame_number += 1;
+}
+
+// ============================================================================
+// Statistics and Debugging
+// ============================================================================
+
+struct GameMemoryStats {
+    total_allocated: u64,
+    total_freed: u64,
+    current_usage: u64,
+    peak_usage: u64,
+    heap_size: u64,
+    heap_used: u64,
+    allocation_count: u64,
+    free_count: u64,
+    frame_allocator_usage: u64,
+}
+
+fn get_memory_stats(manager: &GameMemoryManager) -> GameMemoryStats {
+    let mut total_allocated: u64 = 0;
+    let mut total_freed: u64 = 0;
+    let mut total_current: u64 = 0;
+    let mut total_peak: u64 = 0;
+    let mut total_alloc_count: u64 = 0;
+    let mut total_free_count: u64 = 0;
+
+    for i in 0..14 {
+        total_allocated += manager.category_stats[i].allocated;
+        total_freed += manager.category_stats[i].freed;
+        total_current += manager.category_stats[i].current;
+        total_peak += manager.category_stats[i].peak;
+        total_alloc_count += manager.category_stats[i].allocation_count;
+        total_free_count += manager.category_stats[i].free_count;
+    }
+
+    return GameMemoryStats {
+        total_allocated: total_allocated,
+        total_freed: total_freed,
+        current_usage: total_current,
+        peak_usage: total_peak,
+        heap_size: manager.main_heap.total_size,
+        heap_used: manager.main_heap.used_size,
+        allocation_count: total_alloc_count,
+        free_count: total_free_count,
+        frame_allocator_usage: manager.frame_allocator_offset,
+    };
+}
+
+fn get_category_stats(manager: &GameMemoryManager, category: MemoryCategory) -> CategoryStats {
+    return manager.category_stats[category as i32];
+}
+
+fn check_for_leaks(manager: &GameMemoryManager) -> LeakReport {
+    return find_leaks(&manager.tracker);
+}
+
+fn dump_memory_report(manager: &GameMemoryManager) {
+    print("=== Game Memory Report ===");
+
+    let stats = get_memory_stats(manager);
+    print("Total Allocated: " + stats.total_allocated as string + " bytes");
+    print("Total Freed: " + stats.total_freed as string + " bytes");
+    print("Current Usage: " + stats.current_usage as string + " bytes");
+    print("Peak Usage: " + stats.peak_usage as string + " bytes");
+    print("Heap Size: " + stats.heap_size as string + " bytes");
+    print("Heap Used: " + stats.heap_used as string + " bytes");
+    print("Allocations: " + stats.allocation_count as string);
+    print("Frees: " + stats.free_count as string);
+
+    print("\n--- Category Breakdown ---");
+    let categories = ["General", "Entity", "Particle", "Audio", "Texture", "Mesh", "Animation", "Physics", "AI", "Network", "UI", "Script", "Temporary", "Debug"];
+
+    for i in 0..14 {
+        let cat_stats = &manager.category_stats[i];
+        if cat_stats.current > 0 || cat_stats.allocation_count > 0 {
+            print(categories[i] + ": " + cat_stats.current as string + " bytes (" + cat_stats.allocation_count as string + " allocs)");
+        }
+    }
+
+    if manager.config.enable_leak_detection {
+        let leaks = check_for_leaks(manager);
+        if leaks.leak_count > 0 {
+            print("\n!!! MEMORY LEAKS DETECTED !!!");
+            print("Leak count: " + leaks.leak_count as string);
+            print("Total leaked: " + leaks.total_leaked_bytes as string + " bytes");
+        } else {
+            print("\nNo memory leaks detected.");
+        }
+    }
+
+    print("=== End Memory Report ===");
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+fn shutdown_game_memory(manager: &mut GameMemoryManager) {
+    if manager.config.enable_leak_detection {
+        let leaks = check_for_leaks(manager);
+        if leaks.leak_count > 0 {
+            print("WARNING: " + leaks.leak_count as string + " memory leaks detected at shutdown!");
+            dump_memory_report(manager);
+        }
+    }
+
+    manager.is_initialized = false;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_game_memory() {
+    print("Testing Game Memory...");
+
+    // Create manager
+    let config = create_default_memory_config();
+    let mut manager = create_game_memory_manager(config);
+    print("  Created game memory manager");
+
+    // Allocate various categories
+    let addr1 = game_alloc(&mut manager, 1024, MemoryCategory.Entity);
+    print("  Allocated Entity: " + addr1 as string);
+
+    let addr2 = game_alloc(&mut manager, 2048, MemoryCategory.Texture);
+    print("  Allocated Texture: " + addr2 as string);
+
+    let addr3 = game_alloc(&mut manager, 512, MemoryCategory.Particle);
+    print("  Allocated Particle: " + addr3 as string);
+
+    // Get stats
+    let stats = get_memory_stats(&manager);
+    print("  Current usage: " + stats.current_usage as string);
+
+    // Test frame allocator
+    let frame_addr = frame_alloc(&mut manager, 256);
+    print("  Frame alloc: " + frame_addr as string);
+
+    frame_reset(&mut manager);
+    print("  Frame reset");
+
+    // Free some
+    game_free(&mut manager, addr2);
+    print("  Freed Texture allocation");
+
+    // Check category stats
+    let entity_stats = get_category_stats(&manager, MemoryCategory.Entity);
+    print("  Entity current: " + entity_stats.current as string);
+
+    // Dump report
+    dump_memory_report(&manager);
+
+    // Free remaining
+    game_free(&mut manager, addr1);
+    game_free(&mut manager, addr3);
+
+    // Shutdown
+    shutdown_game_memory(&mut manager);
+    print("  Shutdown complete");
+
+    print("Game Memory tests complete!");
+}

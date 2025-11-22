@@ -1,0 +1,528 @@
+// Snow System - Snow particle system with accumulation
+// Handles snowflake particles, ground accumulation, and weather effects
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct SnowSystemConfig {
+    max_particles: i32 = 10000,               // Maximum snowflakes
+    spawn_rate: f32 = 500.0,                  // Particles per second
+    spawn_area: Vec3 = Vec3 { x: 200.0, y: 200.0, z: 100.0 },  // Spawn volume
+    particle_lifetime: f32 = 10.0,            // Seconds before despawn
+    fall_speed_min: f32 = 5.0,
+    fall_speed_max: f32 = 15.0,
+    drift_speed: f32 = 2.0,                   // Horizontal drift
+    drift_frequency: f32 = 0.5,               // Drift oscillation
+    size_min: f32 = 0.1,
+    size_max: f32 = 0.4,
+    rotation_speed: f32 = 1.0,
+    accumulation_rate: f32 = 0.001,           // Snow buildup per second
+    melt_rate: f32 = 0.0005,                  // Snow melt per second
+    max_accumulation: f32 = 1.0,              // Maximum snow depth
+    wind_strength: f32 = 0.0,
+    wind_direction: Vec2 = Vec2 { x: 1.0, y: 0.0 },
+    turbulence: f32 = 0.3,
+}
+
+// ============================================================================
+// Snow Particle
+// ============================================================================
+
+struct SnowParticle {
+    position: Vec3,
+    velocity: Vec3,
+    size: f32,
+    rotation: f32,
+    rotation_speed: f32,
+    lifetime: f32,
+    age: f32,
+    drift_phase: f32,
+    alpha: f32,
+    is_active: bool,
+}
+
+fn create_snow_particle() -> SnowParticle {
+    return SnowParticle {
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        velocity: Vec3 { x: 0.0, y: 0.0, z: -10.0 },
+        size: 0.2,
+        rotation: 0.0,
+        rotation_speed: 1.0,
+        lifetime: 10.0,
+        age: 0.0,
+        drift_phase: 0.0,
+        alpha: 1.0,
+        is_active: false,
+    };
+}
+
+fn spawn_snow_particle(config: &SnowSystemConfig, center: &Vec3) -> SnowParticle {
+    let mut particle = create_snow_particle();
+
+    // Random position in spawn area
+    particle.position = Vec3 {
+        x: center.x + (random_f32() - 0.5) * config.spawn_area.x,
+        y: center.y + (random_f32() - 0.5) * config.spawn_area.y,
+        z: center.z + config.spawn_area.z * 0.5,
+    };
+
+    // Random fall speed
+    let fall_speed = config.fall_speed_min + random_f32() * (config.fall_speed_max - config.fall_speed_min);
+    particle.velocity = Vec3 {
+        x: config.wind_strength * config.wind_direction.x,
+        y: config.wind_strength * config.wind_direction.y,
+        z: -fall_speed,
+    };
+
+    // Random size
+    particle.size = config.size_min + random_f32() * (config.size_max - config.size_min);
+
+    // Random rotation
+    particle.rotation = random_f32() * 6.28318;
+    particle.rotation_speed = (random_f32() - 0.5) * config.rotation_speed * 2.0;
+
+    // Random drift phase
+    particle.drift_phase = random_f32() * 6.28318;
+
+    particle.lifetime = config.particle_lifetime;
+    particle.age = 0.0;
+    particle.alpha = 1.0;
+    particle.is_active = true;
+
+    return particle;
+}
+
+// ============================================================================
+// Snow Accumulation
+// ============================================================================
+
+struct SnowAccumulation {
+    grid_size: i32,
+    cell_size: f32,
+    accumulation: [f32; 4096],                // 64x64 grid
+    temperature: [f32; 4096],                 // Affects melt rate
+    is_sheltered: [bool; 4096],               // Under cover?
+}
+
+fn create_snow_accumulation(grid_size: i32, cell_size: f32) -> SnowAccumulation {
+    return SnowAccumulation {
+        grid_size: grid_size,
+        cell_size: cell_size,
+        accumulation: [0.0; 4096],
+        temperature: [0.0; 4096],
+        is_sheltered: [false; 4096],
+    };
+}
+
+fn get_accumulation_index(accum: &SnowAccumulation, x: f32, y: f32) -> i32 {
+    let ix = ((x / accum.cell_size) as i32) % accum.grid_size;
+    let iy = ((y / accum.cell_size) as i32) % accum.grid_size;
+
+    let safe_ix = if ix < 0 { ix + accum.grid_size } else { ix };
+    let safe_iy = if iy < 0 { iy + accum.grid_size } else { iy };
+
+    return safe_iy * accum.grid_size + safe_ix;
+}
+
+fn add_snow_at(accum: &mut SnowAccumulation, x: f32, y: f32, amount: f32, max_accum: f32) {
+    let idx = get_accumulation_index(accum, x, y);
+    if idx >= 0 && idx < 4096 && !accum.is_sheltered[idx] {
+        accum.accumulation[idx] += amount;
+        if accum.accumulation[idx] > max_accum {
+            accum.accumulation[idx] = max_accum;
+        }
+    }
+}
+
+fn get_snow_depth(accum: &SnowAccumulation, x: f32, y: f32) -> f32 {
+    let idx = get_accumulation_index(accum, x, y);
+    if idx >= 0 && idx < 4096 {
+        return accum.accumulation[idx];
+    }
+    return 0.0;
+}
+
+fn update_accumulation(accum: &mut SnowAccumulation, config: &SnowSystemConfig, delta_time: f32) {
+    for i in 0..4096 {
+        if accum.accumulation[i] > 0.0 {
+            // Melt based on temperature
+            let melt_factor = 1.0 + accum.temperature[i] * 2.0;
+            accum.accumulation[i] -= config.melt_rate * melt_factor * delta_time;
+
+            if accum.accumulation[i] < 0.0 {
+                accum.accumulation[i] = 0.0;
+            }
+        }
+    }
+}
+
+fn set_sheltered(accum: &mut SnowAccumulation, x: f32, y: f32, sheltered: bool) {
+    let idx = get_accumulation_index(accum, x, y);
+    if idx >= 0 && idx < 4096 {
+        accum.is_sheltered[idx] = sheltered;
+    }
+}
+
+fn set_temperature(accum: &mut SnowAccumulation, x: f32, y: f32, temp: f32) {
+    let idx = get_accumulation_index(accum, x, y);
+    if idx >= 0 && idx < 4096 {
+        accum.temperature[idx] = temp;
+    }
+}
+
+// ============================================================================
+// Snow System
+// ============================================================================
+
+struct SnowSystem {
+    config: SnowSystemConfig,
+    particles: [SnowParticle; 10000],
+    particle_count: i32,
+    accumulation: SnowAccumulation,
+    spawn_accumulator: f32,
+    camera_position: Vec3,
+    is_enabled: bool,
+    intensity: f32,                           // 0-1 snow intensity
+    current_time: f32,
+}
+
+fn create_snow_system(config: SnowSystemConfig) -> SnowSystem {
+    return SnowSystem {
+        config: config,
+        particles: [create_snow_particle(); 10000],
+        particle_count: 0,
+        accumulation: create_snow_accumulation(64, 16.0),
+        spawn_accumulator: 0.0,
+        camera_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        is_enabled: true,
+        intensity: 1.0,
+        current_time: 0.0,
+    };
+}
+
+fn set_snow_intensity(system: &mut SnowSystem, intensity: f32) {
+    system.intensity = clamp(intensity, 0.0, 1.0);
+}
+
+fn set_camera_position(system: &mut SnowSystem, pos: Vec3) {
+    system.camera_position = pos;
+}
+
+fn enable_snow(system: &mut SnowSystem, enabled: bool) {
+    system.is_enabled = enabled;
+}
+
+// ============================================================================
+// Update Functions
+// ============================================================================
+
+fn update_snow_system(system: &mut SnowSystem, delta_time: f32) {
+    if !system.is_enabled {
+        return;
+    }
+
+    system.current_time += delta_time;
+
+    // Spawn new particles
+    if system.intensity > 0.0 {
+        spawn_particles(system, delta_time);
+    }
+
+    // Update existing particles
+    update_particles(system, delta_time);
+
+    // Update accumulation
+    update_accumulation(&mut system.accumulation, &system.config, delta_time);
+}
+
+fn spawn_particles(system: &mut SnowSystem, delta_time: f32) {
+    let effective_spawn_rate = system.config.spawn_rate * system.intensity;
+    system.spawn_accumulator += effective_spawn_rate * delta_time;
+
+    while system.spawn_accumulator >= 1.0 {
+        system.spawn_accumulator -= 1.0;
+
+        // Find inactive particle slot
+        for i in 0..system.config.max_particles {
+            if !system.particles[i].is_active {
+                system.particles[i] = spawn_snow_particle(&system.config, &system.camera_position);
+                system.particle_count += 1;
+                break;
+            }
+        }
+    }
+}
+
+fn update_particles(system: &mut SnowSystem, delta_time: f32) {
+    let config = &system.config;
+
+    for i in 0..system.config.max_particles {
+        let particle = &mut system.particles[i];
+        if !particle.is_active {
+            continue;
+        }
+
+        // Update age
+        particle.age += delta_time;
+        if particle.age >= particle.lifetime {
+            particle.is_active = false;
+            system.particle_count -= 1;
+            continue;
+        }
+
+        // Apply drift
+        let drift_x = sin_approx(particle.drift_phase + system.current_time * config.drift_frequency) * config.drift_speed;
+        let drift_y = cos_approx(particle.drift_phase * 1.5 + system.current_time * config.drift_frequency * 0.7) * config.drift_speed;
+
+        // Apply turbulence
+        let turb_x = sin_approx(system.current_time * 3.0 + particle.position.x * 0.1) * config.turbulence;
+        let turb_y = cos_approx(system.current_time * 2.5 + particle.position.y * 0.1) * config.turbulence;
+
+        // Update velocity with drift and turbulence
+        let vel_x = particle.velocity.x + drift_x + turb_x;
+        let vel_y = particle.velocity.y + drift_y + turb_y;
+
+        // Update position
+        particle.position.x += vel_x * delta_time;
+        particle.position.y += vel_y * delta_time;
+        particle.position.z += particle.velocity.z * delta_time;
+
+        // Update rotation
+        particle.rotation += particle.rotation_speed * delta_time;
+
+        // Fade out near end of life
+        let life_ratio = particle.age / particle.lifetime;
+        if life_ratio > 0.8 {
+            particle.alpha = 1.0 - (life_ratio - 0.8) / 0.2;
+        }
+
+        // Check ground collision
+        if particle.position.z <= 0.0 {
+            // Add to accumulation
+            add_snow_at(&mut system.accumulation,
+                       particle.position.x,
+                       particle.position.y,
+                       config.accumulation_rate,
+                       config.max_accumulation);
+
+            // Despawn particle
+            particle.is_active = false;
+            system.particle_count -= 1;
+        }
+
+        // Check if too far from camera (wrap around)
+        let dx = particle.position.x - system.camera_position.x;
+        let dy = particle.position.y - system.camera_position.y;
+
+        if dx > config.spawn_area.x * 0.5 {
+            particle.position.x -= config.spawn_area.x;
+        } else if dx < -config.spawn_area.x * 0.5 {
+            particle.position.x += config.spawn_area.x;
+        }
+
+        if dy > config.spawn_area.y * 0.5 {
+            particle.position.y -= config.spawn_area.y;
+        } else if dy < -config.spawn_area.y * 0.5 {
+            particle.position.y += config.spawn_area.y;
+        }
+    }
+}
+
+// ============================================================================
+// Rendering Data
+// ============================================================================
+
+struct SnowRenderData {
+    positions: [Vec3; 1000],
+    sizes: [f32; 1000],
+    rotations: [f32; 1000],
+    alphas: [f32; 1000],
+    count: i32,
+}
+
+fn get_render_data(system: &SnowSystem, max_particles: i32) -> SnowRenderData {
+    let mut data = SnowRenderData {
+        positions: [Vec3 { x: 0.0, y: 0.0, z: 0.0 }; 1000],
+        sizes: [0.0; 1000],
+        rotations: [0.0; 1000],
+        alphas: [0.0; 1000],
+        count: 0,
+    };
+
+    let limit = min_i32(max_particles, 1000);
+
+    for i in 0..system.config.max_particles {
+        if data.count >= limit {
+            break;
+        }
+
+        let particle = &system.particles[i];
+        if !particle.is_active {
+            continue;
+        }
+
+        data.positions[data.count] = particle.position;
+        data.sizes[data.count] = particle.size;
+        data.rotations[data.count] = particle.rotation;
+        data.alphas[data.count] = particle.alpha;
+        data.count += 1;
+    }
+
+    return data;
+}
+
+// ============================================================================
+// Snow Shader Data
+// ============================================================================
+
+struct SnowShaderUniforms {
+    view_projection: Mat4,
+    camera_right: Vec3,
+    camera_up: Vec3,
+    snow_color: Vec4,
+    ambient_color: Vec3,
+    light_direction: Vec3,
+    time: f32,
+}
+
+fn create_snow_shader_uniforms() -> SnowShaderUniforms {
+    return SnowShaderUniforms {
+        view_projection: mat4_identity(),
+        camera_right: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+        camera_up: Vec3 { x: 0.0, y: 0.0, z: 1.0 },
+        snow_color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+        ambient_color: Vec3 { x: 0.7, y: 0.75, z: 0.85 },
+        light_direction: Vec3 { x: 0.5, y: 0.3, z: 0.8 },
+        time: 0.0,
+    };
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+let mut snow_random_seed: u64 = 98765;
+
+fn random_f32() -> f32 {
+    snow_random_seed = snow_random_seed * 1103515245 + 12345;
+    return ((snow_random_seed >> 16) & 0x7FFF) as f32 / 32767.0;
+}
+
+fn sin_approx(x: f32) -> f32 {
+    let mut x2 = x;
+    while x2 > 3.14159 { x2 -= 6.28318; }
+    while x2 < -3.14159 { x2 += 6.28318; }
+    let x3 = x2 * x2 * x2;
+    let x5 = x3 * x2 * x2;
+    return x2 - x3 / 6.0 + x5 / 120.0;
+}
+
+fn cos_approx(x: f32) -> f32 {
+    return sin_approx(x + 1.5708);
+}
+
+fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
+    if x < min_val { return min_val; }
+    if x > max_val { return max_val; }
+    return x;
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn mat4_identity() -> Mat4 {
+    return Mat4 { data: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0] };
+}
+
+// ============================================================================
+// Pre-built Configurations
+// ============================================================================
+
+fn create_light_snow_config() -> SnowSystemConfig {
+    return SnowSystemConfig {
+        max_particles: 5000,
+        spawn_rate: 200.0,
+        fall_speed_min: 3.0,
+        fall_speed_max: 8.0,
+        size_min: 0.05,
+        size_max: 0.2,
+        accumulation_rate: 0.0003,
+        melt_rate: 0.001,
+    };
+}
+
+fn create_heavy_snow_config() -> SnowSystemConfig {
+    return SnowSystemConfig {
+        max_particles: 10000,
+        spawn_rate: 800.0,
+        fall_speed_min: 8.0,
+        fall_speed_max: 20.0,
+        size_min: 0.15,
+        size_max: 0.5,
+        accumulation_rate: 0.003,
+        melt_rate: 0.0002,
+        wind_strength: 3.0,
+    };
+}
+
+fn create_blizzard_config() -> SnowSystemConfig {
+    return SnowSystemConfig {
+        max_particles: 10000,
+        spawn_rate: 1000.0,
+        fall_speed_min: 15.0,
+        fall_speed_max: 30.0,
+        size_min: 0.1,
+        size_max: 0.4,
+        drift_speed: 5.0,
+        accumulation_rate: 0.005,
+        melt_rate: 0.0001,
+        wind_strength: 10.0,
+        turbulence: 0.8,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_snow_system() {
+    print("Testing Snow System...");
+
+    // Create system
+    let config = create_light_snow_config();
+    let mut system = create_snow_system(config);
+    print("  Created snow system");
+
+    // Set camera position
+    set_camera_position(&mut system, Vec3 { x: 100.0, y: 100.0, z: 50.0 });
+
+    // Update for a few frames
+    for _ in 0..10 {
+        update_snow_system(&mut system, 0.016);
+    }
+    print("  Particle count after 10 frames: " + system.particle_count as string);
+
+    // Test accumulation
+    let depth = get_snow_depth(&system.accumulation, 100.0, 100.0);
+    print("  Snow depth at (100, 100): " + depth as string);
+
+    // Test intensity
+    set_snow_intensity(&mut system, 0.5);
+    print("  Set intensity to 0.5");
+
+    // Get render data
+    let render_data = get_render_data(&system, 100);
+    print("  Render data count: " + render_data.count as string);
+
+    // Test configurations
+    let heavy = create_heavy_snow_config();
+    print("  Heavy snow spawn rate: " + heavy.spawn_rate as string);
+
+    let blizzard = create_blizzard_config();
+    print("  Blizzard wind strength: " + blizzard.wind_strength as string);
+
+    print("Snow System tests complete!");
+}

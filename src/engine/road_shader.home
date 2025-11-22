@@ -1,0 +1,641 @@
+// Road Shader - Road rendering with curve sampling and edge AA
+// Handles road splines, texture mapping, and smooth edge blending
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct RoadShaderConfig {
+    road_width: f32 = 10.0,                   // Base road width
+    edge_softness: f32 = 0.5,                 // Edge anti-aliasing softness
+    texture_scale: f32 = 1.0,                 // Road texture tiling
+    detail_texture_scale: f32 = 4.0,          // Detail texture tiling
+    normal_strength: f32 = 1.0,               // Normal map intensity
+    specular_power: f32 = 16.0,               // Specular highlight sharpness
+    specular_intensity: f32 = 0.3,            // Specular highlight strength
+    ambient_occlusion: f32 = 0.8,             // AO factor at edges
+    height_blend_range: f32 = 2.0,            // Blend with terrain height
+    dirt_accumulation: f32 = 0.3,             // Dirt/wear at edges
+    wet_factor: f32 = 0.0,                    // Wet road darkening (0-1)
+    snow_coverage: f32 = 0.0,                 // Snow on road (0-1)
+}
+
+// ============================================================================
+// Road Types
+// ============================================================================
+
+enum RoadType {
+    Asphalt,
+    Concrete,
+    Dirt,
+    Gravel,
+    Cobblestone,
+    Sand,
+    Snow,
+}
+
+struct RoadMaterial {
+    road_type: RoadType,
+    base_color: Vec4,
+    roughness: f32,
+    metallic: f32,
+    albedo_texture: string,
+    normal_texture: string,
+    detail_texture: string,
+    wear_texture: string,
+}
+
+fn create_road_material(road_type: RoadType) -> RoadMaterial {
+    match road_type {
+        RoadType.Asphalt => {
+            return RoadMaterial {
+                road_type: RoadType.Asphalt,
+                base_color: Vec4 { x: 0.15, y: 0.15, z: 0.17, w: 1.0 },
+                roughness: 0.7,
+                metallic: 0.0,
+                albedo_texture: "road_asphalt_diffuse",
+                normal_texture: "road_asphalt_normal",
+                detail_texture: "road_asphalt_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Concrete => {
+            return RoadMaterial {
+                road_type: RoadType.Concrete,
+                base_color: Vec4 { x: 0.6, y: 0.58, z: 0.55, w: 1.0 },
+                roughness: 0.8,
+                metallic: 0.0,
+                albedo_texture: "road_concrete_diffuse",
+                normal_texture: "road_concrete_normal",
+                detail_texture: "road_concrete_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Dirt => {
+            return RoadMaterial {
+                road_type: RoadType.Dirt,
+                base_color: Vec4 { x: 0.45, y: 0.35, z: 0.25, w: 1.0 },
+                roughness: 0.95,
+                metallic: 0.0,
+                albedo_texture: "road_dirt_diffuse",
+                normal_texture: "road_dirt_normal",
+                detail_texture: "road_dirt_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Gravel => {
+            return RoadMaterial {
+                road_type: RoadType.Gravel,
+                base_color: Vec4 { x: 0.5, y: 0.48, z: 0.45, w: 1.0 },
+                roughness: 0.9,
+                metallic: 0.0,
+                albedo_texture: "road_gravel_diffuse",
+                normal_texture: "road_gravel_normal",
+                detail_texture: "road_gravel_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Cobblestone => {
+            return RoadMaterial {
+                road_type: RoadType.Cobblestone,
+                base_color: Vec4 { x: 0.55, y: 0.5, z: 0.45, w: 1.0 },
+                roughness: 0.75,
+                metallic: 0.0,
+                albedo_texture: "road_cobble_diffuse",
+                normal_texture: "road_cobble_normal",
+                detail_texture: "road_cobble_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Sand => {
+            return RoadMaterial {
+                road_type: RoadType.Sand,
+                base_color: Vec4 { x: 0.76, y: 0.7, z: 0.5, w: 1.0 },
+                roughness: 1.0,
+                metallic: 0.0,
+                albedo_texture: "road_sand_diffuse",
+                normal_texture: "road_sand_normal",
+                detail_texture: "road_sand_detail",
+                wear_texture: "road_wear",
+            };
+        },
+        RoadType.Snow => {
+            return RoadMaterial {
+                road_type: RoadType.Snow,
+                base_color: Vec4 { x: 0.95, y: 0.95, z: 0.98, w: 1.0 },
+                roughness: 0.85,
+                metallic: 0.0,
+                albedo_texture: "road_snow_diffuse",
+                normal_texture: "road_snow_normal",
+                detail_texture: "road_snow_detail",
+                wear_texture: "road_wear",
+            };
+        },
+    }
+}
+
+// ============================================================================
+// Shader Uniforms
+// ============================================================================
+
+struct RoadShaderUniforms {
+    // Matrices
+    model_matrix: Mat4,
+    view_matrix: Mat4,
+    projection_matrix: Mat4,
+    normal_matrix: Mat3,
+
+    // Lighting
+    light_direction: Vec3,
+    light_color: Vec3,
+    ambient_color: Vec3,
+
+    // Road parameters
+    road_width: f32,
+    road_length: f32,
+    texture_scale: f32,
+    detail_scale: f32,
+
+    // Material
+    base_color: Vec4,
+    roughness: f32,
+    metallic: f32,
+    normal_strength: f32,
+    specular_power: f32,
+    specular_intensity: f32,
+
+    // Effects
+    edge_softness: f32,
+    ao_factor: f32,
+    dirt_amount: f32,
+    wet_factor: f32,
+    snow_coverage: f32,
+
+    // Time
+    time: f32,
+}
+
+fn create_road_uniforms() -> RoadShaderUniforms {
+    return RoadShaderUniforms {
+        model_matrix: mat4_identity(),
+        view_matrix: mat4_identity(),
+        projection_matrix: mat4_identity(),
+        normal_matrix: mat3_identity(),
+        light_direction: Vec3 { x: 0.5, y: 0.8, z: 0.3 },
+        light_color: Vec3 { x: 1.0, y: 0.98, z: 0.95 },
+        ambient_color: Vec3 { x: 0.15, y: 0.18, z: 0.25 },
+        road_width: 10.0,
+        road_length: 100.0,
+        texture_scale: 1.0,
+        detail_scale: 4.0,
+        base_color: Vec4 { x: 0.5, y: 0.5, z: 0.5, w: 1.0 },
+        roughness: 0.8,
+        metallic: 0.0,
+        normal_strength: 1.0,
+        specular_power: 16.0,
+        specular_intensity: 0.3,
+        edge_softness: 0.5,
+        ao_factor: 0.8,
+        dirt_amount: 0.3,
+        wet_factor: 0.0,
+        snow_coverage: 0.0,
+        time: 0.0,
+    };
+}
+
+// ============================================================================
+// Vertex Data
+// ============================================================================
+
+struct RoadVertex {
+    position: Vec3,
+    normal: Vec3,
+    tangent: Vec3,
+    uv: Vec2,
+    road_uv: Vec2,                            // UV along road (u=across, v=along)
+    edge_factor: f32,                         // 0=center, 1=edge
+    wear_factor: f32,                         // Accumulated wear/traffic
+}
+
+fn create_road_vertex(pos: Vec3, normal: Vec3, uv: Vec2, edge: f32) -> RoadVertex {
+    return RoadVertex {
+        position: pos,
+        normal: normal,
+        tangent: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+        uv: uv,
+        road_uv: uv,
+        edge_factor: edge,
+        wear_factor: 0.0,
+    };
+}
+
+// ============================================================================
+// Shader Functions (Simulated)
+// ============================================================================
+
+// Vertex shader simulation
+fn road_vertex_shader(vertex: &RoadVertex, uniforms: &RoadShaderUniforms) -> RoadVertexOutput {
+    // Transform position
+    let world_pos = mat4_transform_point(&uniforms.model_matrix, &vertex.position);
+    let view_pos = mat4_transform_point(&uniforms.view_matrix, &world_pos);
+    let clip_pos = mat4_transform_point(&uniforms.projection_matrix, &view_pos);
+
+    // Transform normal
+    let world_normal = mat3_transform_vector(&uniforms.normal_matrix, &vertex.normal);
+    let world_tangent = mat3_transform_vector(&uniforms.normal_matrix, &vertex.tangent);
+
+    return RoadVertexOutput {
+        clip_position: clip_pos,
+        world_position: world_pos,
+        world_normal: vec3_normalize(&world_normal),
+        world_tangent: vec3_normalize(&world_tangent),
+        uv: vertex.uv,
+        road_uv: vertex.road_uv,
+        edge_factor: vertex.edge_factor,
+        wear_factor: vertex.wear_factor,
+    };
+}
+
+struct RoadVertexOutput {
+    clip_position: Vec3,
+    world_position: Vec3,
+    world_normal: Vec3,
+    world_tangent: Vec3,
+    uv: Vec2,
+    road_uv: Vec2,
+    edge_factor: f32,
+    wear_factor: f32,
+}
+
+// Fragment shader simulation
+fn road_fragment_shader(input: &RoadVertexOutput, uniforms: &RoadShaderUniforms) -> Vec4 {
+    // Sample textures (simulated)
+    let albedo = sample_road_texture(input.uv, uniforms.texture_scale);
+    let detail = sample_detail_texture(input.uv, uniforms.detail_scale);
+    let normal = sample_normal_map(input.uv, uniforms.texture_scale, uniforms.normal_strength);
+    let wear = sample_wear_texture(input.road_uv);
+
+    // Combine base color with texture
+    let mut color = Vec4 {
+        x: uniforms.base_color.x * albedo.x * detail.x,
+        y: uniforms.base_color.y * albedo.y * detail.y,
+        z: uniforms.base_color.z * albedo.z * detail.z,
+        w: 1.0,
+    };
+
+    // Apply wear/dirt at edges
+    let edge_dirt = input.edge_factor * uniforms.dirt_amount;
+    let dirt_color = Vec4 { x: 0.35, y: 0.3, z: 0.25, w: 1.0 };
+    color = vec4_lerp(&color, &dirt_color, edge_dirt * wear.x);
+
+    // Apply wear in high-traffic areas
+    let traffic_wear = (1.0 - input.edge_factor * 2.0) * input.wear_factor;
+    color.x *= 1.0 - traffic_wear * 0.2;
+    color.y *= 1.0 - traffic_wear * 0.2;
+    color.z *= 1.0 - traffic_wear * 0.2;
+
+    // Apply wet factor
+    if uniforms.wet_factor > 0.0 {
+        color.x *= 1.0 - uniforms.wet_factor * 0.3;
+        color.y *= 1.0 - uniforms.wet_factor * 0.3;
+        color.z *= 1.0 - uniforms.wet_factor * 0.3;
+    }
+
+    // Apply snow coverage
+    if uniforms.snow_coverage > 0.0 {
+        let snow_color = Vec4 { x: 0.95, y: 0.95, z: 0.98, w: 1.0 };
+        let snow_factor = uniforms.snow_coverage * (1.0 - input.wear_factor);
+        color = vec4_lerp(&color, &snow_color, snow_factor);
+    }
+
+    // Calculate lighting
+    let perturbed_normal = perturb_normal(&input.world_normal, &input.world_tangent, &normal);
+
+    // Diffuse lighting
+    let n_dot_l = max_f32(vec3_dot(&perturbed_normal, &uniforms.light_direction), 0.0);
+    let diffuse = n_dot_l;
+
+    // Specular lighting (Blinn-Phong)
+    let view_dir = vec3_normalize(&vec3_negate(&input.world_position));
+    let half_dir = vec3_normalize(&vec3_add(&uniforms.light_direction, &view_dir));
+    let n_dot_h = max_f32(vec3_dot(&perturbed_normal, &half_dir), 0.0);
+    let specular = pow_f32(n_dot_h, uniforms.specular_power) * uniforms.specular_intensity;
+
+    // Reduce specular on rough areas
+    let spec_factor = specular * (1.0 - uniforms.roughness * 0.5);
+
+    // Apply lighting
+    color.x = color.x * (uniforms.ambient_color.x + uniforms.light_color.x * diffuse) + spec_factor;
+    color.y = color.y * (uniforms.ambient_color.y + uniforms.light_color.y * diffuse) + spec_factor;
+    color.z = color.z * (uniforms.ambient_color.z + uniforms.light_color.z * diffuse) + spec_factor;
+
+    // Apply ambient occlusion at edges
+    let ao = 1.0 - input.edge_factor * (1.0 - uniforms.ao_factor);
+    color.x *= ao;
+    color.y *= ao;
+    color.z *= ao;
+
+    // Edge anti-aliasing
+    let edge_alpha = smoothstep(1.0, 1.0 - uniforms.edge_softness, input.edge_factor);
+    color.w = edge_alpha;
+
+    return color;
+}
+
+// ============================================================================
+// Texture Sampling (Simulated)
+// ============================================================================
+
+fn sample_road_texture(uv: Vec2, scale: f32) -> Vec4 {
+    // Simulated texture sample with procedural noise
+    let u = uv.x * scale;
+    let v = uv.y * scale;
+
+    let noise = procedural_noise(u, v);
+    let base = 0.5 + noise * 0.15;
+
+    return Vec4 { x: base, y: base, z: base, w: 1.0 };
+}
+
+fn sample_detail_texture(uv: Vec2, scale: f32) -> Vec4 {
+    let u = uv.x * scale;
+    let v = uv.y * scale;
+
+    let detail = 0.85 + procedural_noise(u * 3.0, v * 3.0) * 0.3;
+
+    return Vec4 { x: detail, y: detail, z: detail, w: 1.0 };
+}
+
+fn sample_normal_map(uv: Vec2, scale: f32, strength: f32) -> Vec3 {
+    let u = uv.x * scale;
+    let v = uv.y * scale;
+
+    // Generate procedural normal
+    let dx = procedural_noise(u + 0.01, v) - procedural_noise(u - 0.01, v);
+    let dy = procedural_noise(u, v + 0.01) - procedural_noise(u, v - 0.01);
+
+    return Vec3 {
+        x: dx * strength,
+        y: dy * strength,
+        z: 1.0,
+    };
+}
+
+fn sample_wear_texture(road_uv: Vec2) -> Vec4 {
+    // Center of road has more wear
+    let center_factor = 1.0 - abs_f32(road_uv.x - 0.5) * 2.0;
+    let wear = center_factor * procedural_noise(road_uv.x * 5.0, road_uv.y * 5.0);
+
+    return Vec4 { x: wear, y: wear, z: wear, w: 1.0 };
+}
+
+fn perturb_normal(normal: &Vec3, tangent: &Vec3, map_normal: &Vec3) -> Vec3 {
+    let bitangent = vec3_cross(normal, tangent);
+
+    let perturbed = Vec3 {
+        x: tangent.x * map_normal.x + bitangent.x * map_normal.y + normal.x * map_normal.z,
+        y: tangent.y * map_normal.x + bitangent.y * map_normal.y + normal.y * map_normal.z,
+        z: tangent.z * map_normal.x + bitangent.z * map_normal.y + normal.z * map_normal.z,
+    };
+
+    return vec3_normalize(&perturbed);
+}
+
+// ============================================================================
+// Road Shader Manager
+// ============================================================================
+
+struct RoadShaderManager {
+    config: RoadShaderConfig,
+    materials: Map<i32, RoadMaterial>,
+    current_uniforms: RoadShaderUniforms,
+    is_initialized: bool,
+}
+
+fn create_road_shader_manager(config: RoadShaderConfig) -> RoadShaderManager {
+    let mut manager = RoadShaderManager {
+        config: config,
+        materials: Map<i32, RoadMaterial>.new(),
+        current_uniforms: create_road_uniforms(),
+        is_initialized: false,
+    };
+
+    // Load default materials
+    manager.materials.insert(RoadType.Asphalt as i32, create_road_material(RoadType.Asphalt));
+    manager.materials.insert(RoadType.Concrete as i32, create_road_material(RoadType.Concrete));
+    manager.materials.insert(RoadType.Dirt as i32, create_road_material(RoadType.Dirt));
+    manager.materials.insert(RoadType.Gravel as i32, create_road_material(RoadType.Gravel));
+    manager.materials.insert(RoadType.Cobblestone as i32, create_road_material(RoadType.Cobblestone));
+    manager.materials.insert(RoadType.Sand as i32, create_road_material(RoadType.Sand));
+    manager.materials.insert(RoadType.Snow as i32, create_road_material(RoadType.Snow));
+
+    manager.is_initialized = true;
+    return manager;
+}
+
+fn set_road_material(manager: &mut RoadShaderManager, road_type: RoadType) {
+    let material = manager.materials.get(road_type as i32);
+    if material != null {
+        manager.current_uniforms.base_color = material.base_color;
+        manager.current_uniforms.roughness = material.roughness;
+        manager.current_uniforms.metallic = material.metallic;
+    }
+}
+
+fn update_road_uniforms(manager: &mut RoadShaderManager, view: &Mat4, proj: &Mat4, light_dir: &Vec3, time: f32) {
+    manager.current_uniforms.view_matrix = *view;
+    manager.current_uniforms.projection_matrix = *proj;
+    manager.current_uniforms.light_direction = *light_dir;
+    manager.current_uniforms.time = time;
+
+    // Apply config
+    manager.current_uniforms.edge_softness = manager.config.edge_softness;
+    manager.current_uniforms.ao_factor = manager.config.ambient_occlusion;
+    manager.current_uniforms.dirt_amount = manager.config.dirt_accumulation;
+    manager.current_uniforms.wet_factor = manager.config.wet_factor;
+    manager.current_uniforms.snow_coverage = manager.config.snow_coverage;
+    manager.current_uniforms.normal_strength = manager.config.normal_strength;
+    manager.current_uniforms.specular_power = manager.config.specular_power;
+    manager.current_uniforms.specular_intensity = manager.config.specular_intensity;
+}
+
+fn render_road_segment(manager: &RoadShaderManager, vertices: &[RoadVertex], vertex_count: i32) {
+    // In actual implementation, this would bind shader and draw
+    // For simulation, we just process vertices
+    for i in 0..vertex_count {
+        let output = road_vertex_shader(&vertices[i], &manager.current_uniforms);
+        let color = road_fragment_shader(&output, &manager.current_uniforms);
+        // Color would be written to framebuffer
+    }
+}
+
+// ============================================================================
+// Math Helpers
+// ============================================================================
+
+fn procedural_noise(x: f32, y: f32) -> f32 {
+    // Simple value noise
+    let ix = x as i32;
+    let iy = y as i32;
+    let fx = x - ix as f32;
+    let fy = y - iy as f32;
+
+    let n00 = hash_2d(ix, iy);
+    let n10 = hash_2d(ix + 1, iy);
+    let n01 = hash_2d(ix, iy + 1);
+    let n11 = hash_2d(ix + 1, iy + 1);
+
+    let u = smoothstep(0.0, 1.0, fx);
+    let v = smoothstep(0.0, 1.0, fy);
+
+    let nx0 = lerp(n00, n10, u);
+    let nx1 = lerp(n01, n11, u);
+
+    return lerp(nx0, nx1, v);
+}
+
+fn hash_2d(x: i32, y: i32) -> f32 {
+    let n = x * 374761393 + y * 668265263;
+    let m = (n ^ (n >> 13)) * 1274126177;
+    return (m & 0x7FFFFFFF) as f32 / 2147483647.0;
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t;
+}
+
+fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
+    if x < min_val { return min_val; }
+    if x > max_val { return max_val; }
+    return x;
+}
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a > b { return a; }
+    return b;
+}
+
+fn abs_f32(x: f32) -> f32 {
+    if x < 0.0 { return -x; }
+    return x;
+}
+
+fn pow_f32(base: f32, exp: f32) -> f32 {
+    // Simple power approximation
+    let mut result = 1.0;
+    let n = exp as i32;
+    for _ in 0..n {
+        result *= base;
+    }
+    return result;
+}
+
+fn vec3_dot(a: &Vec3, b: &Vec3) -> f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+fn vec3_cross(a: &Vec3, b: &Vec3) -> Vec3 {
+    return Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    };
+}
+
+fn vec3_add(a: &Vec3, b: &Vec3) -> Vec3 {
+    return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+fn vec3_negate(v: &Vec3) -> Vec3 {
+    return Vec3 { x: -v.x, y: -v.y, z: -v.z };
+}
+
+fn vec3_normalize(v: &Vec3) -> Vec3 {
+    let len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if len < 0.0001 { return Vec3 { x: 0.0, y: 0.0, z: 1.0 }; }
+    return Vec3 { x: v.x / len, y: v.y / len, z: v.z / len };
+}
+
+fn vec4_lerp(a: &Vec4, b: &Vec4, t: f32) -> Vec4 {
+    return Vec4 {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        z: a.z + (b.z - a.z) * t,
+        w: a.w + (b.w - a.w) * t,
+    };
+}
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    let mut guess = x / 2.0;
+    for _ in 0..10 {
+        guess = (guess + x / guess) / 2.0;
+    }
+    return guess;
+}
+
+fn mat4_identity() -> Mat4 {
+    return Mat4 { data: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0] };
+}
+
+fn mat3_identity() -> Mat3 {
+    return Mat3 { data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] };
+}
+
+fn mat4_transform_point(m: &Mat4, p: &Vec3) -> Vec3 {
+    return Vec3 {
+        x: m.data[0] * p.x + m.data[4] * p.y + m.data[8] * p.z + m.data[12],
+        y: m.data[1] * p.x + m.data[5] * p.y + m.data[9] * p.z + m.data[13],
+        z: m.data[2] * p.x + m.data[6] * p.y + m.data[10] * p.z + m.data[14],
+    };
+}
+
+fn mat3_transform_vector(m: &Mat3, v: &Vec3) -> Vec3 {
+    return Vec3 {
+        x: m.data[0] * v.x + m.data[3] * v.y + m.data[6] * v.z,
+        y: m.data[1] * v.x + m.data[4] * v.y + m.data[7] * v.z,
+        z: m.data[2] * v.x + m.data[5] * v.y + m.data[8] * v.z,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_road_shader() {
+    print("Testing Road Shader...");
+
+    // Create manager
+    let config = RoadShaderConfig {};
+    let mut manager = create_road_shader_manager(config);
+    print("  Created road shader manager");
+
+    // Test materials
+    set_road_material(&mut manager, RoadType.Asphalt);
+    print("  Set asphalt material");
+
+    // Create test vertex
+    let vertex = create_road_vertex(
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        Vec3 { x: 0.0, y: 0.0, z: 1.0 },
+        Vec2 { x: 0.5, y: 0.5 },
+        0.3
+    );
+    print("  Created test vertex");
+
+    // Run shader
+    let output = road_vertex_shader(&vertex, &manager.current_uniforms);
+    let color = road_fragment_shader(&output, &manager.current_uniforms);
+    print("  Shader output color: (" + color.x as string + ", " + color.y as string + ", " + color.z as string + ")");
+
+    // Test noise
+    let noise = procedural_noise(1.5, 2.7);
+    print("  Procedural noise: " + noise as string);
+
+    print("Road Shader tests complete!");
+}

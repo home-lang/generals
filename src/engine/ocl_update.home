@@ -1,0 +1,822 @@
+// OCL Update - Object Creation List updates
+// Handles spawning objects on timers, triggers, and conditions
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct OCLConfig {
+    max_spawns_per_frame: i32 = 5,            // Limit spawns per update
+    default_spawn_delay: f32 = 0.0,           // Default delay before spawning
+    inherit_veterancy: bool = false,          // Spawned objects inherit veterancy
+    inherit_player: bool = true,              // Spawned objects inherit player ownership
+    scatter_radius: f32 = 0.0,                // Random scatter radius for spawns
+    spawn_height_offset: f32 = 0.0,           // Height offset for spawned objects
+    check_passability: bool = true,           // Check if spawn location is passable
+    max_spawn_attempts: i32 = 10,             // Max attempts to find valid spawn location
+}
+
+// ============================================================================
+// OCL Entry Types
+// ============================================================================
+
+enum OCLTrigger {
+    OnCreate,                                 // When parent object is created
+    OnDeath,                                  // When parent object dies
+    OnDamage,                                 // When parent takes damage
+    OnTimer,                                  // On repeating timer
+    OnSpecialPower,                           // When special power activates
+    OnProduction,                             // When production completes
+    OnUpgrade,                                // When upgrade completes
+    OnEnterState,                             // When entering specific state
+    OnExitState,                              // When exiting specific state
+    OnCommand,                                // When specific command issued
+    Manual,                                   // Triggered manually only
+}
+
+enum SpawnPosition {
+    AtOwner,                                  // At owner's position
+    AtRallyPoint,                             // At owner's rally point
+    AtBone,                                   // At specific bone on model
+    AtOffset,                                 // At offset from owner
+    InFormation,                              // In formation pattern
+    Random,                                   // Random within radius
+    AtTarget,                                 // At target position
+}
+
+struct SpawnOffset {
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    z: f32 = 0.0,
+    rotation: f32 = 0.0,
+}
+
+// ============================================================================
+// OCL Entry Definition
+// ============================================================================
+
+struct OCLEntry {
+    entry_id: u64,
+    object_type: string,                      // Type of object to spawn
+    count: i32,                               // Number to spawn
+    trigger: OCLTrigger,
+    spawn_position: SpawnPosition,
+    offset: SpawnOffset,
+    bone_name: string,
+    delay: f32,                               // Delay before spawning
+    interval: f32,                            // Interval for timer triggers
+    max_spawns: i32,                          // Max spawns (0 = unlimited)
+    conditions: [SpawnCondition; 4],          // Conditions that must be met
+    condition_count: i32,
+    spawn_with_velocity: bool,
+    initial_velocity: Vec3,
+    spread_formation: bool,
+    formation_spacing: f32,
+    inherit_facing: bool,
+    random_facing: bool,
+}
+
+struct SpawnCondition {
+    condition_type: ConditionType,
+    value: f32,
+    comparison: ComparisonOp,
+}
+
+enum ConditionType {
+    None,
+    HealthPercent,
+    HasUpgrade,
+    PlayerMoney,
+    UnitCount,
+    TimeOfDay,
+    RandomChance,
+}
+
+enum ComparisonOp {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessOrEqual,
+    GreaterThan,
+    GreaterOrEqual,
+}
+
+fn create_ocl_entry(entry_id: u64, object_type: string, trigger: OCLTrigger) -> OCLEntry {
+    return OCLEntry {
+        entry_id: entry_id,
+        object_type: object_type,
+        count: 1,
+        trigger: trigger,
+        spawn_position: SpawnPosition.AtOwner,
+        offset: SpawnOffset {},
+        bone_name: "",
+        delay: 0.0,
+        interval: 0.0,
+        max_spawns: 0,
+        conditions: [SpawnCondition {
+            condition_type: ConditionType.None,
+            value: 0.0,
+            comparison: ComparisonOp.Equal,
+        }; 4],
+        condition_count: 0,
+        spawn_with_velocity: false,
+        initial_velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        spread_formation: false,
+        formation_spacing: 10.0,
+        inherit_facing: true,
+        random_facing: false,
+    };
+}
+
+// ============================================================================
+// Object Creation List (OCL)
+// ============================================================================
+
+struct ObjectCreationList {
+    ocl_id: u64,
+    name: string,
+    entries: [OCLEntry; 16],
+    entry_count: i32,
+    config: OCLConfig,
+}
+
+fn create_ocl(ocl_id: u64, name: string) -> ObjectCreationList {
+    return ObjectCreationList {
+        ocl_id: ocl_id,
+        name: name,
+        entries: [OCLEntry {
+            entry_id: 0,
+            object_type: "",
+            count: 0,
+            trigger: OCLTrigger.Manual,
+            spawn_position: SpawnPosition.AtOwner,
+            offset: SpawnOffset {},
+            bone_name: "",
+            delay: 0.0,
+            interval: 0.0,
+            max_spawns: 0,
+            conditions: [SpawnCondition {
+                condition_type: ConditionType.None,
+                value: 0.0,
+                comparison: ComparisonOp.Equal,
+            }; 4],
+            condition_count: 0,
+            spawn_with_velocity: false,
+            initial_velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            spread_formation: false,
+            formation_spacing: 10.0,
+            inherit_facing: true,
+            random_facing: false,
+        }; 16],
+        entry_count: 0,
+        config: OCLConfig {},
+    };
+}
+
+fn add_entry_to_ocl(ocl: &mut ObjectCreationList, entry: OCLEntry) -> bool {
+    if ocl.entry_count >= 16 {
+        return false;
+    }
+    ocl.entries[ocl.entry_count] = entry;
+    ocl.entry_count += 1;
+    return true;
+}
+
+// ============================================================================
+// OCL Instance (Active spawn tracker)
+// ============================================================================
+
+struct OCLInstance {
+    instance_id: u64,
+    ocl_id: u64,
+    owner_id: u64,
+    owner_player: i32,
+    owner_position: Vec3,
+    owner_facing: f32,
+    owner_health_percent: f32,
+    rally_point: Vec3,
+    has_rally_point: bool,
+    veterancy_level: i32,
+
+    // Per-entry tracking
+    entry_spawn_counts: [i32; 16],            // Spawns per entry
+    entry_timers: [f32; 16],                  // Timer for each entry
+    entry_delays: [f32; 16],                  // Remaining delay
+    entry_enabled: [bool; 16],                // Whether entry is enabled
+
+    // Pending spawns queue
+    pending_spawns: [PendingSpawn; 32],
+    pending_count: i32,
+
+    is_active: bool,
+}
+
+struct PendingSpawn {
+    entry_index: i32,
+    spawn_position: Vec3,
+    spawn_facing: f32,
+    spawn_velocity: Vec3,
+    delay_remaining: f32,
+    object_type: string,
+}
+
+fn create_ocl_instance(instance_id: u64, ocl_id: u64, owner_id: u64, owner_player: i32) -> OCLInstance {
+    return OCLInstance {
+        instance_id: instance_id,
+        ocl_id: ocl_id,
+        owner_id: owner_id,
+        owner_player: owner_player,
+        owner_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        owner_facing: 0.0,
+        owner_health_percent: 1.0,
+        rally_point: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        has_rally_point: false,
+        veterancy_level: 0,
+        entry_spawn_counts: [0; 16],
+        entry_timers: [0.0; 16],
+        entry_delays: [0.0; 16],
+        entry_enabled: [true; 16],
+        pending_spawns: [PendingSpawn {
+            entry_index: 0,
+            spawn_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            spawn_facing: 0.0,
+            spawn_velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            delay_remaining: 0.0,
+            object_type: "",
+        }; 32],
+        pending_count: 0,
+        is_active: true,
+    };
+}
+
+// ============================================================================
+// OCL Update Module
+// ============================================================================
+
+struct OCLUpdateModule {
+    ocl_definitions: Map<u64, ObjectCreationList>,
+    ocl_by_name: Map<string, u64>,
+    instances: Map<u64, OCLInstance>,
+    next_ocl_id: u64,
+    next_instance_id: u64,
+
+    // Spawned objects this frame
+    spawned_objects: [SpawnedObject; 64],
+    spawned_count: i32,
+
+    // Callbacks
+    on_spawn_object: fn(string, Vec3, f32, i32) -> u64 = null,  // Returns spawned object ID
+    on_spawn_complete: fn(u64, u64) = null,                      // instance_id, spawned_id
+    get_bone_position: fn(u64, string) -> Vec3 = null,           // owner_id, bone_name
+    check_passability: fn(Vec3) -> bool = null,
+}
+
+struct SpawnedObject {
+    object_id: u64,
+    object_type: string,
+    position: Vec3,
+    facing: f32,
+    velocity: Vec3,
+    owner_player: i32,
+    veterancy: i32,
+    source_instance_id: u64,
+}
+
+fn create_ocl_update_module() -> OCLUpdateModule {
+    return OCLUpdateModule {
+        ocl_definitions: Map<u64, ObjectCreationList>.new(),
+        ocl_by_name: Map<string, u64>.new(),
+        instances: Map<u64, OCLInstance>.new(),
+        next_ocl_id: 1,
+        next_instance_id: 1,
+        spawned_objects: [SpawnedObject {
+            object_id: 0,
+            object_type: "",
+            position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            facing: 0.0,
+            velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            owner_player: 0,
+            veterancy: 0,
+            source_instance_id: 0,
+        }; 64],
+        spawned_count: 0,
+    };
+}
+
+// ============================================================================
+// OCL Definition Management
+// ============================================================================
+
+fn register_ocl(module: &mut OCLUpdateModule, ocl: ObjectCreationList) -> u64 {
+    let id = module.next_ocl_id;
+    module.next_ocl_id += 1;
+
+    let mut registered_ocl = ocl;
+    registered_ocl.ocl_id = id;
+
+    module.ocl_by_name.insert(registered_ocl.name, id);
+    module.ocl_definitions.insert(id, registered_ocl);
+
+    return id;
+}
+
+fn get_ocl_by_name(module: &OCLUpdateModule, name: string) -> &ObjectCreationList {
+    let id = module.ocl_by_name.get(name);
+    if id != null {
+        return module.ocl_definitions.get(*id);
+    }
+    return null;
+}
+
+// ============================================================================
+// Instance Management
+// ============================================================================
+
+fn create_instance(module: &mut OCLUpdateModule, ocl_id: u64, owner_id: u64, owner_player: i32) -> u64 {
+    let instance_id = module.next_instance_id;
+    module.next_instance_id += 1;
+
+    let instance = create_ocl_instance(instance_id, ocl_id, owner_id, owner_player);
+    module.instances.insert(instance_id, instance);
+
+    return instance_id;
+}
+
+fn destroy_instance(module: &mut OCLUpdateModule, instance_id: u64) {
+    module.instances.remove(instance_id);
+}
+
+fn update_instance_owner(module: &mut OCLUpdateModule, instance_id: u64, position: Vec3, facing: f32, health_percent: f32) {
+    let instance = module.instances.get_mut(instance_id);
+    if instance != null {
+        instance.owner_position = position;
+        instance.owner_facing = facing;
+        instance.owner_health_percent = health_percent;
+    }
+}
+
+fn set_instance_rally_point(module: &mut OCLUpdateModule, instance_id: u64, rally_point: Vec3) {
+    let instance = module.instances.get_mut(instance_id);
+    if instance != null {
+        instance.rally_point = rally_point;
+        instance.has_rally_point = true;
+    }
+}
+
+fn set_instance_veterancy(module: &mut OCLUpdateModule, instance_id: u64, veterancy: i32) {
+    let instance = module.instances.get_mut(instance_id);
+    if instance != null {
+        instance.veterancy_level = veterancy;
+    }
+}
+
+// ============================================================================
+// Trigger Functions
+// ============================================================================
+
+fn trigger_ocl(module: &mut OCLUpdateModule, instance_id: u64, trigger: OCLTrigger) {
+    let instance = module.instances.get_mut(instance_id);
+    if instance == null || !instance.is_active {
+        return;
+    }
+
+    let ocl = module.ocl_definitions.get(instance.ocl_id);
+    if ocl == null {
+        return;
+    }
+
+    for i in 0..ocl.entry_count {
+        let entry = &ocl.entries[i];
+
+        if entry.trigger != trigger {
+            continue;
+        }
+
+        if !instance.entry_enabled[i] {
+            continue;
+        }
+
+        // Check max spawns
+        if entry.max_spawns > 0 && instance.entry_spawn_counts[i] >= entry.max_spawns {
+            continue;
+        }
+
+        // Check conditions
+        if !check_entry_conditions(entry, instance) {
+            continue;
+        }
+
+        // Queue spawns
+        queue_spawns(module, instance, ocl, i);
+    }
+}
+
+fn trigger_ocl_by_name(module: &mut OCLUpdateModule, instance_id: u64, trigger: OCLTrigger) {
+    trigger_ocl(module, instance_id, trigger);
+}
+
+fn check_entry_conditions(entry: &OCLEntry, instance: &OCLInstance) -> bool {
+    for i in 0..entry.condition_count {
+        let condition = &entry.conditions[i];
+
+        if condition.condition_type == ConditionType.None {
+            continue;
+        }
+
+        let value = match condition.condition_type {
+            ConditionType.HealthPercent => instance.owner_health_percent * 100.0,
+            ConditionType.RandomChance => pseudo_random() * 100.0,
+            _ => 0.0,
+        };
+
+        let passed = match condition.comparison {
+            ComparisonOp.Equal => value == condition.value,
+            ComparisonOp.NotEqual => value != condition.value,
+            ComparisonOp.LessThan => value < condition.value,
+            ComparisonOp.LessOrEqual => value <= condition.value,
+            ComparisonOp.GreaterThan => value > condition.value,
+            ComparisonOp.GreaterOrEqual => value >= condition.value,
+        };
+
+        if !passed {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+fn queue_spawns(module: &mut OCLUpdateModule, instance: &mut OCLInstance, ocl: &ObjectCreationList, entry_index: i32) {
+    let entry = &ocl.entries[entry_index];
+
+    for spawn_num in 0..entry.count {
+        if instance.pending_count >= 32 {
+            break;
+        }
+
+        // Calculate spawn position
+        let spawn_pos = calculate_spawn_position(module, instance, entry, spawn_num);
+
+        // Calculate facing
+        let facing = if entry.random_facing {
+            pseudo_random() * 6.28318  // 2*PI
+        } else if entry.inherit_facing {
+            instance.owner_facing
+        } else {
+            0.0
+        };
+
+        // Calculate velocity
+        let velocity = if entry.spawn_with_velocity {
+            entry.initial_velocity
+        } else {
+            Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        };
+
+        // Queue pending spawn
+        instance.pending_spawns[instance.pending_count] = PendingSpawn {
+            entry_index: entry_index,
+            spawn_position: spawn_pos,
+            spawn_facing: facing,
+            spawn_velocity: velocity,
+            delay_remaining: entry.delay,
+            object_type: entry.object_type,
+        };
+        instance.pending_count += 1;
+    }
+}
+
+fn calculate_spawn_position(module: &OCLUpdateModule, instance: &OCLInstance, entry: &OCLEntry, spawn_index: i32) -> Vec3 {
+    let mut pos = match entry.spawn_position {
+        SpawnPosition.AtOwner => instance.owner_position,
+        SpawnPosition.AtRallyPoint => {
+            if instance.has_rally_point {
+                instance.rally_point
+            } else {
+                instance.owner_position
+            }
+        },
+        SpawnPosition.AtBone => {
+            if module.get_bone_position != null {
+                module.get_bone_position(instance.owner_id, entry.bone_name)
+            } else {
+                instance.owner_position
+            }
+        },
+        SpawnPosition.AtOffset => {
+            Vec3 {
+                x: instance.owner_position.x + entry.offset.x,
+                y: instance.owner_position.y + entry.offset.y,
+                z: instance.owner_position.z + entry.offset.z,
+            }
+        },
+        SpawnPosition.Random => {
+            let angle = pseudo_random() * 6.28318;
+            let radius = pseudo_random() * entry.offset.x;  // Use offset.x as radius
+            Vec3 {
+                x: instance.owner_position.x + cos_approx(angle) * radius,
+                y: instance.owner_position.y + sin_approx(angle) * radius,
+                z: instance.owner_position.z,
+            }
+        },
+        SpawnPosition.InFormation => {
+            let row = spawn_index / 4;
+            let col = spawn_index % 4;
+            Vec3 {
+                x: instance.owner_position.x + col as f32 * entry.formation_spacing,
+                y: instance.owner_position.y + row as f32 * entry.formation_spacing,
+                z: instance.owner_position.z,
+            }
+        },
+        SpawnPosition.AtTarget => instance.rally_point,  // Use rally point as target
+    };
+
+    // Apply offset
+    pos.x += entry.offset.x;
+    pos.y += entry.offset.y;
+    pos.z += entry.offset.z;
+
+    return pos;
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_ocl_module(module: &mut OCLUpdateModule, delta_time: f32) {
+    // Clear spawned objects from last frame
+    module.spawned_count = 0;
+
+    for entry in module.instances.iter_mut() {
+        let instance = entry.value;
+
+        if !instance.is_active {
+            continue;
+        }
+
+        let ocl = module.ocl_definitions.get(instance.ocl_id);
+        if ocl == null {
+            continue;
+        }
+
+        // Update timer-based entries
+        update_timer_entries(module, instance, ocl, delta_time);
+
+        // Process pending spawns
+        process_pending_spawns(module, instance, delta_time);
+    }
+}
+
+fn update_timer_entries(module: &mut OCLUpdateModule, instance: &mut OCLInstance, ocl: &ObjectCreationList, delta_time: f32) {
+    for i in 0..ocl.entry_count {
+        let entry = &ocl.entries[i];
+
+        if entry.trigger != OCLTrigger.OnTimer {
+            continue;
+        }
+
+        if !instance.entry_enabled[i] {
+            continue;
+        }
+
+        // Update timer
+        instance.entry_timers[i] += delta_time;
+
+        if instance.entry_timers[i] >= entry.interval {
+            instance.entry_timers[i] -= entry.interval;
+
+            // Check max spawns
+            if entry.max_spawns > 0 && instance.entry_spawn_counts[i] >= entry.max_spawns {
+                instance.entry_enabled[i] = false;
+                continue;
+            }
+
+            // Check conditions and queue spawns
+            if check_entry_conditions(entry, instance) {
+                queue_spawns(module, instance, ocl, i);
+            }
+        }
+    }
+}
+
+fn process_pending_spawns(module: &mut OCLUpdateModule, instance: &mut OCLInstance, delta_time: f32) {
+    let mut spawns_this_frame: i32 = 0;
+    let ocl = module.ocl_definitions.get(instance.ocl_id);
+    let max_per_frame = if ocl != null { ocl.config.max_spawns_per_frame } else { 5 };
+
+    let mut i: i32 = 0;
+    while i < instance.pending_count {
+        let pending = &mut instance.pending_spawns[i];
+
+        // Update delay
+        pending.delay_remaining -= delta_time;
+
+        if pending.delay_remaining <= 0.0 {
+            // Ready to spawn
+            if spawns_this_frame < max_per_frame && module.spawned_count < 64 {
+                // Execute spawn
+                let mut spawn_pos = pending.spawn_position;
+
+                // Check passability if required
+                if ocl != null && ocl.config.check_passability && module.check_passability != null {
+                    let mut attempts: i32 = 0;
+                    while !module.check_passability(spawn_pos) && attempts < ocl.config.max_spawn_attempts {
+                        // Try offset position
+                        spawn_pos.x += (pseudo_random() - 0.5) * 20.0;
+                        spawn_pos.y += (pseudo_random() - 0.5) * 20.0;
+                        attempts += 1;
+                    }
+                }
+
+                // Determine veterancy
+                let vet = if ocl != null && ocl.config.inherit_veterancy {
+                    instance.veterancy_level
+                } else {
+                    0
+                };
+
+                // Spawn the object
+                let object_id: u64 = if module.on_spawn_object != null {
+                    module.on_spawn_object(pending.object_type, spawn_pos, pending.spawn_facing, instance.owner_player)
+                } else {
+                    0
+                };
+
+                // Record spawned object
+                module.spawned_objects[module.spawned_count] = SpawnedObject {
+                    object_id: object_id,
+                    object_type: pending.object_type,
+                    position: spawn_pos,
+                    facing: pending.spawn_facing,
+                    velocity: pending.spawn_velocity,
+                    owner_player: instance.owner_player,
+                    veterancy: vet,
+                    source_instance_id: instance.instance_id,
+                };
+                module.spawned_count += 1;
+
+                // Update spawn count
+                instance.entry_spawn_counts[pending.entry_index] += 1;
+
+                spawns_this_frame += 1;
+
+                // Callback
+                if module.on_spawn_complete != null {
+                    module.on_spawn_complete(instance.instance_id, object_id);
+                }
+
+                // Remove from pending (shift remaining)
+                for j in i..(instance.pending_count - 1) {
+                    instance.pending_spawns[j] = instance.pending_spawns[j + 1];
+                }
+                instance.pending_count -= 1;
+                continue;  // Don't increment i since we shifted
+            }
+        }
+
+        i += 1;
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+let mut ocl_random_seed: u64 = 54321;
+
+fn pseudo_random() -> f32 {
+    ocl_random_seed = ocl_random_seed * 1103515245 + 12345;
+    return ((ocl_random_seed >> 16) & 0x7FFF) as f32 / 32767.0;
+}
+
+fn sin_approx(x: f32) -> f32 {
+    let mut x2 = x;
+    while x2 > 3.14159 { x2 -= 6.28318; }
+    while x2 < -3.14159 { x2 += 6.28318; }
+    let x3 = x2 * x2 * x2;
+    let x5 = x3 * x2 * x2;
+    return x2 - x3 / 6.0 + x5 / 120.0;
+}
+
+fn cos_approx(x: f32) -> f32 {
+    return sin_approx(x + 1.5708);
+}
+
+// ============================================================================
+// Pre-built OCL Definitions
+// ============================================================================
+
+fn create_infantry_death_ocl() -> ObjectCreationList {
+    let mut ocl = create_ocl(0, "InfantryDeathOCL");
+
+    // Create debris on death
+    let mut entry = create_ocl_entry(1, "DebrisSmall", OCLTrigger.OnDeath);
+    entry.count = 3;
+    entry.spawn_position = SpawnPosition.AtOwner;
+    entry.spawn_with_velocity = true;
+    entry.initial_velocity = Vec3 { x: 0.0, y: 0.0, z: 50.0 };
+    add_entry_to_ocl(&mut ocl, entry);
+
+    return ocl;
+}
+
+fn create_vehicle_wreck_ocl() -> ObjectCreationList {
+    let mut ocl = create_ocl(0, "VehicleWreckOCL");
+
+    // Spawn wreckage
+    let mut entry1 = create_ocl_entry(1, "VehicleWreck", OCLTrigger.OnDeath);
+    entry1.spawn_position = SpawnPosition.AtOwner;
+    entry1.inherit_facing = true;
+    add_entry_to_ocl(&mut ocl, entry1);
+
+    // Spawn fire effect
+    let mut entry2 = create_ocl_entry(2, "FireEffect", OCLTrigger.OnDeath);
+    entry2.spawn_position = SpawnPosition.AtOwner;
+    entry2.offset.z = 5.0;
+    add_entry_to_ocl(&mut ocl, entry2);
+
+    return ocl;
+}
+
+fn create_production_ocl() -> ObjectCreationList {
+    let mut ocl = create_ocl(0, "ProductionOCL");
+    ocl.config.check_passability = true;
+    ocl.config.inherit_player = true;
+
+    let mut entry = create_ocl_entry(1, "ProducedUnit", OCLTrigger.OnProduction);
+    entry.spawn_position = SpawnPosition.AtRallyPoint;
+    add_entry_to_ocl(&mut ocl, entry);
+
+    return ocl;
+}
+
+fn create_spawner_ocl(unit_type: string, interval: f32, max_count: i32) -> ObjectCreationList {
+    let mut ocl = create_ocl(0, "SpawnerOCL");
+
+    let mut entry = create_ocl_entry(1, unit_type, OCLTrigger.OnTimer);
+    entry.interval = interval;
+    entry.max_spawns = max_count;
+    entry.spawn_position = SpawnPosition.AtOffset;
+    entry.offset.y = 20.0;  // Spawn in front
+    add_entry_to_ocl(&mut ocl, entry);
+
+    return ocl;
+}
+
+fn create_paradrop_ocl(unit_type: string, count: i32) -> ObjectCreationList {
+    let mut ocl = create_ocl(0, "ParadropOCL");
+
+    let mut entry = create_ocl_entry(1, unit_type, OCLTrigger.OnSpecialPower);
+    entry.count = count;
+    entry.spawn_position = SpawnPosition.InFormation;
+    entry.formation_spacing = 15.0;
+    entry.offset.z = 200.0;  // Spawn high up
+    entry.spawn_with_velocity = true;
+    entry.initial_velocity = Vec3 { x: 0.0, y: 0.0, z: -30.0 };  // Falling
+    add_entry_to_ocl(&mut ocl, entry);
+
+    return ocl;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_ocl_update() {
+    print("Testing OCL Update Module...");
+
+    // Create module
+    let mut module = create_ocl_update_module();
+
+    // Register an OCL
+    let spawner_ocl = create_spawner_ocl("TestUnit", 5.0, 3);
+    let ocl_id = register_ocl(&mut module, spawner_ocl);
+    print("  Registered OCL with ID: " + ocl_id as string);
+
+    // Create instance
+    let instance_id = create_instance(&mut module, ocl_id, 1, 0);
+    print("  Created instance with ID: " + instance_id as string);
+
+    // Update instance owner position
+    update_instance_owner(&mut module, instance_id, Vec3 { x: 100.0, y: 100.0, z: 0.0 }, 0.0, 1.0);
+
+    // Simulate timer updates
+    for _ in 0..10 {
+        update_ocl_module(&mut module, 1.0);
+    }
+
+    print("  Spawned objects this update: " + module.spawned_count as string);
+
+    // Test death OCL
+    let death_ocl = create_infantry_death_ocl();
+    let death_ocl_id = register_ocl(&mut module, death_ocl);
+    let death_instance_id = create_instance(&mut module, death_ocl_id, 2, 0);
+
+    // Trigger death
+    trigger_ocl(&mut module, death_instance_id, OCLTrigger.OnDeath);
+    update_ocl_module(&mut module, 0.1);
+
+    print("  After death trigger, spawned: " + module.spawned_count as string);
+
+    print("OCL Update tests complete!");
+}

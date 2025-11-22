@@ -1,0 +1,672 @@
+// UDP Transport - UDP socket implementation
+// Platform-specific UDP socket management with non-blocking I/O
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct UDPConfig {
+    bind_port: u16 = 0,                       // 0 = any available port
+    bind_address: string = "0.0.0.0",         // Bind to all interfaces
+    recv_buffer_size: i32 = 65536,
+    send_buffer_size: i32 = 65536,
+    non_blocking: bool = true,
+    reuse_address: bool = true,
+    broadcast: bool = false,
+    multicast_ttl: i32 = 1,
+}
+
+// ============================================================================
+// Socket State
+// ============================================================================
+
+enum SocketState {
+    Closed,
+    Binding,
+    Bound,
+    Error,
+}
+
+struct SocketError {
+    code: i32,
+    message: string,
+}
+
+// ============================================================================
+// Address Types
+// ============================================================================
+
+struct SocketAddress {
+    ip_a: u8,
+    ip_b: u8,
+    ip_c: u8,
+    ip_d: u8,
+    port: u16,
+}
+
+fn create_socket_address(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddress {
+    return SocketAddress {
+        ip_a: a,
+        ip_b: b,
+        ip_c: c,
+        ip_d: d,
+        port: port,
+    };
+}
+
+fn address_to_string(addr: &SocketAddress) -> string {
+    return addr.ip_a as string + "." + addr.ip_b as string + "." + addr.ip_c as string + "." + addr.ip_d as string;
+}
+
+fn parse_address(ip_string: string) -> SocketAddress {
+    // Simple IP parser (assumes valid format: "a.b.c.d")
+    let mut addr = SocketAddress {
+        ip_a: 0,
+        ip_b: 0,
+        ip_c: 0,
+        ip_d: 0,
+        port: 0,
+    };
+
+    let mut current_value: i32 = 0;
+    let mut component: i32 = 0;
+
+    for i in 0..ip_string.len() {
+        let c = ip_string.char_at(i);
+        if c == '.' {
+            match component {
+                0 => addr.ip_a = current_value as u8,
+                1 => addr.ip_b = current_value as u8,
+                2 => addr.ip_c = current_value as u8,
+                _ => {},
+            }
+            current_value = 0;
+            component += 1;
+        } else if c >= '0' && c <= '9' {
+            current_value = current_value * 10 + (c as i32 - '0' as i32);
+        }
+    }
+
+    // Last component
+    addr.ip_d = current_value as u8;
+
+    return addr;
+}
+
+fn addresses_equal(a: &SocketAddress, b: &SocketAddress) -> bool {
+    return a.ip_a == b.ip_a &&
+           a.ip_b == b.ip_b &&
+           a.ip_c == b.ip_c &&
+           a.ip_d == b.ip_d &&
+           a.port == b.port;
+}
+
+// ============================================================================
+// Packet Queue
+// ============================================================================
+
+struct UDPPacket {
+    address: SocketAddress,
+    data: [u8; 1500],
+    size: i32,
+    timestamp: f32,
+    is_valid: bool,
+}
+
+fn create_udp_packet() -> UDPPacket {
+    return UDPPacket {
+        address: create_socket_address(0, 0, 0, 0, 0),
+        data: [0; 1500],
+        size: 0,
+        timestamp: 0.0,
+        is_valid: false,
+    };
+}
+
+// ============================================================================
+// UDP Socket
+// ============================================================================
+
+struct UDPSocket {
+    socket_handle: i64,                       // Platform socket handle
+    config: UDPConfig,
+    state: SocketState,
+    last_error: SocketError,
+    local_address: SocketAddress,
+
+    // Receive queue
+    recv_queue: [UDPPacket; 256],
+    recv_queue_head: i32,
+    recv_queue_tail: i32,
+    recv_queue_count: i32,
+
+    // Send queue
+    send_queue: [UDPPacket; 256],
+    send_queue_head: i32,
+    send_queue_tail: i32,
+    send_queue_count: i32,
+
+    // Statistics
+    packets_sent: u64,
+    packets_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    send_errors: u64,
+    recv_errors: u64,
+}
+
+fn create_udp_socket(config: UDPConfig) -> UDPSocket {
+    return UDPSocket {
+        socket_handle: -1,
+        config: config,
+        state: SocketState.Closed,
+        last_error: SocketError { code: 0, message: "" },
+        local_address: create_socket_address(0, 0, 0, 0, 0),
+        recv_queue: [create_udp_packet(); 256],
+        recv_queue_head: 0,
+        recv_queue_tail: 0,
+        recv_queue_count: 0,
+        send_queue: [create_udp_packet(); 256],
+        send_queue_head: 0,
+        send_queue_tail: 0,
+        send_queue_count: 0,
+        packets_sent: 0,
+        packets_received: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        send_errors: 0,
+        recv_errors: 0,
+    };
+}
+
+// ============================================================================
+// Socket Operations (Platform Abstraction)
+// ============================================================================
+
+fn socket_open(socket: &mut UDPSocket) -> bool {
+    if socket.state != SocketState.Closed {
+        return false;
+    }
+
+    // Platform-specific socket creation would go here
+    // For now, simulate success
+    socket.socket_handle = next_socket_handle();
+    socket.state = SocketState.Binding;
+
+    return true;
+}
+
+fn socket_bind(socket: &mut UDPSocket) -> bool {
+    if socket.state != SocketState.Binding {
+        return false;
+    }
+
+    let addr = parse_address(socket.config.bind_address);
+    socket.local_address = addr;
+    socket.local_address.port = if socket.config.bind_port == 0 {
+        allocate_ephemeral_port()
+    } else {
+        socket.config.bind_port
+    };
+
+    // Platform-specific bind would go here
+    socket.state = SocketState.Bound;
+
+    return true;
+}
+
+fn socket_close(socket: &mut UDPSocket) {
+    if socket.state == SocketState.Closed {
+        return;
+    }
+
+    // Platform-specific close would go here
+    socket.socket_handle = -1;
+    socket.state = SocketState.Closed;
+
+    // Clear queues
+    socket.recv_queue_count = 0;
+    socket.send_queue_count = 0;
+}
+
+fn socket_set_non_blocking(socket: &mut UDPSocket, non_blocking: bool) -> bool {
+    if socket.state == SocketState.Closed {
+        return false;
+    }
+
+    socket.config.non_blocking = non_blocking;
+    // Platform-specific ioctl/fcntl would go here
+    return true;
+}
+
+fn socket_set_broadcast(socket: &mut UDPSocket, broadcast: bool) -> bool {
+    if socket.state == SocketState.Closed {
+        return false;
+    }
+
+    socket.config.broadcast = broadcast;
+    // Platform-specific setsockopt would go here
+    return true;
+}
+
+// ============================================================================
+// Send/Receive
+// ============================================================================
+
+fn socket_send_to(socket: &mut UDPSocket, address: &SocketAddress, data: &[u8], size: i32) -> i32 {
+    if socket.state != SocketState.Bound {
+        return -1;
+    }
+
+    // Queue the packet for sending
+    if socket.send_queue_count >= 256 {
+        socket.send_errors += 1;
+        return -1;  // Queue full
+    }
+
+    let idx = socket.send_queue_tail;
+    socket.send_queue[idx].address = *address;
+    for i in 0..size {
+        if i < 1500 {
+            socket.send_queue[idx].data[i] = data[i];
+        }
+    }
+    socket.send_queue[idx].size = size;
+    socket.send_queue[idx].is_valid = true;
+
+    socket.send_queue_tail = (socket.send_queue_tail + 1) % 256;
+    socket.send_queue_count += 1;
+
+    return size;
+}
+
+fn socket_recv_from(socket: &mut UDPSocket, out_address: &mut SocketAddress, out_data: &mut [u8; 1500]) -> i32 {
+    if socket.state != SocketState.Bound {
+        return -1;
+    }
+
+    if socket.recv_queue_count == 0 {
+        return 0;  // No data available (non-blocking)
+    }
+
+    let idx = socket.recv_queue_head;
+    let packet = &socket.recv_queue[idx];
+
+    if !packet.is_valid {
+        return 0;
+    }
+
+    *out_address = packet.address;
+    for i in 0..packet.size {
+        out_data[i] = packet.data[i];
+    }
+    let size = packet.size;
+
+    socket.recv_queue[idx].is_valid = false;
+    socket.recv_queue_head = (socket.recv_queue_head + 1) % 256;
+    socket.recv_queue_count -= 1;
+
+    return size;
+}
+
+fn socket_poll(socket: &mut UDPSocket, timeout_ms: i32) -> i32 {
+    if socket.state != SocketState.Bound {
+        return -1;
+    }
+
+    // Platform-specific poll/select would go here
+    // Returns: -1 on error, 0 on timeout, >0 if data available
+
+    // Simulate: return number of packets in receive queue
+    return socket.recv_queue_count;
+}
+
+// ============================================================================
+// Internal Queue Simulation (for testing without actual sockets)
+// ============================================================================
+
+fn socket_inject_packet(socket: &mut UDPSocket, address: &SocketAddress, data: &[u8], size: i32) {
+    // For testing: inject a packet into the receive queue
+    if socket.recv_queue_count >= 256 {
+        return;
+    }
+
+    let idx = socket.recv_queue_tail;
+    socket.recv_queue[idx].address = *address;
+    for i in 0..size {
+        if i < 1500 {
+            socket.recv_queue[idx].data[i] = data[i];
+        }
+    }
+    socket.recv_queue[idx].size = size;
+    socket.recv_queue[idx].is_valid = true;
+
+    socket.recv_queue_tail = (socket.recv_queue_tail + 1) % 256;
+    socket.recv_queue_count += 1;
+    socket.packets_received += 1;
+    socket.bytes_received += size as u64;
+}
+
+fn socket_flush_send_queue(socket: &mut UDPSocket) -> i32 {
+    // Process all queued sends (in real implementation, this would do actual sendto)
+    let count = socket.send_queue_count;
+
+    while socket.send_queue_count > 0 {
+        let idx = socket.send_queue_head;
+        let packet = &socket.send_queue[idx];
+
+        if packet.is_valid {
+            socket.packets_sent += 1;
+            socket.bytes_sent += packet.size as u64;
+        }
+
+        socket.send_queue[idx].is_valid = false;
+        socket.send_queue_head = (socket.send_queue_head + 1) % 256;
+        socket.send_queue_count -= 1;
+    }
+
+    return count;
+}
+
+// ============================================================================
+// UDP Transport Manager
+// ============================================================================
+
+struct UDPTransportManager {
+    sockets: Map<u64, UDPSocket>,
+    next_socket_id: u64,
+    current_time: f32,
+
+    // Address to socket mapping for routing
+    address_map: Map<string, u64>,            // "ip:port" -> socket_id
+
+    // Callbacks
+    on_packet_received: fn(u64, SocketAddress, &[u8], i32) = null,
+    on_error: fn(u64, SocketError) = null,
+}
+
+fn create_udp_transport_manager() -> UDPTransportManager {
+    return UDPTransportManager {
+        sockets: Map<u64, UDPSocket>.new(),
+        next_socket_id: 1,
+        current_time: 0.0,
+        address_map: Map<string, u64>.new(),
+    };
+}
+
+fn manager_create_socket(manager: &mut UDPTransportManager, config: UDPConfig) -> u64 {
+    let socket_id = manager.next_socket_id;
+    manager.next_socket_id += 1;
+
+    let socket = create_udp_socket(config);
+    manager.sockets.insert(socket_id, socket);
+
+    return socket_id;
+}
+
+fn manager_bind_socket(manager: &mut UDPTransportManager, socket_id: u64) -> bool {
+    let socket = manager.sockets.get_mut(socket_id);
+    if socket == null {
+        return false;
+    }
+
+    if !socket_open(socket) {
+        return false;
+    }
+
+    if !socket_bind(socket) {
+        return false;
+    }
+
+    // Register in address map
+    let addr_key = address_to_string(&socket.local_address) + ":" + socket.local_address.port as string;
+    manager.address_map.insert(addr_key, socket_id);
+
+    return true;
+}
+
+fn manager_close_socket(manager: &mut UDPTransportManager, socket_id: u64) {
+    let socket = manager.sockets.get_mut(socket_id);
+    if socket != null {
+        let addr_key = address_to_string(&socket.local_address) + ":" + socket.local_address.port as string;
+        manager.address_map.remove(addr_key);
+
+        socket_close(socket);
+    }
+
+    manager.sockets.remove(socket_id);
+}
+
+fn manager_send(manager: &mut UDPTransportManager, socket_id: u64, address: &SocketAddress, data: &[u8], size: i32) -> bool {
+    let socket = manager.sockets.get_mut(socket_id);
+    if socket == null {
+        return false;
+    }
+
+    let result = socket_send_to(socket, address, data, size);
+    return result >= 0;
+}
+
+fn manager_update(manager: &mut UDPTransportManager, delta_time: f32) {
+    manager.current_time += delta_time;
+
+    for entry in manager.sockets.iter_mut() {
+        let socket_id = entry.key;
+        let socket = entry.value;
+
+        if socket.state != SocketState.Bound {
+            continue;
+        }
+
+        // Flush send queue
+        socket_flush_send_queue(socket);
+
+        // Poll for received packets
+        let available = socket_poll(socket, 0);
+
+        if available > 0 {
+            let mut addr = create_socket_address(0, 0, 0, 0, 0);
+            let mut data: [u8; 1500] = [0; 1500];
+
+            let size = socket_recv_from(socket, &mut addr, &mut data);
+
+            if size > 0 && manager.on_packet_received != null {
+                manager.on_packet_received(socket_id, addr, &data, size);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Broadcast Support
+// ============================================================================
+
+fn socket_send_broadcast(socket: &mut UDPSocket, port: u16, data: &[u8], size: i32) -> i32 {
+    if socket.state != SocketState.Bound || !socket.config.broadcast {
+        return -1;
+    }
+
+    let broadcast_addr = create_socket_address(255, 255, 255, 255, port);
+    return socket_send_to(socket, &broadcast_addr, data, size);
+}
+
+fn is_broadcast_address(addr: &SocketAddress) -> bool {
+    return addr.ip_a == 255 && addr.ip_b == 255 && addr.ip_c == 255 && addr.ip_d == 255;
+}
+
+fn is_multicast_address(addr: &SocketAddress) -> bool {
+    return addr.ip_a >= 224 && addr.ip_a <= 239;
+}
+
+fn is_local_address(addr: &SocketAddress) -> bool {
+    return addr.ip_a == 127;
+}
+
+fn is_private_address(addr: &SocketAddress) -> bool {
+    // 10.x.x.x
+    if addr.ip_a == 10 {
+        return true;
+    }
+    // 172.16.x.x - 172.31.x.x
+    if addr.ip_a == 172 && addr.ip_b >= 16 && addr.ip_b <= 31 {
+        return true;
+    }
+    // 192.168.x.x
+    if addr.ip_a == 192 && addr.ip_b == 168 {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+let mut global_socket_handle: i64 = 1000;
+let mut global_ephemeral_port: u16 = 49152;
+
+fn next_socket_handle() -> i64 {
+    let handle = global_socket_handle;
+    global_socket_handle += 1;
+    return handle;
+}
+
+fn allocate_ephemeral_port() -> u16 {
+    let port = global_ephemeral_port;
+    global_ephemeral_port += 1;
+    if global_ephemeral_port > 65535 {
+        global_ephemeral_port = 49152;
+    }
+    return port;
+}
+
+// ============================================================================
+// Socket Statistics
+// ============================================================================
+
+struct UDPStats {
+    packets_sent: u64,
+    packets_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    send_errors: u64,
+    recv_errors: u64,
+    queue_full_drops: u64,
+}
+
+fn get_socket_stats(socket: &UDPSocket) -> UDPStats {
+    return UDPStats {
+        packets_sent: socket.packets_sent,
+        packets_received: socket.packets_received,
+        bytes_sent: socket.bytes_sent,
+        bytes_received: socket.bytes_received,
+        send_errors: socket.send_errors,
+        recv_errors: socket.recv_errors,
+        queue_full_drops: 0,
+    };
+}
+
+// ============================================================================
+// Pre-built Configurations
+// ============================================================================
+
+fn create_default_udp_config() -> UDPConfig {
+    return UDPConfig {};
+}
+
+fn create_server_udp_config(port: u16) -> UDPConfig {
+    return UDPConfig {
+        bind_port: port,
+        bind_address: "0.0.0.0",
+        recv_buffer_size: 131072,
+        send_buffer_size: 131072,
+        non_blocking: true,
+        reuse_address: true,
+    };
+}
+
+fn create_client_udp_config() -> UDPConfig {
+    return UDPConfig {
+        bind_port: 0,                         // Any port
+        bind_address: "0.0.0.0",
+        recv_buffer_size: 65536,
+        send_buffer_size: 65536,
+        non_blocking: true,
+        reuse_address: false,
+    };
+}
+
+fn create_lan_discovery_config() -> UDPConfig {
+    return UDPConfig {
+        bind_port: 0,
+        bind_address: "0.0.0.0",
+        recv_buffer_size: 8192,
+        send_buffer_size: 8192,
+        non_blocking: true,
+        reuse_address: true,
+        broadcast: true,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_udp_transport() {
+    print("Testing UDP Transport...");
+
+    // Test address parsing
+    let addr = parse_address("192.168.1.100");
+    print("  Parsed address: " + address_to_string(&addr));
+
+    // Test socket creation
+    let config = create_default_udp_config();
+    let mut socket = create_udp_socket(config);
+    print("  Created socket, state: " + socket.state as i32 as string);
+
+    // Open and bind
+    socket_open(&mut socket);
+    socket_bind(&mut socket);
+    print("  Bound socket to port: " + socket.local_address.port as string);
+
+    // Test send
+    let dest_addr = create_socket_address(192, 168, 1, 1, 8080);
+    let test_data: [u8; 5] = [1, 2, 3, 4, 5];
+    let sent = socket_send_to(&mut socket, &dest_addr, &test_data, 5);
+    print("  Queued " + sent as string + " bytes");
+
+    // Flush send queue
+    let flushed = socket_flush_send_queue(&mut socket);
+    print("  Flushed " + flushed as string + " packets");
+
+    // Test receive (inject test packet)
+    let src_addr = create_socket_address(10, 0, 0, 1, 12345);
+    let recv_data: [u8; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+    socket_inject_packet(&mut socket, &src_addr, &recv_data, 8);
+
+    let mut out_addr = create_socket_address(0, 0, 0, 0, 0);
+    let mut out_data: [u8; 1500] = [0; 1500];
+    let received = socket_recv_from(&mut socket, &mut out_addr, &mut out_data);
+    print("  Received " + received as string + " bytes from " + address_to_string(&out_addr));
+
+    // Test manager
+    let mut manager = create_udp_transport_manager();
+    let socket_id = manager_create_socket(&mut manager, create_server_udp_config(9999));
+    manager_bind_socket(&mut manager, socket_id);
+    print("  Manager created socket: " + socket_id as string);
+
+    // Test address classification
+    let private_addr = create_socket_address(192, 168, 0, 1, 80);
+    let local_addr = create_socket_address(127, 0, 0, 1, 80);
+    let broadcast = create_socket_address(255, 255, 255, 255, 80);
+
+    print("  192.168.0.1 is private: " + is_private_address(&private_addr) as string);
+    print("  127.0.0.1 is local: " + is_local_address(&local_addr) as string);
+    print("  255.255.255.255 is broadcast: " + is_broadcast_address(&broadcast) as string);
+
+    // Close
+    socket_close(&mut socket);
+    print("  Socket closed");
+
+    print("UDP Transport tests complete!");
+}

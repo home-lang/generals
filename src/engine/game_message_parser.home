@@ -1,0 +1,785 @@
+// Game Message Parser - Network command parsing and validation
+// Handles serialization and deserialization of game commands for multiplayer sync
+
+// ============================================================================
+// Message Types
+// ============================================================================
+
+enum GameMessageType {
+    // Connection messages
+    Connect = 0,
+    Disconnect = 1,
+    Heartbeat = 2,
+    Sync = 3,
+
+    // Game state messages
+    GameStart = 10,
+    GamePause = 11,
+    GameResume = 12,
+    GameEnd = 13,
+
+    // Player commands
+    UnitMove = 20,
+    UnitAttack = 21,
+    UnitStop = 22,
+    UnitGuard = 23,
+    UnitPatrol = 24,
+    UnitAbility = 25,
+    UnitFormation = 26,
+    UnitStance = 27,
+
+    // Building commands
+    BuildStructure = 30,
+    CancelBuild = 31,
+    SellStructure = 32,
+    RepairStructure = 33,
+    SetRallyPoint = 34,
+
+    // Production commands
+    ProduceUnit = 40,
+    CancelProduction = 41,
+    QueueUpgrade = 42,
+    CancelUpgrade = 43,
+
+    // Special powers
+    ActivatePower = 50,
+    SelectPower = 51,
+
+    // Economy
+    TransferCredits = 60,
+
+    // Chat
+    ChatMessage = 70,
+    TeamMessage = 71,
+
+    // Sync/validation
+    Checksum = 80,
+    DesyncReport = 81,
+    StateRequest = 82,
+    StateResponse = 83,
+}
+
+// ============================================================================
+// Message Header
+// ============================================================================
+
+struct MessageHeader {
+    message_type: GameMessageType,
+    player_id: u8,
+    frame_number: u32,
+    sequence: u32,
+    payload_size: u16,
+    checksum: u32,
+}
+
+fn create_message_header(msg_type: GameMessageType, player_id: u8, frame: u32) -> MessageHeader {
+    return MessageHeader {
+        message_type: msg_type,
+        player_id: player_id,
+        frame_number: frame,
+        sequence: 0,
+        payload_size: 0,
+        checksum: 0,
+    };
+}
+
+// ============================================================================
+// Command Payloads
+// ============================================================================
+
+struct UnitMoveCommand {
+    unit_ids: [u64; 32],
+    unit_count: i32,
+    target_x: f32,
+    target_y: f32,
+    target_z: f32,
+    formation: u8,
+    queued: bool,
+    attack_move: bool,
+}
+
+struct UnitAttackCommand {
+    attacker_ids: [u64; 32],
+    attacker_count: i32,
+    target_id: u64,
+    target_x: f32,
+    target_y: f32,
+    force_attack: bool,
+}
+
+struct UnitAbilityCommand {
+    unit_ids: [u64; 32],
+    unit_count: i32,
+    ability_id: u32,
+    target_id: u64,
+    target_x: f32,
+    target_y: f32,
+}
+
+struct BuildStructureCommand {
+    builder_id: u64,
+    structure_type: u32,
+    position_x: f32,
+    position_y: f32,
+    rotation: f32,
+}
+
+struct ProduceUnitCommand {
+    producer_id: u64,
+    unit_type: u32,
+    quantity: i32,
+}
+
+struct ActivatePowerCommand {
+    power_id: u32,
+    target_x: f32,
+    target_y: f32,
+    target_id: u64,
+}
+
+struct ChatCommand {
+    message: [u8; 256],
+    message_len: i32,
+    to_team_only: bool,
+}
+
+struct SyncCommand {
+    frame: u32,
+    checksum: u32,
+    unit_count: i32,
+    building_count: i32,
+    resource_checksum: u32,
+}
+
+// ============================================================================
+// Message Buffer
+// ============================================================================
+
+struct MessageBuffer {
+    data: [u8; 2048],
+    size: i32,
+    read_pos: i32,
+    write_pos: i32,
+}
+
+fn create_message_buffer() -> MessageBuffer {
+    return MessageBuffer {
+        data: [0; 2048],
+        size: 0,
+        read_pos: 0,
+        write_pos: 0,
+    };
+}
+
+fn buffer_write_u8(buffer: &mut MessageBuffer, value: u8) {
+    if buffer.write_pos < 2048 {
+        buffer.data[buffer.write_pos] = value;
+        buffer.write_pos += 1;
+        buffer.size = buffer.write_pos;
+    }
+}
+
+fn buffer_write_u16(buffer: &mut MessageBuffer, value: u16) {
+    buffer_write_u8(buffer, (value & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 8) & 0xFF) as u8);
+}
+
+fn buffer_write_u32(buffer: &mut MessageBuffer, value: u32) {
+    buffer_write_u8(buffer, (value & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 8) & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 16) & 0xFF) as u8);
+    buffer_write_u8(buffer, ((value >> 24) & 0xFF) as u8);
+}
+
+fn buffer_write_u64(buffer: &mut MessageBuffer, value: u64) {
+    buffer_write_u32(buffer, (value & 0xFFFFFFFF) as u32);
+    buffer_write_u32(buffer, ((value >> 32) & 0xFFFFFFFF) as u32);
+}
+
+fn buffer_write_f32(buffer: &mut MessageBuffer, value: f32) {
+    let bits = (value * 1000.0) as i32;
+    buffer_write_u32(buffer, bits as u32);
+}
+
+fn buffer_write_bool(buffer: &mut MessageBuffer, value: bool) {
+    buffer_write_u8(buffer, if value { 1 } else { 0 });
+}
+
+fn buffer_read_u8(buffer: &mut MessageBuffer) -> u8 {
+    if buffer.read_pos < buffer.size {
+        let value = buffer.data[buffer.read_pos];
+        buffer.read_pos += 1;
+        return value;
+    }
+    return 0;
+}
+
+fn buffer_read_u16(buffer: &mut MessageBuffer) -> u16 {
+    let low = buffer_read_u8(buffer) as u16;
+    let high = buffer_read_u8(buffer) as u16;
+    return low | (high << 8);
+}
+
+fn buffer_read_u32(buffer: &mut MessageBuffer) -> u32 {
+    let b0 = buffer_read_u8(buffer) as u32;
+    let b1 = buffer_read_u8(buffer) as u32;
+    let b2 = buffer_read_u8(buffer) as u32;
+    let b3 = buffer_read_u8(buffer) as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn buffer_read_u64(buffer: &mut MessageBuffer) -> u64 {
+    let low = buffer_read_u32(buffer) as u64;
+    let high = buffer_read_u32(buffer) as u64;
+    return low | (high << 32);
+}
+
+fn buffer_read_f32(buffer: &mut MessageBuffer) -> f32 {
+    let bits = buffer_read_u32(buffer) as i32;
+    return bits as f32 / 1000.0;
+}
+
+fn buffer_read_bool(buffer: &mut MessageBuffer) -> bool {
+    return buffer_read_u8(buffer) != 0;
+}
+
+fn buffer_reset(buffer: &mut MessageBuffer) {
+    buffer.read_pos = 0;
+    buffer.write_pos = 0;
+    buffer.size = 0;
+}
+
+// ============================================================================
+// Message Serialization
+// ============================================================================
+
+fn serialize_header(buffer: &mut MessageBuffer, header: &MessageHeader) {
+    buffer_write_u8(buffer, header.message_type as u8);
+    buffer_write_u8(buffer, header.player_id);
+    buffer_write_u32(buffer, header.frame_number);
+    buffer_write_u32(buffer, header.sequence);
+    buffer_write_u16(buffer, header.payload_size);
+    buffer_write_u32(buffer, header.checksum);
+}
+
+fn deserialize_header(buffer: &mut MessageBuffer) -> MessageHeader {
+    let msg_type_raw = buffer_read_u8(buffer);
+    let msg_type = match msg_type_raw {
+        0 => GameMessageType.Connect,
+        1 => GameMessageType.Disconnect,
+        2 => GameMessageType.Heartbeat,
+        3 => GameMessageType.Sync,
+        10 => GameMessageType.GameStart,
+        20 => GameMessageType.UnitMove,
+        21 => GameMessageType.UnitAttack,
+        22 => GameMessageType.UnitStop,
+        25 => GameMessageType.UnitAbility,
+        30 => GameMessageType.BuildStructure,
+        40 => GameMessageType.ProduceUnit,
+        50 => GameMessageType.ActivatePower,
+        70 => GameMessageType.ChatMessage,
+        80 => GameMessageType.Checksum,
+        _ => GameMessageType.Heartbeat,
+    };
+
+    return MessageHeader {
+        message_type: msg_type,
+        player_id: buffer_read_u8(buffer),
+        frame_number: buffer_read_u32(buffer),
+        sequence: buffer_read_u32(buffer),
+        payload_size: buffer_read_u16(buffer),
+        checksum: buffer_read_u32(buffer),
+    };
+}
+
+fn serialize_unit_move(buffer: &mut MessageBuffer, cmd: &UnitMoveCommand) {
+    buffer_write_u8(buffer, cmd.unit_count as u8);
+    for i in 0..cmd.unit_count {
+        buffer_write_u64(buffer, cmd.unit_ids[i]);
+    }
+    buffer_write_f32(buffer, cmd.target_x);
+    buffer_write_f32(buffer, cmd.target_y);
+    buffer_write_f32(buffer, cmd.target_z);
+    buffer_write_u8(buffer, cmd.formation);
+    buffer_write_bool(buffer, cmd.queued);
+    buffer_write_bool(buffer, cmd.attack_move);
+}
+
+fn deserialize_unit_move(buffer: &mut MessageBuffer) -> UnitMoveCommand {
+    let mut cmd = UnitMoveCommand {
+        unit_ids: [0; 32],
+        unit_count: 0,
+        target_x: 0.0,
+        target_y: 0.0,
+        target_z: 0.0,
+        formation: 0,
+        queued: false,
+        attack_move: false,
+    };
+
+    cmd.unit_count = buffer_read_u8(buffer) as i32;
+    for i in 0..cmd.unit_count {
+        if i < 32 {
+            cmd.unit_ids[i] = buffer_read_u64(buffer);
+        }
+    }
+    cmd.target_x = buffer_read_f32(buffer);
+    cmd.target_y = buffer_read_f32(buffer);
+    cmd.target_z = buffer_read_f32(buffer);
+    cmd.formation = buffer_read_u8(buffer);
+    cmd.queued = buffer_read_bool(buffer);
+    cmd.attack_move = buffer_read_bool(buffer);
+
+    return cmd;
+}
+
+fn serialize_unit_attack(buffer: &mut MessageBuffer, cmd: &UnitAttackCommand) {
+    buffer_write_u8(buffer, cmd.attacker_count as u8);
+    for i in 0..cmd.attacker_count {
+        buffer_write_u64(buffer, cmd.attacker_ids[i]);
+    }
+    buffer_write_u64(buffer, cmd.target_id);
+    buffer_write_f32(buffer, cmd.target_x);
+    buffer_write_f32(buffer, cmd.target_y);
+    buffer_write_bool(buffer, cmd.force_attack);
+}
+
+fn deserialize_unit_attack(buffer: &mut MessageBuffer) -> UnitAttackCommand {
+    let mut cmd = UnitAttackCommand {
+        attacker_ids: [0; 32],
+        attacker_count: 0,
+        target_id: 0,
+        target_x: 0.0,
+        target_y: 0.0,
+        force_attack: false,
+    };
+
+    cmd.attacker_count = buffer_read_u8(buffer) as i32;
+    for i in 0..cmd.attacker_count {
+        if i < 32 {
+            cmd.attacker_ids[i] = buffer_read_u64(buffer);
+        }
+    }
+    cmd.target_id = buffer_read_u64(buffer);
+    cmd.target_x = buffer_read_f32(buffer);
+    cmd.target_y = buffer_read_f32(buffer);
+    cmd.force_attack = buffer_read_bool(buffer);
+
+    return cmd;
+}
+
+fn serialize_build_structure(buffer: &mut MessageBuffer, cmd: &BuildStructureCommand) {
+    buffer_write_u64(buffer, cmd.builder_id);
+    buffer_write_u32(buffer, cmd.structure_type);
+    buffer_write_f32(buffer, cmd.position_x);
+    buffer_write_f32(buffer, cmd.position_y);
+    buffer_write_f32(buffer, cmd.rotation);
+}
+
+fn deserialize_build_structure(buffer: &mut MessageBuffer) -> BuildStructureCommand {
+    return BuildStructureCommand {
+        builder_id: buffer_read_u64(buffer),
+        structure_type: buffer_read_u32(buffer),
+        position_x: buffer_read_f32(buffer),
+        position_y: buffer_read_f32(buffer),
+        rotation: buffer_read_f32(buffer),
+    };
+}
+
+fn serialize_produce_unit(buffer: &mut MessageBuffer, cmd: &ProduceUnitCommand) {
+    buffer_write_u64(buffer, cmd.producer_id);
+    buffer_write_u32(buffer, cmd.unit_type);
+    buffer_write_u32(buffer, cmd.quantity as u32);
+}
+
+fn deserialize_produce_unit(buffer: &mut MessageBuffer) -> ProduceUnitCommand {
+    return ProduceUnitCommand {
+        producer_id: buffer_read_u64(buffer),
+        unit_type: buffer_read_u32(buffer),
+        quantity: buffer_read_u32(buffer) as i32,
+    };
+}
+
+fn serialize_activate_power(buffer: &mut MessageBuffer, cmd: &ActivatePowerCommand) {
+    buffer_write_u32(buffer, cmd.power_id);
+    buffer_write_f32(buffer, cmd.target_x);
+    buffer_write_f32(buffer, cmd.target_y);
+    buffer_write_u64(buffer, cmd.target_id);
+}
+
+fn deserialize_activate_power(buffer: &mut MessageBuffer) -> ActivatePowerCommand {
+    return ActivatePowerCommand {
+        power_id: buffer_read_u32(buffer),
+        target_x: buffer_read_f32(buffer),
+        target_y: buffer_read_f32(buffer),
+        target_id: buffer_read_u64(buffer),
+    };
+}
+
+fn serialize_sync(buffer: &mut MessageBuffer, cmd: &SyncCommand) {
+    buffer_write_u32(buffer, cmd.frame);
+    buffer_write_u32(buffer, cmd.checksum);
+    buffer_write_u32(buffer, cmd.unit_count as u32);
+    buffer_write_u32(buffer, cmd.building_count as u32);
+    buffer_write_u32(buffer, cmd.resource_checksum);
+}
+
+fn deserialize_sync(buffer: &mut MessageBuffer) -> SyncCommand {
+    return SyncCommand {
+        frame: buffer_read_u32(buffer),
+        checksum: buffer_read_u32(buffer),
+        unit_count: buffer_read_u32(buffer) as i32,
+        building_count: buffer_read_u32(buffer) as i32,
+        resource_checksum: buffer_read_u32(buffer),
+    };
+}
+
+// ============================================================================
+// Checksum Calculation
+// ============================================================================
+
+fn calculate_checksum(data: &[u8], size: i32) -> u32 {
+    // CRC32-like checksum
+    let mut crc: u32 = 0xFFFFFFFF;
+
+    for i in 0..size {
+        let byte = data[i] as u32;
+        crc ^= byte;
+
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return crc ^ 0xFFFFFFFF;
+}
+
+fn validate_message_checksum(buffer: &MessageBuffer, header: &MessageHeader) -> bool {
+    if header.payload_size == 0 {
+        return true;
+    }
+
+    // Calculate checksum of payload
+    let payload_start = 18;  // Header size
+    let payload_end = payload_start + header.payload_size as i32;
+
+    if payload_end > buffer.size {
+        return false;
+    }
+
+    let calculated = calculate_checksum(&buffer.data[payload_start..], header.payload_size as i32);
+    return calculated == header.checksum;
+}
+
+// ============================================================================
+// Message Parser
+// ============================================================================
+
+struct GameMessageParser {
+    pending_messages: [ParsedMessage; 128],
+    pending_count: i32,
+    last_sequence: Map<u8, u32>,              // player_id -> last sequence
+    validation_enabled: bool,
+
+    // Statistics
+    messages_parsed: u64,
+    messages_rejected: u64,
+    checksum_failures: u64,
+    sequence_errors: u64,
+}
+
+struct ParsedMessage {
+    header: MessageHeader,
+    buffer: MessageBuffer,
+    is_valid: bool,
+    rejection_reason: string,
+}
+
+fn create_game_message_parser() -> GameMessageParser {
+    return GameMessageParser {
+        pending_messages: [ParsedMessage {
+            header: create_message_header(GameMessageType.Heartbeat, 0, 0),
+            buffer: create_message_buffer(),
+            is_valid: false,
+            rejection_reason: "",
+        }; 128],
+        pending_count: 0,
+        last_sequence: Map<u8, u32>.new(),
+        validation_enabled: true,
+        messages_parsed: 0,
+        messages_rejected: 0,
+        checksum_failures: 0,
+        sequence_errors: 0,
+    };
+}
+
+fn parse_message(parser: &mut GameMessageParser, data: &[u8], size: i32) -> bool {
+    if size < 18 {  // Minimum header size
+        parser.messages_rejected += 1;
+        return false;
+    }
+
+    // Create buffer and copy data
+    let mut buffer = create_message_buffer();
+    for i in 0..size {
+        if i < 2048 {
+            buffer.data[i] = data[i];
+        }
+    }
+    buffer.size = size;
+    buffer.read_pos = 0;
+
+    // Parse header
+    let header = deserialize_header(&mut buffer);
+
+    // Validate checksum if enabled
+    if parser.validation_enabled && header.payload_size > 0 {
+        buffer.read_pos = 0;  // Reset for checksum validation
+        if !validate_message_checksum(&buffer, &header) {
+            parser.checksum_failures += 1;
+            parser.messages_rejected += 1;
+            return false;
+        }
+    }
+
+    // Check sequence
+    let last_seq = parser.last_sequence.get(header.player_id);
+    if last_seq != null {
+        if header.sequence <= *last_seq && header.sequence != 0 {
+            // Allow sequence 0 for connection messages
+            if header.message_type != GameMessageType.Connect &&
+               header.message_type != GameMessageType.Heartbeat {
+                parser.sequence_errors += 1;
+                // Don't reject, just note the error
+            }
+        }
+    }
+    parser.last_sequence.insert(header.player_id, header.sequence);
+
+    // Queue parsed message
+    if parser.pending_count < 128 {
+        buffer.read_pos = 18;  // Skip header for payload reading
+        parser.pending_messages[parser.pending_count] = ParsedMessage {
+            header: header,
+            buffer: buffer,
+            is_valid: true,
+            rejection_reason: "",
+        };
+        parser.pending_count += 1;
+    }
+
+    parser.messages_parsed += 1;
+    return true;
+}
+
+fn get_next_message(parser: &mut GameMessageParser) -> &ParsedMessage {
+    if parser.pending_count == 0 {
+        return null;
+    }
+
+    // Return first message (FIFO)
+    return &parser.pending_messages[0];
+}
+
+fn consume_message(parser: &mut GameMessageParser) {
+    if parser.pending_count == 0 {
+        return;
+    }
+
+    // Shift remaining messages
+    for i in 0..(parser.pending_count - 1) {
+        parser.pending_messages[i] = parser.pending_messages[i + 1];
+    }
+    parser.pending_count -= 1;
+}
+
+fn clear_pending_messages(parser: &mut GameMessageParser) {
+    parser.pending_count = 0;
+}
+
+// ============================================================================
+// Message Builder
+// ============================================================================
+
+struct GameMessageBuilder {
+    buffer: MessageBuffer,
+    header: MessageHeader,
+    next_sequence: Map<u8, u32>,
+}
+
+fn create_game_message_builder() -> GameMessageBuilder {
+    return GameMessageBuilder {
+        buffer: create_message_buffer(),
+        header: create_message_header(GameMessageType.Heartbeat, 0, 0),
+        next_sequence: Map<u8, u32>.new(),
+    };
+}
+
+fn begin_message(builder: &mut GameMessageBuilder, msg_type: GameMessageType, player_id: u8, frame: u32) {
+    buffer_reset(&mut builder.buffer);
+    builder.header = create_message_header(msg_type, player_id, frame);
+
+    // Get next sequence for this player
+    let seq = builder.next_sequence.get(player_id);
+    builder.header.sequence = if seq != null { *seq + 1 } else { 1 };
+    builder.next_sequence.insert(player_id, builder.header.sequence);
+
+    // Reserve space for header (write placeholder)
+    builder.buffer.write_pos = 18;
+    builder.buffer.size = 18;
+}
+
+fn write_unit_move(builder: &mut GameMessageBuilder, cmd: &UnitMoveCommand) {
+    serialize_unit_move(&mut builder.buffer, cmd);
+}
+
+fn write_unit_attack(builder: &mut GameMessageBuilder, cmd: &UnitAttackCommand) {
+    serialize_unit_attack(&mut builder.buffer, cmd);
+}
+
+fn write_build_structure(builder: &mut GameMessageBuilder, cmd: &BuildStructureCommand) {
+    serialize_build_structure(&mut builder.buffer, cmd);
+}
+
+fn write_produce_unit(builder: &mut GameMessageBuilder, cmd: &ProduceUnitCommand) {
+    serialize_produce_unit(&mut builder.buffer, cmd);
+}
+
+fn write_activate_power(builder: &mut GameMessageBuilder, cmd: &ActivatePowerCommand) {
+    serialize_activate_power(&mut builder.buffer, cmd);
+}
+
+fn write_sync(builder: &mut GameMessageBuilder, cmd: &SyncCommand) {
+    serialize_sync(&mut builder.buffer, cmd);
+}
+
+fn finish_message(builder: &mut GameMessageBuilder) -> &MessageBuffer {
+    // Calculate payload size
+    let payload_size = builder.buffer.write_pos - 18;
+    builder.header.payload_size = payload_size as u16;
+
+    // Calculate checksum of payload
+    builder.header.checksum = calculate_checksum(&builder.buffer.data[18..], payload_size);
+
+    // Write header at beginning
+    let saved_write_pos = builder.buffer.write_pos;
+    builder.buffer.write_pos = 0;
+    serialize_header(&mut builder.buffer, &builder.header);
+    builder.buffer.write_pos = saved_write_pos;
+    builder.buffer.size = saved_write_pos;
+
+    return &builder.buffer;
+}
+
+// ============================================================================
+// Command Validation
+// ============================================================================
+
+fn validate_unit_move(cmd: &UnitMoveCommand) -> bool {
+    if cmd.unit_count <= 0 || cmd.unit_count > 32 {
+        return false;
+    }
+    // Position bounds check (map size assumed 4096x4096)
+    if cmd.target_x < 0.0 || cmd.target_x > 4096.0 ||
+       cmd.target_y < 0.0 || cmd.target_y > 4096.0 {
+        return false;
+    }
+    return true;
+}
+
+fn validate_unit_attack(cmd: &UnitAttackCommand) -> bool {
+    if cmd.attacker_count <= 0 || cmd.attacker_count > 32 {
+        return false;
+    }
+    return true;
+}
+
+fn validate_build_structure(cmd: &BuildStructureCommand) -> bool {
+    if cmd.builder_id == 0 {
+        return false;
+    }
+    if cmd.position_x < 0.0 || cmd.position_x > 4096.0 ||
+       cmd.position_y < 0.0 || cmd.position_y > 4096.0 {
+        return false;
+    }
+    return true;
+}
+
+fn validate_produce_unit(cmd: &ProduceUnitCommand) -> bool {
+    if cmd.producer_id == 0 {
+        return false;
+    }
+    if cmd.quantity <= 0 || cmd.quantity > 10 {
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_game_message_parser() {
+    print("Testing Game Message Parser...");
+
+    // Test buffer operations
+    let mut buffer = create_message_buffer();
+    buffer_write_u8(&mut buffer, 42);
+    buffer_write_u16(&mut buffer, 1234);
+    buffer_write_u32(&mut buffer, 0xDEADBEEF);
+    buffer_write_f32(&mut buffer, 3.14159);
+
+    buffer.read_pos = 0;
+    let v1 = buffer_read_u8(&mut buffer);
+    let v2 = buffer_read_u16(&mut buffer);
+    let v3 = buffer_read_u32(&mut buffer);
+    let v4 = buffer_read_f32(&mut buffer);
+
+    print("  Buffer: u8=" + v1 as string + " u16=" + v2 as string);
+
+    // Test message building
+    let mut builder = create_game_message_builder();
+    begin_message(&mut builder, GameMessageType.UnitMove, 1, 100);
+
+    let move_cmd = UnitMoveCommand {
+        unit_ids: [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        unit_count: 3,
+        target_x: 100.0,
+        target_y: 200.0,
+        target_z: 0.0,
+        formation: 1,
+        queued: false,
+        attack_move: true,
+    };
+    write_unit_move(&mut builder, &move_cmd);
+
+    let msg_buffer = finish_message(&mut builder);
+    print("  Built message, size: " + msg_buffer.size as string);
+
+    // Test parsing
+    let mut parser = create_game_message_parser();
+    let parsed = parse_message(&mut parser, &msg_buffer.data, msg_buffer.size);
+    print("  Parse result: " + parsed as string);
+
+    let msg = get_next_message(&mut parser);
+    if msg != null {
+        print("  Message type: " + msg.header.message_type as u8 as string);
+        print("  Player ID: " + msg.header.player_id as string);
+        print("  Frame: " + msg.header.frame_number as string);
+    }
+
+    // Test checksum
+    let test_data: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let checksum = calculate_checksum(&test_data, 10);
+    print("  Checksum: " + checksum as string);
+
+    // Test validation
+    let valid = validate_unit_move(&move_cmd);
+    print("  Move command valid: " + valid as string);
+
+    print("Game Message Parser tests complete!");
+}
