@@ -1,0 +1,465 @@
+// WAV Audio Loader - RIFF WAVE Format Support
+// Used for loading sound effects in C&C Generals Zero Hour
+// Reference: Microsoft RIFF WAVE format specification
+
+from basics import Collection, Map
+
+// RIFF chunk IDs
+const RIFF_MAGIC: Int = 0x46464952    // "RIFF"
+const WAVE_FORMAT: Int = 0x45564157   // "WAVE"
+const FMT_CHUNK: Int = 0x20746D66     // "fmt "
+const DATA_CHUNK: Int = 0x61746164    // "data"
+const FACT_CHUNK: Int = 0x74636166    // "fact"
+const LIST_CHUNK: Int = 0x5453494C    // "LIST"
+
+// Audio format codes
+const WAVE_FORMAT_PCM: Int = 0x0001
+const WAVE_FORMAT_IEEE_FLOAT: Int = 0x0003
+const WAVE_FORMAT_ALAW: Int = 0x0006
+const WAVE_FORMAT_MULAW: Int = 0x0007
+const WAVE_FORMAT_EXTENSIBLE: Int = 0xFFFE
+const WAVE_FORMAT_ADPCM: Int = 0x0002
+const WAVE_FORMAT_IMA_ADPCM: Int = 0x0011
+
+// WAV format header
+struct WAVFormat {
+    audio_format: Int,      // 1 = PCM, 3 = IEEE float, etc.
+    num_channels: Int,      // 1 = mono, 2 = stereo
+    sample_rate: Int,       // Samples per second (44100, 48000, etc.)
+    byte_rate: Int,         // Bytes per second
+    block_align: Int,       // Bytes per sample frame
+    bits_per_sample: Int,   // 8, 16, 24, or 32 bits
+    extra_params_size: Int, // Size of extra format parameters
+}
+
+// Loaded WAV file
+struct WAVAudio {
+    format: WAVFormat,
+    samples: Collection<Int>,  // Raw sample data as bytes
+    duration_seconds: Float,
+    num_samples: Int,
+    name: String,
+}
+
+/// Create empty WAV audio
+fn create_wav_audio() -> WAVAudio {
+    return WAVAudio {
+        format: WAVFormat {
+            audio_format: WAVE_FORMAT_PCM,
+            num_channels: 1,
+            sample_rate: 44100,
+            byte_rate: 88200,
+            block_align: 2,
+            bits_per_sample: 16,
+            extra_params_size: 0,
+        },
+        samples: Collection<Int>{},
+        duration_seconds: 0.0,
+        num_samples: 0,
+        name: "",
+    }
+}
+
+/// Read 16-bit little-endian integer
+fn read_u16_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 > data.len() {
+        return 0
+    }
+    return data.get(offset) | (data.get(offset + 1) << 8)
+}
+
+/// Read 32-bit little-endian integer
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Parse format chunk
+fn parse_fmt_chunk(data: Collection<Int>, offset: Int, chunk_size: Int) -> (WAVFormat, Bool) {
+    let format = WAVFormat {
+        audio_format: WAVE_FORMAT_PCM,
+        num_channels: 1,
+        sample_rate: 44100,
+        byte_rate: 88200,
+        block_align: 2,
+        bits_per_sample: 16,
+        extra_params_size: 0,
+    }
+
+    if chunk_size < 16 {
+        return (format, false)
+    }
+
+    format.audio_format = read_u16_le(data, offset)
+    format.num_channels = read_u16_le(data, offset + 2)
+    format.sample_rate = read_u32_le(data, offset + 4)
+    format.byte_rate = read_u32_le(data, offset + 8)
+    format.block_align = read_u16_le(data, offset + 12)
+    format.bits_per_sample = read_u16_le(data, offset + 14)
+
+    if chunk_size > 16 {
+        format.extra_params_size = read_u16_le(data, offset + 16)
+    }
+
+    // Validate
+    if format.num_channels == 0 || format.sample_rate == 0 {
+        return (format, false)
+    }
+
+    return (format, true)
+}
+
+/// Check if data is a valid WAV file
+fn is_wav_file(data: Collection<Int>) -> Bool {
+    if data.len() < 12 {
+        return false
+    }
+
+    let riff = read_u32_le(data, 0)
+    let wave = read_u32_le(data, 8)
+
+    return riff == RIFF_MAGIC && wave == WAVE_FORMAT
+}
+
+/// Load WAV audio from data
+fn load_wav(data: Collection<Int>) -> (WAVAudio, Bool) {
+    let audio = create_wav_audio()
+
+    if !is_wav_file(data) {
+        return (audio, false)
+    }
+
+    let file_size = read_u32_le(data, 4) + 8
+
+    // Parse chunks
+    let offset = 12
+    let fmt_found = false
+    let data_found = false
+
+    while offset < data.len() - 8 {
+        let chunk_id = read_u32_le(data, offset)
+        let chunk_size = read_u32_le(data, offset + 4)
+
+        if chunk_id == FMT_CHUNK {
+            let (format, success) = parse_fmt_chunk(data, offset + 8, chunk_size)
+            if success {
+                audio.format = format
+                fmt_found = true
+            }
+        } else if chunk_id == DATA_CHUNK {
+            // Copy sample data
+            let data_offset = offset + 8
+            let data_end = data_offset + chunk_size
+
+            if data_end <= data.len() {
+                for i in data_offset..data_end {
+                    audio.samples.add(data.get(i))
+                }
+                data_found = true
+
+                // Calculate stats
+                if audio.format.block_align > 0 {
+                    audio.num_samples = chunk_size / audio.format.block_align
+                }
+                if audio.format.sample_rate > 0 {
+                    audio.duration_seconds = (audio.num_samples as Float) / (audio.format.sample_rate as Float)
+                }
+            }
+        }
+
+        // Move to next chunk (chunks are 2-byte aligned)
+        offset = offset + 8 + chunk_size
+        if (chunk_size % 2) != 0 {
+            offset = offset + 1
+        }
+    }
+
+    if !fmt_found || !data_found {
+        return (audio, false)
+    }
+
+    return (audio, true)
+}
+
+/// Get format description string
+fn get_format_description(format: WAVFormat) -> String {
+    let format_name = match format.audio_format {
+        WAVE_FORMAT_PCM => "PCM",
+        WAVE_FORMAT_IEEE_FLOAT => "IEEE Float",
+        WAVE_FORMAT_ALAW => "A-law",
+        WAVE_FORMAT_MULAW => "µ-law",
+        WAVE_FORMAT_ADPCM => "ADPCM",
+        WAVE_FORMAT_IMA_ADPCM => "IMA ADPCM",
+        _ => "Unknown",
+    }
+
+    let channels = if format.num_channels == 1 { "Mono" } else { "Stereo" }
+
+    return format_name + " " + channels + " " +
+           format.sample_rate.to_string() + "Hz " +
+           format.bits_per_sample.to_string() + "-bit"
+}
+
+/// Convert 8-bit samples to 16-bit
+fn convert_8_to_16(samples: Collection<Int>) -> Collection<Int> {
+    let result = Collection<Int>{}
+
+    for i in 0..samples.len() {
+        // 8-bit WAV is unsigned, center at 128
+        let sample = (samples.get(i) - 128) * 256
+        result.add(sample & 0xFF)
+        result.add((sample >> 8) & 0xFF)
+    }
+
+    return result
+}
+
+/// Get sample at index as normalized float (-1.0 to 1.0)
+fn get_sample_normalized(audio: WAVAudio, index: Int, channel: Int) -> Float {
+    if audio.format.bits_per_sample == 16 {
+        let sample_offset = index * audio.format.block_align + channel * 2
+        if sample_offset + 2 > audio.samples.len() {
+            return 0.0
+        }
+
+        let lo = audio.samples.get(sample_offset)
+        let hi = audio.samples.get(sample_offset + 1)
+        let value = lo | (hi << 8)
+
+        // Handle signed 16-bit
+        if value > 32767 {
+            return ((value - 65536) as Float) / 32768.0
+        }
+        return (value as Float) / 32767.0
+
+    } else if audio.format.bits_per_sample == 8 {
+        let sample_offset = index * audio.format.block_align + channel
+        if sample_offset >= audio.samples.len() {
+            return 0.0
+        }
+
+        // 8-bit is unsigned, center at 128
+        return ((audio.samples.get(sample_offset) - 128) as Float) / 128.0
+    }
+
+    return 0.0
+}
+
+/// Mix stereo to mono
+fn mix_to_mono(audio: WAVAudio) -> Collection<Int> {
+    if audio.format.num_channels == 1 {
+        return audio.samples
+    }
+
+    let result = Collection<Int>{}
+    let bytes_per_sample = audio.format.bits_per_sample / 8
+
+    for i in 0..audio.num_samples {
+        if audio.format.bits_per_sample == 16 {
+            let left_offset = i * audio.format.block_align
+            let right_offset = left_offset + 2
+
+            let left = read_u16_le(audio.samples, left_offset)
+            let right = read_u16_le(audio.samples, right_offset)
+
+            // Average the samples
+            let mixed = (left + right) / 2
+
+            result.add(mixed & 0xFF)
+            result.add((mixed >> 8) & 0xFF)
+        } else if audio.format.bits_per_sample == 8 {
+            let left_offset = i * audio.format.block_align
+            let right_offset = left_offset + 1
+
+            let left = audio.samples.get(left_offset)
+            let right = audio.samples.get(right_offset)
+
+            result.add((left + right) / 2)
+        }
+    }
+
+    return result
+}
+
+// ============================================================================
+// WAV Audio Manager
+// ============================================================================
+
+struct WAVManager {
+    sounds: Map<String, WAVAudio>,
+    master_volume: Float,
+    sfx_volume: Float,
+    music_volume: Float,
+
+    fn init() -> WAVManager {
+        return WAVManager {
+            sounds: Map<String, WAVAudio>{},
+            master_volume: 1.0,
+            sfx_volume: 1.0,
+            music_volume: 1.0,
+        }
+    }
+
+    fn load_sound(self, name: String, data: Collection<Int>) -> Bool {
+        let (audio, success) = load_wav(data)
+        if success {
+            audio.name = name
+            self.sounds.set(name, audio)
+        }
+        return success
+    }
+
+    fn has_sound(self, name: String) -> Bool {
+        return self.sounds.has(name)
+    }
+
+    fn get_sound(self, name: String) -> WAVAudio {
+        return self.sounds.get(name)
+    }
+
+    fn get_duration(self, name: String) -> Float {
+        if self.sounds.has(name) {
+            return self.sounds.get(name).duration_seconds
+        }
+        return 0.0
+    }
+
+    fn set_master_volume(self, volume: Float) {
+        self.master_volume = if volume < 0.0 { 0.0 } else if volume > 1.0 { 1.0 } else { volume }
+    }
+
+    fn set_sfx_volume(self, volume: Float) {
+        self.sfx_volume = if volume < 0.0 { 0.0 } else if volume > 1.0 { 1.0 } else { volume }
+    }
+
+    fn set_music_volume(self, volume: Float) {
+        self.music_volume = if volume < 0.0 { 0.0 } else if volume > 1.0 { 1.0 } else { volume }
+    }
+
+    fn get_effective_sfx_volume(self) -> Float {
+        return self.master_volume * self.sfx_volume
+    }
+
+    fn get_effective_music_volume(self) -> Float {
+        return self.master_volume * self.music_volume
+    }
+
+    fn count(self) -> Int {
+        return self.sounds.len()
+    }
+
+    fn clear(self) {
+        self.sounds.clear()
+    }
+}
+
+// ============================================================================
+// Common Audio Files
+// ============================================================================
+
+// UI sounds
+const UI_CLICK: String = "UIClick.wav"
+const UI_HOVER: String = "UIHover.wav"
+const UI_ERROR: String = "UIError.wav"
+const UI_CONFIRM: String = "UIConfirm.wav"
+
+// Game sounds
+const UNIT_SELECT: String = "UnitSelect.wav"
+const UNIT_MOVE: String = "UnitMove.wav"
+const UNIT_ATTACK: String = "UnitAttack.wav"
+const BUILDING_PLACED: String = "BuildingPlaced.wav"
+const BUILDING_COMPLETE: String = "BuildingComplete.wav"
+const UNIT_CREATED: String = "UnitCreated.wav"
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_wav_creation() -> Bool {
+    let audio = create_wav_audio()
+    assert(audio.format.audio_format == WAVE_FORMAT_PCM, "Default should be PCM")
+    assert(audio.format.sample_rate == 44100, "Default sample rate should be 44100")
+    return true
+}
+
+fn test_wav_detection() -> Bool {
+    // Create minimal valid WAV header
+    let data = Collection<Int>{}
+
+    // "RIFF"
+    data.add(0x52)
+    data.add(0x49)
+    data.add(0x46)
+    data.add(0x46)
+    // File size (placeholder)
+    data.add(0x24)
+    data.add(0x00)
+    data.add(0x00)
+    data.add(0x00)
+    // "WAVE"
+    data.add(0x57)
+    data.add(0x41)
+    data.add(0x56)
+    data.add(0x45)
+
+    assert(is_wav_file(data) == true, "Should detect valid WAV")
+
+    // Invalid magic
+    let invalid = Collection<Int>{}
+    for i in 0..12 {
+        invalid.add(0)
+    }
+
+    assert(is_wav_file(invalid) == false, "Should reject invalid magic")
+
+    return true
+}
+
+fn test_format_description() -> Bool {
+    let format = WAVFormat {
+        audio_format: WAVE_FORMAT_PCM,
+        num_channels: 2,
+        sample_rate: 44100,
+        byte_rate: 176400,
+        block_align: 4,
+        bits_per_sample: 16,
+        extra_params_size: 0,
+    }
+
+    let desc = get_format_description(format)
+    assert(desc.contains("PCM"), "Should contain PCM")
+    assert(desc.contains("Stereo"), "Should contain Stereo")
+    assert(desc.contains("44100"), "Should contain sample rate")
+
+    return true
+}
+
+fn test_wav_manager() -> Bool {
+    let manager = WAVManager::init()
+    assert(manager.master_volume == 1.0, "Default master volume should be 1.0")
+    assert(manager.count() == 0, "Should start empty")
+
+    manager.set_master_volume(0.5)
+    assert(manager.master_volume == 0.5, "Should set master volume")
+
+    manager.set_master_volume(1.5)
+    assert(manager.master_volume == 1.0, "Should clamp to 1.0")
+
+    manager.set_master_volume(-0.5)
+    assert(manager.master_volume == 0.0, "Should clamp to 0.0")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_wav_creation(), "WAV creation test failed")
+    assert(test_wav_detection(), "WAV detection test failed")
+    assert(test_format_description(), "Format description test failed")
+    assert(test_wav_manager(), "WAV manager test failed")
+    return true
+}

@@ -1,0 +1,505 @@
+// STR String File Parser
+// Used for external string tables and localization data in C&C Generals
+// STR files are simple text-based key-value string files
+// Format: KEY:String value (one per line)
+// Lines starting with # or ; are comments
+// Empty lines are ignored
+
+from basics import Collection, Map
+
+// Parsed string entry
+struct StringEntry {
+    key: String,
+    value: String,
+    line_number: Int,
+}
+
+// String table loaded from STR file
+struct StringTable {
+    entries: Map<String, String>,
+    ordered_keys: Collection<String>,  // Preserve insertion order
+    source_file: String,
+    language: String,
+}
+
+/// Create empty string table
+fn create_string_table() -> StringTable {
+    return StringTable {
+        entries: Map<String, String>{},
+        ordered_keys: Collection<String>{},
+        source_file: "",
+        language: "English",
+    }
+}
+
+/// Check if character is whitespace
+fn is_whitespace(c: Int) -> Bool {
+    return c == 32 || c == 9 || c == 10 || c == 13  // space, tab, newline, CR
+}
+
+/// Check if character starts a comment
+fn is_comment_char(c: Int) -> Bool {
+    return c == 35 || c == 59  // '#' or ';'
+}
+
+/// Trim leading whitespace from string
+fn trim_leading(s: String) -> String {
+    let start = 0
+    while start < s.len() {
+        let c = s.char_at(start)
+        if !is_whitespace(c) {
+            break
+        }
+        start = start + 1
+    }
+    return s.substring(start, s.len())
+}
+
+/// Trim trailing whitespace from string
+fn trim_trailing(s: String) -> String {
+    let end = s.len()
+    while end > 0 {
+        let c = s.char_at(end - 1)
+        if !is_whitespace(c) {
+            break
+        }
+        end = end - 1
+    }
+    return s.substring(0, end)
+}
+
+/// Trim both leading and trailing whitespace
+fn trim(s: String) -> String {
+    return trim_trailing(trim_leading(s))
+}
+
+/// Parse a single line into key-value pair
+fn parse_line(line: String, line_number: Int) -> (StringEntry, Bool) {
+    let entry = StringEntry {
+        key: "",
+        value: "",
+        line_number: line_number,
+    }
+
+    let trimmed = trim(line)
+
+    // Skip empty lines
+    if trimmed.len() == 0 {
+        return (entry, false)
+    }
+
+    // Skip comment lines
+    if is_comment_char(trimmed.char_at(0)) {
+        return (entry, false)
+    }
+
+    // Find the colon separator
+    let colon_pos = -1
+    for i in 0..trimmed.len() {
+        if trimmed.char_at(i) == 58 {  // ':'
+            colon_pos = i
+            break
+        }
+    }
+
+    // No colon found - invalid line
+    if colon_pos < 0 {
+        return (entry, false)
+    }
+
+    // Extract key and value
+    entry.key = trim(trimmed.substring(0, colon_pos))
+    entry.value = trim(trimmed.substring(colon_pos + 1, trimmed.len()))
+
+    // Skip entries with empty keys
+    if entry.key.len() == 0 {
+        return (entry, false)
+    }
+
+    return (entry, true)
+}
+
+/// Split text into lines
+fn split_lines(text: String) -> Collection<String> {
+    let lines = Collection<String>{}
+    let current_line = ""
+
+    for i in 0..text.len() {
+        let c = text.char_at(i)
+
+        if c == 10 {  // '\n'
+            lines.add(current_line)
+            current_line = ""
+        } else if c == 13 {  // '\r'
+            // Handle Windows-style CRLF
+            if i + 1 < text.len() && text.char_at(i + 1) == 10 {
+                // Skip the \r, the \n will be handled next iteration
+            } else {
+                // Old Mac-style CR only
+                lines.add(current_line)
+                current_line = ""
+            }
+        } else {
+            current_line = current_line + text.char_from_code(c)
+        }
+    }
+
+    // Add last line if not empty
+    if current_line.len() > 0 {
+        lines.add(current_line)
+    }
+
+    return lines
+}
+
+/// Parse STR file content
+fn parse_str_file(content: String) -> (StringTable, Bool) {
+    let table = create_string_table()
+    let lines = split_lines(content)
+
+    for i in 0..lines.len() {
+        let line = lines.get(i)
+        let (entry, valid) = parse_line(line, i + 1)
+
+        if valid {
+            table.entries.set(entry.key, entry.value)
+            table.ordered_keys.add(entry.key)
+        }
+    }
+
+    return (table, true)
+}
+
+/// Load STR file from raw byte data
+fn load_str_file(data: Collection<Int>) -> (StringTable, Bool) {
+    // Convert bytes to string
+    let content = ""
+    for i in 0..data.len() {
+        content = content + String::char_from_code(data.get(i))
+    }
+
+    return parse_str_file(content)
+}
+
+/// Get string by key
+fn get_string(table: StringTable, key: String) -> String {
+    if table.entries.has(key) {
+        return table.entries.get(key)
+    }
+    return ""
+}
+
+/// Get string by key with default fallback
+fn get_string_or(table: StringTable, key: String, default_value: String) -> String {
+    if table.entries.has(key) {
+        return table.entries.get(key)
+    }
+    return default_value
+}
+
+/// Check if key exists
+fn has_string(table: StringTable, key: String) -> Bool {
+    return table.entries.has(key)
+}
+
+/// Get all keys
+fn get_keys(table: StringTable) -> Collection<String> {
+    return table.ordered_keys
+}
+
+/// Get number of entries
+fn get_count(table: StringTable) -> Int {
+    return table.entries.len()
+}
+
+/// Add or update a string entry
+fn set_string(table: StringTable, key: String, value: String) {
+    if !table.entries.has(key) {
+        table.ordered_keys.add(key)
+    }
+    table.entries.set(key, value)
+}
+
+/// Remove a string entry
+fn remove_string(table: StringTable, key: String) -> Bool {
+    if !table.entries.has(key) {
+        return false
+    }
+
+    table.entries.remove(key)
+
+    // Remove from ordered keys
+    let new_keys = Collection<String>{}
+    for k in table.ordered_keys {
+        if k != key {
+            new_keys.add(k)
+        }
+    }
+    table.ordered_keys = new_keys
+
+    return true
+}
+
+/// Merge another string table into this one
+fn merge_tables(target: StringTable, source: StringTable) {
+    for key in source.ordered_keys {
+        set_string(target, key, source.entries.get(key))
+    }
+}
+
+/// Export string table to STR format
+fn export_str(table: StringTable) -> String {
+    let output = ""
+
+    // Header comment
+    output = output + "# Generated string table\n"
+    output = output + "# Language: " + table.language + "\n"
+    output = output + "\n"
+
+    // Entries
+    for key in table.ordered_keys {
+        let value = table.entries.get(key)
+        output = output + key + ":" + value + "\n"
+    }
+
+    return output
+}
+
+// ============================================================================
+// Format String Support
+// ============================================================================
+
+/// Replace placeholders like %s, %d, %1, %2 in strings
+fn format_string(template: String, args: Collection<String>) -> String {
+    let result = ""
+    let i = 0
+
+    while i < template.len() {
+        let c = template.char_at(i)
+
+        if c == 37 && i + 1 < template.len() {  // '%'
+            let next = template.char_at(i + 1)
+
+            // Handle numbered placeholders (%1, %2, etc.)
+            if next >= 49 && next <= 57 {  // '1' to '9'
+                let index = next - 49  // Convert to 0-based index
+                if index < args.len() {
+                    result = result + args.get(index)
+                }
+                i = i + 2
+            }
+            // Handle %s, %d (sequential replacement)
+            else if next == 115 || next == 100 {  // 's' or 'd'
+                // Find next available arg
+                let arg_index = count_placeholders_before(template, i, args.len())
+                if arg_index < args.len() {
+                    result = result + args.get(arg_index)
+                }
+                i = i + 2
+            }
+            // Handle %%
+            else if next == 37 {
+                result = result + "%"
+                i = i + 2
+            }
+            else {
+                result = result + String::char_from_code(c)
+                i = i + 1
+            }
+        } else {
+            result = result + String::char_from_code(c)
+            i = i + 1
+        }
+    }
+
+    return result
+}
+
+/// Count %s/%d placeholders before position
+fn count_placeholders_before(template: String, pos: Int, max_args: Int) -> Int {
+    let count = 0
+    let i = 0
+
+    while i < pos {
+        if template.char_at(i) == 37 && i + 1 < template.len() {  // '%'
+            let next = template.char_at(i + 1)
+            if next == 115 || next == 100 {  // 's' or 'd'
+                count = count + 1
+            }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    return count
+}
+
+// ============================================================================
+// String Table Manager
+// ============================================================================
+
+struct StringManager {
+    tables: Map<String, StringTable>,
+    active_language: String,
+
+    fn init() -> StringManager {
+        return StringManager {
+            tables: Map<String, StringTable>{},
+            active_language: "English",
+        }
+    }
+
+    fn load_table(self, name: String, content: String) -> Bool {
+        let (table, success) = parse_str_file(content)
+        if success {
+            table.source_file = name
+            self.tables.set(name, table)
+        }
+        return success
+    }
+
+    fn get_string(self, table_name: String, key: String) -> String {
+        if self.tables.has(table_name) {
+            let table = self.tables.get(table_name)
+            return get_string(table, key)
+        }
+        return ""
+    }
+
+    fn get_string_formatted(self, table_name: String, key: String, args: Collection<String>) -> String {
+        let template = self.get_string(table_name, key)
+        if template.len() == 0 {
+            return ""
+        }
+        return format_string(template, args)
+    }
+
+    fn set_language(self, language: String) {
+        self.active_language = language
+    }
+
+    fn has_table(self, name: String) -> Bool {
+        return self.tables.has(name)
+    }
+}
+
+// ============================================================================
+// Common Game Strings
+// ============================================================================
+
+// Standard string table names
+const STR_GENERALS: String = "generals"
+const STR_INGAME: String = "ingame"
+const STR_MENU: String = "menu"
+const STR_CREDITS: String = "credits"
+const STR_TOOLTIPS: String = "tooltips"
+
+// Common string keys
+const KEY_LOADING: String = "GUI:Loading"
+const KEY_PLEASE_WAIT: String = "GUI:PleaseWait"
+const KEY_PRESS_ANY_KEY: String = "GUI:PressAnyKey"
+const KEY_CONNECTING: String = "GUI:Connecting"
+const KEY_ERROR: String = "GUI:Error"
+const KEY_OK: String = "GUI:OK"
+const KEY_CANCEL: String = "GUI:Cancel"
+const KEY_YES: String = "GUI:Yes"
+const KEY_NO: String = "GUI:No"
+const KEY_BACK: String = "GUI:Back"
+const KEY_CONTINUE: String = "GUI:Continue"
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_basic_parsing() -> Bool {
+    let content = "KEY1:Value One\nKEY2:Value Two\n"
+    let (table, success) = parse_str_file(content)
+
+    assert(success == true, "Parsing should succeed")
+    assert(get_count(table) == 2, "Should have 2 entries")
+    assert(get_string(table, "KEY1") == "Value One", "KEY1 should be 'Value One'")
+    assert(get_string(table, "KEY2") == "Value Two", "KEY2 should be 'Value Two'")
+
+    return true
+}
+
+fn test_comments_and_empty_lines() -> Bool {
+    let content = "# This is a comment\n\nKEY:Value\n; Another comment\n"
+    let (table, success) = parse_str_file(content)
+
+    assert(success == true, "Parsing should succeed")
+    assert(get_count(table) == 1, "Should have only 1 entry (comments ignored)")
+    assert(get_string(table, "KEY") == "Value", "KEY should be 'Value'")
+
+    return true
+}
+
+fn test_whitespace_handling() -> Bool {
+    let content = "  KEY  :  Value with spaces  \n"
+    let (table, success) = parse_str_file(content)
+
+    assert(success == true, "Parsing should succeed")
+    assert(get_string(table, "KEY") == "Value with spaces", "Value should be trimmed")
+
+    return true
+}
+
+fn test_format_string() -> Bool {
+    let template = "Hello %s, you have %d messages"
+    let args = Collection<String>{}
+    args.add("World")
+    args.add("5")
+
+    let result = format_string(template, args)
+    assert(result == "Hello World, you have 5 messages", "Format should work")
+
+    return true
+}
+
+fn test_numbered_placeholders() -> Bool {
+    let template = "Player %2 defeated player %1"
+    let args = Collection<String>{}
+    args.add("Alice")
+    args.add("Bob")
+
+    let result = format_string(template, args)
+    assert(result == "Player Bob defeated player Alice", "Numbered placeholders should work")
+
+    return true
+}
+
+fn test_string_manager() -> Bool {
+    let manager = StringManager::init()
+
+    let content = "HELLO:Hello World\nGOODBYE:Goodbye World"
+    manager.load_table("test", content)
+
+    assert(manager.has_table("test") == true, "Should have test table")
+    assert(manager.get_string("test", "HELLO") == "Hello World", "Should get HELLO")
+
+    return true
+}
+
+fn test_export() -> Bool {
+    let table = create_string_table()
+    set_string(table, "A", "Value A")
+    set_string(table, "B", "Value B")
+
+    let exported = export_str(table)
+    assert(exported.contains("A:Value A"), "Export should contain A entry")
+    assert(exported.contains("B:Value B"), "Export should contain B entry")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_basic_parsing(), "Basic parsing test failed")
+    assert(test_comments_and_empty_lines(), "Comments test failed")
+    assert(test_whitespace_handling(), "Whitespace test failed")
+    assert(test_format_string(), "Format string test failed")
+    assert(test_numbered_placeholders(), "Numbered placeholders test failed")
+    assert(test_string_manager(), "String manager test failed")
+    assert(test_export(), "Export test failed")
+    return true
+}

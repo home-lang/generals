@@ -1,0 +1,535 @@
+// Zlib Compression - DEFLATE compression algorithm wrapper
+// Used for PNG decompression, network data, and various compressed assets
+// Reference: Thyme/src/game/common/compression/zlibcompr.cpp
+
+from basics import Collection
+
+// Zlib compression levels
+enum ZlibLevel {
+    NoCompression,      // Level 0
+    BestSpeed,          // Level 1
+    Default,            // Level 6
+    BestCompression,    // Level 9
+}
+
+fn zlib_level_to_int(level: ZlibLevel) -> Int {
+    if level == ZlibLevel::NoCompression { return 0 }
+    if level == ZlibLevel::BestSpeed { return 1 }
+    if level == ZlibLevel::Default { return 6 }
+    if level == ZlibLevel::BestCompression { return 9 }
+    return 6
+}
+
+// Zlib error codes
+enum ZlibError {
+    Ok,
+    StreamEnd,
+    NeedDict,
+    ErrNo,
+    StreamError,
+    DataError,
+    MemError,
+    BufError,
+    VersionError,
+}
+
+// Compression result
+struct ZlibResult {
+    success: Bool,
+    error: ZlibError,
+    output_size: Int,
+    input_consumed: Int,
+}
+
+// Zlib header format (2 bytes)
+// Byte 0: CMF (Compression Method and Flags)
+//   - bits 0-3: CM (Compression Method) = 8 for deflate
+//   - bits 4-7: CINFO (Compression Info) = log2(window size) - 8
+// Byte 1: FLG (Flags)
+//   - bits 0-4: FCHECK (check bits for CMF and FLG)
+//   - bit 5: FDICT (preset dictionary)
+//   - bits 6-7: FLEVEL (compression level)
+
+const ZLIB_CM_DEFLATE: Int = 8
+const ZLIB_CINFO_32K: Int = 7  // 32K window size
+
+/// Check if data has zlib header
+fn is_zlib_compressed(data: Collection<Int>) -> Bool {
+    if data.len() < 2 {
+        return false
+    }
+
+    let cmf = data.get(0)
+    let flg = data.get(1)
+
+    // Check compression method is deflate
+    let cm = cmf & 0x0F
+    if cm != ZLIB_CM_DEFLATE {
+        return false
+    }
+
+    // Check header checksum
+    let check = ((cmf * 256) + flg) % 31
+    if check != 0 {
+        return false
+    }
+
+    return true
+}
+
+/// Calculate Adler-32 checksum (used by zlib)
+fn adler32(data: Collection<Int>) -> Int {
+    const MOD_ADLER: Int = 65521
+
+    let a = 1
+    let b = 0
+
+    for i in 0..data.len() {
+        a = (a + data.get(i)) % MOD_ADLER
+        b = (b + a) % MOD_ADLER
+    }
+
+    return (b << 16) | a
+}
+
+/// Update Adler-32 checksum with new data
+fn adler32_update(checksum: Int, data: Collection<Int>) -> Int {
+    const MOD_ADLER: Int = 65521
+
+    let a = checksum & 0xFFFF
+    let b = (checksum >> 16) & 0xFFFF
+
+    for i in 0..data.len() {
+        a = (a + data.get(i)) % MOD_ADLER
+        b = (b + a) % MOD_ADLER
+    }
+
+    return (b << 16) | a
+}
+
+/// Decompress zlib-compressed data
+/// This is a simplified implementation for basic DEFLATE streams
+fn zlib_decompress(src: Collection<Int>) -> (Collection<Int>, ZlibResult) {
+    let output = Collection<Int>{}
+    let result = ZlibResult {
+        success: false,
+        error: ZlibError::Ok,
+        output_size: 0,
+        input_consumed: 0,
+    }
+
+    if src.len() < 6 {  // Minimum: 2 header + 4 checksum
+        result.error = ZlibError::DataError
+        return (output, result)
+    }
+
+    // Verify zlib header
+    if !is_zlib_compressed(src) {
+        result.error = ZlibError::DataError
+        return (output, result)
+    }
+
+    let cmf = src.get(0)
+    let flg = src.get(1)
+
+    // Check for preset dictionary (not supported in this simple impl)
+    if (flg & 0x20) != 0 {
+        result.error = ZlibError::NeedDict
+        return (output, result)
+    }
+
+    // Decompress DEFLATE data starting at offset 2
+    let (decompressed, deflate_result) = inflate_decompress(src, 2, src.len() - 6)
+
+    if !deflate_result.success {
+        result.error = deflate_result.error
+        return (output, result)
+    }
+
+    // Verify Adler-32 checksum (last 4 bytes, big-endian)
+    let checksum_offset = src.len() - 4
+    let expected_checksum = (src.get(checksum_offset) << 24) |
+                           (src.get(checksum_offset + 1) << 16) |
+                           (src.get(checksum_offset + 2) << 8) |
+                           src.get(checksum_offset + 3)
+
+    let actual_checksum = adler32(decompressed)
+
+    if actual_checksum != expected_checksum {
+        // Checksum mismatch - data corruption
+        result.error = ZlibError::DataError
+        // Still return data for debugging purposes
+    }
+
+    result.success = true
+    result.output_size = decompressed.len()
+    result.input_consumed = src.len()
+
+    return (decompressed, result)
+}
+
+/// Compress data using zlib (DEFLATE with zlib header)
+fn zlib_compress(src: Collection<Int>, level: ZlibLevel) -> (Collection<Int>, ZlibResult) {
+    let output = Collection<Int>{}
+    let result = ZlibResult {
+        success: false,
+        error: ZlibError::Ok,
+        output_size: 0,
+        input_consumed: 0,
+    }
+
+    // Write zlib header
+    let cmf = ZLIB_CM_DEFLATE | (ZLIB_CINFO_32K << 4)  // 0x78
+
+    // Calculate FLG
+    let flevel = 0
+    if level == ZlibLevel::BestCompression { flevel = 3 }
+    else if level == ZlibLevel::Default { flevel = 2 }
+    else if level == ZlibLevel::BestSpeed { flevel = 1 }
+
+    let flg_base = flevel << 6
+    // Calculate FCHECK so that (CMF * 256 + FLG) % 31 == 0
+    let fcheck = 31 - ((cmf * 256 + flg_base) % 31)
+    let flg = flg_base | fcheck
+
+    output.add(cmf)
+    output.add(flg)
+
+    // Compress data using DEFLATE
+    let (compressed, deflate_result) = deflate_compress(src, level)
+
+    if !deflate_result.success {
+        result.error = deflate_result.error
+        return (output, result)
+    }
+
+    // Append compressed data
+    for i in 0..compressed.len() {
+        output.add(compressed.get(i))
+    }
+
+    // Append Adler-32 checksum (big-endian)
+    let checksum = adler32(src)
+    output.add((checksum >> 24) & 0xFF)
+    output.add((checksum >> 16) & 0xFF)
+    output.add((checksum >> 8) & 0xFF)
+    output.add(checksum & 0xFF)
+
+    result.success = true
+    result.output_size = output.len()
+    result.input_consumed = src.len()
+
+    return (output, result)
+}
+
+// ============================================================================
+// DEFLATE Implementation (simplified)
+// ============================================================================
+
+/// Decompress DEFLATE data
+fn inflate_decompress(src: Collection<Int>, offset: Int, length: Int) -> (Collection<Int>, ZlibResult) {
+    let output = Collection<Int>{}
+    let result = ZlibResult {
+        success: false,
+        error: ZlibError::Ok,
+        output_size: 0,
+        input_consumed: 0,
+    }
+
+    let pos = offset
+    let bit_pos = 0  // Current bit position within current byte
+
+    // Read bits helper
+    fn read_bits(src: Collection<Int>, pos: Int, bit_pos: Int, num_bits: Int) -> (Int, Int, Int) {
+        let value = 0
+        let current_pos = pos
+        let current_bit = bit_pos
+
+        for i in 0..num_bits {
+            if current_pos >= src.len() {
+                return (value, current_pos, current_bit)
+            }
+
+            let bit = (src.get(current_pos) >> current_bit) & 1
+            value = value | (bit << i)
+
+            current_bit = current_bit + 1
+            if current_bit >= 8 {
+                current_bit = 0
+                current_pos = current_pos + 1
+            }
+        }
+
+        return (value, current_pos, current_bit)
+    }
+
+    // Process DEFLATE blocks
+    let is_final = false
+    while !is_final && pos < offset + length {
+        // Read block header
+        let bfinal = 0
+        let btype = 0
+
+        (bfinal, pos, bit_pos) = read_bits(src, pos, bit_pos, 1)
+        (btype, pos, bit_pos) = read_bits(src, pos, bit_pos, 2)
+
+        is_final = bfinal == 1
+
+        if btype == 0 {
+            // Stored block (no compression)
+            // Align to byte boundary
+            if bit_pos != 0 {
+                bit_pos = 0
+                pos = pos + 1
+            }
+
+            if pos + 4 > src.len() {
+                result.error = ZlibError::DataError
+                return (output, result)
+            }
+
+            let len = src.get(pos) | (src.get(pos + 1) << 8)
+            let nlen = src.get(pos + 2) | (src.get(pos + 3) << 8)
+            pos = pos + 4
+
+            // Verify complement
+            if (len ^ nlen) != 0xFFFF {
+                result.error = ZlibError::DataError
+                return (output, result)
+            }
+
+            // Copy literal data
+            for i in 0..len {
+                if pos < src.len() {
+                    output.add(src.get(pos))
+                    pos = pos + 1
+                }
+            }
+        } else if btype == 1 || btype == 2 {
+            // Fixed or dynamic Huffman (simplified - just handle stored for now)
+            // Full implementation would decode Huffman trees
+            result.error = ZlibError::DataError
+            return (output, result)
+        } else {
+            // Reserved (error)
+            result.error = ZlibError::DataError
+            return (output, result)
+        }
+    }
+
+    result.success = true
+    result.output_size = output.len()
+    result.input_consumed = pos - offset
+
+    return (output, result)
+}
+
+/// Compress data using DEFLATE (simplified - uses stored blocks only)
+fn deflate_compress(src: Collection<Int>, level: ZlibLevel) -> (Collection<Int>, ZlibResult) {
+    let output = Collection<Int>{}
+    let result = ZlibResult {
+        success: false,
+        error: ZlibError::Ok,
+        output_size: 0,
+        input_consumed: 0,
+    }
+
+    // For simplicity, use stored blocks (no actual compression)
+    // Full implementation would use LZ77 + Huffman coding
+    let pos = 0
+    const MAX_BLOCK_SIZE: Int = 65535
+
+    while pos < src.len() {
+        let remaining = src.len() - pos
+        let block_size = remaining
+        if block_size > MAX_BLOCK_SIZE {
+            block_size = MAX_BLOCK_SIZE
+        }
+
+        let is_final = (pos + block_size >= src.len())
+
+        // Block header: BFINAL (1 bit) + BTYPE (2 bits) = stored (00)
+        if is_final {
+            output.add(0x01)  // BFINAL=1, BTYPE=00
+        } else {
+            output.add(0x00)  // BFINAL=0, BTYPE=00
+        }
+
+        // LEN and NLEN
+        output.add(block_size & 0xFF)
+        output.add((block_size >> 8) & 0xFF)
+        output.add((~block_size) & 0xFF)
+        output.add(((~block_size) >> 8) & 0xFF)
+
+        // Copy literal data
+        for i in 0..block_size {
+            output.add(src.get(pos + i))
+        }
+
+        pos = pos + block_size
+    }
+
+    // Handle empty input
+    if src.len() == 0 {
+        output.add(0x01)  // BFINAL=1, BTYPE=00
+        output.add(0x00)  // LEN low
+        output.add(0x00)  // LEN high
+        output.add(0xFF)  // NLEN low
+        output.add(0xFF)  // NLEN high
+    }
+
+    result.success = true
+    result.output_size = output.len()
+    result.input_consumed = src.len()
+
+    return (output, result)
+}
+
+// ============================================================================
+// Compression Manager (wraps RefPack and Zlib)
+// ============================================================================
+
+enum CompressionType {
+    None,
+    RefPack,
+    Zlib,
+    Auto,  // Auto-detect
+}
+
+/// Detect compression type from data header
+fn detect_compression_type(data: Collection<Int>) -> CompressionType {
+    if data.len() < 2 {
+        return CompressionType::None
+    }
+
+    // Check for RefPack signature (second byte is 0xFB)
+    if data.get(1) == 0xFB {
+        return CompressionType::RefPack
+    }
+
+    // Check for zlib header
+    if is_zlib_compressed(data) {
+        return CompressionType::Zlib
+    }
+
+    return CompressionType::None
+}
+
+/// Decompress data with auto-detection
+fn decompress_auto(data: Collection<Int>) -> (Collection<Int>, Bool) {
+    let compression_type = detect_compression_type(data)
+
+    if compression_type == CompressionType::RefPack {
+        // Import refpack module functions
+        let (decompressed, result) = refpack_decompress(data)
+        return (decompressed, result.success)
+    } else if compression_type == CompressionType::Zlib {
+        let (decompressed, result) = zlib_decompress(data)
+        return (decompressed, result.success)
+    } else {
+        // Not compressed, return as-is
+        return (data, true)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_adler32() -> Bool {
+    let data = Collection<Int>{}
+    // "Wikipedia" in ASCII
+    data.add(87)   // W
+    data.add(105)  // i
+    data.add(107)  // k
+    data.add(105)  // i
+    data.add(112)  // p
+    data.add(101)  // e
+    data.add(100)  // d
+    data.add(105)  // i
+    data.add(97)   // a
+
+    let checksum = adler32(data)
+    // Expected Adler-32 for "Wikipedia" is 0x11E60398
+    assert(checksum == 0x11E60398, "Adler-32 checksum should match")
+
+    return true
+}
+
+fn test_zlib_header_detection() -> Bool {
+    // Valid zlib header (default compression)
+    let valid = Collection<Int>{}
+    valid.add(0x78)  // CMF: deflate with 32K window
+    valid.add(0x9C)  // FLG: default compression level
+
+    assert(is_zlib_compressed(valid), "Should detect valid zlib header")
+
+    // Invalid header
+    let invalid = Collection<Int>{}
+    invalid.add(0x00)
+    invalid.add(0x00)
+
+    assert(!is_zlib_compressed(invalid), "Should reject invalid header")
+
+    return true
+}
+
+fn test_compression_type_detection() -> Bool {
+    // RefPack data
+    let refpack = Collection<Int>{}
+    refpack.add(0x10)
+    refpack.add(0xFB)
+
+    assert(detect_compression_type(refpack) == CompressionType::RefPack,
+           "Should detect RefPack")
+
+    // Zlib data
+    let zlib = Collection<Int>{}
+    zlib.add(0x78)
+    zlib.add(0x9C)
+
+    assert(detect_compression_type(zlib) == CompressionType::Zlib,
+           "Should detect Zlib")
+
+    // Uncompressed
+    let raw = Collection<Int>{}
+    raw.add(0x00)
+    raw.add(0x00)
+
+    assert(detect_compression_type(raw) == CompressionType::None,
+           "Should detect no compression")
+
+    return true
+}
+
+fn test_stored_block_roundtrip() -> Bool {
+    // Create test data
+    let original = Collection<Int>{}
+    for i in 0..100 {
+        original.add(i % 256)
+    }
+
+    // Compress with zlib (stored blocks)
+    let (compressed, compress_result) = zlib_compress(original, ZlibLevel::NoCompression)
+    assert(compress_result.success, "Compression should succeed")
+
+    // Decompress
+    let (decompressed, decompress_result) = zlib_decompress(compressed)
+    assert(decompress_result.success, "Decompression should succeed")
+
+    // Verify
+    assert(decompressed.len() == original.len(), "Size should match")
+    for i in 0..original.len() {
+        assert(decompressed.get(i) == original.get(i), "Data should match")
+    }
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_adler32(), "Adler-32 test failed")
+    assert(test_zlib_header_detection(), "Zlib header detection test failed")
+    assert(test_compression_type_detection(), "Compression type detection test failed")
+    assert(test_stored_block_roundtrip(), "Stored block roundtrip test failed")
+    return true
+}

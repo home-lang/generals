@@ -1,0 +1,455 @@
+// Cursor Loader - ANI (Animated Cursor) and CUR (Static Cursor) format support
+// Used for game cursors in C&C Generals Zero Hour
+// Reference: Microsoft RIFF-based ANI format
+
+from basics import Collection, Map
+
+// ANI file magic: "RIFF"
+const RIFF_MAGIC: Int = 0x46464952  // "RIFF" little-endian
+const ACON_TYPE: Int = 0x4E4F4341   // "ACON" little-endian
+
+// Chunk types
+const CHUNK_ANIH: Int = 0x68696E61  // "anih" - animation header
+const CHUNK_RATE: Int = 0x65746172  // "rate" - frame rates
+const CHUNK_SEQ: Int = 0x20716573   // "seq " - sequence data
+const CHUNK_LIST: Int = 0x5453494C  // "LIST"
+const CHUNK_ICON: Int = 0x6E6F6369  // "icon"
+const CHUNK_FRAM: Int = 0x6D617266  // "fram"
+
+// Cursor types
+enum CursorType {
+    Static,     // .cur file
+    Animated,   // .ani file
+}
+
+// Animation header structure (36 bytes)
+struct ANIHeader {
+    size: Int,           // Header size (36)
+    num_frames: Int,     // Number of frames
+    num_steps: Int,      // Number of steps in sequence
+    width: Int,          // Width (0 = use icon width)
+    height: Int,         // Height (0 = use icon height)
+    bit_count: Int,      // Bits per pixel
+    num_planes: Int,     // Color planes
+    display_rate: Int,   // Default frame rate (jiffies, 1/60 sec)
+    flags: Int,          // Flags (bit 0 = has sequence, bit 1 = has icon)
+}
+
+// Single cursor frame
+struct CursorFrame {
+    width: Int,
+    height: Int,
+    hotspot_x: Int,
+    hotspot_y: Int,
+    pixels: Collection<Int>,  // RGBA pixel data
+}
+
+// Animated cursor
+struct AnimatedCursor {
+    cursor_type: CursorType,
+    header: ANIHeader,
+    frames: Collection<CursorFrame>,
+    frame_rates: Collection<Int>,   // Per-frame display rates
+    sequence: Collection<Int>,       // Frame display sequence
+    current_frame: Int,
+    elapsed_time: Float,
+    name: String,
+}
+
+/// Create empty cursor
+fn create_cursor() -> AnimatedCursor {
+    return AnimatedCursor {
+        cursor_type: CursorType::Static,
+        header: ANIHeader {
+            size: 36,
+            num_frames: 1,
+            num_steps: 1,
+            width: 32,
+            height: 32,
+            bit_count: 32,
+            num_planes: 1,
+            display_rate: 10,
+            flags: 0,
+        },
+        frames: Collection<CursorFrame>{},
+        frame_rates: Collection<Int>{},
+        sequence: Collection<Int>{},
+        current_frame: 0,
+        elapsed_time: 0.0,
+        name: "",
+    }
+}
+
+/// Read 32-bit little-endian integer
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Read 16-bit little-endian integer
+fn read_u16_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 > data.len() {
+        return 0
+    }
+    return data.get(offset) | (data.get(offset + 1) << 8)
+}
+
+/// Parse ANI header
+fn parse_ani_header(data: Collection<Int>, offset: Int) -> ANIHeader {
+    return ANIHeader {
+        size: read_u32_le(data, offset),
+        num_frames: read_u32_le(data, offset + 4),
+        num_steps: read_u32_le(data, offset + 8),
+        width: read_u32_le(data, offset + 12),
+        height: read_u32_le(data, offset + 16),
+        bit_count: read_u32_le(data, offset + 20),
+        num_planes: read_u32_le(data, offset + 24),
+        display_rate: read_u32_le(data, offset + 28),
+        flags: read_u32_le(data, offset + 32),
+    }
+}
+
+/// Parse ICO/CUR header for a single frame
+fn parse_ico_frame(data: Collection<Int>, offset: Int) -> CursorFrame {
+    // ICO/CUR directory entry (16 bytes)
+    let width = data.get(offset)
+    if width == 0 { width = 256 }
+    let height = data.get(offset + 1)
+    if height == 0 { height = 256 }
+
+    let hotspot_x = read_u16_le(data, offset + 4)
+    let hotspot_y = read_u16_le(data, offset + 6)
+
+    let frame = CursorFrame {
+        width: width,
+        height: height,
+        hotspot_x: hotspot_x,
+        hotspot_y: hotspot_y,
+        pixels: Collection<Int>{},
+    }
+
+    // Allocate RGBA pixels
+    for i in 0..(width * height * 4) {
+        frame.pixels.add(0)
+    }
+
+    return frame
+}
+
+/// Load ANI (animated cursor) file
+fn load_ani_cursor(data: Collection<Int>) -> (AnimatedCursor, Bool) {
+    let cursor = create_cursor()
+    cursor.cursor_type = CursorType::Animated
+
+    if data.len() < 12 {
+        return (cursor, false)
+    }
+
+    // Check RIFF header
+    let magic = read_u32_le(data, 0)
+    if magic != RIFF_MAGIC {
+        return (cursor, false)
+    }
+
+    let file_size = read_u32_le(data, 4)
+    let format = read_u32_le(data, 8)
+
+    if format != ACON_TYPE {
+        return (cursor, false)
+    }
+
+    // Parse chunks
+    let offset = 12
+    while offset < data.len() - 8 {
+        let chunk_id = read_u32_le(data, offset)
+        let chunk_size = read_u32_le(data, offset + 4)
+
+        if chunk_id == CHUNK_ANIH {
+            // Animation header
+            cursor.header = parse_ani_header(data, offset + 8)
+        } else if chunk_id == CHUNK_RATE {
+            // Frame rates
+            let num_rates = chunk_size / 4
+            for i in 0..num_rates {
+                let rate = read_u32_le(data, offset + 8 + i * 4)
+                cursor.frame_rates.add(rate)
+            }
+        } else if chunk_id == CHUNK_SEQ {
+            // Sequence data
+            let num_seq = chunk_size / 4
+            for i in 0..num_seq {
+                let seq = read_u32_le(data, offset + 8 + i * 4)
+                cursor.sequence.add(seq)
+            }
+        } else if chunk_id == CHUNK_LIST {
+            // LIST chunk contains frames
+            let list_type = read_u32_le(data, offset + 8)
+            if list_type == CHUNK_FRAM {
+                // Parse icon frames
+                let list_offset = offset + 12
+                let list_end = offset + 8 + chunk_size
+
+                while list_offset < list_end - 8 {
+                    let icon_id = read_u32_le(data, list_offset)
+                    let icon_size = read_u32_le(data, list_offset + 4)
+
+                    if icon_id == CHUNK_ICON {
+                        let frame = parse_ico_frame(data, list_offset + 8)
+                        cursor.frames.add(frame)
+                    }
+
+                    list_offset = list_offset + 8 + icon_size
+                    // Align to word boundary
+                    if (icon_size % 2) != 0 {
+                        list_offset = list_offset + 1
+                    }
+                }
+            }
+        }
+
+        offset = offset + 8 + chunk_size
+        // Align to word boundary
+        if (chunk_size % 2) != 0 {
+            offset = offset + 1
+        }
+    }
+
+    // Initialize sequence if not provided
+    if cursor.sequence.len() == 0 {
+        for i in 0..cursor.header.num_frames {
+            cursor.sequence.add(i)
+        }
+    }
+
+    // Initialize frame rates if not provided
+    if cursor.frame_rates.len() == 0 {
+        for i in 0..cursor.header.num_steps {
+            cursor.frame_rates.add(cursor.header.display_rate)
+        }
+    }
+
+    return (cursor, true)
+}
+
+/// Load CUR (static cursor) file
+fn load_cur_cursor(data: Collection<Int>) -> (AnimatedCursor, Bool) {
+    let cursor = create_cursor()
+    cursor.cursor_type = CursorType::Static
+
+    if data.len() < 6 {
+        return (cursor, false)
+    }
+
+    // CUR header
+    let reserved = read_u16_le(data, 0)
+    let image_type = read_u16_le(data, 2)  // 2 = cursor
+    let num_images = read_u16_le(data, 4)
+
+    if image_type != 2 {
+        return (cursor, false)
+    }
+
+    cursor.header.num_frames = num_images
+    cursor.header.num_steps = num_images
+
+    // Parse directory entries
+    let offset = 6
+    for i in 0..num_images {
+        let frame = parse_ico_frame(data, offset)
+        cursor.frames.add(frame)
+        cursor.sequence.add(i)
+        cursor.frame_rates.add(cursor.header.display_rate)
+        offset = offset + 16
+    }
+
+    return (cursor, true)
+}
+
+/// Update cursor animation
+fn update_cursor(cursor: AnimatedCursor, delta_time: Float) {
+    if cursor.cursor_type == CursorType::Static {
+        return
+    }
+
+    if cursor.frame_rates.len() == 0 || cursor.sequence.len() == 0 {
+        return
+    }
+
+    cursor.elapsed_time = cursor.elapsed_time + delta_time
+
+    // Get current frame rate (in jiffies, 1/60 second)
+    let frame_duration = (cursor.frame_rates.get(cursor.current_frame) as Float) / 60.0
+
+    if cursor.elapsed_time >= frame_duration {
+        cursor.elapsed_time = cursor.elapsed_time - frame_duration
+        cursor.current_frame = (cursor.current_frame + 1) % cursor.sequence.len()
+    }
+}
+
+/// Get current frame to display
+fn get_current_frame(cursor: AnimatedCursor) -> CursorFrame {
+    if cursor.frames.len() == 0 {
+        return CursorFrame {
+            width: 32,
+            height: 32,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            pixels: Collection<Int>{},
+        }
+    }
+
+    let frame_index = 0
+    if cursor.sequence.len() > 0 {
+        frame_index = cursor.sequence.get(cursor.current_frame)
+    }
+
+    if frame_index < cursor.frames.len() {
+        return cursor.frames.get(frame_index)
+    }
+
+    return cursor.frames.get(0)
+}
+
+// ============================================================================
+// Cursor Manager
+// ============================================================================
+
+// Standard game cursors
+enum GameCursor {
+    Default,
+    Select,
+    Move,
+    Attack,
+    AttackMove,
+    Guard,
+    Patrol,
+    ForceAttack,
+    ForceFire,
+    Garrison,
+    GetOut,
+    Repair,
+    Capture,
+    Sell,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+    Invalid,
+}
+
+struct CursorManager {
+    cursors: Map<String, AnimatedCursor>,
+    current_cursor: GameCursor,
+    cursor_scale: Float,
+
+    fn init() -> CursorManager {
+        return CursorManager {
+            cursors: Map<String, AnimatedCursor>{},
+            current_cursor: GameCursor::Default,
+            cursor_scale: 1.0,
+        }
+    }
+
+    fn load_cursor(self, name: String, data: Collection<Int>) -> Bool {
+        // Detect format from data
+        if data.len() < 4 {
+            return false
+        }
+
+        let magic = read_u32_le(data, 0)
+
+        let (cursor, success) = if magic == RIFF_MAGIC {
+            load_ani_cursor(data)
+        } else {
+            load_cur_cursor(data)
+        }
+
+        if success {
+            cursor.name = name
+            self.cursors.set(name, cursor)
+        }
+
+        return success
+    }
+
+    fn set_cursor(self, cursor_type: GameCursor) {
+        self.current_cursor = cursor_type
+    }
+
+    fn update(self, delta_time: Float) {
+        // Update all animated cursors
+        for cursor in self.cursors.values() {
+            update_cursor(cursor, delta_time)
+        }
+    }
+
+    fn get_current_cursor_frame(self) -> CursorFrame {
+        let cursor_name = get_cursor_name(self.current_cursor)
+        if self.cursors.has(cursor_name) {
+            let cursor = self.cursors.get(cursor_name)
+            return get_current_frame(cursor)
+        }
+
+        // Return default empty frame
+        return CursorFrame {
+            width: 32,
+            height: 32,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            pixels: Collection<Int>{},
+        }
+    }
+}
+
+fn get_cursor_name(cursor_type: GameCursor) -> String {
+    match cursor_type {
+        GameCursor::Default => "SCCAttack7",
+        GameCursor::Select => "SCCSelect",
+        GameCursor::Move => "SCCMove",
+        GameCursor::Attack => "SCCAttack7",
+        GameCursor::AttackMove => "SCCAttackMove",
+        GameCursor::Guard => "SCCGuard",
+        GameCursor::Patrol => "SCCPatrol",
+        GameCursor::ForceAttack => "SCCForceAttack",
+        GameCursor::ForceFire => "SCCForceFire",
+        GameCursor::Garrison => "SCCGarrison",
+        GameCursor::GetOut => "SCCGetOut",
+        GameCursor::Repair => "SCCRepair",
+        GameCursor::Capture => "SCCCapture",
+        GameCursor::Sell => "SCCSell",
+        GameCursor::ScrollUp => "SCCScrollUp",
+        GameCursor::ScrollDown => "SCCScrollDown",
+        GameCursor::ScrollLeft => "SCCScrollLeft",
+        GameCursor::ScrollRight => "SCCScrollRight",
+        GameCursor::Invalid => "SCCInvalid",
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_cursor_creation() -> Bool {
+    let cursor = create_cursor()
+    assert(cursor.cursor_type == CursorType::Static, "Default should be static")
+    assert(cursor.header.num_frames == 1, "Default should have 1 frame")
+    return true
+}
+
+fn test_cursor_manager() -> Bool {
+    let manager = CursorManager::init()
+    manager.set_cursor(GameCursor::Attack)
+    assert(manager.current_cursor == GameCursor::Attack, "Should set attack cursor")
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_cursor_creation(), "Cursor creation test failed")
+    assert(test_cursor_manager(), "Cursor manager test failed")
+    return true
+}

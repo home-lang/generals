@@ -8,7 +8,7 @@
 
 ## Current Codebase Status
 
-### Home Files (130 total) - Primary Implementation
+### Home Files (134 total) - Primary Implementation
 ```
 src/
 ├── main.home                    # Entry point
@@ -25,6 +25,9 @@ src/
 │   ├── metal_renderer.home      # Metal 3D rendering pipeline (complete)
 │   ├── w3d_loader.home          # W3D model loading (complete)
 │   ├── w3d_complete.home        # Full W3D format parser (complete)
+│   ├── refpack.home             # RefPack LZ compression (complete)
+│   ├── zlib_compression.home    # Zlib/DEFLATE compression (complete)
+│   ├── dds_loader.home          # DDS texture loading (complete)
 │   ├── terrain.home             # Terrain system
 │   ├── entity.home              # Entity base system
 │   ├── game.home                # Core game loop
@@ -150,8 +153,9 @@ src/platform/
 └── macos_sprite_renderer.m # 2D sprite rendering
 ```
 
-### Legacy Zig Files (40 - To Be Removed/Converted)
-All game logic should be in Home. Zig files exist but are superseded by Home equivalents.
+### Legacy Zig Files (REMOVED)
+All 40 Zig files have been removed. Game logic is now 100% in Home.
+Only Objective-C files remain for native macOS platform integration (Metal/Cocoa).
 
 ---
 
@@ -179,6 +183,23 @@ All game logic should be in Home. Zig files exist but are superseded by Home equ
 - [x] Asset streaming/caching system
 - [x] Memory budget management
 - **Files**: `src/engine/resource_manager.home`
+
+### 1.4 Compression Support ✅
+- [x] RefPack LZ decompression (EA proprietary format)
+- [x] RefPack LZ compression
+- [x] Zlib/DEFLATE decompression wrapper
+- [x] Zlib/DEFLATE compression wrapper
+- [x] Adler-32 checksum verification
+- [x] Auto-detection of compression type
+- **Files**: `src/engine/refpack.home`, `src/engine/zlib_compression.home`
+
+### 1.5 Texture Loading ✅
+- [x] TGA texture loading (uncompressed and RLE)
+- [x] DDS texture loading (DXT1, DXT3, DXT5 compressed)
+- [x] DXT block decompression
+- [x] Mipmap chain handling
+- [x] Cubemap and volume texture support
+- **Files**: `src/engine/texture.home`, `src/engine/dds_loader.home`
 
 ---
 

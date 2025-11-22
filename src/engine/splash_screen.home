@@ -1,0 +1,585 @@
+// Splash Screen Loader - BMP image format support
+// Used for loading screens, splash images, and static backgrounds
+// Reference: Microsoft BMP file format specification
+
+from basics import Collection, Map
+
+// BMP file signatures
+const BMP_SIGNATURE: Int = 0x4D42  // "BM" little-endian
+
+// Compression types
+const BI_RGB: Int = 0           // No compression
+const BI_RLE8: Int = 1          // RLE 8-bit
+const BI_RLE4: Int = 2          // RLE 4-bit
+const BI_BITFIELDS: Int = 3     // Bitfield masks
+
+// BMP file header (14 bytes)
+struct BMPFileHeader {
+    signature: Int,       // "BM"
+    file_size: Int,       // Total file size
+    reserved1: Int,       // Reserved
+    reserved2: Int,       // Reserved
+    data_offset: Int,     // Offset to pixel data
+}
+
+// BMP info header (40 bytes for BITMAPINFOHEADER)
+struct BMPInfoHeader {
+    header_size: Int,     // Size of this header (40)
+    width: Int,           // Image width
+    height: Int,          // Image height (negative = top-down)
+    planes: Int,          // Color planes (1)
+    bit_count: Int,       // Bits per pixel (1, 4, 8, 16, 24, 32)
+    compression: Int,     // Compression method
+    image_size: Int,      // Size of raw bitmap data
+    x_pixels_per_m: Int,  // Horizontal resolution
+    y_pixels_per_m: Int,  // Vertical resolution
+    colors_used: Int,     // Number of colors in palette
+    colors_important: Int,// Important colors
+}
+
+// Color palette entry (4 bytes)
+struct BMPColor {
+    blue: Int,
+    green: Int,
+    red: Int,
+    alpha: Int,
+}
+
+// Loaded splash screen
+struct SplashScreen {
+    width: Int,
+    height: Int,
+    bit_depth: Int,
+    pixels: Collection<Int>,  // RGBA pixel data
+    name: String,
+    is_top_down: Bool,
+}
+
+/// Create empty splash screen
+fn create_splash_screen() -> SplashScreen {
+    return SplashScreen {
+        width: 0,
+        height: 0,
+        bit_depth: 32,
+        pixels: Collection<Int>{},
+        name: "",
+        is_top_down: false,
+    }
+}
+
+/// Read 16-bit little-endian integer
+fn read_u16_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 > data.len() {
+        return 0
+    }
+    return data.get(offset) | (data.get(offset + 1) << 8)
+}
+
+/// Read 32-bit little-endian integer
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Read signed 32-bit integer
+fn read_i32_le(data: Collection<Int>, offset: Int) -> Int {
+    let value = read_u32_le(data, offset)
+    // Handle sign extension
+    if (value & 0x80000000) != 0 {
+        return value - 0x100000000
+    }
+    return value
+}
+
+/// Parse BMP file header
+fn parse_bmp_file_header(data: Collection<Int>) -> (BMPFileHeader, Bool) {
+    let header = BMPFileHeader {
+        signature: 0,
+        file_size: 0,
+        reserved1: 0,
+        reserved2: 0,
+        data_offset: 0,
+    }
+
+    if data.len() < 14 {
+        return (header, false)
+    }
+
+    header.signature = read_u16_le(data, 0)
+    if header.signature != BMP_SIGNATURE {
+        return (header, false)
+    }
+
+    header.file_size = read_u32_le(data, 2)
+    header.reserved1 = read_u16_le(data, 6)
+    header.reserved2 = read_u16_le(data, 8)
+    header.data_offset = read_u32_le(data, 10)
+
+    return (header, true)
+}
+
+/// Parse BMP info header
+fn parse_bmp_info_header(data: Collection<Int>) -> (BMPInfoHeader, Bool) {
+    let header = BMPInfoHeader {
+        header_size: 0,
+        width: 0,
+        height: 0,
+        planes: 0,
+        bit_count: 0,
+        compression: 0,
+        image_size: 0,
+        x_pixels_per_m: 0,
+        y_pixels_per_m: 0,
+        colors_used: 0,
+        colors_important: 0,
+    }
+
+    if data.len() < 54 {
+        return (header, false)
+    }
+
+    header.header_size = read_u32_le(data, 14)
+    header.width = read_i32_le(data, 18)
+    header.height = read_i32_le(data, 22)
+    header.planes = read_u16_le(data, 26)
+    header.bit_count = read_u16_le(data, 28)
+    header.compression = read_u32_le(data, 30)
+    header.image_size = read_u32_le(data, 34)
+    header.x_pixels_per_m = read_i32_le(data, 38)
+    header.y_pixels_per_m = read_i32_le(data, 42)
+    header.colors_used = read_u32_le(data, 46)
+    header.colors_important = read_u32_le(data, 50)
+
+    return (header, true)
+}
+
+/// Parse color palette
+fn parse_palette(data: Collection<Int>, offset: Int, num_colors: Int) -> Collection<BMPColor> {
+    let palette = Collection<BMPColor>{}
+
+    for i in 0..num_colors {
+        let entry_offset = offset + i * 4
+        if entry_offset + 4 > data.len() {
+            break
+        }
+
+        let color = BMPColor {
+            blue: data.get(entry_offset),
+            green: data.get(entry_offset + 1),
+            red: data.get(entry_offset + 2),
+            alpha: 255,  // BMP palette entries don't have alpha
+        }
+        palette.add(color)
+    }
+
+    return palette
+}
+
+/// Calculate row stride (BMP rows are padded to 4-byte boundaries)
+fn calculate_stride(width: Int, bit_count: Int) -> Int {
+    let bits_per_row = width * bit_count
+    let bytes_per_row = (bits_per_row + 7) / 8
+    // Round up to next 4-byte boundary
+    return (bytes_per_row + 3) & ~3
+}
+
+/// Load 24-bit BMP pixel data
+fn load_24bit_pixels(data: Collection<Int>, info: BMPInfoHeader, data_offset: Int, is_top_down: Bool) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = info.width
+    let height = if info.height < 0 { -info.height } else { info.height }
+    let stride = calculate_stride(width, 24)
+
+    // Allocate RGBA pixels
+    let total_pixels = width * height * 4
+    for i in 0..total_pixels {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        // BMP stores bottom-up by default, top-down if height is negative
+        let src_y = if is_top_down { y } else { height - 1 - y }
+        let row_offset = data_offset + src_y * stride
+
+        for x in 0..width {
+            let src_offset = row_offset + x * 3
+            let dst_offset = (y * width + x) * 4
+
+            if src_offset + 3 <= data.len() {
+                pixels.set(dst_offset, data.get(src_offset + 2))      // R (BMP is BGR)
+                pixels.set(dst_offset + 1, data.get(src_offset + 1))  // G
+                pixels.set(dst_offset + 2, data.get(src_offset))      // B
+                pixels.set(dst_offset + 3, 255)                        // A
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Load 32-bit BMP pixel data
+fn load_32bit_pixels(data: Collection<Int>, info: BMPInfoHeader, data_offset: Int, is_top_down: Bool) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = info.width
+    let height = if info.height < 0 { -info.height } else { info.height }
+    let stride = calculate_stride(width, 32)
+
+    // Allocate RGBA pixels
+    let total_pixels = width * height * 4
+    for i in 0..total_pixels {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        let src_y = if is_top_down { y } else { height - 1 - y }
+        let row_offset = data_offset + src_y * stride
+
+        for x in 0..width {
+            let src_offset = row_offset + x * 4
+            let dst_offset = (y * width + x) * 4
+
+            if src_offset + 4 <= data.len() {
+                pixels.set(dst_offset, data.get(src_offset + 2))      // R (BMP is BGRA)
+                pixels.set(dst_offset + 1, data.get(src_offset + 1))  // G
+                pixels.set(dst_offset + 2, data.get(src_offset))      // B
+                pixels.set(dst_offset + 3, data.get(src_offset + 3))  // A
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Load 8-bit indexed BMP pixel data
+fn load_8bit_pixels(data: Collection<Int>, info: BMPInfoHeader, data_offset: Int, palette: Collection<BMPColor>, is_top_down: Bool) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = info.width
+    let height = if info.height < 0 { -info.height } else { info.height }
+    let stride = calculate_stride(width, 8)
+
+    // Allocate RGBA pixels
+    let total_pixels = width * height * 4
+    for i in 0..total_pixels {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        let src_y = if is_top_down { y } else { height - 1 - y }
+        let row_offset = data_offset + src_y * stride
+
+        for x in 0..width {
+            let src_offset = row_offset + x
+            let dst_offset = (y * width + x) * 4
+
+            if src_offset < data.len() {
+                let index = data.get(src_offset)
+                if index < palette.len() {
+                    let color = palette.get(index)
+                    pixels.set(dst_offset, color.red)
+                    pixels.set(dst_offset + 1, color.green)
+                    pixels.set(dst_offset + 2, color.blue)
+                    pixels.set(dst_offset + 3, 255)
+                }
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Check if data is a valid BMP file
+fn is_bmp_file(data: Collection<Int>) -> Bool {
+    if data.len() < 2 {
+        return false
+    }
+    return read_u16_le(data, 0) == BMP_SIGNATURE
+}
+
+/// Load BMP splash screen
+fn load_splash_screen(data: Collection<Int>) -> (SplashScreen, Bool) {
+    let splash = create_splash_screen()
+
+    // Parse file header
+    let (file_header, file_ok) = parse_bmp_file_header(data)
+    if !file_ok {
+        return (splash, false)
+    }
+
+    // Parse info header
+    let (info_header, info_ok) = parse_bmp_info_header(data)
+    if !info_ok {
+        return (splash, false)
+    }
+
+    // Only support uncompressed BMPs for now
+    if info_header.compression != BI_RGB && info_header.compression != BI_BITFIELDS {
+        return (splash, false)
+    }
+
+    // Determine if top-down
+    let is_top_down = info_header.height < 0
+    let actual_height = if is_top_down { -info_header.height } else { info_header.height }
+
+    splash.width = info_header.width
+    splash.height = actual_height
+    splash.bit_depth = info_header.bit_count
+    splash.is_top_down = is_top_down
+
+    // Calculate palette offset (right after info header)
+    let palette_offset = 14 + info_header.header_size
+
+    // Load pixels based on bit depth
+    if info_header.bit_count == 24 {
+        splash.pixels = load_24bit_pixels(data, info_header, file_header.data_offset, is_top_down)
+    } else if info_header.bit_count == 32 {
+        splash.pixels = load_32bit_pixels(data, info_header, file_header.data_offset, is_top_down)
+    } else if info_header.bit_count == 8 {
+        let num_colors = if info_header.colors_used > 0 { info_header.colors_used } else { 256 }
+        let palette = parse_palette(data, palette_offset, num_colors)
+        splash.pixels = load_8bit_pixels(data, info_header, file_header.data_offset, palette, is_top_down)
+    } else {
+        // Unsupported bit depth
+        return (splash, false)
+    }
+
+    return (splash, true)
+}
+
+/// Create solid color splash screen (fallback)
+fn create_solid_splash(width: Int, height: Int, r: Int, g: Int, b: Int) -> SplashScreen {
+    let splash = SplashScreen {
+        width: width,
+        height: height,
+        bit_depth: 32,
+        pixels: Collection<Int>{},
+        name: "solid",
+        is_top_down: false,
+    }
+
+    let total_pixels = width * height
+    for i in 0..total_pixels {
+        splash.pixels.add(r)      // R
+        splash.pixels.add(g)      // G
+        splash.pixels.add(b)      // B
+        splash.pixels.add(255)    // A
+    }
+
+    return splash
+}
+
+/// Get pixel at coordinate
+fn get_pixel(splash: SplashScreen, x: Int, y: Int) -> (Int, Int, Int, Int) {
+    if x < 0 || x >= splash.width || y < 0 || y >= splash.height {
+        return (0, 0, 0, 0)
+    }
+
+    let offset = (y * splash.width + x) * 4
+    if offset + 4 > splash.pixels.len() {
+        return (0, 0, 0, 0)
+    }
+
+    return (
+        splash.pixels.get(offset),
+        splash.pixels.get(offset + 1),
+        splash.pixels.get(offset + 2),
+        splash.pixels.get(offset + 3)
+    )
+}
+
+// ============================================================================
+// Splash Screen Manager
+// ============================================================================
+
+// Standard splash screens used in the game
+const LOADING_SCREENS: [String; 8] = [
+    "LoadingScreen.bmp",
+    "LoadingScreen_USA.bmp",
+    "LoadingScreen_CHINA.bmp",
+    "LoadingScreen_GLA.bmp",
+    "LoadingScreen_Tutorial.bmp",
+    "LoadingScreen_Skirmish.bmp",
+    "LoadingScreen_Multiplayer.bmp",
+    "LoadingScreen_Campaign.bmp",
+]
+
+enum SplashType {
+    Loading,
+    MainMenu,
+    Campaign,
+    Skirmish,
+    Multiplayer,
+    Tutorial,
+    Custom,
+}
+
+struct SplashManager {
+    screens: Map<String, SplashScreen>,
+    current_splash: String,
+    fade_alpha: Float,
+    fade_speed: Float,
+    is_fading_in: Bool,
+    is_fading_out: Bool,
+
+    fn init() -> SplashManager {
+        return SplashManager {
+            screens: Map<String, SplashScreen>{},
+            current_splash: "",
+            fade_alpha: 1.0,
+            fade_speed: 2.0,
+            is_fading_in: false,
+            is_fading_out: false,
+        }
+    }
+
+    fn load_splash(self, name: String, data: Collection<Int>) -> Bool {
+        let (splash, success) = load_splash_screen(data)
+        if success {
+            splash.name = name
+            self.screens.set(name, splash)
+        }
+        return success
+    }
+
+    fn show_splash(self, name: String, fade_in: Bool) {
+        self.current_splash = name
+        if fade_in {
+            self.fade_alpha = 0.0
+            self.is_fading_in = true
+            self.is_fading_out = false
+        } else {
+            self.fade_alpha = 1.0
+            self.is_fading_in = false
+        }
+    }
+
+    fn hide_splash(self, fade_out: Bool) {
+        if fade_out {
+            self.is_fading_out = true
+            self.is_fading_in = false
+        } else {
+            self.current_splash = ""
+            self.fade_alpha = 0.0
+        }
+    }
+
+    fn update(self, delta_time: Float) {
+        if self.is_fading_in {
+            self.fade_alpha = self.fade_alpha + self.fade_speed * delta_time
+            if self.fade_alpha >= 1.0 {
+                self.fade_alpha = 1.0
+                self.is_fading_in = false
+            }
+        }
+
+        if self.is_fading_out {
+            self.fade_alpha = self.fade_alpha - self.fade_speed * delta_time
+            if self.fade_alpha <= 0.0 {
+                self.fade_alpha = 0.0
+                self.is_fading_out = false
+                self.current_splash = ""
+            }
+        }
+    }
+
+    fn get_current_splash(self) -> SplashScreen {
+        if self.current_splash != "" && self.screens.has(self.current_splash) {
+            return self.screens.get(self.current_splash)
+        }
+        return create_splash_screen()
+    }
+
+    fn get_fade_alpha(self) -> Float {
+        return self.fade_alpha
+    }
+
+    fn is_visible(self) -> Bool {
+        return self.current_splash != "" && self.fade_alpha > 0.0
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_splash_creation() -> Bool {
+    let splash = create_splash_screen()
+    assert(splash.width == 0, "Default width should be 0")
+    assert(splash.height == 0, "Default height should be 0")
+    return true
+}
+
+fn test_solid_splash() -> Bool {
+    let splash = create_solid_splash(100, 100, 255, 0, 0)
+    assert(splash.width == 100, "Width should be 100")
+    assert(splash.height == 100, "Height should be 100")
+    assert(splash.pixels.len() == 40000, "Should have 40000 color values (100x100x4)")
+
+    let (r, g, b, a) = get_pixel(splash, 0, 0)
+    assert(r == 255, "Red should be 255")
+    assert(g == 0, "Green should be 0")
+    assert(b == 0, "Blue should be 0")
+
+    return true
+}
+
+fn test_bmp_detection() -> Bool {
+    // Valid BMP signature
+    let data = Collection<Int>{}
+    data.add(0x42)  // 'B'
+    data.add(0x4D)  // 'M'
+
+    assert(is_bmp_file(data) == true, "Should detect BM signature")
+
+    // Invalid signature
+    let invalid = Collection<Int>{}
+    invalid.add(0x00)
+    invalid.add(0x00)
+
+    assert(is_bmp_file(invalid) == false, "Should reject invalid signature")
+
+    return true
+}
+
+fn test_splash_manager() -> Bool {
+    let manager = SplashManager::init()
+
+    // Create and load a solid splash
+    let splash = create_solid_splash(640, 480, 0, 0, 128)
+    manager.screens.set("test", splash)
+
+    manager.show_splash("test", false)
+    assert(manager.is_visible() == true, "Should be visible after show")
+
+    manager.hide_splash(false)
+    assert(manager.is_visible() == false, "Should not be visible after hide")
+
+    return true
+}
+
+fn test_stride_calculation() -> Bool {
+    // 24-bit: 100 pixels = 300 bytes, padded to 300 bytes (already aligned)
+    // Wait, 300 % 4 = 0, so stride = 300
+    assert(calculate_stride(100, 24) == 300, "100 pixels @ 24-bit should be 300 bytes")
+
+    // 24-bit: 101 pixels = 303 bytes, padded to 304
+    assert(calculate_stride(101, 24) == 304, "101 pixels @ 24-bit should be 304 bytes")
+
+    // 32-bit: always aligned
+    assert(calculate_stride(100, 32) == 400, "100 pixels @ 32-bit should be 400 bytes")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_splash_creation(), "Splash creation test failed")
+    assert(test_solid_splash(), "Solid splash test failed")
+    assert(test_bmp_detection(), "BMP detection test failed")
+    assert(test_splash_manager(), "Splash manager test failed")
+    assert(test_stride_calculation(), "Stride calculation test failed")
+    return true
+}

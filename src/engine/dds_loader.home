@@ -1,0 +1,685 @@
+// DDS Texture Loader - DirectDraw Surface format
+// Used for compressed textures (DXT1, DXT3, DXT5) in C&C Generals
+// Reference: Thyme/src/w3d/renderer/ddsfile.h
+
+from basics import Collection
+
+// DDS magic number: "DDS " (0x20534444)
+const DDS_MAGIC: Int = 0x20534444
+
+// DDS pixel format flags
+const DDPF_ALPHAPIXELS: Int = 0x1
+const DDPF_ALPHA: Int = 0x2
+const DDPF_FOURCC: Int = 0x4
+const DDPF_RGB: Int = 0x40
+const DDPF_YUV: Int = 0x200
+const DDPF_LUMINANCE: Int = 0x20000
+
+// DDS header flags
+const DDSD_CAPS: Int = 0x1
+const DDSD_HEIGHT: Int = 0x2
+const DDSD_WIDTH: Int = 0x4
+const DDSD_PITCH: Int = 0x8
+const DDSD_PIXELFORMAT: Int = 0x1000
+const DDSD_MIPMAPCOUNT: Int = 0x20000
+const DDSD_LINEARSIZE: Int = 0x80000
+const DDSD_DEPTH: Int = 0x800000
+
+// DDS caps flags
+const DDSCAPS_COMPLEX: Int = 0x8
+const DDSCAPS_TEXTURE: Int = 0x1000
+const DDSCAPS_MIPMAP: Int = 0x400000
+
+// DDS caps2 flags (cubemaps, volume textures)
+const DDSCAPS2_CUBEMAP: Int = 0x200
+const DDSCAPS2_CUBEMAP_POSITIVEX: Int = 0x400
+const DDSCAPS2_CUBEMAP_NEGATIVEX: Int = 0x800
+const DDSCAPS2_CUBEMAP_POSITIVEY: Int = 0x1000
+const DDSCAPS2_CUBEMAP_NEGATIVEY: Int = 0x2000
+const DDSCAPS2_CUBEMAP_POSITIVEZ: Int = 0x4000
+const DDSCAPS2_CUBEMAP_NEGATIVEZ: Int = 0x8000
+const DDSCAPS2_VOLUME: Int = 0x200000
+
+// FourCC codes for compressed formats
+const FOURCC_DXT1: Int = 0x31545844  // "DXT1"
+const FOURCC_DXT2: Int = 0x32545844  // "DXT2"
+const FOURCC_DXT3: Int = 0x33545844  // "DXT3"
+const FOURCC_DXT4: Int = 0x34545844  // "DXT4"
+const FOURCC_DXT5: Int = 0x35545844  // "DXT5"
+
+// DDS pixel format (32 bytes)
+struct DDSPixelFormat {
+    size: Int,           // Should be 32
+    flags: Int,
+    four_cc: Int,        // FourCC code for compressed formats
+    rgb_bit_count: Int,
+    r_bit_mask: Int,
+    g_bit_mask: Int,
+    b_bit_mask: Int,
+    a_bit_mask: Int,
+}
+
+// DDS header (124 bytes)
+struct DDSHeader {
+    size: Int,           // Should be 124
+    flags: Int,
+    height: Int,
+    width: Int,
+    pitch_or_linear_size: Int,
+    depth: Int,
+    mipmap_count: Int,
+    reserved1: Collection<Int>,  // 11 ints
+    pixel_format: DDSPixelFormat,
+    caps: Int,
+    caps2: Int,
+    caps3: Int,
+    caps4: Int,
+    reserved2: Int,
+}
+
+// DDS texture format enumeration
+enum DDSFormat {
+    Unknown,
+    DXT1,       // BC1 - 4bpp, 1-bit alpha
+    DXT2,       // BC2 with premultiplied alpha
+    DXT3,       // BC2 - 8bpp, explicit alpha
+    DXT4,       // BC3 with premultiplied alpha
+    DXT5,       // BC3 - 8bpp, interpolated alpha
+    RGBA8,      // Uncompressed RGBA
+    RGB8,       // Uncompressed RGB
+    BGRA8,      // Uncompressed BGRA
+    BGR8,       // Uncompressed BGR
+    L8,         // Luminance 8-bit
+    A8,         // Alpha 8-bit
+    LA8,        // Luminance + Alpha
+}
+
+// DDS texture type
+enum DDSTextureType {
+    Texture2D,
+    Cubemap,
+    Volume,
+}
+
+// DDS loading error
+enum DDSError {
+    None,
+    InvalidMagic,
+    InvalidHeader,
+    InvalidFormat,
+    UnsupportedFormat,
+    ReadError,
+}
+
+// DDS loading result
+struct DDSResult {
+    success: Bool,
+    error: DDSError,
+    width: Int,
+    height: Int,
+    depth: Int,
+    mipmap_count: Int,
+    format: DDSFormat,
+    texture_type: DDSTextureType,
+}
+
+// Loaded DDS texture
+struct DDSTexture {
+    header: DDSHeader,
+    format: DDSFormat,
+    texture_type: DDSTextureType,
+    data: Collection<Int>,         // Raw pixel/compressed data
+    level_sizes: Collection<Int>,  // Size of each mipmap level
+    level_offsets: Collection<Int>, // Offset of each mipmap level
+    is_loaded: Bool,
+}
+
+/// Create an empty DDS texture
+fn create_dds_texture() -> DDSTexture {
+    let texture = DDSTexture {
+        header: DDSHeader {
+            size: 124,
+            flags: 0,
+            height: 0,
+            width: 0,
+            pitch_or_linear_size: 0,
+            depth: 0,
+            mipmap_count: 1,
+            reserved1: Collection<Int>{},
+            pixel_format: DDSPixelFormat {
+                size: 32,
+                flags: 0,
+                four_cc: 0,
+                rgb_bit_count: 0,
+                r_bit_mask: 0,
+                g_bit_mask: 0,
+                b_bit_mask: 0,
+                a_bit_mask: 0,
+            },
+            caps: 0,
+            caps2: 0,
+            caps3: 0,
+            caps4: 0,
+            reserved2: 0,
+        },
+        format: DDSFormat::Unknown,
+        texture_type: DDSTextureType::Texture2D,
+        data: Collection<Int>{},
+        level_sizes: Collection<Int>{},
+        level_offsets: Collection<Int>{},
+        is_loaded: false,
+    }
+
+    // Initialize reserved array
+    for i in 0..11 {
+        texture.header.reserved1.add(0)
+    }
+
+    return texture
+}
+
+/// Read 32-bit little-endian integer from byte array
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Parse DDS pixel format from byte data
+fn parse_pixel_format(data: Collection<Int>, offset: Int) -> DDSPixelFormat {
+    let pf = DDSPixelFormat {
+        size: read_u32_le(data, offset),
+        flags: read_u32_le(data, offset + 4),
+        four_cc: read_u32_le(data, offset + 8),
+        rgb_bit_count: read_u32_le(data, offset + 12),
+        r_bit_mask: read_u32_le(data, offset + 16),
+        g_bit_mask: read_u32_le(data, offset + 20),
+        b_bit_mask: read_u32_le(data, offset + 24),
+        a_bit_mask: read_u32_le(data, offset + 28),
+    }
+    return pf
+}
+
+/// Parse DDS header from byte data
+fn parse_dds_header(data: Collection<Int>) -> (DDSHeader, Bool) {
+    if data.len() < 128 {  // 4 magic + 124 header
+        let empty = create_dds_texture().header
+        return (empty, false)
+    }
+
+    // Check magic
+    let magic = read_u32_le(data, 0)
+    if magic != DDS_MAGIC {
+        let empty = create_dds_texture().header
+        return (empty, false)
+    }
+
+    let header = DDSHeader {
+        size: read_u32_le(data, 4),
+        flags: read_u32_le(data, 8),
+        height: read_u32_le(data, 12),
+        width: read_u32_le(data, 16),
+        pitch_or_linear_size: read_u32_le(data, 20),
+        depth: read_u32_le(data, 24),
+        mipmap_count: read_u32_le(data, 28),
+        reserved1: Collection<Int>{},
+        pixel_format: parse_pixel_format(data, 76),  // Offset 76 = 4 + 7*4 + 11*4
+        caps: read_u32_le(data, 108),
+        caps2: read_u32_le(data, 112),
+        caps3: read_u32_le(data, 116),
+        caps4: read_u32_le(data, 120),
+        reserved2: read_u32_le(data, 124),
+    }
+
+    // Read reserved1 array
+    for i in 0..11 {
+        header.reserved1.add(read_u32_le(data, 32 + i * 4))
+    }
+
+    // Validate header size
+    if header.size != 124 {
+        return (header, false)
+    }
+
+    return (header, true)
+}
+
+/// Determine DDS format from pixel format
+fn determine_format(pf: DDSPixelFormat) -> DDSFormat {
+    // Check for compressed formats (FourCC)
+    if (pf.flags & DDPF_FOURCC) != 0 {
+        if pf.four_cc == FOURCC_DXT1 { return DDSFormat::DXT1 }
+        if pf.four_cc == FOURCC_DXT2 { return DDSFormat::DXT2 }
+        if pf.four_cc == FOURCC_DXT3 { return DDSFormat::DXT3 }
+        if pf.four_cc == FOURCC_DXT4 { return DDSFormat::DXT4 }
+        if pf.four_cc == FOURCC_DXT5 { return DDSFormat::DXT5 }
+        return DDSFormat::Unknown
+    }
+
+    // Check for RGB formats
+    if (pf.flags & DDPF_RGB) != 0 {
+        let has_alpha = (pf.flags & DDPF_ALPHAPIXELS) != 0
+
+        if pf.rgb_bit_count == 32 {
+            // Check byte order from masks
+            if pf.r_bit_mask == 0x00FF0000 {
+                return if has_alpha { DDSFormat::BGRA8 } else { DDSFormat::BGR8 }
+            } else {
+                return if has_alpha { DDSFormat::RGBA8 } else { DDSFormat::RGB8 }
+            }
+        } else if pf.rgb_bit_count == 24 {
+            if pf.r_bit_mask == 0x00FF0000 {
+                return DDSFormat::BGR8
+            } else {
+                return DDSFormat::RGB8
+            }
+        }
+    }
+
+    // Check for luminance formats
+    if (pf.flags & DDPF_LUMINANCE) != 0 {
+        let has_alpha = (pf.flags & DDPF_ALPHAPIXELS) != 0
+        if has_alpha {
+            return DDSFormat::LA8
+        } else {
+            return DDSFormat::L8
+        }
+    }
+
+    // Check for alpha-only format
+    if (pf.flags & DDPF_ALPHA) != 0 {
+        return DDSFormat::A8
+    }
+
+    return DDSFormat::Unknown
+}
+
+/// Calculate size of a single mipmap level for compressed formats
+fn calculate_compressed_size(width: Int, height: Int, format: DDSFormat) -> Int {
+    // DXT block size is 4x4 pixels
+    let block_width = (width + 3) / 4
+    let block_height = (height + 3) / 4
+    let num_blocks = block_width * block_height
+
+    // Block sizes:
+    // DXT1: 8 bytes per block
+    // DXT3/DXT5: 16 bytes per block
+    if format == DDSFormat::DXT1 {
+        return num_blocks * 8
+    } else if format == DDSFormat::DXT3 || format == DDSFormat::DXT5 ||
+              format == DDSFormat::DXT2 || format == DDSFormat::DXT4 {
+        return num_blocks * 16
+    }
+
+    return 0
+}
+
+/// Calculate size of a single mipmap level for uncompressed formats
+fn calculate_uncompressed_size(width: Int, height: Int, format: DDSFormat) -> Int {
+    let bytes_per_pixel = 0
+
+    if format == DDSFormat::RGBA8 || format == DDSFormat::BGRA8 {
+        bytes_per_pixel = 4
+    } else if format == DDSFormat::RGB8 || format == DDSFormat::BGR8 {
+        bytes_per_pixel = 3
+    } else if format == DDSFormat::LA8 {
+        bytes_per_pixel = 2
+    } else if format == DDSFormat::L8 || format == DDSFormat::A8 {
+        bytes_per_pixel = 1
+    }
+
+    return width * height * bytes_per_pixel
+}
+
+/// Calculate total size including all mipmap levels
+fn calculate_mipmap_chain_size(width: Int, height: Int, mipmap_count: Int, format: DDSFormat) -> Int {
+    let total_size = 0
+    let mip_width = width
+    let mip_height = height
+
+    for level in 0..mipmap_count {
+        let level_size = 0
+
+        if format == DDSFormat::DXT1 || format == DDSFormat::DXT2 ||
+           format == DDSFormat::DXT3 || format == DDSFormat::DXT4 ||
+           format == DDSFormat::DXT5 {
+            level_size = calculate_compressed_size(mip_width, mip_height, format)
+        } else {
+            level_size = calculate_uncompressed_size(mip_width, mip_height, format)
+        }
+
+        total_size = total_size + level_size
+
+        // Next mipmap level
+        mip_width = max_int(1, mip_width / 2)
+        mip_height = max_int(1, mip_height / 2)
+    }
+
+    return total_size
+}
+
+fn max_int(a: Int, b: Int) -> Int {
+    if a > b { return a }
+    return b
+}
+
+/// Load DDS texture from byte data
+fn load_dds(data: Collection<Int>) -> (DDSTexture, DDSResult) {
+    let texture = create_dds_texture()
+    let result = DDSResult {
+        success: false,
+        error: DDSError::None,
+        width: 0,
+        height: 0,
+        depth: 0,
+        mipmap_count: 0,
+        format: DDSFormat::Unknown,
+        texture_type: DDSTextureType::Texture2D,
+    }
+
+    // Parse header
+    let (header, valid) = parse_dds_header(data)
+    if !valid {
+        result.error = DDSError::InvalidHeader
+        return (texture, result)
+    }
+
+    texture.header = header
+
+    // Determine format
+    texture.format = determine_format(header.pixel_format)
+    if texture.format == DDSFormat::Unknown {
+        result.error = DDSError::UnsupportedFormat
+        return (texture, result)
+    }
+
+    // Determine texture type
+    if (header.caps2 & DDSCAPS2_CUBEMAP) != 0 {
+        texture.texture_type = DDSTextureType::Cubemap
+    } else if (header.caps2 & DDSCAPS2_VOLUME) != 0 {
+        texture.texture_type = DDSTextureType::Volume
+    } else {
+        texture.texture_type = DDSTextureType::Texture2D
+    }
+
+    // Calculate mipmap level sizes and offsets
+    let mipmap_count = header.mipmap_count
+    if mipmap_count == 0 {
+        mipmap_count = 1
+    }
+
+    let offset = 128  // Header is 128 bytes
+    let mip_width = header.width
+    let mip_height = header.height
+
+    for level in 0..mipmap_count {
+        texture.level_offsets.add(offset)
+
+        let level_size = 0
+        if texture.format == DDSFormat::DXT1 || texture.format == DDSFormat::DXT2 ||
+           texture.format == DDSFormat::DXT3 || texture.format == DDSFormat::DXT4 ||
+           texture.format == DDSFormat::DXT5 {
+            level_size = calculate_compressed_size(mip_width, mip_height, texture.format)
+        } else {
+            level_size = calculate_uncompressed_size(mip_width, mip_height, texture.format)
+        }
+
+        texture.level_sizes.add(level_size)
+        offset = offset + level_size
+
+        mip_width = max_int(1, mip_width / 2)
+        mip_height = max_int(1, mip_height / 2)
+    }
+
+    // Copy texture data
+    for i in 128..data.len() {
+        texture.data.add(data.get(i))
+    }
+
+    texture.is_loaded = true
+
+    // Fill result
+    result.success = true
+    result.width = header.width
+    result.height = header.height
+    result.depth = if header.depth > 0 { header.depth } else { 1 }
+    result.mipmap_count = mipmap_count
+    result.format = texture.format
+    result.texture_type = texture.texture_type
+
+    return (texture, result)
+}
+
+/// Get width at specific mipmap level
+fn get_width_at_level(texture: DDSTexture, level: Int) -> Int {
+    let width = texture.header.width
+    for i in 0..level {
+        width = max_int(1, width / 2)
+    }
+    return width
+}
+
+/// Get height at specific mipmap level
+fn get_height_at_level(texture: DDSTexture, level: Int) -> Int {
+    let height = texture.header.height
+    for i in 0..level {
+        height = max_int(1, height / 2)
+    }
+    return height
+}
+
+/// Get pointer to mipmap level data
+fn get_level_data(texture: DDSTexture, level: Int) -> Collection<Int> {
+    let result = Collection<Int>{}
+
+    if level >= texture.level_offsets.len() {
+        return result
+    }
+
+    let offset = texture.level_offsets.get(level) - 128  // Subtract header size
+    let size = texture.level_sizes.get(level)
+
+    for i in 0..size {
+        if offset + i < texture.data.len() {
+            result.add(texture.data.get(offset + i))
+        }
+    }
+
+    return result
+}
+
+// ============================================================================
+// DXT Decompression
+// ============================================================================
+
+/// Decode 565 packed color to RGB
+fn decode_565(packed: Int) -> (Int, Int, Int) {
+    let r = ((packed >> 11) & 0x1F) * 255 / 31
+    let g = ((packed >> 5) & 0x3F) * 255 / 63
+    let b = (packed & 0x1F) * 255 / 31
+    return (r, g, b)
+}
+
+/// Decompress a single DXT1 block (4x4 pixels)
+fn decompress_dxt1_block(block: Collection<Int>, output: Collection<Int>, out_x: Int, out_y: Int, stride: Int) {
+    if block.len() < 8 {
+        return
+    }
+
+    // Read two 16-bit colors
+    let c0 = block.get(0) | (block.get(1) << 8)
+    let c1 = block.get(2) | (block.get(3) << 8)
+
+    // Decode colors
+    let (r0, g0, b0) = decode_565(c0)
+    let (r1, g1, b1) = decode_565(c1)
+
+    // Build color palette
+    let colors = Collection<(Int, Int, Int, Int)>{}  // RGBA tuples
+
+    colors.add((r0, g0, b0, 255))
+    colors.add((r1, g1, b1, 255))
+
+    if c0 > c1 {
+        // 4-color mode
+        colors.add(((2 * r0 + r1) / 3, (2 * g0 + g1) / 3, (2 * b0 + b1) / 3, 255))
+        colors.add(((r0 + 2 * r1) / 3, (g0 + 2 * g1) / 3, (b0 + 2 * b1) / 3, 255))
+    } else {
+        // 3-color + transparent mode
+        colors.add(((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2, 255))
+        colors.add((0, 0, 0, 0))  // Transparent
+    }
+
+    // Read lookup indices (4 bytes = 16 2-bit indices)
+    let lookup = block.get(4) | (block.get(5) << 8) | (block.get(6) << 16) | (block.get(7) << 24)
+
+    // Decode 4x4 block
+    for y in 0..4 {
+        for x in 0..4 {
+            let bit_offset = (y * 4 + x) * 2
+            let index = (lookup >> bit_offset) & 3
+
+            let out_offset = ((out_y + y) * stride + (out_x + x)) * 4
+
+            let (r, g, b, a) = colors.get(index)
+            output.set(out_offset, r)
+            output.set(out_offset + 1, g)
+            output.set(out_offset + 2, b)
+            output.set(out_offset + 3, a)
+        }
+    }
+}
+
+/// Decompress DXT1 texture to RGBA
+fn decompress_dxt1(texture: DDSTexture, level: Int) -> Collection<Int> {
+    let width = get_width_at_level(texture, level)
+    let height = get_height_at_level(texture, level)
+
+    // Allocate output (RGBA = 4 bytes per pixel)
+    let output = Collection<Int>{}
+    for i in 0..(width * height * 4) {
+        output.add(0)
+    }
+
+    let data = get_level_data(texture, level)
+    let block_width = (width + 3) / 4
+    let block_height = (height + 3) / 4
+
+    let block_offset = 0
+    for by in 0..block_height {
+        for bx in 0..block_width {
+            // Extract 8-byte block
+            let block = Collection<Int>{}
+            for i in 0..8 {
+                if block_offset + i < data.len() {
+                    block.add(data.get(block_offset + i))
+                } else {
+                    block.add(0)
+                }
+            }
+
+            decompress_dxt1_block(block, output, bx * 4, by * 4, width)
+            block_offset = block_offset + 8
+        }
+    }
+
+    return output
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_dds_magic() -> Bool {
+    // Create minimal DDS header
+    let data = Collection<Int>{}
+
+    // "DDS " magic (little-endian)
+    data.add(0x44)  // D
+    data.add(0x44)  // D
+    data.add(0x53)  // S
+    data.add(0x20)  // space
+
+    let magic = read_u32_le(data, 0)
+    assert(magic == DDS_MAGIC, "Should detect DDS magic")
+
+    return true
+}
+
+fn test_565_decode() -> Bool {
+    // Test white (0xFFFF)
+    let (r, g, b) = decode_565(0xFFFF)
+    assert(r == 255, "Red should be 255")
+    assert(g == 255, "Green should be 255")
+    assert(b == 255, "Blue should be 255")
+
+    // Test black (0x0000)
+    let (r2, g2, b2) = decode_565(0x0000)
+    assert(r2 == 0, "Red should be 0")
+    assert(g2 == 0, "Green should be 0")
+    assert(b2 == 0, "Blue should be 0")
+
+    return true
+}
+
+fn test_compressed_size_calculation() -> Bool {
+    // 64x64 DXT1: (64/4) * (64/4) * 8 = 16 * 16 * 8 = 2048 bytes
+    let size = calculate_compressed_size(64, 64, DDSFormat::DXT1)
+    assert(size == 2048, "DXT1 64x64 should be 2048 bytes")
+
+    // 64x64 DXT5: (64/4) * (64/4) * 16 = 16 * 16 * 16 = 4096 bytes
+    let size2 = calculate_compressed_size(64, 64, DDSFormat::DXT5)
+    assert(size2 == 4096, "DXT5 64x64 should be 4096 bytes")
+
+    // Non-power-of-2: 63x63 DXT1: (16) * (16) * 8 = 2048 bytes
+    let size3 = calculate_compressed_size(63, 63, DDSFormat::DXT1)
+    assert(size3 == 2048, "DXT1 63x63 should be 2048 bytes (rounded up)")
+
+    return true
+}
+
+fn test_format_detection() -> Bool {
+    // Test DXT1 detection
+    let pf_dxt1 = DDSPixelFormat {
+        size: 32,
+        flags: DDPF_FOURCC,
+        four_cc: FOURCC_DXT1,
+        rgb_bit_count: 0,
+        r_bit_mask: 0,
+        g_bit_mask: 0,
+        b_bit_mask: 0,
+        a_bit_mask: 0,
+    }
+
+    let format = determine_format(pf_dxt1)
+    assert(format == DDSFormat::DXT1, "Should detect DXT1")
+
+    // Test RGBA8 detection
+    let pf_rgba = DDSPixelFormat {
+        size: 32,
+        flags: DDPF_RGB | DDPF_ALPHAPIXELS,
+        four_cc: 0,
+        rgb_bit_count: 32,
+        r_bit_mask: 0x000000FF,
+        g_bit_mask: 0x0000FF00,
+        b_bit_mask: 0x00FF0000,
+        a_bit_mask: 0xFF000000,
+    }
+
+    let format2 = determine_format(pf_rgba)
+    assert(format2 == DDSFormat::RGBA8, "Should detect RGBA8")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_dds_magic(), "DDS magic test failed")
+    assert(test_565_decode(), "565 decode test failed")
+    assert(test_compressed_size_calculation(), "Compressed size test failed")
+    assert(test_format_detection(), "Format detection test failed")
+    return true
+}

@@ -1,0 +1,433 @@
+// RefPack Compression - EA's proprietary LZ compression algorithm
+// Used for compressed assets in BIG archives and save games
+// Ported from Thyme Engine (GPL licensed)
+// Reference: Thyme/src/game/common/compression/refpack.cpp
+
+from basics import Collection
+
+// RefPack compression error types
+enum RefPackError {
+    None,
+    InvalidData,
+    OutputTooSmall,
+    InvalidHeader,
+    DecompressFailed,
+}
+
+// RefPack compression result
+struct RefPackResult {
+    success: Bool,
+    error: RefPackError,
+    output_size: Int,
+}
+
+// Hash function for compression lookup
+fn refpack_hash(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 >= data.len() {
+        return 0
+    }
+    let b0 = data.get(offset)
+    let b1 = data.get(offset + 1)
+    let b2 = data.get(offset + 2)
+    return ((b0 << 8) | b2) ^ (b1 << 4)
+}
+
+// Calculate length of matching data at two positions
+fn refpack_matchlen(data: Collection<Int>, pos1: Int, pos2: Int, max_match: Int) -> Int {
+    let current = 0
+    while current < max_match {
+        if pos1 + current >= data.len() || pos2 + current >= data.len() {
+            break
+        }
+        if data.get(pos1 + current) != data.get(pos2 + current) {
+            break
+        }
+        current = current + 1
+    }
+    return current
+}
+
+// Minimum of two integers
+fn min_int(a: Int, b: Int) -> Int {
+    if a < b { return a }
+    return b
+}
+
+// Maximum of two integers
+fn max_int(a: Int, b: Int) -> Int {
+    if a > b { return a }
+    return b
+}
+
+/// Decompress RefPack compressed data
+/// Returns the decompressed data and size in the result
+fn refpack_decompress(src: Collection<Int>) -> (Collection<Int>, RefPackResult) {
+    let output = Collection<Int>{}
+    let result = RefPackResult {
+        success: false,
+        error: RefPackError::None,
+        output_size: 0,
+    }
+
+    if src.len() < 5 {
+        result.error = RefPackError::InvalidHeader
+        return (output, result)
+    }
+
+    let pos = 0
+
+    // Read flags (big endian 16-bit)
+    let flags = (src.get(0) << 8) | src.get(1)
+    pos = 2
+
+    // Determine output length from header
+    let out_length = 0
+    if (flags & 0x8000) != 0 {
+        // Large size format
+        if (flags & 0x0100) != 0 {
+            pos = pos + 4  // Skip extra bytes
+        }
+
+        if pos + 4 > src.len() {
+            result.error = RefPackError::InvalidHeader
+            return (output, result)
+        }
+
+        out_length = (src.get(pos) << 24) | (src.get(pos + 1) << 16) |
+                     (src.get(pos + 2) << 8) | src.get(pos + 3)
+        pos = pos + 4
+    } else {
+        // Standard size format
+        if (flags & 0x0100) != 0 {
+            pos = pos + 3  // Skip extra bytes
+        }
+
+        if pos + 3 > src.len() {
+            result.error = RefPackError::InvalidHeader
+            return (output, result)
+        }
+
+        out_length = (src.get(pos) << 16) | (src.get(pos + 1) << 8) | src.get(pos + 2)
+        pos = pos + 3
+    }
+
+    // Pre-allocate output buffer
+    for i in 0..out_length {
+        output.add(0)
+    }
+
+    let out_pos = 0
+
+    // Decompress loop
+    while pos < src.len() && out_pos < out_length {
+        let first = src.get(pos)
+        pos = pos + 1
+
+        // Short command: first byte has bit 7 clear
+        if (first & 0x80) == 0 {
+            if pos >= src.len() {
+                result.error = RefPackError::DecompressFailed
+                return (output, result)
+            }
+            let second = src.get(pos)
+            pos = pos + 1
+
+            // Copy literal bytes
+            let run = first & 3
+            for i in 0..run {
+                if pos < src.len() && out_pos < out_length {
+                    output.set(out_pos, src.get(pos))
+                    out_pos = out_pos + 1
+                    pos = pos + 1
+                }
+            }
+
+            // Back reference
+            let ref_offset = out_pos - 1 - (((first & 0x60) << 3) + second)
+            let copy_len = ((first & 0x1c) >> 2) + 3
+
+            for i in 0..copy_len {
+                if ref_offset + i >= 0 && ref_offset + i < out_pos && out_pos < out_length {
+                    output.set(out_pos, output.get(ref_offset + i))
+                    out_pos = out_pos + 1
+                }
+            }
+            continue
+        }
+
+        // Medium command: first byte has bits 7 set, 6 clear
+        if (first & 0x40) == 0 {
+            if pos + 1 >= src.len() {
+                result.error = RefPackError::DecompressFailed
+                return (output, result)
+            }
+            let second = src.get(pos)
+            let third = src.get(pos + 1)
+            pos = pos + 2
+
+            // Copy literal bytes
+            let run = second >> 6
+            for i in 0..run {
+                if pos < src.len() && out_pos < out_length {
+                    output.set(out_pos, src.get(pos))
+                    out_pos = out_pos + 1
+                    pos = pos + 1
+                }
+            }
+
+            // Back reference
+            let ref_offset = out_pos - 1 - (((second & 0x3f) << 8) + third)
+            let copy_len = (first & 0x3f) + 4
+
+            for i in 0..copy_len {
+                if ref_offset + i >= 0 && ref_offset + i < out_pos && out_pos < out_length {
+                    output.set(out_pos, output.get(ref_offset + i))
+                    out_pos = out_pos + 1
+                }
+            }
+            continue
+        }
+
+        // Long command: first byte has bits 7,6 set, 5 clear
+        if (first & 0x20) == 0 {
+            if pos + 2 >= src.len() {
+                result.error = RefPackError::DecompressFailed
+                return (output, result)
+            }
+            let second = src.get(pos)
+            let third = src.get(pos + 1)
+            let forth = src.get(pos + 2)
+            pos = pos + 3
+
+            // Copy literal bytes
+            let run = first & 3
+            for i in 0..run {
+                if pos < src.len() && out_pos < out_length {
+                    output.set(out_pos, src.get(pos))
+                    out_pos = out_pos + 1
+                    pos = pos + 1
+                }
+            }
+
+            // Back reference
+            let ref_offset = out_pos - 1 - ((((first & 0x10) >> 4) << 16) + (second << 8) + third)
+            let copy_len = (((first & 0x0c) >> 2) << 8) + forth + 5
+
+            for i in 0..copy_len {
+                if ref_offset + i >= 0 && ref_offset + i < out_pos && out_pos < out_length {
+                    output.set(out_pos, output.get(ref_offset + i))
+                    out_pos = out_pos + 1
+                }
+            }
+            continue
+        }
+
+        // Byte command: copy literal run
+        let run = ((first & 0x1f) << 2) + 4
+
+        if run <= 112 {
+            for i in 0..run {
+                if pos < src.len() && out_pos < out_length {
+                    output.set(out_pos, src.get(pos))
+                    out_pos = out_pos + 1
+                    pos = pos + 1
+                }
+            }
+            continue
+        }
+
+        // End marker: possible run of 0-3 bytes
+        let final_run = first & 3
+        for i in 0..final_run {
+            if pos < src.len() && out_pos < out_length {
+                output.set(out_pos, src.get(pos))
+                out_pos = out_pos + 1
+                pos = pos + 1
+            }
+        }
+        break
+    }
+
+    result.success = true
+    result.output_size = out_pos
+    return (output, result)
+}
+
+/// Compress data using RefPack LZ algorithm
+fn refpack_compress(src: Collection<Int>) -> (Collection<Int>, RefPackResult) {
+    let output = Collection<Int>{}
+    let result = RefPackResult {
+        success: false,
+        error: RefPackError::None,
+        output_size: 0,
+    }
+
+    let size = src.len()
+
+    // Write header
+    if size < 0xFFFFFF {
+        // 5-byte header for small files
+        output.add(0x10)
+        output.add(0xFB)
+        output.add((size >> 16) & 0xFF)
+        output.add((size >> 8) & 0xFF)
+        output.add(size & 0xFF)
+    } else {
+        // 6-byte header for large files
+        output.add(0x90)
+        output.add(0xFB)
+        output.add((size >> 24) & 0xFF)
+        output.add((size >> 16) & 0xFF)
+        output.add((size >> 8) & 0xFF)
+        output.add(size & 0xFF)
+    }
+
+    // For simplicity, use literal encoding (no compression)
+    // Full LZ compression would require hash tables as in the original
+    let pos = 0
+    while pos < size {
+        // Calculate how many bytes to write in this chunk
+        let remaining = size - pos
+        let chunk_size = min_int(112, remaining)
+
+        // Align to 4 bytes for literal blocks > 3 bytes
+        if chunk_size > 3 {
+            let aligned_size = (chunk_size / 4) * 4
+            if aligned_size > 0 {
+                // Write literal block header
+                output.add(0xe0 + (aligned_size / 4) - 1)
+
+                // Write data
+                for i in 0..aligned_size {
+                    output.add(src.get(pos + i))
+                }
+                pos = pos + aligned_size
+            }
+        } else {
+            break
+        }
+    }
+
+    // Write end marker with remaining bytes (0-3)
+    let final_run = size - pos
+    output.add(0xFC + final_run)
+
+    for i in 0..final_run {
+        output.add(src.get(pos + i))
+    }
+
+    result.success = true
+    result.output_size = output.len()
+    return (output, result)
+}
+
+/// Check if data has RefPack signature
+fn is_refpack_compressed(data: Collection<Int>) -> Bool {
+    if data.len() < 2 {
+        return false
+    }
+
+    let flags = (data.get(0) << 8) | data.get(1)
+
+    // Check for RefPack signature patterns
+    // Common patterns: 0x10FB, 0x90FB (with size flag)
+    let second_byte = data.get(1)
+    return second_byte == 0xFB
+}
+
+/// Get decompressed size from RefPack header without decompressing
+fn refpack_get_decompressed_size(data: Collection<Int>) -> Int {
+    if data.len() < 5 {
+        return 0
+    }
+
+    let flags = (data.get(0) << 8) | data.get(1)
+    let pos = 2
+
+    if (flags & 0x8000) != 0 {
+        // Large size format (4 bytes)
+        if (flags & 0x0100) != 0 {
+            pos = pos + 4
+        }
+
+        if pos + 4 > data.len() {
+            return 0
+        }
+
+        return (data.get(pos) << 24) | (data.get(pos + 1) << 16) |
+               (data.get(pos + 2) << 8) | data.get(pos + 3)
+    } else {
+        // Standard size format (3 bytes)
+        if (flags & 0x0100) != 0 {
+            pos = pos + 3
+        }
+
+        if pos + 3 > data.len() {
+            return 0
+        }
+
+        return (data.get(pos) << 16) | (data.get(pos + 1) << 8) | data.get(pos + 2)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_refpack_header_detection() -> Bool {
+    // Test RefPack signature detection
+    let data = Collection<Int>{}
+    data.add(0x10)
+    data.add(0xFB)
+    data.add(0x00)
+    data.add(0x00)
+    data.add(0x10)  // 16 bytes uncompressed
+
+    assert(is_refpack_compressed(data), "Should detect RefPack signature")
+
+    let size = refpack_get_decompressed_size(data)
+    assert(size == 16, "Should read decompressed size correctly")
+
+    return true
+}
+
+fn test_refpack_simple_compress_decompress() -> Bool {
+    // Create test data
+    let original = Collection<Int>{}
+    for i in 0..64 {
+        original.add(i % 256)
+    }
+
+    // Compress
+    let (compressed, compress_result) = refpack_compress(original)
+    assert(compress_result.success, "Compression should succeed")
+
+    // Decompress
+    let (decompressed, decompress_result) = refpack_decompress(compressed)
+    assert(decompress_result.success, "Decompression should succeed")
+
+    // Verify data matches
+    assert(decompressed.len() >= original.len(), "Decompressed size should match")
+    for i in 0..original.len() {
+        assert(decompressed.get(i) == original.get(i), "Data should match after roundtrip")
+    }
+
+    return true
+}
+
+fn test_refpack_empty_data() -> Bool {
+    let empty = Collection<Int>{}
+
+    let (result, status) = refpack_decompress(empty)
+    assert(!status.success, "Should fail on empty data")
+    assert(status.error == RefPackError::InvalidHeader, "Should report invalid header")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_refpack_header_detection(), "Header detection test failed")
+    assert(test_refpack_simple_compress_decompress(), "Compress/decompress test failed")
+    assert(test_refpack_empty_data(), "Empty data test failed")
+    return true
+}

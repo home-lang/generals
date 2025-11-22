@@ -1,0 +1,498 @@
+// Bink Video Handler - BIK video format support
+// Used for intro videos, cutscenes, and cinematics in C&C Generals Zero Hour
+// Reference: RAD Game Tools Bink format
+//
+// Since Bink is a proprietary format, this module provides:
+// 1. Detection of Bink video files
+// 2. Placeholder/skip system for missing videos
+// 3. Frame callback system for custom video handling
+
+from basics import Collection, Map
+
+// Bink file signatures
+const BINK_SIGNATURE_1: Int = 0x424B4942  // "BIKb" (Bink 1)
+const BINK_SIGNATURE_2: Int = 0x324B4942  // "BIK2" (Bink 2)
+const BINK_SIGNATURE_F: Int = 0x664B4942  // "BIKf"
+const BINK_SIGNATURE_G: Int = 0x674B4942  // "BIKg"
+const BINK_SIGNATURE_H: Int = 0x684B4942  // "BIKh"
+const BINK_SIGNATURE_I: Int = 0x694B4942  // "BIKi"
+
+// Video state
+enum VideoState {
+    Stopped,
+    Playing,
+    Paused,
+    Finished,
+    Skipped,
+    NotFound,
+}
+
+// Video info extracted from Bink header
+struct BinkHeader {
+    signature: Int,
+    file_size: Int,
+    num_frames: Int,
+    largest_frame_size: Int,
+    width: Int,
+    height: Int,
+    fps_dividend: Int,
+    fps_divisor: Int,
+    flags: Int,
+    num_audio_tracks: Int,
+}
+
+// Video instance
+struct BinkVideo {
+    path: String,
+    header: BinkHeader,
+    state: VideoState,
+    current_frame: Int,
+    elapsed_time: Float,
+    frame_duration: Float,
+    is_looping: Bool,
+    skip_requested: Bool,
+}
+
+/// Create empty video instance
+fn create_video() -> BinkVideo {
+    return BinkVideo {
+        path: "",
+        header: BinkHeader {
+            signature: 0,
+            file_size: 0,
+            num_frames: 0,
+            largest_frame_size: 0,
+            width: 0,
+            height: 0,
+            fps_dividend: 30,
+            fps_divisor: 1,
+            flags: 0,
+            num_audio_tracks: 0,
+        },
+        state: VideoState::Stopped,
+        current_frame: 0,
+        elapsed_time: 0.0,
+        frame_duration: 1.0 / 30.0,
+        is_looping: false,
+        skip_requested: false,
+    }
+}
+
+/// Read 32-bit little-endian integer
+fn read_u32_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 4 > data.len() {
+        return 0
+    }
+    return data.get(offset) |
+           (data.get(offset + 1) << 8) |
+           (data.get(offset + 2) << 16) |
+           (data.get(offset + 3) << 24)
+}
+
+/// Check if data is a valid Bink video
+fn is_bink_video(data: Collection<Int>) -> Bool {
+    if data.len() < 4 {
+        return false
+    }
+
+    let sig = read_u32_le(data, 0)
+    return sig == BINK_SIGNATURE_1 ||
+           sig == BINK_SIGNATURE_2 ||
+           sig == BINK_SIGNATURE_F ||
+           sig == BINK_SIGNATURE_G ||
+           sig == BINK_SIGNATURE_H ||
+           sig == BINK_SIGNATURE_I
+}
+
+/// Parse Bink video header
+fn parse_bink_header(data: Collection<Int>) -> (BinkHeader, Bool) {
+    let header = BinkHeader {
+        signature: 0,
+        file_size: 0,
+        num_frames: 0,
+        largest_frame_size: 0,
+        width: 0,
+        height: 0,
+        fps_dividend: 30,
+        fps_divisor: 1,
+        flags: 0,
+        num_audio_tracks: 0,
+    }
+
+    if data.len() < 44 {
+        return (header, false)
+    }
+
+    header.signature = read_u32_le(data, 0)
+
+    if !is_bink_video(data) {
+        return (header, false)
+    }
+
+    header.file_size = read_u32_le(data, 4)
+    header.num_frames = read_u32_le(data, 8)
+    header.largest_frame_size = read_u32_le(data, 12)
+
+    // Skip 4 bytes (unused)
+    header.width = read_u32_le(data, 20)
+    header.height = read_u32_le(data, 24)
+    header.fps_dividend = read_u32_le(data, 28)
+    header.fps_divisor = read_u32_le(data, 32)
+    header.flags = read_u32_le(data, 36)
+    header.num_audio_tracks = read_u32_le(data, 40)
+
+    if header.fps_divisor == 0 {
+        header.fps_divisor = 1
+    }
+
+    return (header, true)
+}
+
+/// Load Bink video (header only - actual decoding would require Bink SDK)
+fn load_bink_video(path: String, data: Collection<Int>) -> (BinkVideo, Bool) {
+    let video = create_video()
+    video.path = path
+
+    if data.len() == 0 {
+        video.state = VideoState::NotFound
+        return (video, false)
+    }
+
+    let (header, success) = parse_bink_header(data)
+    if !success {
+        return (video, false)
+    }
+
+    video.header = header
+    video.frame_duration = (header.fps_divisor as Float) / (header.fps_dividend as Float)
+    video.state = VideoState::Stopped
+
+    return (video, true)
+}
+
+/// Create placeholder video for missing files
+fn create_placeholder_video(path: String, width: Int, height: Int, duration_seconds: Float) -> BinkVideo {
+    let video = create_video()
+    video.path = path
+    video.header.width = width
+    video.header.height = height
+    video.header.fps_dividend = 30
+    video.header.fps_divisor = 1
+    video.header.num_frames = (duration_seconds * 30.0) as Int
+    video.frame_duration = 1.0 / 30.0
+    video.state = VideoState::Stopped
+
+    return video
+}
+
+/// Start video playback
+fn play_video(video: BinkVideo) {
+    if video.state == VideoState::NotFound {
+        // Auto-skip missing videos
+        video.state = VideoState::Skipped
+        return
+    }
+
+    video.state = VideoState::Playing
+    video.current_frame = 0
+    video.elapsed_time = 0.0
+    video.skip_requested = false
+}
+
+/// Pause video playback
+fn pause_video(video: BinkVideo) {
+    if video.state == VideoState::Playing {
+        video.state = VideoState::Paused
+    }
+}
+
+/// Resume video playback
+fn resume_video(video: BinkVideo) {
+    if video.state == VideoState::Paused {
+        video.state = VideoState::Playing
+    }
+}
+
+/// Stop video playback
+fn stop_video(video: BinkVideo) {
+    video.state = VideoState::Stopped
+    video.current_frame = 0
+    video.elapsed_time = 0.0
+}
+
+/// Request skip (user pressed key to skip)
+fn skip_video(video: BinkVideo) {
+    video.skip_requested = true
+    video.state = VideoState::Skipped
+}
+
+/// Update video state (call each frame)
+fn update_video(video: BinkVideo, delta_time: Float) -> Bool {
+    if video.state != VideoState::Playing {
+        return video.state == VideoState::Finished || video.state == VideoState::Skipped
+    }
+
+    if video.skip_requested {
+        video.state = VideoState::Skipped
+        return true
+    }
+
+    video.elapsed_time = video.elapsed_time + delta_time
+
+    // Advance frames based on elapsed time
+    let target_frame = (video.elapsed_time / video.frame_duration) as Int
+
+    if target_frame >= video.header.num_frames {
+        if video.is_looping {
+            video.current_frame = 0
+            video.elapsed_time = 0.0
+        } else {
+            video.state = VideoState::Finished
+            return true
+        }
+    } else {
+        video.current_frame = target_frame
+    }
+
+    return false
+}
+
+/// Get video dimensions
+fn get_video_dimensions(video: BinkVideo) -> (Int, Int) {
+    return (video.header.width, video.header.height)
+}
+
+/// Get video duration in seconds
+fn get_video_duration(video: BinkVideo) -> Float {
+    return (video.header.num_frames as Float) * video.frame_duration
+}
+
+/// Get current playback position in seconds
+fn get_video_position(video: BinkVideo) -> Float {
+    return video.elapsed_time
+}
+
+/// Get playback progress (0.0 to 1.0)
+fn get_video_progress(video: BinkVideo) -> Float {
+    if video.header.num_frames == 0 {
+        return 0.0
+    }
+    return (video.current_frame as Float) / (video.header.num_frames as Float)
+}
+
+/// Check if video is done (finished or skipped)
+fn is_video_done(video: BinkVideo) -> Bool {
+    return video.state == VideoState::Finished ||
+           video.state == VideoState::Skipped ||
+           video.state == VideoState::NotFound
+}
+
+// ============================================================================
+// Video Manager
+// ============================================================================
+
+// Standard game videos
+const INTRO_VIDEOS: [String; 4] = [
+    "EALogo.bik",
+    "NewLineLogo.bik",
+    "CC_Generals_Logo.bik",
+    "ZH_Intro.bik",
+]
+
+const CAMPAIGN_VIDEOS: [String; 9] = [
+    "USA01.bik",
+    "USA01_WIN.bik",
+    "USA07_WIN.bik",
+    "CHINA01.bik",
+    "CHINA01_WIN.bik",
+    "CHINA07_WIN.bik",
+    "GLA01.bik",
+    "GLA01_WIN.bik",
+    "GLA07_WIN.bik",
+]
+
+struct VideoManager {
+    videos: Map<String, BinkVideo>,
+    current_video: String,
+    video_path: String,
+    skip_all_videos: Bool,
+    auto_skip_missing: Bool,
+
+    fn init() -> VideoManager {
+        return VideoManager {
+            videos: Map<String, BinkVideo>{},
+            current_video: "",
+            video_path: "assets/video",
+            skip_all_videos: false,
+            auto_skip_missing: true,
+        }
+    }
+
+    fn set_video_path(self, path: String) {
+        self.video_path = path
+    }
+
+    fn load_video(self, name: String, data: Collection<Int>) -> Bool {
+        let (video, success) = load_bink_video(self.video_path + "/" + name, data)
+
+        if !success && self.auto_skip_missing {
+            // Create placeholder for missing video
+            let placeholder = create_placeholder_video(name, 800, 600, 0.5)
+            placeholder.state = VideoState::NotFound
+            self.videos.set(name, placeholder)
+            return true
+        }
+
+        if success {
+            self.videos.set(name, video)
+        }
+
+        return success
+    }
+
+    fn play(self, name: String) -> Bool {
+        if self.skip_all_videos {
+            return true
+        }
+
+        if self.videos.has(name) {
+            self.current_video = name
+            let video = self.videos.get(name)
+            play_video(video)
+            return true
+        }
+
+        return false
+    }
+
+    fn skip_current(self) {
+        if self.current_video != "" && self.videos.has(self.current_video) {
+            let video = self.videos.get(self.current_video)
+            skip_video(video)
+        }
+    }
+
+    fn update(self, delta_time: Float) -> Bool {
+        if self.current_video == "" {
+            return true
+        }
+
+        if !self.videos.has(self.current_video) {
+            return true
+        }
+
+        let video = self.videos.get(self.current_video)
+        let done = update_video(video, delta_time)
+
+        if done {
+            self.current_video = ""
+        }
+
+        return done
+    }
+
+    fn is_playing(self) -> Bool {
+        if self.current_video == "" {
+            return false
+        }
+
+        if !self.videos.has(self.current_video) {
+            return false
+        }
+
+        let video = self.videos.get(self.current_video)
+        return video.state == VideoState::Playing
+    }
+
+    fn get_current_frame(self) -> Int {
+        if self.current_video == "" || !self.videos.has(self.current_video) {
+            return 0
+        }
+        return self.videos.get(self.current_video).current_frame
+    }
+
+    fn get_current_progress(self) -> Float {
+        if self.current_video == "" || !self.videos.has(self.current_video) {
+            return 0.0
+        }
+        return get_video_progress(self.videos.get(self.current_video))
+    }
+}
+
+/// Play intro sequence (all intro videos in order)
+fn play_intro_sequence(manager: VideoManager) {
+    // Queue all intro videos
+    for video_name in INTRO_VIDEOS {
+        if !manager.videos.has(video_name) {
+            // Register placeholder for missing intro videos
+            let placeholder = create_placeholder_video(video_name, 800, 600, 0.1)
+            placeholder.state = VideoState::NotFound
+            manager.videos.set(video_name, placeholder)
+        }
+    }
+
+    // Start first video
+    if INTRO_VIDEOS.len() > 0 {
+        manager.play(INTRO_VIDEOS.get(0))
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_video_creation() -> Bool {
+    let video = create_video()
+    assert(video.state == VideoState::Stopped, "Default state should be Stopped")
+    assert(video.current_frame == 0, "Initial frame should be 0")
+    return true
+}
+
+fn test_placeholder_video() -> Bool {
+    let video = create_placeholder_video("test.bik", 640, 480, 5.0)
+    assert(video.header.width == 640, "Width should be 640")
+    assert(video.header.height == 480, "Height should be 480")
+    assert(video.header.num_frames == 150, "Should have 150 frames (5 sec * 30 fps)")
+    return true
+}
+
+fn test_video_manager() -> Bool {
+    let manager = VideoManager::init()
+    manager.skip_all_videos = true
+
+    // With skip_all_videos, play should return true immediately
+    let result = manager.play("test.bik")
+    assert(result == true, "Should return true when skip_all_videos is set")
+
+    return true
+}
+
+fn test_bink_detection() -> Bool {
+    // Test valid Bink signature
+    let data = Collection<Int>{}
+    data.add(0x42)  // 'B'
+    data.add(0x49)  // 'I'
+    data.add(0x4B)  // 'K'
+    data.add(0x62)  // 'b' (Bink 1 signature)
+
+    assert(is_bink_video(data) == true, "Should detect BIKb signature")
+
+    // Test invalid data
+    let invalid_data = Collection<Int>{}
+    invalid_data.add(0x00)
+    invalid_data.add(0x00)
+    invalid_data.add(0x00)
+    invalid_data.add(0x00)
+
+    assert(is_bink_video(invalid_data) == false, "Should reject invalid signature")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_video_creation(), "Video creation test failed")
+    assert(test_placeholder_video(), "Placeholder video test failed")
+    assert(test_video_manager(), "Video manager test failed")
+    assert(test_bink_detection(), "Bink detection test failed")
+    return true
+}

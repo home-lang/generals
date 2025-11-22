@@ -1,0 +1,555 @@
+// TGA Texture Loader - Targa Image Format Support
+// Used for loading texture files in C&C Generals Zero Hour
+// Reference: Truevision TGA File Format Specification
+
+from basics import Collection, Map
+
+// TGA image types
+const TGA_TYPE_NO_IMAGE: Int = 0
+const TGA_TYPE_INDEXED: Int = 1
+const TGA_TYPE_RGB: Int = 2
+const TGA_TYPE_GRAYSCALE: Int = 3
+const TGA_TYPE_RLE_INDEXED: Int = 9
+const TGA_TYPE_RLE_RGB: Int = 10
+const TGA_TYPE_RLE_GRAYSCALE: Int = 11
+
+// TGA image descriptor flags
+const TGA_ORIGIN_LOWER_LEFT: Int = 0x00
+const TGA_ORIGIN_UPPER_LEFT: Int = 0x20
+const TGA_ALPHA_BITS_MASK: Int = 0x0F
+
+// TGA file header (18 bytes)
+struct TGAHeader {
+    id_length: Int,           // Length of image ID field
+    color_map_type: Int,      // 0 = no color map, 1 = has color map
+    image_type: Int,          // Image type code
+    color_map_origin: Int,    // First color map entry index
+    color_map_length: Int,    // Number of color map entries
+    color_map_depth: Int,     // Bits per color map entry
+    x_origin: Int,            // X origin of image
+    y_origin: Int,            // Y origin of image
+    width: Int,               // Image width
+    height: Int,              // Image height
+    pixel_depth: Int,         // Bits per pixel
+    image_descriptor: Int,    // Image descriptor flags
+}
+
+// Loaded TGA image
+struct TGAImage {
+    width: Int,
+    height: Int,
+    channels: Int,             // 3 for RGB, 4 for RGBA
+    pixels: Collection<Int>,   // RGBA pixel data (always 4 channels internally)
+    name: String,
+    is_flipped: Bool,          // True if origin is upper-left
+}
+
+/// Create empty TGA image
+fn create_tga_image() -> TGAImage {
+    return TGAImage {
+        width: 0,
+        height: 0,
+        channels: 4,
+        pixels: Collection<Int>{},
+        name: "",
+        is_flipped: false,
+    }
+}
+
+/// Read byte from data
+fn read_byte(data: Collection<Int>, offset: Int) -> Int {
+    if offset >= data.len() {
+        return 0
+    }
+    return data.get(offset)
+}
+
+/// Read 16-bit little-endian integer
+fn read_u16_le(data: Collection<Int>, offset: Int) -> Int {
+    if offset + 2 > data.len() {
+        return 0
+    }
+    return data.get(offset) | (data.get(offset + 1) << 8)
+}
+
+/// Parse TGA header
+fn parse_tga_header(data: Collection<Int>) -> (TGAHeader, Bool) {
+    let header = TGAHeader {
+        id_length: 0,
+        color_map_type: 0,
+        image_type: 0,
+        color_map_origin: 0,
+        color_map_length: 0,
+        color_map_depth: 0,
+        x_origin: 0,
+        y_origin: 0,
+        width: 0,
+        height: 0,
+        pixel_depth: 0,
+        image_descriptor: 0,
+    }
+
+    if data.len() < 18 {
+        return (header, false)
+    }
+
+    header.id_length = read_byte(data, 0)
+    header.color_map_type = read_byte(data, 1)
+    header.image_type = read_byte(data, 2)
+    header.color_map_origin = read_u16_le(data, 3)
+    header.color_map_length = read_u16_le(data, 5)
+    header.color_map_depth = read_byte(data, 7)
+    header.x_origin = read_u16_le(data, 8)
+    header.y_origin = read_u16_le(data, 10)
+    header.width = read_u16_le(data, 12)
+    header.height = read_u16_le(data, 14)
+    header.pixel_depth = read_byte(data, 16)
+    header.image_descriptor = read_byte(data, 17)
+
+    // Validate
+    if header.width == 0 || header.height == 0 {
+        return (header, false)
+    }
+
+    let valid_types = [TGA_TYPE_RGB, TGA_TYPE_GRAYSCALE, TGA_TYPE_INDEXED,
+                       TGA_TYPE_RLE_RGB, TGA_TYPE_RLE_GRAYSCALE, TGA_TYPE_RLE_INDEXED]
+
+    let type_valid = false
+    for t in valid_types {
+        if header.image_type == t {
+            type_valid = true
+            break
+        }
+    }
+
+    if !type_valid {
+        return (header, false)
+    }
+
+    return (header, true)
+}
+
+/// Load uncompressed RGB/RGBA pixels
+fn load_rgb_pixels(data: Collection<Int>, header: TGAHeader, data_offset: Int) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = header.width
+    let height = header.height
+    let bpp = header.pixel_depth / 8
+    let is_top_down = (header.image_descriptor & TGA_ORIGIN_UPPER_LEFT) != 0
+
+    // Pre-allocate RGBA pixels
+    let total = width * height * 4
+    for i in 0..total {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        let dst_y = if is_top_down { y } else { height - 1 - y }
+
+        for x in 0..width {
+            let src_offset = data_offset + (y * width + x) * bpp
+            let dst_offset = (dst_y * width + x) * 4
+
+            if bpp == 3 {
+                // BGR -> RGBA
+                pixels.set(dst_offset, read_byte(data, src_offset + 2))     // R
+                pixels.set(dst_offset + 1, read_byte(data, src_offset + 1)) // G
+                pixels.set(dst_offset + 2, read_byte(data, src_offset))     // B
+                pixels.set(dst_offset + 3, 255)                              // A
+            } else if bpp == 4 {
+                // BGRA -> RGBA
+                pixels.set(dst_offset, read_byte(data, src_offset + 2))     // R
+                pixels.set(dst_offset + 1, read_byte(data, src_offset + 1)) // G
+                pixels.set(dst_offset + 2, read_byte(data, src_offset))     // B
+                pixels.set(dst_offset + 3, read_byte(data, src_offset + 3)) // A
+            } else if bpp == 2 {
+                // 16-bit: ARRRRRGG GGGBBBBB -> RGBA
+                let lo = read_byte(data, src_offset)
+                let hi = read_byte(data, src_offset + 1)
+                let r = (hi & 0x7C) >> 2
+                let g = ((hi & 0x03) << 3) | ((lo & 0xE0) >> 5)
+                let b = lo & 0x1F
+                pixels.set(dst_offset, (r * 255) / 31)
+                pixels.set(dst_offset + 1, (g * 255) / 31)
+                pixels.set(dst_offset + 2, (b * 255) / 31)
+                pixels.set(dst_offset + 3, if (hi & 0x80) != 0 { 255 } else { 0 })
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Load grayscale pixels
+fn load_grayscale_pixels(data: Collection<Int>, header: TGAHeader, data_offset: Int) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = header.width
+    let height = header.height
+    let bpp = header.pixel_depth / 8
+    let is_top_down = (header.image_descriptor & TGA_ORIGIN_UPPER_LEFT) != 0
+
+    // Pre-allocate RGBA pixels
+    let total = width * height * 4
+    for i in 0..total {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        let dst_y = if is_top_down { y } else { height - 1 - y }
+
+        for x in 0..width {
+            let src_offset = data_offset + (y * width + x) * bpp
+            let dst_offset = (dst_y * width + x) * 4
+
+            let gray = read_byte(data, src_offset)
+            let alpha = if bpp == 2 { read_byte(data, src_offset + 1) } else { 255 }
+
+            pixels.set(dst_offset, gray)
+            pixels.set(dst_offset + 1, gray)
+            pixels.set(dst_offset + 2, gray)
+            pixels.set(dst_offset + 3, alpha)
+        }
+    }
+
+    return pixels
+}
+
+/// Load RLE compressed RGB/RGBA pixels
+fn load_rle_rgb_pixels(data: Collection<Int>, header: TGAHeader, data_offset: Int) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = header.width
+    let height = header.height
+    let bpp = header.pixel_depth / 8
+    let is_top_down = (header.image_descriptor & TGA_ORIGIN_UPPER_LEFT) != 0
+
+    // Pre-allocate RGBA pixels
+    let total = width * height * 4
+    for i in 0..total {
+        pixels.add(0)
+    }
+
+    let src_offset = data_offset
+    let pixel_index = 0
+    let total_pixels = width * height
+
+    while pixel_index < total_pixels {
+        if src_offset >= data.len() {
+            break
+        }
+
+        let packet_header = read_byte(data, src_offset)
+        src_offset = src_offset + 1
+
+        let count = (packet_header & 0x7F) + 1
+        let is_rle = (packet_header & 0x80) != 0
+
+        if is_rle {
+            // RLE packet - one pixel repeated
+            let r = if bpp >= 3 { read_byte(data, src_offset + 2) } else { 0 }
+            let g = if bpp >= 3 { read_byte(data, src_offset + 1) } else { 0 }
+            let b = if bpp >= 3 { read_byte(data, src_offset) } else { 0 }
+            let a = if bpp == 4 { read_byte(data, src_offset + 3) } else { 255 }
+            src_offset = src_offset + bpp
+
+            for i in 0..count {
+                if pixel_index >= total_pixels {
+                    break
+                }
+
+                let y = pixel_index / width
+                let x = pixel_index % width
+                let dst_y = if is_top_down { y } else { height - 1 - y }
+                let dst_offset = (dst_y * width + x) * 4
+
+                pixels.set(dst_offset, r)
+                pixels.set(dst_offset + 1, g)
+                pixels.set(dst_offset + 2, b)
+                pixels.set(dst_offset + 3, a)
+
+                pixel_index = pixel_index + 1
+            }
+        } else {
+            // Raw packet - multiple distinct pixels
+            for i in 0..count {
+                if pixel_index >= total_pixels || src_offset + bpp > data.len() {
+                    break
+                }
+
+                let r = if bpp >= 3 { read_byte(data, src_offset + 2) } else { 0 }
+                let g = if bpp >= 3 { read_byte(data, src_offset + 1) } else { 0 }
+                let b = if bpp >= 3 { read_byte(data, src_offset) } else { 0 }
+                let a = if bpp == 4 { read_byte(data, src_offset + 3) } else { 255 }
+                src_offset = src_offset + bpp
+
+                let y = pixel_index / width
+                let x = pixel_index % width
+                let dst_y = if is_top_down { y } else { height - 1 - y }
+                let dst_offset = (dst_y * width + x) * 4
+
+                pixels.set(dst_offset, r)
+                pixels.set(dst_offset + 1, g)
+                pixels.set(dst_offset + 2, b)
+                pixels.set(dst_offset + 3, a)
+
+                pixel_index = pixel_index + 1
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Load indexed pixels with color map
+fn load_indexed_pixels(data: Collection<Int>, header: TGAHeader, data_offset: Int) -> Collection<Int> {
+    let pixels = Collection<Int>{}
+    let width = header.width
+    let height = header.height
+    let is_top_down = (header.image_descriptor & TGA_ORIGIN_UPPER_LEFT) != 0
+
+    // Calculate color map offset and size
+    let color_map_offset = 18 + header.id_length
+    let color_map_entry_size = header.color_map_depth / 8
+
+    // Pre-allocate RGBA pixels
+    let total = width * height * 4
+    for i in 0..total {
+        pixels.add(0)
+    }
+
+    for y in 0..height {
+        let dst_y = if is_top_down { y } else { height - 1 - y }
+
+        for x in 0..width {
+            let src_offset = data_offset + (y * width + x)
+            let index = read_byte(data, src_offset)
+
+            // Look up color in palette
+            let color_offset = color_map_offset + (index - header.color_map_origin) * color_map_entry_size
+            let dst_offset = (dst_y * width + x) * 4
+
+            if color_map_entry_size == 3 {
+                pixels.set(dst_offset, read_byte(data, color_offset + 2))     // R
+                pixels.set(dst_offset + 1, read_byte(data, color_offset + 1)) // G
+                pixels.set(dst_offset + 2, read_byte(data, color_offset))     // B
+                pixels.set(dst_offset + 3, 255)
+            } else if color_map_entry_size == 4 {
+                pixels.set(dst_offset, read_byte(data, color_offset + 2))
+                pixels.set(dst_offset + 1, read_byte(data, color_offset + 1))
+                pixels.set(dst_offset + 2, read_byte(data, color_offset))
+                pixels.set(dst_offset + 3, read_byte(data, color_offset + 3))
+            }
+        }
+    }
+
+    return pixels
+}
+
+/// Check if data is a valid TGA file
+fn is_tga_file(data: Collection<Int>) -> Bool {
+    if data.len() < 18 {
+        return false
+    }
+
+    let image_type = read_byte(data, 2)
+    let valid_types = [TGA_TYPE_RGB, TGA_TYPE_GRAYSCALE, TGA_TYPE_INDEXED,
+                       TGA_TYPE_RLE_RGB, TGA_TYPE_RLE_GRAYSCALE, TGA_TYPE_RLE_INDEXED]
+
+    for t in valid_types {
+        if image_type == t {
+            return true
+        }
+    }
+
+    return false
+}
+
+/// Load TGA image from data
+fn load_tga(data: Collection<Int>) -> (TGAImage, Bool) {
+    let image = create_tga_image()
+
+    let (header, valid) = parse_tga_header(data)
+    if !valid {
+        return (image, false)
+    }
+
+    image.width = header.width
+    image.height = header.height
+    image.channels = if header.pixel_depth == 32 { 4 } else { 3 }
+    image.is_flipped = (header.image_descriptor & TGA_ORIGIN_UPPER_LEFT) != 0
+
+    // Calculate data offset (header + ID + color map)
+    let color_map_size = if header.color_map_type == 1 {
+        header.color_map_length * (header.color_map_depth / 8)
+    } else {
+        0
+    }
+    let data_offset = 18 + header.id_length + color_map_size
+
+    // Load pixels based on image type
+    if header.image_type == TGA_TYPE_RGB {
+        image.pixels = load_rgb_pixels(data, header, data_offset)
+    } else if header.image_type == TGA_TYPE_GRAYSCALE {
+        image.pixels = load_grayscale_pixels(data, header, data_offset)
+    } else if header.image_type == TGA_TYPE_INDEXED {
+        image.pixels = load_indexed_pixels(data, header, data_offset)
+    } else if header.image_type == TGA_TYPE_RLE_RGB {
+        image.pixels = load_rle_rgb_pixels(data, header, data_offset)
+    } else if header.image_type == TGA_TYPE_RLE_GRAYSCALE {
+        // Treat RLE grayscale same as RLE RGB for now
+        image.pixels = load_rle_rgb_pixels(data, header, data_offset)
+    } else {
+        return (image, false)
+    }
+
+    return (image, true)
+}
+
+/// Get pixel at coordinate
+fn get_tga_pixel(image: TGAImage, x: Int, y: Int) -> (Int, Int, Int, Int) {
+    if x < 0 || x >= image.width || y < 0 || y >= image.height {
+        return (0, 0, 0, 0)
+    }
+
+    let offset = (y * image.width + x) * 4
+    if offset + 4 > image.pixels.len() {
+        return (0, 0, 0, 0)
+    }
+
+    return (
+        image.pixels.get(offset),
+        image.pixels.get(offset + 1),
+        image.pixels.get(offset + 2),
+        image.pixels.get(offset + 3)
+    )
+}
+
+/// Create solid color TGA image
+fn create_solid_tga(width: Int, height: Int, r: Int, g: Int, b: Int, a: Int) -> TGAImage {
+    let image = TGAImage {
+        width: width,
+        height: height,
+        channels: 4,
+        pixels: Collection<Int>{},
+        name: "solid",
+        is_flipped: false,
+    }
+
+    let total = width * height
+    for i in 0..total {
+        image.pixels.add(r)
+        image.pixels.add(g)
+        image.pixels.add(b)
+        image.pixels.add(a)
+    }
+
+    return image
+}
+
+/// Export image to TGA format
+fn export_tga(image: TGAImage) -> Collection<Int> {
+    let data = Collection<Int>{}
+
+    // Write header
+    data.add(0)                     // ID length
+    data.add(0)                     // No color map
+    data.add(TGA_TYPE_RGB)          // Uncompressed RGB
+    data.add(0)                     // Color map origin (low)
+    data.add(0)                     // Color map origin (high)
+    data.add(0)                     // Color map length (low)
+    data.add(0)                     // Color map length (high)
+    data.add(0)                     // Color map depth
+    data.add(0)                     // X origin (low)
+    data.add(0)                     // X origin (high)
+    data.add(0)                     // Y origin (low)
+    data.add(0)                     // Y origin (high)
+    data.add(image.width & 0xFF)    // Width (low)
+    data.add((image.width >> 8) & 0xFF)  // Width (high)
+    data.add(image.height & 0xFF)   // Height (low)
+    data.add((image.height >> 8) & 0xFF) // Height (high)
+    data.add(32)                    // 32 bits per pixel
+    data.add(0x28)                  // Image descriptor (top-down, 8 alpha bits)
+
+    // Write pixels (RGBA -> BGRA)
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let offset = (y * image.width + x) * 4
+            data.add(image.pixels.get(offset + 2))  // B
+            data.add(image.pixels.get(offset + 1))  // G
+            data.add(image.pixels.get(offset))      // R
+            data.add(image.pixels.get(offset + 3))  // A
+        }
+    }
+
+    return data
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_tga_creation() -> Bool {
+    let image = create_tga_image()
+    assert(image.width == 0, "Default width should be 0")
+    assert(image.height == 0, "Default height should be 0")
+    return true
+}
+
+fn test_solid_tga() -> Bool {
+    let image = create_solid_tga(10, 10, 255, 128, 64, 255)
+    assert(image.width == 10, "Width should be 10")
+    assert(image.height == 10, "Height should be 10")
+    assert(image.pixels.len() == 400, "Should have 400 color values (10x10x4)")
+
+    let (r, g, b, a) = get_tga_pixel(image, 0, 0)
+    assert(r == 255, "Red should be 255")
+    assert(g == 128, "Green should be 128")
+    assert(b == 64, "Blue should be 64")
+
+    return true
+}
+
+fn test_tga_export_roundtrip() -> Bool {
+    let original = create_solid_tga(4, 4, 100, 150, 200, 255)
+    let exported = export_tga(original)
+
+    // Verify header
+    assert(exported.get(2) == TGA_TYPE_RGB, "Should be RGB type")
+    assert(exported.get(12) == 4, "Width low byte should be 4")
+    assert(exported.get(14) == 4, "Height low byte should be 4")
+    assert(exported.get(16) == 32, "Should be 32 bpp")
+
+    return true
+}
+
+fn test_tga_detection() -> Bool {
+    // Create minimal valid TGA header for RGB
+    let data = Collection<Int>{}
+    for i in 0..18 {
+        data.add(0)
+    }
+    data.set(2, TGA_TYPE_RGB)  // Image type
+    data.set(12, 1)  // Width = 1
+    data.set(14, 1)  // Height = 1
+    data.set(16, 24) // 24 bpp
+
+    assert(is_tga_file(data) == true, "Should detect valid TGA")
+
+    // Invalid type
+    let invalid = Collection<Int>{}
+    for i in 0..18 {
+        invalid.add(0)
+    }
+    invalid.set(2, 99)  // Invalid image type
+
+    assert(is_tga_file(invalid) == false, "Should reject invalid type")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_tga_creation(), "TGA creation test failed")
+    assert(test_solid_tga(), "Solid TGA test failed")
+    assert(test_tga_export_roundtrip(), "TGA export roundtrip test failed")
+    assert(test_tga_detection(), "TGA detection test failed")
+    return true
+}
