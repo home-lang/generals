@@ -1,0 +1,683 @@
+// Bridge Tower Behavior - Bridge tower special logic
+// Handles tower-specific bridge interaction, damage propagation, and repair coordination
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct BridgeTowerConfig {
+    tower_health: i32 = 1000,
+    repair_rate: f32 = 5.0,                    // Health per second when repairing
+    repair_range: f32 = 50.0,                  // Range to detect repair vehicles
+    collapse_threshold: f32 = 0.25,            // Health % that triggers bridge collapse
+    tower_armor: f32 = 0.3,                    // Damage reduction
+    linked_bridge_id: u64 = 0,                 // Bridge this tower supports
+    is_primary_tower: bool = true,             // Primary towers trigger full collapse
+    repair_cost_per_health: f32 = 0.5,         // Resource cost to repair
+    smoke_threshold: f32 = 0.5,                // Health % to start showing smoke
+    fire_threshold: f32 = 0.25,                // Health % to start showing fire
+    auto_repair: bool = false,                 // Whether tower self-repairs over time
+    auto_repair_delay: f32 = 30.0,             // Delay before auto-repair starts
+    auto_repair_rate: f32 = 1.0,               // Auto-repair health per second
+}
+
+// ============================================================================
+// State Management
+// ============================================================================
+
+enum TowerState {
+    Intact,
+    Damaged,
+    Critical,
+    Collapsed,
+    Repairing,
+}
+
+enum TowerDamageEffect {
+    None,
+    Smoke,
+    Fire,
+    SmokeAndFire,
+    Rubble,
+}
+
+struct TowerVisualState {
+    damage_effect: TowerDamageEffect = TowerDamageEffect.None,
+    smoke_intensity: f32 = 0.0,
+    fire_intensity: f32 = 0.0,
+    collapse_progress: f32 = 0.0,
+    repair_sparks: bool = false,
+    rubble_pieces: i32 = 0,
+}
+
+// ============================================================================
+// Tower Instance
+// ============================================================================
+
+struct BridgeTowerInstance {
+    tower_id: u64,
+    config: BridgeTowerConfig,
+    state: TowerState,
+    visual_state: TowerVisualState,
+    current_health: f32,
+    max_health: f32,
+    position: Vec3,
+    rotation: f32,
+    linked_bridge_id: u64,
+    linked_tower_ids: [u64; 4],              // Other towers on same bridge (max 4)
+    linked_tower_count: i32,
+    is_being_repaired: bool,
+    repair_progress: f32,
+    time_since_damage: f32,
+    collapse_timer: f32,
+    owner_player: i32,
+}
+
+fn create_tower_instance(tower_id: u64, config: BridgeTowerConfig, position: Vec3) -> BridgeTowerInstance {
+    return BridgeTowerInstance {
+        tower_id: tower_id,
+        config: config,
+        state: TowerState.Intact,
+        visual_state: TowerVisualState {},
+        current_health: config.tower_health as f32,
+        max_health: config.tower_health as f32,
+        position: position,
+        rotation: 0.0,
+        linked_bridge_id: config.linked_bridge_id,
+        linked_tower_ids: [0, 0, 0, 0],
+        linked_tower_count: 0,
+        is_being_repaired: false,
+        repair_progress: 0.0,
+        time_since_damage: 0.0,
+        collapse_timer: 0.0,
+        owner_player: -1,  // Neutral by default
+    };
+}
+
+// ============================================================================
+// Bridge Tower Behavior Module
+// ============================================================================
+
+struct BridgeTowerBehavior {
+    towers: Map<u64, BridgeTowerInstance>,
+    bridge_links: Map<u64, [u64; 8]>,        // Bridge ID -> Tower IDs (max 8 towers per bridge)
+    next_tower_id: u64,
+
+    // Callbacks
+    on_tower_damaged: fn(u64, f32) = null,
+    on_tower_collapsed: fn(u64) = null,
+    on_tower_repaired: fn(u64) = null,
+    on_bridge_collapse_triggered: fn(u64) = null,
+}
+
+fn create_bridge_tower_behavior() -> BridgeTowerBehavior {
+    return BridgeTowerBehavior {
+        towers: Map<u64, BridgeTowerInstance>.new(),
+        bridge_links: Map<u64, [u64; 8]>.new(),
+        next_tower_id: 1,
+    };
+}
+
+// ============================================================================
+// Tower Management
+// ============================================================================
+
+fn register_tower(behavior: &mut BridgeTowerBehavior, config: BridgeTowerConfig, position: Vec3) -> u64 {
+    let tower_id = behavior.next_tower_id;
+    behavior.next_tower_id += 1;
+
+    let instance = create_tower_instance(tower_id, config, position);
+    behavior.towers.insert(tower_id, instance);
+
+    // Link to bridge
+    if config.linked_bridge_id != 0 {
+        link_tower_to_bridge(behavior, tower_id, config.linked_bridge_id);
+    }
+
+    return tower_id;
+}
+
+fn link_tower_to_bridge(behavior: &mut BridgeTowerBehavior, tower_id: u64, bridge_id: u64) {
+    if !behavior.bridge_links.contains(bridge_id) {
+        behavior.bridge_links.insert(bridge_id, [0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    let links = behavior.bridge_links.get_mut(bridge_id);
+    if links != null {
+        // Find empty slot
+        for i in 0..8 {
+            if links[i] == 0 {
+                links[i] = tower_id;
+                break;
+            }
+        }
+    }
+
+    // Update tower's linked bridge
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower != null {
+        tower.linked_bridge_id = bridge_id;
+
+        // Update linked tower list for this tower
+        update_tower_links(behavior, tower_id, bridge_id);
+    }
+}
+
+fn update_tower_links(behavior: &mut BridgeTowerBehavior, tower_id: u64, bridge_id: u64) {
+    let links = behavior.bridge_links.get(bridge_id);
+    if links == null {
+        return;
+    }
+
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null {
+        return;
+    }
+
+    tower.linked_tower_count = 0;
+    for i in 0..8 {
+        if links[i] != 0 && links[i] != tower_id {
+            if tower.linked_tower_count < 4 {
+                tower.linked_tower_ids[tower.linked_tower_count] = links[i];
+                tower.linked_tower_count += 1;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Damage Handling
+// ============================================================================
+
+fn damage_tower(behavior: &mut BridgeTowerBehavior, tower_id: u64, damage: f32, damage_type: i32) -> bool {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null || tower.state == TowerState.Collapsed {
+        return false;
+    }
+
+    // Apply armor reduction
+    let actual_damage = damage * (1.0 - tower.config.tower_armor);
+    tower.current_health -= actual_damage;
+    tower.time_since_damage = 0.0;
+
+    // Update state based on health percentage
+    let health_pct = tower.current_health / tower.max_health;
+
+    if tower.current_health <= 0.0 {
+        tower.current_health = 0.0;
+        trigger_tower_collapse(behavior, tower_id);
+        return true;
+    } else if health_pct <= tower.config.collapse_threshold {
+        tower.state = TowerState.Critical;
+        update_visual_state(tower, TowerDamageEffect.SmokeAndFire);
+    } else if health_pct <= tower.config.smoke_threshold {
+        tower.state = TowerState.Damaged;
+        if health_pct <= tower.config.fire_threshold {
+            update_visual_state(tower, TowerDamageEffect.Fire);
+        } else {
+            update_visual_state(tower, TowerDamageEffect.Smoke);
+        }
+    }
+
+    // Fire callback
+    if behavior.on_tower_damaged != null {
+        behavior.on_tower_damaged(tower_id, actual_damage);
+    }
+
+    return false;
+}
+
+fn update_visual_state(tower: &mut BridgeTowerInstance, effect: TowerDamageEffect) {
+    tower.visual_state.damage_effect = effect;
+
+    let health_pct = tower.current_health / tower.max_health;
+
+    match effect {
+        TowerDamageEffect.None => {
+            tower.visual_state.smoke_intensity = 0.0;
+            tower.visual_state.fire_intensity = 0.0;
+        },
+        TowerDamageEffect.Smoke => {
+            tower.visual_state.smoke_intensity = 1.0 - health_pct;
+            tower.visual_state.fire_intensity = 0.0;
+        },
+        TowerDamageEffect.Fire => {
+            tower.visual_state.smoke_intensity = 0.5;
+            tower.visual_state.fire_intensity = 1.0 - health_pct;
+        },
+        TowerDamageEffect.SmokeAndFire => {
+            tower.visual_state.smoke_intensity = 0.8;
+            tower.visual_state.fire_intensity = 0.8;
+        },
+        TowerDamageEffect.Rubble => {
+            tower.visual_state.smoke_intensity = 0.2;
+            tower.visual_state.fire_intensity = 0.0;
+            tower.visual_state.rubble_pieces = 5;
+        },
+    }
+}
+
+fn trigger_tower_collapse(behavior: &mut BridgeTowerBehavior, tower_id: u64) {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null {
+        return;
+    }
+
+    tower.state = TowerState.Collapsed;
+    tower.collapse_timer = 0.0;
+    update_visual_state(tower, TowerDamageEffect.Rubble);
+
+    // Fire callback
+    if behavior.on_tower_collapsed != null {
+        behavior.on_tower_collapsed(tower_id);
+    }
+
+    // If primary tower, trigger bridge collapse
+    if tower.config.is_primary_tower && tower.linked_bridge_id != 0 {
+        if behavior.on_bridge_collapse_triggered != null {
+            behavior.on_bridge_collapse_triggered(tower.linked_bridge_id);
+        }
+    }
+
+    // Propagate damage to linked towers
+    propagate_collapse_damage(behavior, tower_id);
+}
+
+fn propagate_collapse_damage(behavior: &mut BridgeTowerBehavior, collapsed_tower_id: u64) {
+    let tower = behavior.towers.get(collapsed_tower_id);
+    if tower == null {
+        return;
+    }
+
+    // Deal 25% max health damage to linked towers
+    let collapse_damage = tower.max_health * 0.25;
+
+    for i in 0..tower.linked_tower_count {
+        let linked_id = tower.linked_tower_ids[i];
+        if linked_id != 0 {
+            damage_tower(behavior, linked_id, collapse_damage, 0);  // 0 = structural damage
+        }
+    }
+}
+
+// ============================================================================
+// Repair System
+// ============================================================================
+
+fn start_repair(behavior: &mut BridgeTowerBehavior, tower_id: u64) -> bool {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null {
+        return false;
+    }
+
+    // Can't repair collapsed towers through normal means
+    if tower.state == TowerState.Collapsed {
+        return false;
+    }
+
+    // Already fully repaired
+    if tower.current_health >= tower.max_health {
+        return false;
+    }
+
+    tower.is_being_repaired = true;
+    tower.state = TowerState.Repairing;
+    tower.visual_state.repair_sparks = true;
+
+    return true;
+}
+
+fn stop_repair(behavior: &mut BridgeTowerBehavior, tower_id: u64) {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null {
+        return;
+    }
+
+    tower.is_being_repaired = false;
+    tower.visual_state.repair_sparks = false;
+
+    // Update state based on current health
+    let health_pct = tower.current_health / tower.max_health;
+    if health_pct >= 1.0 {
+        tower.state = TowerState.Intact;
+    } else if health_pct <= tower.config.collapse_threshold {
+        tower.state = TowerState.Critical;
+    } else {
+        tower.state = TowerState.Damaged;
+    }
+}
+
+fn repair_tower(behavior: &mut BridgeTowerBehavior, tower_id: u64, amount: f32) -> f32 {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null || tower.state == TowerState.Collapsed {
+        return 0.0;
+    }
+
+    let old_health = tower.current_health;
+    tower.current_health = min_f32(tower.current_health + amount, tower.max_health);
+    let actual_repair = tower.current_health - old_health;
+
+    // Update visual state
+    let health_pct = tower.current_health / tower.max_health;
+    if health_pct >= 1.0 {
+        tower.state = TowerState.Intact;
+        update_visual_state(tower, TowerDamageEffect.None);
+        tower.is_being_repaired = false;
+        tower.visual_state.repair_sparks = false;
+
+        if behavior.on_tower_repaired != null {
+            behavior.on_tower_repaired(tower_id);
+        }
+    } else if health_pct > tower.config.smoke_threshold {
+        update_visual_state(tower, TowerDamageEffect.None);
+    } else if health_pct > tower.config.fire_threshold {
+        update_visual_state(tower, TowerDamageEffect.Smoke);
+    }
+
+    return actual_repair;
+}
+
+fn get_repair_cost(behavior: &BridgeTowerBehavior, tower_id: u64) -> f32 {
+    let tower = behavior.towers.get(tower_id);
+    if tower == null || tower.state == TowerState.Collapsed {
+        return 0.0;
+    }
+
+    let missing_health = tower.max_health - tower.current_health;
+    return missing_health * tower.config.repair_cost_per_health;
+}
+
+// ============================================================================
+// Rebuild System (for collapsed towers)
+// ============================================================================
+
+fn can_rebuild_tower(behavior: &BridgeTowerBehavior, tower_id: u64) -> bool {
+    let tower = behavior.towers.get(tower_id);
+    if tower == null {
+        return false;
+    }
+
+    return tower.state == TowerState.Collapsed;
+}
+
+fn rebuild_tower(behavior: &mut BridgeTowerBehavior, tower_id: u64) -> bool {
+    let tower = behavior.towers.get_mut(tower_id);
+    if tower == null || tower.state != TowerState.Collapsed {
+        return false;
+    }
+
+    // Reset tower to damaged state (needs repair after rebuild)
+    tower.state = TowerState.Damaged;
+    tower.current_health = tower.max_health * 0.5;  // Start at 50% health
+    tower.collapse_timer = 0.0;
+    update_visual_state(tower, TowerDamageEffect.Smoke);
+
+    return true;
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_bridge_tower_behavior(behavior: &mut BridgeTowerBehavior, delta_time: f32) {
+    for entry in behavior.towers.iter_mut() {
+        let tower = entry.value;
+
+        // Update time since damage
+        tower.time_since_damage += delta_time;
+
+        match tower.state {
+            TowerState.Intact => {
+                // Nothing to update
+            },
+            TowerState.Damaged => {
+                update_damaged_tower(tower, delta_time);
+            },
+            TowerState.Critical => {
+                update_critical_tower(tower, delta_time);
+            },
+            TowerState.Collapsed => {
+                update_collapsed_tower(tower, delta_time);
+            },
+            TowerState.Repairing => {
+                update_repairing_tower(behavior, tower, delta_time);
+            },
+        }
+    }
+}
+
+fn update_damaged_tower(tower: &mut BridgeTowerInstance, delta_time: f32) {
+    // Check for auto-repair
+    if tower.config.auto_repair && tower.time_since_damage >= tower.config.auto_repair_delay {
+        tower.current_health += tower.config.auto_repair_rate * delta_time;
+        tower.current_health = min_f32(tower.current_health, tower.max_health);
+
+        if tower.current_health >= tower.max_health {
+            tower.state = TowerState.Intact;
+            update_visual_state(tower, TowerDamageEffect.None);
+        }
+    }
+}
+
+fn update_critical_tower(tower: &mut BridgeTowerInstance, delta_time: f32) {
+    // Critical towers may spontaneously collapse without repair
+    // Add slight randomness to collapse timing (simulated with time-based probability)
+    if tower.time_since_damage > 60.0 {  // After 60 seconds without repair
+        // Tower is at risk of collapse
+        tower.current_health -= delta_time * 0.5;  // Slow health decay
+    }
+}
+
+fn update_collapsed_tower(tower: &mut BridgeTowerInstance, delta_time: f32) {
+    // Update collapse animation progress
+    if tower.visual_state.collapse_progress < 1.0 {
+        tower.visual_state.collapse_progress += delta_time * 0.5;
+        if tower.visual_state.collapse_progress > 1.0 {
+            tower.visual_state.collapse_progress = 1.0;
+        }
+    }
+
+    // Fade out smoke over time
+    if tower.visual_state.smoke_intensity > 0.0 {
+        tower.visual_state.smoke_intensity -= delta_time * 0.02;
+        if tower.visual_state.smoke_intensity < 0.0 {
+            tower.visual_state.smoke_intensity = 0.0;
+        }
+    }
+}
+
+fn update_repairing_tower(behavior: &mut BridgeTowerBehavior, tower: &mut BridgeTowerInstance, delta_time: f32) {
+    if tower.is_being_repaired {
+        let repair_amount = tower.config.repair_rate * delta_time;
+        repair_tower(behavior, tower.tower_id, repair_amount);
+    }
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+fn get_tower_health_percent(behavior: &BridgeTowerBehavior, tower_id: u64) -> f32 {
+    let tower = behavior.towers.get(tower_id);
+    if tower == null {
+        return 0.0;
+    }
+    return tower.current_health / tower.max_health;
+}
+
+fn get_tower_state(behavior: &BridgeTowerBehavior, tower_id: u64) -> TowerState {
+    let tower = behavior.towers.get(tower_id);
+    if tower == null {
+        return TowerState.Collapsed;
+    }
+    return tower.state;
+}
+
+fn is_tower_passable(behavior: &BridgeTowerBehavior, tower_id: u64) -> bool {
+    let tower = behavior.towers.get(tower_id);
+    if tower == null {
+        return false;
+    }
+    return tower.state != TowerState.Collapsed;
+}
+
+fn get_bridge_health_percent(behavior: &BridgeTowerBehavior, bridge_id: u64) -> f32 {
+    let links = behavior.bridge_links.get(bridge_id);
+    if links == null {
+        return 0.0;
+    }
+
+    let mut total_health: f32 = 0.0;
+    let mut total_max_health: f32 = 0.0;
+    let mut tower_count: i32 = 0;
+
+    for i in 0..8 {
+        if links[i] != 0 {
+            let tower = behavior.towers.get(links[i]);
+            if tower != null {
+                total_health += tower.current_health;
+                total_max_health += tower.max_health;
+                tower_count += 1;
+            }
+        }
+    }
+
+    if total_max_health <= 0.0 {
+        return 0.0;
+    }
+
+    return total_health / total_max_health;
+}
+
+fn are_all_towers_intact(behavior: &BridgeTowerBehavior, bridge_id: u64) -> bool {
+    let links = behavior.bridge_links.get(bridge_id);
+    if links == null {
+        return false;
+    }
+
+    for i in 0..8 {
+        if links[i] != 0 {
+            let tower = behavior.towers.get(links[i]);
+            if tower != null && tower.state != TowerState.Intact {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+fn is_any_tower_collapsed(behavior: &BridgeTowerBehavior, bridge_id: u64) -> bool {
+    let links = behavior.bridge_links.get(bridge_id);
+    if links == null {
+        return false;
+    }
+
+    for i in 0..8 {
+        if links[i] != 0 {
+            let tower = behavior.towers.get(links[i]);
+            if tower != null && tower.state == TowerState.Collapsed {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn min_f32(a: f32, b: f32) -> f32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a > b { return a; }
+    return b;
+}
+
+// ============================================================================
+// Pre-built Configurations
+// ============================================================================
+
+fn create_standard_tower_config(bridge_id: u64, is_primary: bool) -> BridgeTowerConfig {
+    return BridgeTowerConfig {
+        tower_health: 1000,
+        repair_rate: 5.0,
+        repair_range: 50.0,
+        collapse_threshold: 0.25,
+        tower_armor: 0.3,
+        linked_bridge_id: bridge_id,
+        is_primary_tower: is_primary,
+        repair_cost_per_health: 0.5,
+        smoke_threshold: 0.5,
+        fire_threshold: 0.25,
+        auto_repair: false,
+        auto_repair_delay: 30.0,
+        auto_repair_rate: 1.0,
+    };
+}
+
+fn create_reinforced_tower_config(bridge_id: u64) -> BridgeTowerConfig {
+    return BridgeTowerConfig {
+        tower_health: 2000,
+        repair_rate: 3.0,
+        repair_range: 50.0,
+        collapse_threshold: 0.15,
+        tower_armor: 0.5,
+        linked_bridge_id: bridge_id,
+        is_primary_tower: true,
+        repair_cost_per_health: 1.0,
+        smoke_threshold: 0.4,
+        fire_threshold: 0.2,
+        auto_repair: true,
+        auto_repair_delay: 45.0,
+        auto_repair_rate: 0.5,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_bridge_tower_behavior() {
+    print("Testing Bridge Tower Behavior...");
+
+    // Create behavior
+    let mut behavior = create_bridge_tower_behavior();
+
+    // Register towers for a bridge
+    let bridge_id: u64 = 100;
+    let tower1_config = create_standard_tower_config(bridge_id, true);
+    let tower2_config = create_standard_tower_config(bridge_id, false);
+
+    let tower1_id = register_tower(&mut behavior, tower1_config, Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+    let tower2_id = register_tower(&mut behavior, tower2_config, Vec3 { x: 100.0, y: 0.0, z: 0.0 });
+
+    print("  Created 2 towers for bridge");
+
+    // Test damage
+    damage_tower(&mut behavior, tower1_id, 200.0, 1);
+    let health1 = get_tower_health_percent(&behavior, tower1_id);
+    print("  Tower 1 health after 200 damage: " + (health1 * 100.0) as string + "%");
+
+    // Test repair
+    start_repair(&mut behavior, tower1_id);
+    repair_tower(&mut behavior, tower1_id, 100.0);
+    let health2 = get_tower_health_percent(&behavior, tower1_id);
+    print("  Tower 1 health after 100 repair: " + (health2 * 100.0) as string + "%");
+
+    // Test collapse
+    damage_tower(&mut behavior, tower2_id, 2000.0, 1);
+    let state = get_tower_state(&behavior, tower2_id);
+    print("  Tower 2 collapsed: " + (state == TowerState.Collapsed) as string);
+
+    // Test bridge health
+    let bridge_health = get_bridge_health_percent(&behavior, bridge_id);
+    print("  Bridge overall health: " + (bridge_health * 100.0) as string + "%");
+
+    print("Bridge Tower Behavior tests complete!");
+}

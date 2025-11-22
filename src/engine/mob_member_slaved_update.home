@@ -1,0 +1,959 @@
+// Mob Member Slaved Update - Angry mob AI and swarm behavior
+// Handles mob recruitment, target selection, and coordinated swarm attacks
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct MobConfig {
+    max_mob_size: i32 = 10,                   // Maximum units in a mob
+    min_mob_size: i32 = 3,                    // Minimum to maintain mob behavior
+    recruitment_range: f32 = 100.0,           // Range to recruit new members
+    cohesion_range: f32 = 50.0,               // Range to stay together
+    separation_distance: f32 = 10.0,          // Minimum distance between members
+    swarm_speed_bonus: f32 = 1.2,             // Speed bonus when in mob
+    mob_damage_bonus: f32 = 1.1,              // Damage bonus per member
+    max_damage_bonus: f32 = 2.0,              // Maximum stacked damage bonus
+    flee_health_threshold: f32 = 0.2,         // Health % to flee
+    rally_range: f32 = 30.0,                  // Range for rallying
+    target_switch_delay: f32 = 2.0,           // Delay before mob switches targets
+    leader_influence_range: f32 = 75.0,       // Range leader influences behavior
+    anger_decay_rate: f32 = 0.05,             // How fast anger decreases
+    anger_gain_rate: f32 = 0.3,               // How fast anger builds from damage
+}
+
+// ============================================================================
+// Mob States
+// ============================================================================
+
+enum MobState {
+    Idle,
+    Roaming,
+    Rallying,
+    Attacking,
+    Fleeing,
+    Disbanded,
+}
+
+enum MemberState {
+    Following,
+    Attacking,
+    Fleeing,
+    Recruiting,
+    Dead,
+}
+
+enum MobTargetType {
+    None,
+    Enemy,
+    Building,
+    Vehicle,
+    HighValue,
+}
+
+// ============================================================================
+// Mob Member
+// ============================================================================
+
+struct MobMember {
+    unit_id: u64,
+    position: Vec3,
+    velocity: Vec3,
+    health: f32,
+    max_health: f32,
+    state: MemberState,
+    anger_level: f32,                         // 0.0 - 1.0, affects aggression
+    time_in_mob: f32,
+    target_id: u64,
+    is_leader: bool,
+    weapon_damage: f32,
+    weapon_range: f32,
+    move_speed: f32,
+    last_attack_time: f32,
+}
+
+fn create_mob_member(unit_id: u64, position: Vec3, health: f32) -> MobMember {
+    return MobMember {
+        unit_id: unit_id,
+        position: position,
+        velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        health: health,
+        max_health: health,
+        state: MemberState.Following,
+        anger_level: 0.5,
+        time_in_mob: 0.0,
+        target_id: 0,
+        is_leader: false,
+        weapon_damage: 10.0,
+        weapon_range: 15.0,
+        move_speed: 30.0,
+        last_attack_time: 0.0,
+    };
+}
+
+// ============================================================================
+// Mob Group
+// ============================================================================
+
+struct MobGroup {
+    mob_id: u64,
+    members: [u64; 16],                       // Member unit IDs
+    member_count: i32,
+    leader_id: u64,
+    state: MobState,
+    center_position: Vec3,
+    target_id: u64,
+    target_type: MobTargetType,
+    target_position: Vec3,
+    average_anger: f32,
+    total_damage_bonus: f32,
+    formation_spread: f32,
+    time_since_target_change: f32,
+    rally_point: Vec3,
+    owner_player: i32,
+}
+
+fn create_mob_group(mob_id: u64) -> MobGroup {
+    return MobGroup {
+        mob_id: mob_id,
+        members: [0; 16],
+        member_count: 0,
+        leader_id: 0,
+        state: MobState.Idle,
+        center_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        target_id: 0,
+        target_type: MobTargetType.None,
+        target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        average_anger: 0.5,
+        total_damage_bonus: 1.0,
+        formation_spread: 1.0,
+        time_since_target_change: 0.0,
+        rally_point: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        owner_player: 0,
+    };
+}
+
+// ============================================================================
+// Mob Member Slaved Update Module
+// ============================================================================
+
+struct MobMemberSlavedUpdateModule {
+    config: MobConfig,
+    members: Map<u64, MobMember>,
+    mobs: Map<u64, MobGroup>,
+    next_mob_id: u64,
+
+    // Potential targets for all mobs
+    potential_targets: [PotentialTarget; 32],
+    target_count: i32,
+
+    // Callbacks
+    on_mob_formed: fn(u64) = null,
+    on_mob_disbanded: fn(u64) = null,
+    on_member_recruited: fn(u64, u64) = null,  // mob_id, unit_id
+    on_target_acquired: fn(u64, u64) = null,   // mob_id, target_id
+}
+
+struct PotentialTarget {
+    target_id: u64,
+    position: Vec3,
+    target_type: MobTargetType,
+    threat_value: f32,
+    is_valid: bool,
+}
+
+fn create_mob_update_module(config: MobConfig) -> MobMemberSlavedUpdateModule {
+    return MobMemberSlavedUpdateModule {
+        config: config,
+        members: Map<u64, MobMember>.new(),
+        mobs: Map<u64, MobGroup>.new(),
+        next_mob_id: 1,
+        potential_targets: [PotentialTarget {
+            target_id: 0,
+            position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            target_type: MobTargetType.None,
+            threat_value: 0.0,
+            is_valid: false,
+        }; 32],
+        target_count: 0,
+    };
+}
+
+// ============================================================================
+// Mob Management
+// ============================================================================
+
+fn form_mob(module: &mut MobMemberSlavedUpdateModule, initial_member_ids: &[u64], count: i32, owner: i32) -> u64 {
+    if count < module.config.min_mob_size {
+        return 0;
+    }
+
+    let mob_id = module.next_mob_id;
+    module.next_mob_id += 1;
+
+    let mut mob = create_mob_group(mob_id);
+    mob.owner_player = owner;
+
+    // Add initial members
+    for i in 0..count {
+        if i < 16 {
+            let unit_id = initial_member_ids[i];
+            mob.members[i] = unit_id;
+            mob.member_count += 1;
+
+            // Create member entry if not exists
+            if !module.members.contains(unit_id) {
+                let member = create_mob_member(unit_id, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100.0);
+                module.members.insert(unit_id, member);
+            }
+        }
+    }
+
+    // Elect leader (highest health)
+    elect_leader(module, &mut mob);
+
+    // Calculate initial center
+    update_mob_center(module, &mut mob);
+
+    mob.state = MobState.Idle;
+    mob.rally_point = mob.center_position;
+
+    module.mobs.insert(mob_id, mob);
+
+    if module.on_mob_formed != null {
+        module.on_mob_formed(mob_id);
+    }
+
+    return mob_id;
+}
+
+fn disband_mob(module: &mut MobMemberSlavedUpdateModule, mob_id: u64) {
+    let mob = module.mobs.get_mut(mob_id);
+    if mob != null {
+        mob.state = MobState.Disbanded;
+
+        // Clear member associations
+        for i in 0..mob.member_count {
+            let member = module.members.get_mut(mob.members[i]);
+            if member != null {
+                member.state = MemberState.Following;
+                member.is_leader = false;
+            }
+        }
+    }
+
+    module.mobs.remove(mob_id);
+
+    if module.on_mob_disbanded != null {
+        module.on_mob_disbanded(mob_id);
+    }
+}
+
+fn recruit_member(module: &mut MobMemberSlavedUpdateModule, mob_id: u64, unit_id: u64) -> bool {
+    let mob = module.mobs.get_mut(mob_id);
+    if mob == null || mob.member_count >= module.config.max_mob_size {
+        return false;
+    }
+
+    // Check if already in a mob
+    for entry in module.mobs.iter() {
+        let other_mob = entry.value;
+        for i in 0..other_mob.member_count {
+            if other_mob.members[i] == unit_id {
+                return false;  // Already in a mob
+            }
+        }
+    }
+
+    // Add to mob
+    mob.members[mob.member_count] = unit_id;
+    mob.member_count += 1;
+
+    // Create or update member
+    if !module.members.contains(unit_id) {
+        let member = create_mob_member(unit_id, mob.center_position, 100.0);
+        module.members.insert(unit_id, member);
+    }
+
+    let member = module.members.get_mut(unit_id);
+    if member != null {
+        member.state = MemberState.Following;
+        member.anger_level = mob.average_anger;  // Match mob's anger
+    }
+
+    // Update damage bonus
+    update_damage_bonus(module, mob);
+
+    if module.on_member_recruited != null {
+        module.on_member_recruited(mob_id, unit_id);
+    }
+
+    return true;
+}
+
+fn remove_member(module: &mut MobMemberSlavedUpdateModule, mob_id: u64, unit_id: u64) {
+    let mob = module.mobs.get_mut(mob_id);
+    if mob == null {
+        return;
+    }
+
+    // Find and remove member
+    for i in 0..mob.member_count {
+        if mob.members[i] == unit_id {
+            // Shift remaining members
+            for j in i..(mob.member_count - 1) {
+                mob.members[j] = mob.members[j + 1];
+            }
+            mob.member_count -= 1;
+            break;
+        }
+    }
+
+    // If leader left, elect new one
+    if mob.leader_id == unit_id {
+        elect_leader(module, mob);
+    }
+
+    // Update damage bonus
+    update_damage_bonus(module, mob);
+
+    // Check if mob should disband
+    if mob.member_count < module.config.min_mob_size {
+        disband_mob(module, mob_id);
+    }
+}
+
+// ============================================================================
+// Leader Election
+// ============================================================================
+
+fn elect_leader(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup) {
+    let mut best_leader_id: u64 = 0;
+    let mut best_health: f32 = 0.0;
+
+    for i in 0..mob.member_count {
+        let member = module.members.get(mob.members[i]);
+        if member != null && member.health > best_health && member.state != MemberState.Dead {
+            best_health = member.health;
+            best_leader_id = member.unit_id;
+        }
+    }
+
+    // Clear old leader
+    if mob.leader_id != 0 {
+        let old_leader = module.members.get_mut(mob.leader_id);
+        if old_leader != null {
+            old_leader.is_leader = false;
+        }
+    }
+
+    // Set new leader
+    mob.leader_id = best_leader_id;
+    let new_leader = module.members.get_mut(best_leader_id);
+    if new_leader != null {
+        new_leader.is_leader = true;
+    }
+}
+
+// ============================================================================
+// Target Management
+// ============================================================================
+
+fn add_potential_target(module: &mut MobMemberSlavedUpdateModule, target_id: u64, position: Vec3, target_type: MobTargetType, threat: f32) {
+    if module.target_count >= 32 {
+        return;
+    }
+
+    module.potential_targets[module.target_count] = PotentialTarget {
+        target_id: target_id,
+        position: position,
+        target_type: target_type,
+        threat_value: threat,
+        is_valid: true,
+    };
+    module.target_count += 1;
+}
+
+fn select_target_for_mob(module: &mut MobMemberSlavedUpdateModule, mob_id: u64) -> u64 {
+    let mob = module.mobs.get(mob_id);
+    if mob == null {
+        return 0;
+    }
+
+    let mut best_target_id: u64 = 0;
+    let mut best_score: f32 = 0.0;
+
+    for i in 0..module.target_count {
+        let target = &module.potential_targets[i];
+        if !target.is_valid {
+            continue;
+        }
+
+        // Calculate distance
+        let dx = target.position.x - mob.center_position.x;
+        let dy = target.position.y - mob.center_position.y;
+        let distance = sqrt(dx * dx + dy * dy);
+
+        // Score based on distance and threat
+        let distance_factor = 1.0 / (1.0 + distance / 100.0);
+        let anger_factor = mob.average_anger;
+
+        // Prefer buildings when angry
+        let type_bonus = match target.target_type {
+            MobTargetType.Building => 1.5 * anger_factor,
+            MobTargetType.HighValue => 2.0,
+            MobTargetType.Vehicle => 1.2,
+            MobTargetType.Enemy => 1.0,
+            _ => 0.5,
+        };
+
+        let score = target.threat_value * distance_factor * type_bonus;
+
+        if score > best_score {
+            best_score = score;
+            best_target_id = target.target_id;
+        }
+    }
+
+    return best_target_id;
+}
+
+fn set_mob_target(module: &mut MobMemberSlavedUpdateModule, mob_id: u64, target_id: u64) {
+    let mob = module.mobs.get_mut(mob_id);
+    if mob == null {
+        return;
+    }
+
+    mob.target_id = target_id;
+    mob.time_since_target_change = 0.0;
+
+    // Find target info
+    for i in 0..module.target_count {
+        if module.potential_targets[i].target_id == target_id {
+            mob.target_position = module.potential_targets[i].position;
+            mob.target_type = module.potential_targets[i].target_type;
+            break;
+        }
+    }
+
+    // Set all members to attack
+    for i in 0..mob.member_count {
+        let member = module.members.get_mut(mob.members[i]);
+        if member != null && member.state != MemberState.Dead {
+            member.state = MemberState.Attacking;
+            member.target_id = target_id;
+        }
+    }
+
+    mob.state = MobState.Attacking;
+
+    if module.on_target_acquired != null {
+        module.on_target_acquired(mob_id, target_id);
+    }
+}
+
+// ============================================================================
+// Update Functions
+// ============================================================================
+
+fn update_mob_module(module: &mut MobMemberSlavedUpdateModule, delta_time: f32) {
+    for entry in module.mobs.iter_mut() {
+        let mob = entry.value;
+
+        if mob.state == MobState.Disbanded {
+            continue;
+        }
+
+        // Update mob center position
+        update_mob_center(module, mob);
+
+        // Update average anger
+        update_mob_anger(module, mob, delta_time);
+
+        // Update target timing
+        mob.time_since_target_change += delta_time;
+
+        // State-specific update
+        match mob.state {
+            MobState.Idle => update_idle_mob(module, mob, delta_time),
+            MobState.Roaming => update_roaming_mob(module, mob, delta_time),
+            MobState.Rallying => update_rallying_mob(module, mob, delta_time),
+            MobState.Attacking => update_attacking_mob(module, mob, delta_time),
+            MobState.Fleeing => update_fleeing_mob(module, mob, delta_time),
+            _ => {},
+        }
+
+        // Update individual members
+        update_mob_members(module, mob, delta_time);
+    }
+}
+
+fn update_mob_center(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup) {
+    if mob.member_count == 0 {
+        return;
+    }
+
+    let mut total_x: f32 = 0.0;
+    let mut total_y: f32 = 0.0;
+    let mut total_z: f32 = 0.0;
+    let mut alive_count: i32 = 0;
+
+    for i in 0..mob.member_count {
+        let member = module.members.get(mob.members[i]);
+        if member != null && member.state != MemberState.Dead {
+            total_x += member.position.x;
+            total_y += member.position.y;
+            total_z += member.position.z;
+            alive_count += 1;
+        }
+    }
+
+    if alive_count > 0 {
+        mob.center_position = Vec3 {
+            x: total_x / alive_count as f32,
+            y: total_y / alive_count as f32,
+            z: total_z / alive_count as f32,
+        };
+    }
+}
+
+fn update_mob_anger(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    let mut total_anger: f32 = 0.0;
+    let mut count: i32 = 0;
+
+    for i in 0..mob.member_count {
+        let member = module.members.get(mob.members[i]);
+        if member != null && member.state != MemberState.Dead {
+            total_anger += member.anger_level;
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        mob.average_anger = total_anger / count as f32;
+    }
+
+    // Anger decays slowly over time when not attacking
+    if mob.state != MobState.Attacking {
+        mob.average_anger -= module.config.anger_decay_rate * delta_time;
+        if mob.average_anger < 0.0 {
+            mob.average_anger = 0.0;
+        }
+    }
+}
+
+fn update_damage_bonus(module: &MobMemberSlavedUpdateModule, mob: &mut MobGroup) {
+    // Damage bonus scales with mob size
+    let size_bonus = 1.0 + (mob.member_count - 1) as f32 * (module.config.mob_damage_bonus - 1.0);
+    mob.total_damage_bonus = min_f32(size_bonus, module.config.max_damage_bonus);
+}
+
+fn update_idle_mob(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    // Look for nearby targets
+    let target_id = select_target_for_mob(module, mob.mob_id);
+
+    if target_id != 0 && mob.average_anger > 0.3 {
+        set_mob_target(module, mob.mob_id, target_id);
+    } else {
+        // Start roaming if no target
+        mob.state = MobState.Roaming;
+    }
+}
+
+fn update_roaming_mob(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    // Look for targets while roaming
+    let target_id = select_target_for_mob(module, mob.mob_id);
+
+    if target_id != 0 {
+        set_mob_target(module, mob.mob_id, target_id);
+        return;
+    }
+
+    // Move towards rally point slowly
+    let dx = mob.rally_point.x - mob.center_position.x;
+    let dy = mob.rally_point.y - mob.center_position.y;
+    let distance = sqrt(dx * dx + dy * dy);
+
+    if distance < 20.0 {
+        // Pick new random rally point
+        mob.rally_point.x = mob.center_position.x + (pseudo_random() - 0.5) * 200.0;
+        mob.rally_point.y = mob.center_position.y + (pseudo_random() - 0.5) * 200.0;
+    }
+}
+
+fn update_rallying_mob(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    // Check if all members are gathered
+    let mut all_gathered = true;
+
+    for i in 0..mob.member_count {
+        let member = module.members.get(mob.members[i]);
+        if member != null && member.state != MemberState.Dead {
+            let dx = member.position.x - mob.rally_point.x;
+            let dy = member.position.y - mob.rally_point.y;
+            let distance = sqrt(dx * dx + dy * dy);
+
+            if distance > module.config.rally_range {
+                all_gathered = false;
+                break;
+            }
+        }
+    }
+
+    if all_gathered {
+        mob.state = MobState.Idle;
+    }
+}
+
+fn update_attacking_mob(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    // Check if target still valid
+    let mut target_valid = false;
+    for i in 0..module.target_count {
+        if module.potential_targets[i].target_id == mob.target_id && module.potential_targets[i].is_valid {
+            target_valid = true;
+            mob.target_position = module.potential_targets[i].position;
+            break;
+        }
+    }
+
+    if !target_valid {
+        // Target eliminated, find new target
+        mob.target_id = 0;
+        mob.state = MobState.Idle;
+        return;
+    }
+
+    // Increase anger during combat
+    for i in 0..mob.member_count {
+        let member = module.members.get_mut(mob.members[i]);
+        if member != null {
+            member.anger_level += module.config.anger_gain_rate * delta_time * 0.1;
+            if member.anger_level > 1.0 {
+                member.anger_level = 1.0;
+            }
+        }
+    }
+
+    // Check for flee condition
+    let mut low_health_count: i32 = 0;
+    for i in 0..mob.member_count {
+        let member = module.members.get(mob.members[i]);
+        if member != null && member.health / member.max_health < module.config.flee_health_threshold {
+            low_health_count += 1;
+        }
+    }
+
+    if low_health_count > mob.member_count / 2 {
+        mob.state = MobState.Fleeing;
+    }
+}
+
+fn update_fleeing_mob(module: &mut MobMemberSlavedUpdateModule, mob: &mut MobGroup, delta_time: f32) {
+    // Clear target
+    mob.target_id = 0;
+
+    // All members flee
+    for i in 0..mob.member_count {
+        let member = module.members.get_mut(mob.members[i]);
+        if member != null {
+            member.state = MemberState.Fleeing;
+            member.anger_level *= 0.9;  // Anger decays faster when fleeing
+        }
+    }
+
+    // Check if safe (no nearby enemies)
+    let mut has_nearby_enemy = false;
+    for i in 0..module.target_count {
+        let target = &module.potential_targets[i];
+        if target.is_valid {
+            let dx = target.position.x - mob.center_position.x;
+            let dy = target.position.y - mob.center_position.y;
+            let distance = sqrt(dx * dx + dy * dy);
+
+            if distance < 150.0 {
+                has_nearby_enemy = true;
+                break;
+            }
+        }
+    }
+
+    if !has_nearby_enemy {
+        mob.state = MobState.Rallying;
+        mob.rally_point = mob.center_position;
+
+        for i in 0..mob.member_count {
+            let member = module.members.get_mut(mob.members[i]);
+            if member != null {
+                member.state = MemberState.Following;
+            }
+        }
+    }
+}
+
+fn update_mob_members(module: &mut MobMemberSlavedUpdateModule, mob: &MobGroup, delta_time: f32) {
+    let leader = module.members.get(mob.leader_id);
+    let leader_pos = if leader != null { leader.position } else { mob.center_position };
+
+    for i in 0..mob.member_count {
+        let member = module.members.get_mut(mob.members[i]);
+        if member == null || member.state == MemberState.Dead {
+            continue;
+        }
+
+        member.time_in_mob += delta_time;
+        member.last_attack_time += delta_time;
+
+        // Calculate swarm forces
+        let mut force_x: f32 = 0.0;
+        let mut force_y: f32 = 0.0;
+
+        // 1. Cohesion - move towards center
+        let to_center_x = mob.center_position.x - member.position.x;
+        let to_center_y = mob.center_position.y - member.position.y;
+        let center_dist = sqrt(to_center_x * to_center_x + to_center_y * to_center_y);
+
+        if center_dist > module.config.cohesion_range {
+            force_x += to_center_x / center_dist * 0.5;
+            force_y += to_center_y / center_dist * 0.5;
+        }
+
+        // 2. Follow leader
+        if !member.is_leader {
+            let to_leader_x = leader_pos.x - member.position.x;
+            let to_leader_y = leader_pos.y - member.position.y;
+            let leader_dist = sqrt(to_leader_x * to_leader_x + to_leader_y * to_leader_y);
+
+            if leader_dist > module.config.leader_influence_range {
+                force_x += to_leader_x / leader_dist * 0.3;
+                force_y += to_leader_y / leader_dist * 0.3;
+            }
+        }
+
+        // 3. Separation - avoid crowding
+        for j in 0..mob.member_count {
+            if i == j { continue; }
+
+            let other = module.members.get(mob.members[j]);
+            if other == null { continue; }
+
+            let sep_x = member.position.x - other.position.x;
+            let sep_y = member.position.y - other.position.y;
+            let sep_dist = sqrt(sep_x * sep_x + sep_y * sep_y);
+
+            if sep_dist < module.config.separation_distance && sep_dist > 0.1 {
+                force_x += sep_x / sep_dist * 0.8;
+                force_y += sep_y / sep_dist * 0.8;
+            }
+        }
+
+        // 4. Move towards target if attacking
+        if member.state == MemberState.Attacking && mob.target_id != 0 {
+            let to_target_x = mob.target_position.x - member.position.x;
+            let to_target_y = mob.target_position.y - member.position.y;
+            let target_dist = sqrt(to_target_x * to_target_x + to_target_y * to_target_y);
+
+            if target_dist > member.weapon_range {
+                force_x += to_target_x / target_dist * 1.0;
+                force_y += to_target_y / target_dist * 1.0;
+            }
+        }
+
+        // 5. Flee away from enemies if fleeing
+        if member.state == MemberState.Fleeing && mob.target_id != 0 {
+            let away_x = member.position.x - mob.target_position.x;
+            let away_y = member.position.y - mob.target_position.y;
+            let away_dist = sqrt(away_x * away_x + away_y * away_y);
+
+            if away_dist > 0.1 {
+                force_x += away_x / away_dist * 1.5;
+                force_y += away_y / away_dist * 1.5;
+            }
+        }
+
+        // Apply forces to velocity
+        let speed = member.move_speed * module.config.swarm_speed_bonus;
+        let force_mag = sqrt(force_x * force_x + force_y * force_y);
+
+        if force_mag > 0.1 {
+            member.velocity.x = force_x / force_mag * speed;
+            member.velocity.y = force_y / force_mag * speed;
+        }
+
+        // Update position
+        member.position.x += member.velocity.x * delta_time;
+        member.position.y += member.velocity.y * delta_time;
+    }
+}
+
+// ============================================================================
+// Combat Functions
+// ============================================================================
+
+fn member_take_damage(module: &mut MobMemberSlavedUpdateModule, unit_id: u64, damage: f32) {
+    let member = module.members.get_mut(unit_id);
+    if member == null {
+        return;
+    }
+
+    member.health -= damage;
+    member.anger_level += module.config.anger_gain_rate;
+    if member.anger_level > 1.0 {
+        member.anger_level = 1.0;
+    }
+
+    if member.health <= 0.0 {
+        member.health = 0.0;
+        member.state = MemberState.Dead;
+
+        // Remove from mob
+        for entry in module.mobs.iter_mut() {
+            remove_member(module, entry.key, unit_id);
+        }
+    }
+}
+
+fn get_member_damage(module: &MobMemberSlavedUpdateModule, unit_id: u64) -> f32 {
+    let member = module.members.get(unit_id);
+    if member == null {
+        return 0.0;
+    }
+
+    // Find mob for damage bonus
+    let mut damage_bonus: f32 = 1.0;
+    for entry in module.mobs.iter() {
+        let mob = entry.value;
+        for i in 0..mob.member_count {
+            if mob.members[i] == unit_id {
+                damage_bonus = mob.total_damage_bonus;
+                break;
+            }
+        }
+    }
+
+    return member.weapon_damage * damage_bonus * (1.0 + member.anger_level * 0.5);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    let mut guess = x / 2.0;
+    for _ in 0..10 {
+        guess = (guess + x / guess) / 2.0;
+    }
+    return guess;
+}
+
+fn min_f32(a: f32, b: f32) -> f32 {
+    if a < b { return a; }
+    return b;
+}
+
+let mut random_seed: u64 = 12345;
+
+fn pseudo_random() -> f32 {
+    random_seed = random_seed * 1103515245 + 12345;
+    return ((random_seed >> 16) & 0x7FFF) as f32 / 32767.0;
+}
+
+// ============================================================================
+// Pre-built Configurations
+// ============================================================================
+
+fn create_default_mob_config() -> MobConfig {
+    return MobConfig {};
+}
+
+fn create_angry_mob_config() -> MobConfig {
+    return MobConfig {
+        max_mob_size: 15,
+        min_mob_size: 5,
+        recruitment_range: 150.0,
+        cohesion_range: 40.0,
+        separation_distance: 8.0,
+        swarm_speed_bonus: 1.3,
+        mob_damage_bonus: 1.15,
+        max_damage_bonus: 2.5,
+        flee_health_threshold: 0.15,
+        target_switch_delay: 1.5,
+        anger_decay_rate: 0.02,
+        anger_gain_rate: 0.5,
+    };
+}
+
+fn create_terrorist_mob_config() -> MobConfig {
+    return MobConfig {
+        max_mob_size: 8,
+        min_mob_size: 2,
+        recruitment_range: 80.0,
+        cohesion_range: 30.0,
+        separation_distance: 12.0,
+        swarm_speed_bonus: 1.1,
+        mob_damage_bonus: 1.2,
+        max_damage_bonus: 2.0,
+        flee_health_threshold: 0.1,           // Rarely flee
+        target_switch_delay: 3.0,
+        anger_decay_rate: 0.01,               // Stay angry longer
+        anger_gain_rate: 0.8,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_mob_member_slaved() {
+    print("Testing Mob Member Slaved Update...");
+
+    // Create module
+    let config = create_default_mob_config();
+    let mut module = create_mob_update_module(config);
+
+    // Create initial members
+    let unit_ids: [u64; 5] = [1, 2, 3, 4, 5];
+
+    // Form mob
+    let mob_id = form_mob(&mut module, &unit_ids, 5, 0);
+    print("  Formed mob with ID: " + mob_id as string);
+
+    // Set member positions
+    for i in 0..5 {
+        let member = module.members.get_mut(unit_ids[i]);
+        if member != null {
+            member.position = Vec3 {
+                x: i as f32 * 10.0,
+                y: 0.0,
+                z: 0.0,
+            };
+        }
+    }
+
+    // Add potential target
+    add_potential_target(&mut module, 100, Vec3 { x: 50.0, y: 50.0, z: 0.0 }, MobTargetType.Building, 2.0);
+    print("  Added potential target");
+
+    // Update mob
+    update_mob_module(&mut module, 0.016);
+
+    let mob = module.mobs.get(mob_id);
+    if mob != null {
+        print("  Mob state: " + mob.state as i32 as string);
+        print("  Mob center: (" + mob.center_position.x as string + ", " + mob.center_position.y as string + ")");
+        print("  Member count: " + mob.member_count as string);
+    }
+
+    // Test damage
+    member_take_damage(&mut module, 1, 50.0);
+    let damage = get_member_damage(&module, 2);
+    print("  Member 2 damage output: " + damage as string);
+
+    // Recruit new member
+    recruit_member(&mut module, mob_id, 6);
+    let mob2 = module.mobs.get(mob_id);
+    if mob2 != null {
+        print("  After recruitment, member count: " + mob2.member_count as string);
+    }
+
+    print("Mob Member Slaved Update tests complete!");
+}

@@ -1,0 +1,782 @@
+// Assisted Targeting Update - Target sharing and coordination between units
+// Handles priority targets, target designation, and coordinated fire
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct AssistedTargetingConfig {
+    share_range: f32 = 200.0,                 // Range to share targets with allies
+    target_priority_decay: f32 = 0.1,         // Priority decay per second
+    max_shared_targets: i32 = 10,             // Maximum targets to track
+    coordination_bonus: f32 = 1.25,           // Damage bonus when focusing fire
+    target_lock_duration: f32 = 5.0,          // How long to maintain target lock
+    auto_designate: bool = true,              // Automatically designate high-value targets
+    designation_cooldown: f32 = 10.0,         // Cooldown between manual designations
+    requires_line_of_sight: bool = true,      // Require LOS for target sharing
+    share_with_structures: bool = false,      // Share targets with defensive structures
+    priority_multiplier: f32 = 1.5,           // Multiplier for designated targets
+}
+
+// ============================================================================
+// Target Priority System
+// ============================================================================
+
+enum TargetPriority {
+    Low = 1,
+    Normal = 2,
+    High = 3,
+    Critical = 4,
+    Designated = 5,                           // Player-designated priority target
+}
+
+enum TargetType {
+    Infantry,
+    Vehicle,
+    Aircraft,
+    Structure,
+    Harvester,
+    Artillery,
+    AntiAir,
+    CommandUnit,
+    Superweapon,
+}
+
+struct TargetInfo {
+    target_id: u64,
+    target_type: TargetType,
+    position: Vec3,
+    priority: TargetPriority,
+    priority_value: f32,                      // Numeric priority for sorting
+    health_percent: f32,
+    threat_level: f32,
+    time_since_seen: f32,
+    is_designated: bool,
+    designated_by: u64,                       // Unit that designated this target
+    attackers_count: i32,                     // Number of units attacking this target
+    last_damage_time: f32,
+    is_valid: bool,
+}
+
+fn create_target_info(target_id: u64, target_type: TargetType, position: Vec3) -> TargetInfo {
+    return TargetInfo {
+        target_id: target_id,
+        target_type: target_type,
+        position: position,
+        priority: TargetPriority.Normal,
+        priority_value: 2.0,
+        health_percent: 1.0,
+        threat_level: 1.0,
+        time_since_seen: 0.0,
+        is_designated: false,
+        designated_by: 0,
+        attackers_count: 0,
+        last_damage_time: 0.0,
+        is_valid: true,
+    };
+}
+
+// ============================================================================
+// Target Priority Matrix
+// ============================================================================
+
+struct PriorityMatrix {
+    // Priority values for unit types vs target types
+    // Rows: attacker type, Columns: target type
+    infantry_vs: [f32; 9],
+    vehicle_vs: [f32; 9],
+    aircraft_vs: [f32; 9],
+    antiair_vs: [f32; 9],
+    artillery_vs: [f32; 9],
+}
+
+fn create_default_priority_matrix() -> PriorityMatrix {
+    return PriorityMatrix {
+        // Infantry priorities: Infantry, Vehicle, Aircraft, Structure, Harvester, Artillery, AntiAir, CommandUnit, Superweapon
+        infantry_vs: [1.5, 0.5, 0.3, 1.0, 2.0, 1.8, 1.5, 2.5, 3.0],
+        // Vehicle priorities
+        vehicle_vs: [1.0, 1.2, 0.5, 1.5, 2.0, 1.5, 1.2, 2.5, 3.0],
+        // Aircraft priorities
+        aircraft_vs: [0.8, 1.5, 1.5, 2.0, 2.5, 2.0, 0.5, 2.5, 3.0],
+        // Anti-air priorities
+        antiair_vs: [0.5, 0.5, 3.0, 0.3, 0.5, 0.5, 1.0, 2.0, 1.5],
+        // Artillery priorities
+        artillery_vs: [1.2, 1.0, 0.2, 2.5, 1.5, 1.0, 1.5, 2.0, 3.5],
+    };
+}
+
+fn get_priority_multiplier(matrix: &PriorityMatrix, attacker_type: TargetType, target_type: TargetType) -> f32 {
+    let target_index = target_type as i32;
+
+    match attacker_type {
+        TargetType.Infantry => return matrix.infantry_vs[target_index],
+        TargetType.Vehicle => return matrix.vehicle_vs[target_index],
+        TargetType.Aircraft => return matrix.aircraft_vs[target_index],
+        TargetType.AntiAir => return matrix.antiair_vs[target_index],
+        TargetType.Artillery => return matrix.artillery_vs[target_index],
+        _ => return 1.0,
+    }
+}
+
+// ============================================================================
+// Unit Targeting State
+// ============================================================================
+
+struct UnitTargetingState {
+    unit_id: u64,
+    unit_type: TargetType,
+    position: Vec3,
+    weapon_range: f32,
+    current_target_id: u64,
+    target_lock_time: f32,
+    visible_targets: [u64; 16],               // IDs of visible targets
+    visible_count: i32,
+    shared_targets: [u64; 16],                // IDs of targets shared by allies
+    shared_count: i32,
+    can_designate: bool,
+    designation_cooldown: f32,
+    is_coordinating: bool,
+    coordination_group: u64,
+}
+
+fn create_unit_targeting_state(unit_id: u64, unit_type: TargetType, position: Vec3, weapon_range: f32) -> UnitTargetingState {
+    return UnitTargetingState {
+        unit_id: unit_id,
+        unit_type: unit_type,
+        position: position,
+        weapon_range: weapon_range,
+        current_target_id: 0,
+        target_lock_time: 0.0,
+        visible_targets: [0; 16],
+        visible_count: 0,
+        shared_targets: [0; 16],
+        shared_count: 0,
+        can_designate: true,
+        designation_cooldown: 0.0,
+        is_coordinating: false,
+        coordination_group: 0,
+    };
+}
+
+// ============================================================================
+// Assisted Targeting Module
+// ============================================================================
+
+struct AssistedTargetingUpdateModule {
+    config: AssistedTargetingConfig,
+    priority_matrix: PriorityMatrix,
+
+    // Global target pool
+    targets: Map<u64, TargetInfo>,
+    designated_targets: [u64; 8],             // Priority designated targets
+    designated_count: i32,
+
+    // Unit states
+    unit_states: Map<u64, UnitTargetingState>,
+
+    // Coordination groups
+    coordination_groups: Map<u64, [u64; 16]>, // Group ID -> Unit IDs
+
+    // Callbacks
+    on_target_designated: fn(u64, u64) = null,   // target_id, designator_id
+    on_target_eliminated: fn(u64) = null,
+    on_coordination_started: fn(u64) = null,
+}
+
+fn create_assisted_targeting_module(config: AssistedTargetingConfig) -> AssistedTargetingUpdateModule {
+    return AssistedTargetingUpdateModule {
+        config: config,
+        priority_matrix: create_default_priority_matrix(),
+        targets: Map<u64, TargetInfo>.new(),
+        designated_targets: [0; 8],
+        designated_count: 0,
+        unit_states: Map<u64, UnitTargetingState>.new(),
+        coordination_groups: Map<u64, [u64; 16]>.new(),
+    };
+}
+
+// ============================================================================
+// Unit Registration
+// ============================================================================
+
+fn register_unit(module: &mut AssistedTargetingUpdateModule, unit_id: u64, unit_type: TargetType, position: Vec3, weapon_range: f32) {
+    let state = create_unit_targeting_state(unit_id, unit_type, position, weapon_range);
+    module.unit_states.insert(unit_id, state);
+}
+
+fn unregister_unit(module: &mut AssistedTargetingUpdateModule, unit_id: u64) {
+    module.unit_states.remove(unit_id);
+}
+
+fn update_unit_position(module: &mut AssistedTargetingUpdateModule, unit_id: u64, position: Vec3) {
+    let state = module.unit_states.get_mut(unit_id);
+    if state != null {
+        state.position = position;
+    }
+}
+
+// ============================================================================
+// Target Management
+// ============================================================================
+
+fn add_target(module: &mut AssistedTargetingUpdateModule, target_id: u64, target_type: TargetType, position: Vec3, threat_level: f32) {
+    if module.targets.contains(target_id) {
+        // Update existing target
+        let target = module.targets.get_mut(target_id);
+        if target != null {
+            target.position = position;
+            target.threat_level = threat_level;
+            target.time_since_seen = 0.0;
+            target.is_valid = true;
+        }
+    } else {
+        // Add new target
+        let mut info = create_target_info(target_id, target_type, position);
+        info.threat_level = threat_level;
+        info.priority_value = calculate_base_priority(target_type, threat_level);
+        module.targets.insert(target_id, info);
+    }
+}
+
+fn remove_target(module: &mut AssistedTargetingUpdateModule, target_id: u64) {
+    module.targets.remove(target_id);
+
+    // Remove from designated list
+    for i in 0..module.designated_count {
+        if module.designated_targets[i] == target_id {
+            // Shift remaining targets
+            for j in i..(module.designated_count - 1) {
+                module.designated_targets[j] = module.designated_targets[j + 1];
+            }
+            module.designated_count -= 1;
+            break;
+        }
+    }
+
+    // Fire callback
+    if module.on_target_eliminated != null {
+        module.on_target_eliminated(target_id);
+    }
+}
+
+fn update_target_health(module: &mut AssistedTargetingUpdateModule, target_id: u64, health_percent: f32) {
+    let target = module.targets.get_mut(target_id);
+    if target != null {
+        target.health_percent = health_percent;
+        target.last_damage_time = 0.0;
+
+        // Increase priority for damaged targets (easier to finish off)
+        if health_percent < 0.25 {
+            target.priority_value *= 1.5;
+        }
+    }
+}
+
+fn calculate_base_priority(target_type: TargetType, threat_level: f32) -> f32 {
+    let type_priority = match target_type {
+        TargetType.Infantry => 1.0,
+        TargetType.Vehicle => 1.5,
+        TargetType.Aircraft => 1.8,
+        TargetType.Structure => 1.2,
+        TargetType.Harvester => 2.5,
+        TargetType.Artillery => 2.0,
+        TargetType.AntiAir => 1.5,
+        TargetType.CommandUnit => 3.0,
+        TargetType.Superweapon => 4.0,
+    };
+
+    return type_priority * threat_level;
+}
+
+// ============================================================================
+// Target Designation
+// ============================================================================
+
+fn designate_target(module: &mut AssistedTargetingUpdateModule, target_id: u64, designator_id: u64) -> bool {
+    // Check designator cooldown
+    let state = module.unit_states.get_mut(designator_id);
+    if state != null {
+        if !state.can_designate || state.designation_cooldown > 0.0 {
+            return false;
+        }
+        state.designation_cooldown = module.config.designation_cooldown;
+    }
+
+    let target = module.targets.get_mut(target_id);
+    if target == null {
+        return false;
+    }
+
+    // Mark as designated
+    target.is_designated = true;
+    target.designated_by = designator_id;
+    target.priority = TargetPriority.Designated;
+    target.priority_value *= module.config.priority_multiplier;
+
+    // Add to designated list if not already present
+    let mut found = false;
+    for i in 0..module.designated_count {
+        if module.designated_targets[i] == target_id {
+            found = true;
+            break;
+        }
+    }
+
+    if !found && module.designated_count < 8 {
+        module.designated_targets[module.designated_count] = target_id;
+        module.designated_count += 1;
+    }
+
+    // Fire callback
+    if module.on_target_designated != null {
+        module.on_target_designated(target_id, designator_id);
+    }
+
+    return true;
+}
+
+fn undesignate_target(module: &mut AssistedTargetingUpdateModule, target_id: u64) {
+    let target = module.targets.get_mut(target_id);
+    if target != null && target.is_designated {
+        target.is_designated = false;
+        target.designated_by = 0;
+        target.priority = TargetPriority.High;  // Keep elevated priority
+        target.priority_value /= module.config.priority_multiplier;
+    }
+
+    // Remove from designated list
+    for i in 0..module.designated_count {
+        if module.designated_targets[i] == target_id {
+            for j in i..(module.designated_count - 1) {
+                module.designated_targets[j] = module.designated_targets[j + 1];
+            }
+            module.designated_count -= 1;
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// Target Selection
+// ============================================================================
+
+fn get_best_target(module: &AssistedTargetingUpdateModule, unit_id: u64) -> u64 {
+    let state = module.unit_states.get(unit_id);
+    if state == null {
+        return 0;
+    }
+
+    let mut best_target_id: u64 = 0;
+    let mut best_priority: f32 = 0.0;
+
+    for entry in module.targets.iter() {
+        let target = entry.value;
+        if !target.is_valid {
+            continue;
+        }
+
+        // Check range
+        let dx = target.position.x - state.position.x;
+        let dy = target.position.y - state.position.y;
+        let dz = target.position.z - state.position.z;
+        let distance = sqrt(dx * dx + dy * dy + dz * dz);
+
+        if distance > state.weapon_range {
+            continue;
+        }
+
+        // Calculate effective priority for this unit
+        let type_mult = get_priority_multiplier(&module.priority_matrix, state.unit_type, target.target_type);
+        let effective_priority = target.priority_value * type_mult;
+
+        // Bonus for designated targets
+        if target.is_designated {
+            let priority_boost = effective_priority * 0.5;
+            let boosted = effective_priority + priority_boost;
+            if boosted > best_priority {
+                best_priority = boosted;
+                best_target_id = target.target_id;
+            }
+        } else if effective_priority > best_priority {
+            best_priority = effective_priority;
+            best_target_id = target.target_id;
+        }
+    }
+
+    return best_target_id;
+}
+
+fn get_shared_targets_for_unit(module: &AssistedTargetingUpdateModule, unit_id: u64, out_targets: &mut [u64; 16]) -> i32 {
+    let state = module.unit_states.get(unit_id);
+    if state == null {
+        return 0;
+    }
+
+    let mut count: i32 = 0;
+
+    // Find allies in range and get their visible targets
+    for entry in module.unit_states.iter() {
+        let ally_state = entry.value;
+        if ally_state.unit_id == unit_id {
+            continue;
+        }
+
+        // Check if ally is in share range
+        let dx = ally_state.position.x - state.position.x;
+        let dy = ally_state.position.y - state.position.y;
+        let distance = sqrt(dx * dx + dy * dy);
+
+        if distance <= module.config.share_range {
+            // Share this ally's visible targets
+            for i in 0..ally_state.visible_count {
+                if count < 16 {
+                    let target_id = ally_state.visible_targets[i];
+
+                    // Check if not already in list
+                    let mut found = false;
+                    for j in 0..count {
+                        if out_targets[j] == target_id {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        out_targets[count] = target_id;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return count;
+}
+
+// ============================================================================
+// Coordination System
+// ============================================================================
+
+fn create_coordination_group(module: &mut AssistedTargetingUpdateModule, unit_ids: &[u64], count: i32) -> u64 {
+    let group_id = generate_group_id();
+
+    let mut group_units: [u64; 16] = [0; 16];
+    for i in 0..count {
+        if i < 16 {
+            group_units[i] = unit_ids[i];
+
+            // Update unit state
+            let state = module.unit_states.get_mut(unit_ids[i]);
+            if state != null {
+                state.is_coordinating = true;
+                state.coordination_group = group_id;
+            }
+        }
+    }
+
+    module.coordination_groups.insert(group_id, group_units);
+
+    if module.on_coordination_started != null {
+        module.on_coordination_started(group_id);
+    }
+
+    return group_id;
+}
+
+fn dissolve_coordination_group(module: &mut AssistedTargetingUpdateModule, group_id: u64) {
+    let group = module.coordination_groups.get(group_id);
+    if group != null {
+        for i in 0..16 {
+            if group[i] != 0 {
+                let state = module.unit_states.get_mut(group[i]);
+                if state != null {
+                    state.is_coordinating = false;
+                    state.coordination_group = 0;
+                }
+            }
+        }
+    }
+
+    module.coordination_groups.remove(group_id);
+}
+
+fn get_coordination_damage_bonus(module: &AssistedTargetingUpdateModule, unit_id: u64, target_id: u64) -> f32 {
+    let state = module.unit_states.get(unit_id);
+    if state == null || !state.is_coordinating {
+        return 1.0;
+    }
+
+    // Count how many units in the group are attacking the same target
+    let group = module.coordination_groups.get(state.coordination_group);
+    if group == null {
+        return 1.0;
+    }
+
+    let mut attacking_count: i32 = 0;
+    for i in 0..16 {
+        if group[i] != 0 {
+            let ally_state = module.unit_states.get(group[i]);
+            if ally_state != null && ally_state.current_target_id == target_id {
+                attacking_count += 1;
+            }
+        }
+    }
+
+    // Bonus scales with number of coordinated attackers
+    if attacking_count >= 3 {
+        return module.config.coordination_bonus;
+    } else if attacking_count >= 2 {
+        return 1.0 + (module.config.coordination_bonus - 1.0) * 0.5;
+    }
+
+    return 1.0;
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_assisted_targeting(module: &mut AssistedTargetingUpdateModule, delta_time: f32) {
+    // Update target priorities
+    update_target_priorities(module, delta_time);
+
+    // Update unit states
+    update_unit_states(module, delta_time);
+
+    // Auto-designate high-value targets
+    if module.config.auto_designate {
+        auto_designate_targets(module);
+    }
+
+    // Clean up invalid targets
+    cleanup_invalid_targets(module);
+}
+
+fn update_target_priorities(module: &mut AssistedTargetingUpdateModule, delta_time: f32) {
+    for entry in module.targets.iter_mut() {
+        let target = entry.value;
+
+        // Decay priority over time
+        if !target.is_designated {
+            target.priority_value -= module.config.target_priority_decay * delta_time;
+            if target.priority_value < 0.5 {
+                target.priority_value = 0.5;
+            }
+        }
+
+        // Update time since seen
+        target.time_since_seen += delta_time;
+        target.last_damage_time += delta_time;
+
+        // Invalidate targets not seen for too long
+        if target.time_since_seen > 30.0 {
+            target.is_valid = false;
+        }
+    }
+}
+
+fn update_unit_states(module: &mut AssistedTargetingUpdateModule, delta_time: f32) {
+    for entry in module.unit_states.iter_mut() {
+        let state = entry.value;
+
+        // Update target lock time
+        if state.current_target_id != 0 {
+            state.target_lock_time += delta_time;
+
+            // Check if target still valid
+            let target = module.targets.get(state.current_target_id);
+            if target == null || !target.is_valid {
+                state.current_target_id = 0;
+                state.target_lock_time = 0.0;
+            } else if state.target_lock_time > module.config.target_lock_duration {
+                // Re-evaluate target after lock duration
+                let new_target = get_best_target(module, state.unit_id);
+                if new_target != state.current_target_id {
+                    state.current_target_id = new_target;
+                    state.target_lock_time = 0.0;
+                }
+            }
+        }
+
+        // Update designation cooldown
+        if state.designation_cooldown > 0.0 {
+            state.designation_cooldown -= delta_time;
+            if state.designation_cooldown <= 0.0 {
+                state.designation_cooldown = 0.0;
+                state.can_designate = true;
+            }
+        }
+
+        // Update shared targets
+        state.shared_count = get_shared_targets_for_unit(module, state.unit_id, &mut state.shared_targets);
+    }
+}
+
+fn auto_designate_targets(module: &mut AssistedTargetingUpdateModule) {
+    // Find high-value undesignated targets
+    let mut best_target_id: u64 = 0;
+    let mut best_value: f32 = 0.0;
+
+    for entry in module.targets.iter() {
+        let target = entry.value;
+        if !target.is_valid || target.is_designated {
+            continue;
+        }
+
+        // Check if high-value target type
+        let is_high_value = target.target_type == TargetType.CommandUnit ||
+                           target.target_type == TargetType.Superweapon ||
+                           target.target_type == TargetType.Harvester;
+
+        if is_high_value && target.priority_value > best_value {
+            best_value = target.priority_value;
+            best_target_id = target.target_id;
+        }
+    }
+
+    // Auto-designate if we have capacity
+    if best_target_id != 0 && module.designated_count < 4 {
+        let target = module.targets.get_mut(best_target_id);
+        if target != null {
+            target.is_designated = true;
+            target.priority = TargetPriority.Designated;
+            target.priority_value *= module.config.priority_multiplier;
+
+            module.designated_targets[module.designated_count] = best_target_id;
+            module.designated_count += 1;
+        }
+    }
+}
+
+fn cleanup_invalid_targets(module: &mut AssistedTargetingUpdateModule) {
+    let mut to_remove: [u64; 32] = [0; 32];
+    let mut remove_count: i32 = 0;
+
+    for entry in module.targets.iter() {
+        if !entry.value.is_valid && remove_count < 32 {
+            to_remove[remove_count] = entry.key;
+            remove_count += 1;
+        }
+    }
+
+    for i in 0..remove_count {
+        remove_target(module, to_remove[i]);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    let mut guess = x / 2.0;
+    for _ in 0..10 {
+        guess = (guess + x / guess) / 2.0;
+    }
+    return guess;
+}
+
+let mut next_group_id: u64 = 1;
+
+fn generate_group_id() -> u64 {
+    let id = next_group_id;
+    next_group_id += 1;
+    return id;
+}
+
+// ============================================================================
+// Pre-built Configurations
+// ============================================================================
+
+fn create_default_targeting_config() -> AssistedTargetingConfig {
+    return AssistedTargetingConfig {};
+}
+
+fn create_sniper_targeting_config() -> AssistedTargetingConfig {
+    return AssistedTargetingConfig {
+        share_range: 300.0,
+        target_priority_decay: 0.05,
+        max_shared_targets: 5,
+        coordination_bonus: 1.0,              // Snipers work independently
+        target_lock_duration: 10.0,           // Longer lock for aimed shots
+        auto_designate: false,                // Manual targeting preferred
+        designation_cooldown: 5.0,
+        requires_line_of_sight: true,
+        priority_multiplier: 2.0,             // High priority on designated
+    };
+}
+
+fn create_artillery_targeting_config() -> AssistedTargetingConfig {
+    return AssistedTargetingConfig {
+        share_range: 400.0,
+        target_priority_decay: 0.15,
+        max_shared_targets: 8,
+        coordination_bonus: 1.5,              // High coordination bonus for barrages
+        target_lock_duration: 3.0,            // Quick retargeting
+        auto_designate: true,
+        designation_cooldown: 15.0,
+        requires_line_of_sight: false,        // Indirect fire
+        share_with_structures: true,
+        priority_multiplier: 1.3,
+    };
+}
+
+fn create_antiair_targeting_config() -> AssistedTargetingConfig {
+    return AssistedTargetingConfig {
+        share_range: 250.0,
+        target_priority_decay: 0.2,
+        max_shared_targets: 6,
+        coordination_bonus: 1.4,
+        target_lock_duration: 2.0,            // Fast retargeting for aircraft
+        auto_designate: true,
+        designation_cooldown: 8.0,
+        requires_line_of_sight: true,
+        priority_multiplier: 1.8,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_assisted_targeting() {
+    print("Testing Assisted Targeting...");
+
+    // Create module
+    let config = create_default_targeting_config();
+    let mut module = create_assisted_targeting_module(config);
+
+    // Register units
+    register_unit(&mut module, 1, TargetType.Infantry, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 150.0);
+    register_unit(&mut module, 2, TargetType.Vehicle, Vec3 { x: 50.0, y: 0.0, z: 0.0 }, 200.0);
+    print("  Registered 2 units");
+
+    // Add targets
+    add_target(&mut module, 100, TargetType.Vehicle, Vec3 { x: 100.0, y: 0.0, z: 0.0 }, 1.5);
+    add_target(&mut module, 101, TargetType.Harvester, Vec3 { x: 80.0, y: 0.0, z: 0.0 }, 1.0);
+    print("  Added 2 targets");
+
+    // Get best target for unit 1
+    let best1 = get_best_target(&module, 1);
+    print("  Best target for unit 1: " + best1 as string);
+
+    // Designate target
+    designate_target(&mut module, 100, 1);
+    print("  Designated target 100");
+
+    // Get best target again (should prefer designated)
+    let best2 = get_best_target(&module, 2);
+    print("  Best target for unit 2 after designation: " + best2 as string);
+
+    // Create coordination group
+    let units: [u64; 2] = [1, 2];
+    let group_id = create_coordination_group(&mut module, &units, 2);
+    print("  Created coordination group: " + group_id as string);
+
+    // Check coordination bonus
+    let bonus = get_coordination_damage_bonus(&module, 1, 100);
+    print("  Coordination damage bonus: " + bonus as string);
+
+    print("Assisted Targeting tests complete!");
+}
