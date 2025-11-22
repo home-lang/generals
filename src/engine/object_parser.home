@@ -1,0 +1,628 @@
+// Object INI Parser - Unit and Building Definition Parser
+// Parses Object/*.ini files for unit/building/structure definitions
+// Used for defining all game objects in C&C Generals
+
+from basics import Collection, Map
+
+// Object categories (EditorSorting)
+enum ObjectCategory {
+    Unit,
+    Infantry,
+    Vehicle,
+    Aircraft,
+    Structure,
+    Prop,
+    System,
+    Misc,
+}
+
+// Object sides/factions
+enum ObjectSide {
+    America,
+    China,
+    GLA,
+    Civilian,
+    Neutral,
+}
+
+// Weapon slot types
+enum WeaponSlot {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+// ============================================================================
+// Object Components
+// ============================================================================
+
+// Weapon set definition
+struct WeaponSetDef {
+    conditions: String,
+    primary: String,
+    secondary: String,
+    tertiary: String,
+    preferred_against: Map<String, String>,
+}
+
+// Armor set definition
+struct ArmorSetDef {
+    conditions: String,
+    armor: String,
+    damage_fx: String,
+}
+
+// Draw module definition
+struct DrawModuleDef {
+    module_type: String,
+    tag: String,
+    model: String,
+    turret: String,
+    show_sub_objects: Collection<String>,
+    hide_sub_objects: Collection<String>,
+    condition_states: Collection<ConditionStateDef>,
+}
+
+// Condition state for draw module
+struct ConditionStateDef {
+    conditions: Collection<String>,
+    model: String,
+    turret: String,
+    show_sub_objects: Collection<String>,
+    hide_sub_objects: Collection<String>,
+    animation: String,
+    animation_mode: String,
+}
+
+// Behavior module definition
+struct BehaviorModuleDef {
+    module_type: String,
+    tag: String,
+    properties: Map<String, String>,
+}
+
+// Body module definition
+struct BodyModuleDef {
+    module_type: String,
+    tag: String,
+    max_health: Float,
+    initial_health: Float,
+}
+
+// Locomotor definition
+struct LocomotorDef {
+    set_name: String,
+    speed: Float,
+    turn_rate: Float,
+    locomotor: String,
+}
+
+// ============================================================================
+// Complete Object Definition
+// ============================================================================
+
+struct ObjectDef {
+    // Identity
+    name: String,
+    display_name: String,
+    side: ObjectSide,
+    category: ObjectCategory,
+    prerequisites: Collection<String>,
+
+    // Art
+    select_portrait: String,
+    button_image: String,
+    upgrade_cameos: Collection<String>,
+
+    // Stats
+    build_cost: Int,
+    build_time: Float,
+    vision_range: Float,
+    shroud_clearing_range: Float,
+    transport_slot_count: Int,
+    command_set: String,
+
+    // Combat
+    weapon_sets: Collection<WeaponSetDef>,
+    armor_sets: Collection<ArmorSetDef>,
+
+    // Modules
+    draw_modules: Collection<DrawModuleDef>,
+    behavior_modules: Collection<BehaviorModuleDef>,
+    body_module: BodyModuleDef,
+    locomotor_sets: Collection<LocomotorDef>,
+
+    // Flags
+    kindof: Collection<String>,
+    is_selectable: Bool,
+    is_prerequsite_for: Collection<String>,
+
+    // Audio
+    unit_specific_sounds: Map<String, String>,
+
+    // Raw properties for unparsed data
+    raw_properties: Map<String, String>,
+}
+
+/// Create empty object definition
+fn create_object_def(name: String) -> ObjectDef {
+    return ObjectDef {
+        name: name,
+        display_name: "",
+        side: ObjectSide::Neutral,
+        category: ObjectCategory::Misc,
+        prerequisites: Collection<String>{},
+        select_portrait: "",
+        button_image: "",
+        upgrade_cameos: Collection<String>{},
+        build_cost: 0,
+        build_time: 0.0,
+        vision_range: 0.0,
+        shroud_clearing_range: 0.0,
+        transport_slot_count: 0,
+        command_set: "",
+        weapon_sets: Collection<WeaponSetDef>{},
+        armor_sets: Collection<ArmorSetDef>{},
+        draw_modules: Collection<DrawModuleDef>{},
+        behavior_modules: Collection<BehaviorModuleDef>{},
+        body_module: BodyModuleDef {
+            module_type: "",
+            tag: "",
+            max_health: 100.0,
+            initial_health: 100.0,
+        },
+        locomotor_sets: Collection<LocomotorDef>{},
+        kindof: Collection<String>{},
+        is_selectable: true,
+        is_prerequsite_for: Collection<String>{},
+        unit_specific_sounds: Map<String, String>{},
+        raw_properties: Map<String, String>{},
+    }
+}
+
+// ============================================================================
+// Parser
+// ============================================================================
+
+/// Trim whitespace
+fn trim(s: String) -> String {
+    let start = 0
+    let end = s.len()
+    while start < end && is_whitespace(s.char_at(start)) {
+        start = start + 1
+    }
+    while end > start && is_whitespace(s.char_at(end - 1)) {
+        end = end - 1
+    }
+    return s.substring(start, end)
+}
+
+fn is_whitespace(c: Int) -> Bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+/// Check if line is comment or empty
+fn is_comment_or_empty(line: String) -> Bool {
+    let trimmed = trim(line)
+    if trimmed.len() == 0 {
+        return true
+    }
+    return trimmed.starts_with(";") || trimmed.starts_with("//")
+}
+
+/// Check if line starts Object block
+fn is_object_start(line: String) -> Bool {
+    let trimmed = trim(line)
+    return trimmed.starts_with("Object ")
+}
+
+/// Check if line is End marker
+fn is_end_marker(line: String) -> Bool {
+    return trim(line) == "End"
+}
+
+/// Extract object name from Object line
+fn extract_object_name(line: String) -> String {
+    let trimmed = trim(line)
+    if trimmed.starts_with("Object ") {
+        return trim(trimmed.substring(7, trimmed.len()))
+    }
+    return ""
+}
+
+/// Parse property line (key = value or key value)
+fn parse_property(line: String) -> (String, String) {
+    let trimmed = trim(line)
+
+    // Find = sign or first space
+    let eq_pos = -1
+    let space_pos = -1
+
+    for i in 0..trimmed.len() {
+        let c = trimmed.char_at(i)
+        if c == 61 && eq_pos < 0 {  // '='
+            eq_pos = i
+        }
+        if (c == 32 || c == 9) && space_pos < 0 && eq_pos < 0 {  // space/tab
+            space_pos = i
+        }
+    }
+
+    if eq_pos > 0 {
+        let key = trim(trimmed.substring(0, eq_pos))
+        let value = trim(trimmed.substring(eq_pos + 1, trimmed.len()))
+        return (key, value)
+    } else if space_pos > 0 {
+        let key = trim(trimmed.substring(0, space_pos))
+        let value = trim(trimmed.substring(space_pos, trimmed.len()))
+        return (key, value)
+    }
+
+    return (trimmed, "")
+}
+
+/// Parse integer value
+fn parse_int(s: String) -> Int {
+    let result = 0
+    let negative = false
+    let start = 0
+
+    if s.len() > 0 && s.char_at(0) == 45 {  // '-'
+        negative = true
+        start = 1
+    }
+
+    for i in start..s.len() {
+        let c = s.char_at(i)
+        if c >= 48 && c <= 57 {  // '0'-'9'
+            result = result * 10 + (c - 48)
+        } else {
+            break
+        }
+    }
+
+    if negative {
+        return -result
+    }
+    return result
+}
+
+/// Parse float value
+fn parse_float(s: String) -> Float {
+    // Simplified float parsing
+    let parts = split_by_char(s, 46)  // '.'
+    let integer_part = parse_int(parts.get(0))
+    let decimal_part = 0.0
+
+    if parts.len() > 1 {
+        let dec_str = parts.get(1)
+        let dec_int = parse_int(dec_str)
+        let divisor = 1.0
+        for i in 0..dec_str.len() {
+            divisor = divisor * 10.0
+        }
+        decimal_part = (dec_int as Float) / divisor
+    }
+
+    if s.starts_with("-") {
+        return -((integer_part as Float) + decimal_part)
+    }
+    return (integer_part as Float) + decimal_part
+}
+
+/// Split by character
+fn split_by_char(s: String, ch: Int) -> Collection<String> {
+    let parts = Collection<String>{}
+    let current = ""
+
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c == ch {
+            parts.add(current)
+            current = ""
+        } else {
+            current = current + String::char_from_code(c)
+        }
+    }
+
+    parts.add(current)
+    return parts
+}
+
+/// Split by space
+fn split_by_space(s: String) -> Collection<String> {
+    let parts = Collection<String>{}
+    let current = ""
+
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c == 32 || c == 9 {
+            if current.len() > 0 {
+                parts.add(current)
+                current = ""
+            }
+        } else {
+            current = current + String::char_from_code(c)
+        }
+    }
+
+    if current.len() > 0 {
+        parts.add(current)
+    }
+
+    return parts
+}
+
+/// Parse side from string
+fn parse_side(s: String) -> ObjectSide {
+    let lower = s.to_lowercase()
+    if lower == "america" || lower == "usa" {
+        return ObjectSide::America
+    } else if lower == "china" {
+        return ObjectSide::China
+    } else if lower == "gla" {
+        return ObjectSide::GLA
+    } else if lower == "civilian" {
+        return ObjectSide::Civilian
+    }
+    return ObjectSide::Neutral
+}
+
+/// Parse category from string
+fn parse_category(s: String) -> ObjectCategory {
+    let upper = s.to_uppercase()
+    if upper == "UNIT" {
+        return ObjectCategory::Unit
+    } else if upper == "INFANTRY" {
+        return ObjectCategory::Infantry
+    } else if upper == "VEHICLE" {
+        return ObjectCategory::Vehicle
+    } else if upper == "AIRCRAFT" {
+        return ObjectCategory::Aircraft
+    } else if upper == "STRUCTURE" {
+        return ObjectCategory::Structure
+    } else if upper == "PROP" {
+        return ObjectCategory::Prop
+    } else if upper == "SYSTEM" {
+        return ObjectCategory::System
+    }
+    return ObjectCategory::Misc
+}
+
+/// Split lines
+fn split_lines(text: String) -> Collection<String> {
+    let lines = Collection<String>{}
+    let current = ""
+
+    for i in 0..text.len() {
+        let c = text.char_at(i)
+        if c == 10 {
+            lines.add(current)
+            current = ""
+        } else if c != 13 {
+            current = current + String::char_from_code(c)
+        }
+    }
+
+    if current.len() > 0 {
+        lines.add(current)
+    }
+
+    return lines
+}
+
+/// Parse Object INI content
+fn parse_object_ini(content: String) -> Collection<ObjectDef> {
+    let objects = Collection<ObjectDef>{}
+    let lines = split_lines(content)
+
+    let current_object: ObjectDef = create_object_def("")
+    let in_object = false
+    let block_depth = 0
+    let current_block = ""
+
+    for i in 0..lines.len() {
+        let line = lines.get(i)
+
+        if is_comment_or_empty(line) {
+            continue
+        }
+
+        let trimmed = trim(line)
+
+        if is_object_start(line) && !in_object {
+            current_object = create_object_def(extract_object_name(line))
+            in_object = true
+            block_depth = 0
+            current_block = ""
+
+        } else if in_object {
+            // Track nested blocks
+            if trimmed.starts_with("Draw ") || trimmed.starts_with("Body ") ||
+               trimmed.starts_with("Behavior ") || trimmed.starts_with("WeaponSet") ||
+               trimmed.starts_with("ArmorSet") || trimmed.starts_with("ConditionState") ||
+               trimmed.starts_with("LocomotorSet") || trimmed.starts_with("UnitSpecificSounds") {
+                block_depth = block_depth + 1
+                current_block = trimmed
+            } else if is_end_marker(line) {
+                if block_depth > 0 {
+                    block_depth = block_depth - 1
+                    current_block = ""
+                } else {
+                    // End of object
+                    if current_object.name.len() > 0 {
+                        objects.add(current_object)
+                    }
+                    in_object = false
+                }
+            } else if block_depth == 0 {
+                // Top-level property
+                let (key, value) = parse_property(trimmed)
+                apply_property(current_object, key, value)
+            }
+        }
+    }
+
+    return objects
+}
+
+/// Apply a property to object definition
+fn apply_property(obj: ObjectDef, key: String, value: String) {
+    if key == "DisplayName" {
+        obj.display_name = value
+    } else if key == "Side" {
+        obj.side = parse_side(value)
+    } else if key == "EditorSorting" {
+        obj.category = parse_category(value)
+    } else if key == "SelectPortrait" {
+        obj.select_portrait = value
+    } else if key == "ButtonImage" {
+        obj.button_image = value
+    } else if key == "BuildCost" {
+        obj.build_cost = parse_int(value)
+    } else if key == "BuildTime" {
+        obj.build_time = parse_float(value)
+    } else if key == "VisionRange" {
+        obj.vision_range = parse_float(value)
+    } else if key == "ShroudClearingRange" {
+        obj.shroud_clearing_range = parse_float(value)
+    } else if key == "TransportSlotCount" {
+        obj.transport_slot_count = parse_int(value)
+    } else if key == "CommandSet" {
+        obj.command_set = value
+    } else if key == "KindOf" {
+        obj.kindof = split_by_space(value)
+    } else if key.starts_with("UpgradeCameo") {
+        obj.upgrade_cameos.add(value)
+    } else if key.starts_with("Prerequisite") {
+        obj.prerequisites.add(value)
+    } else {
+        // Store unparsed properties
+        obj.raw_properties.set(key, value)
+    }
+}
+
+// ============================================================================
+// Object Database
+// ============================================================================
+
+struct ObjectDatabase {
+    objects: Map<String, ObjectDef>,
+    by_side: Map<String, Collection<String>>,
+    by_category: Map<String, Collection<String>>,
+
+    fn init() -> ObjectDatabase {
+        return ObjectDatabase {
+            objects: Map<String, ObjectDef>{},
+            by_side: Map<String, Collection<String>>{},
+            by_category: Map<String, Collection<String>>{},
+        }
+    }
+
+    fn load_file(self, content: String) -> Int {
+        let parsed = parse_object_ini(content)
+        let count = 0
+
+        for obj in parsed {
+            self.objects.set(obj.name, obj)
+            count = count + 1
+        }
+
+        return count
+    }
+
+    fn get_object(self, name: String) -> ObjectDef {
+        if self.objects.has(name) {
+            return self.objects.get(name)
+        }
+        return create_object_def("")
+    }
+
+    fn has_object(self, name: String) -> Bool {
+        return self.objects.has(name)
+    }
+
+    fn get_objects_by_side(self, side: ObjectSide) -> Collection<ObjectDef> {
+        let result = Collection<ObjectDef>{}
+        for obj in self.objects.values() {
+            if obj.side == side {
+                result.add(obj)
+            }
+        }
+        return result
+    }
+
+    fn get_objects_by_category(self, category: ObjectCategory) -> Collection<ObjectDef> {
+        let result = Collection<ObjectDef>{}
+        for obj in self.objects.values() {
+            if obj.category == category {
+                result.add(obj)
+            }
+        }
+        return result
+    }
+
+    fn get_count(self) -> Int {
+        return self.objects.len()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_parse_simple() -> Bool {
+    let content = """
+Object TestUnit
+  DisplayName = OBJECT:TestUnit
+  Side = America
+  EditorSorting = VEHICLE
+  BuildCost = 1000
+  BuildTime = 10.5
+End
+"""
+    let objects = parse_object_ini(content)
+
+    assert(objects.len() == 1, "Should have 1 object")
+
+    let obj = objects.get(0)
+    assert(obj.name == "TestUnit", "Name should match")
+    assert(obj.side == ObjectSide::America, "Side should be America")
+    assert(obj.category == ObjectCategory::Vehicle, "Category should be Vehicle")
+    assert(obj.build_cost == 1000, "BuildCost should be 1000")
+
+    return true
+}
+
+fn test_database() -> Bool {
+    let db = ObjectDatabase::init()
+
+    let content = """
+Object Unit1
+  Side = America
+End
+
+Object Unit2
+  Side = China
+End
+"""
+    let count = db.load_file(content)
+    assert(count == 2, "Should load 2 objects")
+    assert(db.has_object("Unit1"), "Should have Unit1")
+    assert(db.has_object("Unit2"), "Should have Unit2")
+
+    return true
+}
+
+fn test_parse_float() -> Bool {
+    assert(parse_float("10.5") == 10.5, "Should parse 10.5")
+    assert(parse_float("100") == 100.0, "Should parse 100")
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_parse_simple(), "Parse simple test failed")
+    assert(test_database(), "Database test failed")
+    assert(test_parse_float(), "Float parsing test failed")
+    return true
+}

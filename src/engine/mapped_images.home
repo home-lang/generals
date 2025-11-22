@@ -1,0 +1,478 @@
+// MappedImages INI Parser - Texture Atlas and UI Image Definitions
+// Parses MappedImages/*.ini files for UI texture coordinates
+// Used for mapping UI elements to positions within texture atlases
+
+from basics import Collection, Map
+
+// Image status flags
+const IMAGE_STATUS_NONE: Int = 0
+const IMAGE_STATUS_ROTATED_90: Int = 1
+
+// Texture coordinates for a mapped image
+struct MappedImage {
+    name: String,
+    texture: String,        // Source texture file
+    texture_width: Int,     // Full texture width
+    texture_height: Int,    // Full texture height
+    coords_left: Int,       // Left coordinate in texture
+    coords_top: Int,        // Top coordinate in texture
+    coords_right: Int,      // Right coordinate in texture
+    coords_bottom: Int,     // Bottom coordinate in texture
+    status: Int,            // Rotation/flip status
+}
+
+// Collection of mapped images from one INI file
+struct MappedImageSet {
+    images: Map<String, MappedImage>,
+    source_file: String,
+    texture_file: String,
+}
+
+/// Create empty mapped image
+fn create_mapped_image(name: String) -> MappedImage {
+    return MappedImage {
+        name: name,
+        texture: "",
+        texture_width: 0,
+        texture_height: 0,
+        coords_left: 0,
+        coords_top: 0,
+        coords_right: 0,
+        coords_bottom: 0,
+        status: IMAGE_STATUS_NONE,
+    }
+}
+
+/// Create empty image set
+fn create_image_set() -> MappedImageSet {
+    return MappedImageSet {
+        images: Map<String, MappedImage>{},
+        source_file: "",
+        texture_file: "",
+    }
+}
+
+/// Trim whitespace
+fn trim(s: String) -> String {
+    let start = 0
+    let end = s.len()
+    while start < end && is_whitespace(s.char_at(start)) {
+        start = start + 1
+    }
+    while end > start && is_whitespace(s.char_at(end - 1)) {
+        end = end - 1
+    }
+    return s.substring(start, end)
+}
+
+fn is_whitespace(c: Int) -> Bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+/// Check if line is a comment or empty
+fn is_comment_or_empty(line: String) -> Bool {
+    let trimmed = trim(line)
+    if trimmed.len() == 0 {
+        return true
+    }
+    return trimmed.starts_with(";") || trimmed.starts_with("//")
+}
+
+/// Check if line starts a MappedImage block
+fn is_mapped_image_start(line: String) -> Bool {
+    let trimmed = trim(line)
+    return trimmed.starts_with("MappedImage ")
+}
+
+/// Check if line is End marker
+fn is_end_marker(line: String) -> Bool {
+    return trim(line) == "End"
+}
+
+/// Extract image name from MappedImage line
+fn extract_image_name(line: String) -> String {
+    // Format: MappedImage ImageName
+    let trimmed = trim(line)
+    if trimmed.starts_with("MappedImage ") {
+        return trim(trimmed.substring(12, trimmed.len()))
+    }
+    return ""
+}
+
+/// Parse key-value property line
+fn parse_property(line: String) -> (String, String) {
+    let trimmed = trim(line)
+
+    // Find = sign
+    let eq_pos = -1
+    for i in 0..trimmed.len() {
+        if trimmed.char_at(i) == 61 {  // '='
+            eq_pos = i
+            break
+        }
+    }
+
+    if eq_pos < 0 {
+        return ("", "")
+    }
+
+    let key = trim(trimmed.substring(0, eq_pos))
+    let value = trim(trimmed.substring(eq_pos + 1, trimmed.len()))
+
+    return (key, value)
+}
+
+/// Parse integer value
+fn parse_int(s: String) -> Int {
+    let result = 0
+    let negative = false
+    let start = 0
+
+    if s.len() > 0 && s.char_at(0) == 45 {  // '-'
+        negative = true
+        start = 1
+    }
+
+    for i in start..s.len() {
+        let c = s.char_at(i)
+        if c >= 48 && c <= 57 {  // '0'-'9'
+            result = result * 10 + (c - 48)
+        } else {
+            break
+        }
+    }
+
+    if negative {
+        return -result
+    }
+    return result
+}
+
+/// Parse coords value "Left:X Top:Y Right:Z Bottom:W"
+fn parse_coords(value: String) -> (Int, Int, Int, Int) {
+    let left = 0
+    let top = 0
+    let right = 0
+    let bottom = 0
+
+    // Split by spaces
+    let parts = split_by_space(value)
+
+    for part in parts {
+        if part.starts_with("Left:") {
+            left = parse_int(part.substring(5, part.len()))
+        } else if part.starts_with("Top:") {
+            top = parse_int(part.substring(4, part.len()))
+        } else if part.starts_with("Right:") {
+            right = parse_int(part.substring(6, part.len()))
+        } else if part.starts_with("Bottom:") {
+            bottom = parse_int(part.substring(7, part.len()))
+        }
+    }
+
+    return (left, top, right, bottom)
+}
+
+/// Split string by spaces
+fn split_by_space(s: String) -> Collection<String> {
+    let parts = Collection<String>{}
+    let current = ""
+
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c == 32 || c == 9 {  // space or tab
+            if current.len() > 0 {
+                parts.add(current)
+                current = ""
+            }
+        } else {
+            current = current + String::char_from_code(c)
+        }
+    }
+
+    if current.len() > 0 {
+        parts.add(current)
+    }
+
+    return parts
+}
+
+/// Parse texture size "TextureWidth:X TextureHeight:Y"
+fn parse_texture_size(value: String) -> (Int, Int) {
+    let width = 0
+    let height = 0
+
+    let parts = split_by_space(value)
+
+    for part in parts {
+        if part.starts_with("TextureWidth:") {
+            width = parse_int(part.substring(13, part.len()))
+        } else if part.starts_with("TextureHeight:") {
+            height = parse_int(part.substring(14, part.len()))
+        }
+    }
+
+    return (width, height)
+}
+
+/// Split lines
+fn split_lines(text: String) -> Collection<String> {
+    let lines = Collection<String>{}
+    let current = ""
+
+    for i in 0..text.len() {
+        let c = text.char_at(i)
+        if c == 10 {
+            lines.add(current)
+            current = ""
+        } else if c != 13 {
+            current = current + String::char_from_code(c)
+        }
+    }
+
+    if current.len() > 0 {
+        lines.add(current)
+    }
+
+    return lines
+}
+
+/// Parse MappedImages INI content
+fn parse_mapped_images(content: String) -> MappedImageSet {
+    let set = create_image_set()
+    let lines = split_lines(content)
+
+    let current_image: MappedImage = create_mapped_image("")
+    let in_image = false
+
+    for i in 0..lines.len() {
+        let line = lines.get(i)
+
+        if is_comment_or_empty(line) {
+            continue
+        }
+
+        if is_mapped_image_start(line) {
+            // Save previous image if exists
+            if in_image && current_image.name.len() > 0 {
+                set.images.set(current_image.name, current_image)
+            }
+
+            // Start new image
+            current_image = create_mapped_image(extract_image_name(line))
+            in_image = true
+
+        } else if is_end_marker(line) && in_image {
+            // Save current image
+            if current_image.name.len() > 0 {
+                set.images.set(current_image.name, current_image)
+            }
+            current_image = create_mapped_image("")
+            in_image = false
+
+        } else if in_image {
+            // Parse property
+            let (key, value) = parse_property(line)
+
+            if key == "Texture" {
+                current_image.texture = value
+                set.texture_file = value
+            } else if key == "TextureSize" {
+                let (w, h) = parse_texture_size(value)
+                current_image.texture_width = w
+                current_image.texture_height = h
+            } else if key == "Coords" {
+                let (l, t, r, b) = parse_coords(value)
+                current_image.coords_left = l
+                current_image.coords_top = t
+                current_image.coords_right = r
+                current_image.coords_bottom = b
+            } else if key == "Status" {
+                if value == "ROTATED_90_CLOCKWISE" {
+                    current_image.status = IMAGE_STATUS_ROTATED_90
+                }
+            }
+        }
+    }
+
+    // Save last image if not ended
+    if in_image && current_image.name.len() > 0 {
+        set.images.set(current_image.name, current_image)
+    }
+
+    return set
+}
+
+/// Get image by name
+fn get_image(set: MappedImageSet, name: String) -> MappedImage {
+    if set.images.has(name) {
+        return set.images.get(name)
+    }
+    return create_mapped_image("")
+}
+
+/// Check if image exists
+fn has_image(set: MappedImageSet, name: String) -> Bool {
+    return set.images.has(name)
+}
+
+/// Get image dimensions (width, height)
+fn get_image_size(image: MappedImage) -> (Int, Int) {
+    let width = image.coords_right - image.coords_left
+    let height = image.coords_bottom - image.coords_top
+    return (width, height)
+}
+
+/// Get normalized UV coordinates (0.0 to 1.0)
+fn get_uv_coords(image: MappedImage) -> (Float, Float, Float, Float) {
+    if image.texture_width == 0 || image.texture_height == 0 {
+        return (0.0, 0.0, 1.0, 1.0)
+    }
+
+    let u0 = (image.coords_left as Float) / (image.texture_width as Float)
+    let v0 = (image.coords_top as Float) / (image.texture_height as Float)
+    let u1 = (image.coords_right as Float) / (image.texture_width as Float)
+    let v1 = (image.coords_bottom as Float) / (image.texture_height as Float)
+
+    return (u0, v0, u1, v1)
+}
+
+// ============================================================================
+// MappedImages Manager
+// ============================================================================
+
+struct MappedImagesManager {
+    sets: Map<String, MappedImageSet>,
+    all_images: Map<String, MappedImage>,  // Flattened lookup
+
+    fn init() -> MappedImagesManager {
+        return MappedImagesManager {
+            sets: Map<String, MappedImageSet>{},
+            all_images: Map<String, MappedImage>{},
+        }
+    }
+
+    fn load_set(self, name: String, content: String) -> Bool {
+        let set = parse_mapped_images(content)
+        set.source_file = name
+        self.sets.set(name, set)
+
+        // Add to flattened lookup
+        for img_name in set.images.keys() {
+            self.all_images.set(img_name, set.images.get(img_name))
+        }
+
+        return true
+    }
+
+    fn get_image(self, name: String) -> MappedImage {
+        if self.all_images.has(name) {
+            return self.all_images.get(name)
+        }
+        return create_mapped_image("")
+    }
+
+    fn has_image(self, name: String) -> Bool {
+        return self.all_images.has(name)
+    }
+
+    fn get_set(self, name: String) -> MappedImageSet {
+        if self.sets.has(name) {
+            return self.sets.get(name)
+        }
+        return create_image_set()
+    }
+
+    fn get_image_count(self) -> Int {
+        return self.all_images.len()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_parse_simple() -> Bool {
+    let content = """
+MappedImage TestButton
+  Texture = UITextures.tga
+  TextureSize = TextureWidth:512 TextureHeight:512
+  Coords = Left:0 Top:0 Right:64 Bottom:32
+End
+"""
+    let set = parse_mapped_images(content)
+
+    assert(has_image(set, "TestButton"), "Should have TestButton")
+
+    let img = get_image(set, "TestButton")
+    assert(img.texture == "UITextures.tga", "Texture should match")
+    assert(img.texture_width == 512, "Width should be 512")
+    assert(img.coords_right == 64, "Right should be 64")
+
+    return true
+}
+
+fn test_image_size() -> Bool {
+    let img = create_mapped_image("test")
+    img.coords_left = 10
+    img.coords_top = 20
+    img.coords_right = 74
+    img.coords_bottom = 52
+
+    let (w, h) = get_image_size(img)
+    assert(w == 64, "Width should be 64")
+    assert(h == 32, "Height should be 32")
+
+    return true
+}
+
+fn test_uv_coords() -> Bool {
+    let img = create_mapped_image("test")
+    img.texture_width = 256
+    img.texture_height = 256
+    img.coords_left = 0
+    img.coords_top = 0
+    img.coords_right = 128
+    img.coords_bottom = 64
+
+    let (u0, v0, u1, v1) = get_uv_coords(img)
+    assert(u0 == 0.0, "U0 should be 0.0")
+    assert(v0 == 0.0, "V0 should be 0.0")
+    assert(u1 == 0.5, "U1 should be 0.5")
+    assert(v1 == 0.25, "V1 should be 0.25")
+
+    return true
+}
+
+fn test_manager() -> Bool {
+    let manager = MappedImagesManager::init()
+
+    let content = """
+MappedImage Icon1
+  Texture = icons.tga
+  TextureSize = TextureWidth:256 TextureHeight:256
+  Coords = Left:0 Top:0 Right:32 Bottom:32
+End
+
+MappedImage Icon2
+  Texture = icons.tga
+  TextureSize = TextureWidth:256 TextureHeight:256
+  Coords = Left:32 Top:0 Right:64 Bottom:32
+End
+"""
+    manager.load_set("icons", content)
+
+    assert(manager.has_image("Icon1"), "Should have Icon1")
+    assert(manager.has_image("Icon2"), "Should have Icon2")
+    assert(manager.get_image_count() == 2, "Should have 2 images")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_parse_simple(), "Parse simple test failed")
+    assert(test_image_size(), "Image size test failed")
+    assert(test_uv_coords(), "UV coords test failed")
+    assert(test_manager(), "Manager test failed")
+    return true
+}

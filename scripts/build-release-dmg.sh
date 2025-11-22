@@ -105,11 +105,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>CFBundleExecutable</key>
     <string>Generals</string>
     <key>CFBundleIdentifier</key>
-    <string>com.generals.home-edition</string>
+    <string>com.ea.generals-zero-hour</string>
     <key>CFBundleName</key>
-    <string>Generals</string>
+    <string>Command and Conquer Generals Zero Hour</string>
     <key>CFBundleDisplayName</key>
-    <string>Command &amp; Conquer: Generals - Home Edition</string>
+    <string>Command and Conquer Generals Zero Hour</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>
@@ -176,7 +176,7 @@ if [ -d "$ASSETS_DIR" ]; then
     echo "   Copying assets from $ASSETS_DIR..."
 
     # Copy all asset directories
-    for dir in ini textures models audio maps data ui scripts; do
+    for dir in ini textures models audio maps data ui scripts icon; do
         if [ -d "$ASSETS_DIR/$dir" ]; then
             echo "   - Copying $dir/..."
             cp -R "$ASSETS_DIR/$dir" "$RESOURCES_DIR/"
@@ -202,10 +202,18 @@ fi
 # =============================================================================
 echo -e "${BLUE}[6/8] Setting up app icon...${NC}"
 
-ICON_SOURCE="$PROJECT_DIR/packaging/Generals.icns"
-if [ -f "$ICON_SOURCE" ]; then
+# Check multiple locations for the icon
+ICON_SOURCE=""
+if [ -f "$PROJECT_DIR/packaging/Generals.icns" ]; then
+    ICON_SOURCE="$PROJECT_DIR/packaging/Generals.icns"
+elif [ -f "$PROJECT_DIR/assets/icon/Generals.icns" ]; then
+    ICON_SOURCE="$PROJECT_DIR/assets/icon/Generals.icns"
+fi
+
+if [ -n "$ICON_SOURCE" ]; then
     cp "$ICON_SOURCE" "$RESOURCES_DIR/Generals.icns"
-    echo -e "${GREEN}   Icon copied${NC}"
+    ICON_SIZE=$(du -h "$RESOURCES_DIR/Generals.icns" | cut -f1)
+    echo -e "${GREEN}   Icon copied: $ICON_SIZE${NC}"
 else
     # Create a placeholder icon set
     echo -e "${YELLOW}   No icon found, creating placeholder...${NC}"
