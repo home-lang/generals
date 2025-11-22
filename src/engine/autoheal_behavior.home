@@ -1,0 +1,325 @@
+// AutoHeal Behavior - Automatic Healing Over Time
+// Based on Thyme engine AutoHealBehavior
+// Units with this behavior heal themselves or nearby allies
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, ModuleData, create_behavior_module, ModuleType
+
+// ============================================================================
+// AutoHeal Configuration
+// ============================================================================
+
+enum HealTarget {
+    Self,           // Heal only self
+    Allies,         // Heal nearby allies
+    AllUnits,       // Heal all nearby units
+    Structures,     // Heal structures only
+}
+
+struct AutoHealConfig {
+    heal_amount: Float,         // HP healed per tick
+    heal_delay: Float,          // Seconds between heals
+    heal_radius: Float,         // Radius for ally healing
+    heal_target: HealTarget,    // What to heal
+    start_healing_delay: Float, // Delay before healing starts after damage
+    triggered_by: Collection<String>,  // Required conditions
+    forbidden_status: Collection<String>,
+    min_health_percent: Float,  // Only heal if above this
+    max_targets: Int,           // Max units to heal per tick
+}
+
+fn default_autoheal_config() -> AutoHealConfig {
+    return AutoHealConfig {
+        heal_amount: 5.0,
+        heal_delay: 1.0,
+        heal_radius: 0.0,
+        heal_target: HealTarget::Self,
+        start_healing_delay: 10.0,
+        triggered_by: Collection<String>{},
+        forbidden_status: Collection<String>{},
+        min_health_percent: 0.0,
+        max_targets: 1,
+    }
+}
+
+// ============================================================================
+// AutoHeal Behavior
+// ============================================================================
+
+struct AutoHealBehavior {
+    base: BehaviorModule,
+    config: AutoHealConfig,
+
+    // State
+    time_since_damage: Float,
+    time_since_heal: Float,
+    is_healing_active: Bool,
+    total_healed: Float,
+    heal_count: Int,
+}
+
+/// Create AutoHeal behavior
+fn create_autoheal_behavior(tag: String) -> AutoHealBehavior {
+    return AutoHealBehavior {
+        base: create_behavior_module(tag, ModuleType::AutoHeal),
+        config: default_autoheal_config(),
+        time_since_damage: 0.0,
+        time_since_heal: 0.0,
+        is_healing_active: false,
+        total_healed: 0.0,
+        heal_count: 0,
+    }
+}
+
+/// Initialize from data
+fn init_autoheal(behavior: AutoHealBehavior, data: ModuleData) {
+    if data.properties.has("HealingAmount") {
+        behavior.config.heal_amount = parse_float(data.properties.get("HealingAmount"))
+    }
+    if data.properties.has("HealingDelay") {
+        behavior.config.heal_delay = parse_float(data.properties.get("HealingDelay"))
+    }
+    if data.properties.has("Radius") {
+        behavior.config.heal_radius = parse_float(data.properties.get("Radius"))
+    }
+    if data.properties.has("StartHealingDelay") {
+        behavior.config.start_healing_delay = parse_float(data.properties.get("StartHealingDelay"))
+    }
+}
+
+/// On damage received - reset heal timer
+fn on_damage_received(behavior: AutoHealBehavior) {
+    behavior.time_since_damage = 0.0
+    behavior.is_healing_active = false
+}
+
+/// Update behavior
+fn update_autoheal(behavior: AutoHealBehavior, delta: Float, current_health: Float, max_health: Float) -> Float {
+    behavior.time_since_damage = behavior.time_since_damage + delta
+    behavior.time_since_heal = behavior.time_since_heal + delta
+
+    // Check if can start healing
+    if !behavior.is_healing_active {
+        if behavior.time_since_damage >= behavior.config.start_healing_delay {
+            behavior.is_healing_active = true
+        } else {
+            return 0.0
+        }
+    }
+
+    // Check if already at max health
+    if current_health >= max_health {
+        return 0.0
+    }
+
+    // Check heal delay
+    if behavior.time_since_heal < behavior.config.heal_delay {
+        return 0.0
+    }
+
+    // Reset heal timer and apply healing
+    behavior.time_since_heal = 0.0
+
+    let heal_amount = behavior.config.heal_amount
+    let missing_health = max_health - current_health
+    if heal_amount > missing_health {
+        heal_amount = missing_health
+    }
+
+    behavior.total_healed = behavior.total_healed + heal_amount
+    behavior.heal_count = behavior.heal_count + 1
+
+    return heal_amount
+}
+
+/// Get targets for area healing
+fn get_heal_targets(behavior: AutoHealBehavior, owner_x: Float, owner_y: Float, nearby_units: Collection<(Int, Float, Float, Float, Float)>) -> Collection<(Int, Float)> {
+    // Input: Collection of (id, x, y, health, max_health)
+    // Output: Collection of (id, heal_amount)
+
+    let targets = Collection<(Int, Float)>{}
+
+    if behavior.config.heal_radius <= 0.0 {
+        return targets
+    }
+
+    let radius_sq = behavior.config.heal_radius * behavior.config.heal_radius
+    let count = 0
+
+    for unit in nearby_units {
+        if count >= behavior.config.max_targets {
+            break
+        }
+
+        let (id, ux, uy, health, max_health) = unit
+
+        // Check distance
+        let dx = ux - owner_x
+        let dy = uy - owner_y
+        let dist_sq = dx * dx + dy * dy
+
+        if dist_sq <= radius_sq {
+            // Check if needs healing
+            if health < max_health {
+                let heal = behavior.config.heal_amount
+                let missing = max_health - health
+                if heal > missing {
+                    heal = missing
+                }
+                targets.add((id, heal))
+                count = count + 1
+            }
+        }
+    }
+
+    return targets
+}
+
+/// Check if behavior is ready to heal
+fn is_ready_to_heal(behavior: AutoHealBehavior) -> Bool {
+    return behavior.is_healing_active && behavior.time_since_heal >= behavior.config.heal_delay
+}
+
+/// Get time until next heal
+fn time_until_heal(behavior: AutoHealBehavior) -> Float {
+    if !behavior.is_healing_active {
+        return behavior.config.start_healing_delay - behavior.time_since_damage
+    }
+    let remaining = behavior.config.heal_delay - behavior.time_since_heal
+    if remaining < 0.0 {
+        return 0.0
+    }
+    return remaining
+}
+
+/// Reset behavior
+fn reset_autoheal(behavior: AutoHealBehavior) {
+    behavior.time_since_damage = 0.0
+    behavior.time_since_heal = 0.0
+    behavior.is_healing_active = false
+    behavior.total_healed = 0.0
+    behavior.heal_count = 0
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_float(s: String) -> Float {
+    let int_part = 0
+    let frac_part = 0.0
+    let frac_divisor = 1.0
+    let in_frac = false
+    let negative = false
+    let start = 0
+
+    if s.len() > 0 && s.char_at(0) == 45 {
+        negative = true
+        start = 1
+    }
+
+    for i in start..s.len() {
+        let c = s.char_at(i)
+        if c == 46 {
+            in_frac = true
+        } else if c >= 48 && c <= 57 {
+            if in_frac {
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + ((c - 48) as Float) / frac_divisor
+            } else {
+                int_part = int_part * 10 + (c - 48)
+            }
+        }
+    }
+
+    let result = (int_part as Float) + frac_part
+    if negative {
+        return -result
+    }
+    return result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_autoheal_basic() -> Bool {
+    let behavior = create_autoheal_behavior("SelfHeal")
+    behavior.config.heal_amount = 10.0
+    behavior.config.heal_delay = 1.0
+    behavior.config.start_healing_delay = 5.0
+
+    // Initially not healing
+    let heal = update_autoheal(behavior, 0.5, 50.0, 100.0)
+    assert(heal == 0.0, "Should not heal yet")
+
+    // Wait for healing to activate
+    update_autoheal(behavior, 2.0, 50.0, 100.0)
+    update_autoheal(behavior, 2.0, 50.0, 100.0)
+    let heal2 = update_autoheal(behavior, 1.0, 50.0, 100.0)
+    assert(behavior.is_healing_active == true, "Should be active")
+
+    // Next tick should heal
+    let heal3 = update_autoheal(behavior, 1.0, 50.0, 100.0)
+    assert(heal3 == 10.0, "Should heal 10")
+
+    return true
+}
+
+fn test_damage_resets() -> Bool {
+    let behavior = create_autoheal_behavior("TestHeal")
+    behavior.config.start_healing_delay = 5.0
+
+    // Advance time to activate
+    for i in 0..6 {
+        update_autoheal(behavior, 1.0, 50.0, 100.0)
+    }
+    assert(behavior.is_healing_active == true, "Should be active")
+
+    // Take damage
+    on_damage_received(behavior)
+    assert(behavior.is_healing_active == false, "Should deactivate on damage")
+    assert(behavior.time_since_damage == 0.0, "Timer should reset")
+
+    return true
+}
+
+fn test_max_health_cap() -> Bool {
+    let behavior = create_autoheal_behavior("CapTest")
+    behavior.config.heal_amount = 20.0
+    behavior.config.start_healing_delay = 0.0
+    behavior.config.heal_delay = 0.0
+
+    // Heal when near max
+    let heal = update_autoheal(behavior, 0.1, 95.0, 100.0)
+    assert(heal == 5.0, "Should only heal 5 to cap")
+
+    return true
+}
+
+fn test_area_healing() -> Bool {
+    let behavior = create_autoheal_behavior("AreaHeal")
+    behavior.config.heal_radius = 100.0
+    behavior.config.heal_amount = 15.0
+    behavior.config.max_targets = 3
+
+    let nearby = Collection<(Int, Float, Float, Float, Float)>{}
+    // (id, x, y, health, max_health)
+    nearby.add((1, 10.0, 10.0, 50.0, 100.0))  // In range, needs heal
+    nearby.add((2, 200.0, 200.0, 50.0, 100.0))  // Out of range
+    nearby.add((3, 20.0, 20.0, 100.0, 100.0))  // In range, full health
+    nearby.add((4, 30.0, 30.0, 80.0, 100.0))  // In range, needs heal
+
+    let targets = get_heal_targets(behavior, 0.0, 0.0, nearby)
+    assert(targets.len() == 2, "Should find 2 valid targets")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_autoheal_basic(), "Autoheal basic test failed")
+    assert(test_damage_resets(), "Damage resets test failed")
+    assert(test_max_health_cap(), "Max health cap test failed")
+    assert(test_area_healing(), "Area healing test failed")
+    return true
+}

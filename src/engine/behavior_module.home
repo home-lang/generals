@@ -1,0 +1,581 @@
+// Behavior Module - Base Class for All Object Behaviors
+// Based on Thyme engine behavior module architecture
+// Provides base functionality for unit/building behaviors
+
+from basics import Collection, Map
+
+// ============================================================================
+// Module Types and Tags
+// ============================================================================
+
+enum ModuleType {
+    // Core module types
+    Behavior,
+    Body,
+    Draw,
+    Update,
+    Contain,
+    Create,
+    Die,
+    Damage,
+    Collide,
+
+    // Specialized behavior types
+    AutoHeal,
+    Bridge,
+    BridgeTower,
+    Overcharge,
+    ParkingPlace,
+    RebuildHole,
+    Spawn,
+    SlowDeath,
+    FireWeapon,
+    DestroyDie,
+    CreateCrate,
+    UpgradeDie,
+}
+
+// Module interface flags
+const MODULE_FLAG_NONE: Int = 0
+const MODULE_FLAG_DISABLED: Int = 1
+const MODULE_FLAG_SLEEPING: Int = 2
+const MODULE_FLAG_PENDING_DELETE: Int = 4
+
+// ============================================================================
+// Module Data (INI Configuration)
+// ============================================================================
+
+struct ModuleData {
+    module_type: String,
+    tag: String,
+    properties: Map<String, String>,
+    conditions: Collection<String>,
+    triggered_by: Collection<String>,
+}
+
+/// Create empty module data
+fn create_module_data(module_type: String, tag: String) -> ModuleData {
+    return ModuleData {
+        module_type: module_type,
+        tag: tag,
+        properties: Map<String, String>{},
+        conditions: Collection<String>{},
+        triggered_by: Collection<String>{},
+    }
+}
+
+/// Get property as string
+fn get_property(data: ModuleData, key: String) -> String {
+    if data.properties.has(key) {
+        return data.properties.get(key)
+    }
+    return ""
+}
+
+/// Get property as int
+fn get_property_int(data: ModuleData, key: String) -> Int {
+    let str_val = get_property(data, key)
+    return parse_int(str_val)
+}
+
+/// Get property as float
+fn get_property_float(data: ModuleData, key: String) -> Float {
+    let str_val = get_property(data, key)
+    return parse_float(str_val)
+}
+
+/// Get property as bool
+fn get_property_bool(data: ModuleData, key: String) -> Bool {
+    let str_val = get_property(data, key).to_lowercase()
+    return str_val == "yes" || str_val == "true" || str_val == "1"
+}
+
+/// Set property
+fn set_property(data: ModuleData, key: String, value: String) {
+    data.properties.set(key, value)
+}
+
+// ============================================================================
+// Base Module Interface
+// ============================================================================
+
+struct BehaviorModule {
+    // Identity
+    module_id: Int,
+    tag: String,
+    module_type: ModuleType,
+
+    // Owner
+    owner_id: Int,
+    owner_type: String,
+
+    // State
+    flags: Int,
+    is_active: Bool,
+    update_order: Int,
+
+    // Configuration
+    data: ModuleData,
+
+    // Timing
+    frame_delay: Int,
+    last_update_frame: Int,
+    next_update_frame: Int,
+
+    // References
+    related_modules: Collection<Int>,
+}
+
+/// Create base behavior module
+fn create_behavior_module(tag: String, module_type: ModuleType) -> BehaviorModule {
+    return BehaviorModule {
+        module_id: 0,
+        tag: tag,
+        module_type: module_type,
+        owner_id: 0,
+        owner_type: "",
+        flags: MODULE_FLAG_NONE,
+        is_active: true,
+        update_order: 0,
+        data: create_module_data("", tag),
+        frame_delay: 0,
+        last_update_frame: 0,
+        next_update_frame: 0,
+        related_modules: Collection<Int>{},
+    }
+}
+
+/// Initialize module with data
+fn init_module(module: BehaviorModule, data: ModuleData) {
+    module.data = data
+    module.tag = data.tag
+
+    // Parse common properties
+    if data.properties.has("FrameDelay") {
+        module.frame_delay = get_property_int(data, "FrameDelay")
+    }
+    if data.properties.has("UpdateOrder") {
+        module.update_order = get_property_int(data, "UpdateOrder")
+    }
+}
+
+/// Check if module is enabled
+fn is_enabled(module: BehaviorModule) -> Bool {
+    return (module.flags & MODULE_FLAG_DISABLED) == 0
+}
+
+/// Enable module
+fn enable_module(module: BehaviorModule) {
+    module.flags = module.flags & ~MODULE_FLAG_DISABLED
+}
+
+/// Disable module
+fn disable_module(module: BehaviorModule) {
+    module.flags = module.flags | MODULE_FLAG_DISABLED
+}
+
+/// Check if module is sleeping
+fn is_sleeping(module: BehaviorModule) -> Bool {
+    return (module.flags & MODULE_FLAG_SLEEPING) != 0
+}
+
+/// Put module to sleep
+fn sleep_module(module: BehaviorModule) {
+    module.flags = module.flags | MODULE_FLAG_SLEEPING
+}
+
+/// Wake module
+fn wake_module(module: BehaviorModule) {
+    module.flags = module.flags & ~MODULE_FLAG_SLEEPING
+}
+
+/// Mark for deletion
+fn mark_for_delete(module: BehaviorModule) {
+    module.flags = module.flags | MODULE_FLAG_PENDING_DELETE
+}
+
+/// Check if pending delete
+fn is_pending_delete(module: BehaviorModule) -> Bool {
+    return (module.flags & MODULE_FLAG_PENDING_DELETE) != 0
+}
+
+// ============================================================================
+// Module Lifecycle
+// ============================================================================
+
+enum ModulePhase {
+    PreCreate,
+    OnCreate,
+    PostCreate,
+    OnDestroy,
+    OnCapture,
+    OnDamage,
+    OnHealed,
+    OnVeterancyChange,
+    OnUpgrade,
+}
+
+/// Module lifecycle callback result
+enum CallbackResult {
+    Continue,
+    Handled,
+    Abort,
+}
+
+/// Module update result
+struct ModuleUpdateResult {
+    continue_update: Bool,
+    sleep_frames: Int,
+    request_wake: Bool,
+}
+
+/// Create default update result
+fn default_update_result() -> ModuleUpdateResult {
+    return ModuleUpdateResult {
+        continue_update: true,
+        sleep_frames: 0,
+        request_wake: false,
+    }
+}
+
+// ============================================================================
+// Module Manager
+// ============================================================================
+
+struct BehaviorModuleManager {
+    modules: Map<Int, BehaviorModule>,
+    modules_by_tag: Map<String, Collection<Int>>,
+    modules_by_owner: Map<Int, Collection<Int>>,
+    next_module_id: Int,
+    update_queue: Collection<Int>,
+    pending_delete: Collection<Int>,
+}
+
+/// Create module manager
+fn create_module_manager() -> BehaviorModuleManager {
+    return BehaviorModuleManager {
+        modules: Map<Int, BehaviorModule>{},
+        modules_by_tag: Map<String, Collection<Int>>{},
+        modules_by_owner: Map<Int, Collection<Int>>{},
+        next_module_id: 1,
+        update_queue: Collection<Int>{},
+        pending_delete: Collection<Int>{},
+    }
+}
+
+/// Register module
+fn register_module(mgr: BehaviorModuleManager, module: BehaviorModule) -> Int {
+    let id = mgr.next_module_id
+    mgr.next_module_id = mgr.next_module_id + 1
+
+    module.module_id = id
+    mgr.modules.set(id, module)
+
+    // Index by tag
+    if !mgr.modules_by_tag.has(module.tag) {
+        mgr.modules_by_tag.set(module.tag, Collection<Int>{})
+    }
+    mgr.modules_by_tag.get(module.tag).add(id)
+
+    // Index by owner
+    if !mgr.modules_by_owner.has(module.owner_id) {
+        mgr.modules_by_owner.set(module.owner_id, Collection<Int>{})
+    }
+    mgr.modules_by_owner.get(module.owner_id).add(id)
+
+    // Add to update queue
+    mgr.update_queue.add(id)
+
+    return id
+}
+
+/// Unregister module
+fn unregister_module(mgr: BehaviorModuleManager, module_id: Int) -> Bool {
+    if !mgr.modules.has(module_id) {
+        return false
+    }
+
+    let module = mgr.modules.get(module_id)
+
+    // Remove from tag index
+    if mgr.modules_by_tag.has(module.tag) {
+        let tags = mgr.modules_by_tag.get(module.tag)
+        // Note: Collection remove not implemented, mark as deleted instead
+    }
+
+    // Mark for deletion
+    mark_for_delete(module)
+    mgr.pending_delete.add(module_id)
+
+    return true
+}
+
+/// Get module by ID
+fn get_module(mgr: BehaviorModuleManager, id: Int) -> BehaviorModule {
+    if mgr.modules.has(id) {
+        return mgr.modules.get(id)
+    }
+    return create_behavior_module("", ModuleType::Behavior)
+}
+
+/// Get modules by tag
+fn get_modules_by_tag(mgr: BehaviorModuleManager, tag: String) -> Collection<BehaviorModule> {
+    let result = Collection<BehaviorModule>{}
+    if mgr.modules_by_tag.has(tag) {
+        let ids = mgr.modules_by_tag.get(tag)
+        for id in ids {
+            if mgr.modules.has(id) {
+                result.add(mgr.modules.get(id))
+            }
+        }
+    }
+    return result
+}
+
+/// Get modules for owner
+fn get_modules_for_owner(mgr: BehaviorModuleManager, owner_id: Int) -> Collection<BehaviorModule> {
+    let result = Collection<BehaviorModule>{}
+    if mgr.modules_by_owner.has(owner_id) {
+        let ids = mgr.modules_by_owner.get(owner_id)
+        for id in ids {
+            if mgr.modules.has(id) && !is_pending_delete(mgr.modules.get(id)) {
+                result.add(mgr.modules.get(id))
+            }
+        }
+    }
+    return result
+}
+
+/// Update all modules
+fn update_all_modules(mgr: BehaviorModuleManager, current_frame: Int) {
+    // Sort by update order (simplified - just iterate)
+    for id in mgr.update_queue {
+        if mgr.modules.has(id) {
+            let module = mgr.modules.get(id)
+            if is_enabled(module) && !is_sleeping(module) && !is_pending_delete(module) {
+                if current_frame >= module.next_update_frame {
+                    // Virtual update call would go here
+                    module.last_update_frame = current_frame
+                    module.next_update_frame = current_frame + module.frame_delay
+                }
+            }
+        }
+    }
+
+    // Clean up deleted modules
+    for id in mgr.pending_delete {
+        mgr.modules.remove(id)
+    }
+    mgr.pending_delete = Collection<Int>{}
+}
+
+/// Get module count
+fn get_module_count(mgr: BehaviorModuleManager) -> Int {
+    return mgr.modules.len()
+}
+
+// ============================================================================
+// Module Factory
+// ============================================================================
+
+struct ModuleFactory {
+    creators: Map<String, ModuleType>,
+    default_data: Map<String, ModuleData>,
+}
+
+/// Create module factory
+fn create_module_factory() -> ModuleFactory {
+    let factory = ModuleFactory {
+        creators: Map<String, ModuleType>{},
+        default_data: Map<String, ModuleData>{},
+    }
+
+    // Register built-in module types
+    factory.creators.set("AutoHealBehavior", ModuleType::AutoHeal)
+    factory.creators.set("BridgeBehavior", ModuleType::Bridge)
+    factory.creators.set("BridgeTowerBehavior", ModuleType::BridgeTower)
+    factory.creators.set("OverchargeBehavior", ModuleType::Overcharge)
+    factory.creators.set("ParkingPlaceBehavior", ModuleType::ParkingPlace)
+    factory.creators.set("RebuildHoleBehavior", ModuleType::RebuildHole)
+    factory.creators.set("SpawnBehavior", ModuleType::Spawn)
+    factory.creators.set("SlowDeathBehavior", ModuleType::SlowDeath)
+    factory.creators.set("FireWeaponBehavior", ModuleType::FireWeapon)
+    factory.creators.set("DestroyDie", ModuleType::DestroyDie)
+    factory.creators.set("CreateCrateDie", ModuleType::CreateCrate)
+    factory.creators.set("UpgradeDie", ModuleType::UpgradeDie)
+
+    return factory
+}
+
+/// Create module from type name
+fn create_module_from_type(factory: ModuleFactory, type_name: String, tag: String) -> BehaviorModule {
+    let module_type = ModuleType::Behavior
+    if factory.creators.has(type_name) {
+        module_type = factory.creators.get(type_name)
+    }
+
+    let module = create_behavior_module(tag, module_type)
+    module.data.module_type = type_name
+
+    return module
+}
+
+/// Create module from data
+fn create_module_from_data(factory: ModuleFactory, data: ModuleData) -> BehaviorModule {
+    let module = create_module_from_type(factory, data.module_type, data.tag)
+    init_module(module, data)
+    return module
+}
+
+/// Register custom module type
+fn register_module_type(factory: ModuleFactory, type_name: String, module_type: ModuleType) {
+    factory.creators.set(type_name, module_type)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_int(s: String) -> Int {
+    let result = 0
+    let negative = false
+    let start = 0
+
+    if s.len() > 0 && s.char_at(0) == 45 {
+        negative = true
+        start = 1
+    }
+
+    for i in start..s.len() {
+        let c = s.char_at(i)
+        if c >= 48 && c <= 57 {
+            result = result * 10 + (c - 48)
+        } else {
+            break
+        }
+    }
+
+    if negative {
+        return -result
+    }
+    return result
+}
+
+fn parse_float(s: String) -> Float {
+    let int_part = 0
+    let frac_part = 0.0
+    let frac_divisor = 1.0
+    let in_frac = false
+    let negative = false
+    let start = 0
+
+    if s.len() > 0 && s.char_at(0) == 45 {
+        negative = true
+        start = 1
+    }
+
+    for i in start..s.len() {
+        let c = s.char_at(i)
+        if c == 46 {
+            in_frac = true
+        } else if c >= 48 && c <= 57 {
+            if in_frac {
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + ((c - 48) as Float) / frac_divisor
+            } else {
+                int_part = int_part * 10 + (c - 48)
+            }
+        } else {
+            break
+        }
+    }
+
+    let result = (int_part as Float) + frac_part
+    if negative {
+        return -result
+    }
+    return result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_module_data() -> Bool {
+    let data = create_module_data("AutoHealBehavior", "AutoHeal1")
+    set_property(data, "HealDelay", "1000")
+    set_property(data, "HealAmount", "5.5")
+    set_property(data, "Active", "yes")
+
+    assert(get_property_int(data, "HealDelay") == 1000, "HealDelay should be 1000")
+    assert(get_property_float(data, "HealAmount") == 5.5, "HealAmount should be 5.5")
+    assert(get_property_bool(data, "Active") == true, "Active should be true")
+
+    return true
+}
+
+fn test_module_flags() -> Bool {
+    let module = create_behavior_module("Test", ModuleType::Behavior)
+
+    assert(is_enabled(module), "Should be enabled by default")
+    assert(!is_sleeping(module), "Should not be sleeping by default")
+
+    disable_module(module)
+    assert(!is_enabled(module), "Should be disabled")
+
+    enable_module(module)
+    assert(is_enabled(module), "Should be enabled again")
+
+    sleep_module(module)
+    assert(is_sleeping(module), "Should be sleeping")
+
+    wake_module(module)
+    assert(!is_sleeping(module), "Should be awake")
+
+    return true
+}
+
+fn test_module_manager() -> Bool {
+    let mgr = create_module_manager()
+
+    let m1 = create_behavior_module("Heal", ModuleType::AutoHeal)
+    m1.owner_id = 100
+    let id1 = register_module(mgr, m1)
+
+    let m2 = create_behavior_module("Spawn", ModuleType::Spawn)
+    m2.owner_id = 100
+    let id2 = register_module(mgr, m2)
+
+    assert(get_module_count(mgr) == 2, "Should have 2 modules")
+
+    let owner_modules = get_modules_for_owner(mgr, 100)
+    assert(owner_modules.len() == 2, "Owner should have 2 modules")
+
+    unregister_module(mgr, id1)
+    update_all_modules(mgr, 1)
+    // After cleanup
+    // Note: actual removal depends on implementation
+
+    return true
+}
+
+fn test_module_factory() -> Bool {
+    let factory = create_module_factory()
+
+    let data = create_module_data("AutoHealBehavior", "Healer")
+    set_property(data, "HealAmount", "10")
+
+    let module = create_module_from_data(factory, data)
+    assert(module.module_type == ModuleType::AutoHeal, "Should be AutoHeal type")
+    assert(module.tag == "Healer", "Tag should match")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_module_data(), "Module data test failed")
+    assert(test_module_flags(), "Module flags test failed")
+    assert(test_module_manager(), "Module manager test failed")
+    assert(test_module_factory(), "Module factory test failed")
+    return true
+}

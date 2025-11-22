@@ -1,0 +1,573 @@
+// LAN API - Local Network Game Discovery and Connection
+// Based on Thyme engine LAN implementation
+// Handles LAN game broadcasting, discovery, and joining
+
+from basics import Collection, Map
+
+// ============================================================================
+// LAN Constants
+// ============================================================================
+
+const LAN_BROADCAST_PORT: Int = 8086
+const LAN_GAME_PORT: Int = 8087
+const LAN_BROADCAST_INTERVAL: Int = 1000  // ms
+const LAN_GAME_TIMEOUT: Int = 5000  // ms
+const LAN_MAX_GAMES: Int = 32
+const LAN_PROTOCOL_MAGIC: Int = 0x47454E53  // "GENS"
+
+// ============================================================================
+// LAN Game Info
+// ============================================================================
+
+struct LANGameInfo {
+    game_id: Int,
+    host_name: String,
+    host_ip: String,
+    host_port: Int,
+    map_name: String,
+    max_players: Int,
+    current_players: Int,
+    game_speed: Int,
+    starting_cash: Int,
+    is_password_protected: Bool,
+    game_version: Int,
+    last_seen: Int,  // timestamp
+    ping: Int,
+}
+
+fn create_lan_game_info() -> LANGameInfo {
+    return LANGameInfo {
+        game_id: 0,
+        host_name: "",
+        host_ip: "",
+        host_port: LAN_GAME_PORT,
+        map_name: "",
+        max_players: 8,
+        current_players: 1,
+        game_speed: 30,
+        starting_cash: 10000,
+        is_password_protected: false,
+        game_version: 1,
+        last_seen: 0,
+        ping: 0,
+    }
+}
+
+/// Copy game info
+fn copy_game_info(src: LANGameInfo) -> LANGameInfo {
+    let info = create_lan_game_info()
+    info.game_id = src.game_id
+    info.host_name = src.host_name
+    info.host_ip = src.host_ip
+    info.host_port = src.host_port
+    info.map_name = src.map_name
+    info.max_players = src.max_players
+    info.current_players = src.current_players
+    info.game_speed = src.game_speed
+    info.starting_cash = src.starting_cash
+    info.is_password_protected = src.is_password_protected
+    info.game_version = src.game_version
+    info.last_seen = src.last_seen
+    info.ping = src.ping
+    return info
+}
+
+// ============================================================================
+// LAN Packet Types
+// ============================================================================
+
+enum LANPacketType {
+    GameAnnounce,   // Host broadcasting game
+    GameQuery,      // Client looking for games
+    JoinRequest,    // Client wants to join
+    JoinAccept,     // Host accepts join
+    JoinReject,     // Host rejects join
+    Ping,           // Latency check
+    Pong,           // Latency response
+}
+
+// Rejection reasons
+enum JoinRejectReason {
+    GameFull,
+    WrongPassword,
+    VersionMismatch,
+    Banned,
+    GameStarted,
+}
+
+// ============================================================================
+// LAN Broadcast Packet
+// ============================================================================
+
+struct LANPacket {
+    magic: Int,
+    packet_type: LANPacketType,
+    game_id: Int,
+    data: Collection<Int>,
+}
+
+fn create_lan_packet(ptype: LANPacketType, game_id: Int) -> LANPacket {
+    return LANPacket {
+        magic: LAN_PROTOCOL_MAGIC,
+        packet_type: ptype,
+        game_id: game_id,
+        data: Collection<Int>{},
+    }
+}
+
+/// Write int to packet
+fn lan_write_int(packet: LANPacket, value: Int) {
+    packet.data.add((value >> 24) & 0xFF)
+    packet.data.add((value >> 16) & 0xFF)
+    packet.data.add((value >> 8) & 0xFF)
+    packet.data.add(value & 0xFF)
+}
+
+/// Write string to packet
+fn lan_write_string(packet: LANPacket, value: String) {
+    lan_write_int(packet, value.len())
+    for i in 0..value.len() {
+        packet.data.add(value.char_at(i))
+    }
+}
+
+/// Read int from packet
+fn lan_read_int(packet: LANPacket, offset: Int) -> Int {
+    if offset + 4 > packet.data.len() {
+        return 0
+    }
+    let b0 = packet.data.get(offset)
+    let b1 = packet.data.get(offset + 1)
+    let b2 = packet.data.get(offset + 2)
+    let b3 = packet.data.get(offset + 3)
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+/// Read string from packet
+fn lan_read_string(packet: LANPacket, offset: Int) -> (String, Int) {
+    let len = lan_read_int(packet, offset)
+    let str = ""
+    for i in 0..len {
+        str = str + String::char_from_code(packet.data.get(offset + 4 + i))
+    }
+    return (str, offset + 4 + len)
+}
+
+/// Serialize game info to packet
+fn serialize_game_info(info: LANGameInfo) -> LANPacket {
+    let packet = create_lan_packet(LANPacketType::GameAnnounce, info.game_id)
+
+    lan_write_string(packet, info.host_name)
+    lan_write_string(packet, info.map_name)
+    lan_write_int(packet, info.host_port)
+    lan_write_int(packet, info.max_players)
+    lan_write_int(packet, info.current_players)
+    lan_write_int(packet, info.game_speed)
+    lan_write_int(packet, info.starting_cash)
+    lan_write_int(packet, if info.is_password_protected { 1 } else { 0 })
+    lan_write_int(packet, info.game_version)
+
+    return packet
+}
+
+/// Deserialize game info from packet
+fn deserialize_game_info(packet: LANPacket, source_ip: String) -> LANGameInfo {
+    let info = create_lan_game_info()
+    let offset = 0
+
+    info.game_id = packet.game_id
+    info.host_ip = source_ip
+
+    let (host_name, offset1) = lan_read_string(packet, offset)
+    info.host_name = host_name
+    offset = offset1
+
+    let (map_name, offset2) = lan_read_string(packet, offset)
+    info.map_name = map_name
+    offset = offset2
+
+    info.host_port = lan_read_int(packet, offset)
+    offset = offset + 4
+
+    info.max_players = lan_read_int(packet, offset)
+    offset = offset + 4
+
+    info.current_players = lan_read_int(packet, offset)
+    offset = offset + 4
+
+    info.game_speed = lan_read_int(packet, offset)
+    offset = offset + 4
+
+    info.starting_cash = lan_read_int(packet, offset)
+    offset = offset + 4
+
+    info.is_password_protected = lan_read_int(packet, offset) != 0
+    offset = offset + 4
+
+    info.game_version = lan_read_int(packet, offset)
+
+    return info
+}
+
+// ============================================================================
+// LAN Browser (Client Side)
+// ============================================================================
+
+struct LANBrowser {
+    games: Map<Int, LANGameInfo>,
+    game_order: Collection<Int>,
+    is_scanning: Bool,
+    scan_start_time: Int,
+    current_time: Int,
+    last_query_time: Int,
+    game_version: Int,
+}
+
+fn create_lan_browser() -> LANBrowser {
+    return LANBrowser {
+        games: Map<Int, LANGameInfo>{},
+        game_order: Collection<Int>{},
+        is_scanning: false,
+        scan_start_time: 0,
+        current_time: 0,
+        last_query_time: 0,
+        game_version: 1,
+    }
+}
+
+/// Start scanning for games
+fn start_scan(browser: LANBrowser) {
+    browser.is_scanning = true
+    browser.scan_start_time = browser.current_time
+    browser.games = Map<Int, LANGameInfo>{}
+    browser.game_order = Collection<Int>{}
+}
+
+/// Stop scanning
+fn stop_scan(browser: LANBrowser) {
+    browser.is_scanning = false
+}
+
+/// Update browser
+fn update_browser(browser: LANBrowser, delta_ms: Int) -> Bool {
+    browser.current_time = browser.current_time + delta_ms
+
+    // Remove stale games
+    let to_remove = Collection<Int>{}
+    for game_id in browser.game_order {
+        if browser.games.has(game_id) {
+            let info = browser.games.get(game_id)
+            if browser.current_time - info.last_seen > LAN_GAME_TIMEOUT {
+                to_remove.add(game_id)
+            }
+        }
+    }
+
+    // Would remove stale games
+
+    // Should send query?
+    let should_query = browser.is_scanning &&
+                       (browser.current_time - browser.last_query_time > LAN_BROADCAST_INTERVAL)
+
+    if should_query {
+        browser.last_query_time = browser.current_time
+    }
+
+    return should_query
+}
+
+/// Create query packet
+fn create_query_packet(browser: LANBrowser) -> LANPacket {
+    let packet = create_lan_packet(LANPacketType::GameQuery, 0)
+    lan_write_int(packet, browser.game_version)
+    return packet
+}
+
+/// Handle game announcement
+fn on_game_announce(browser: LANBrowser, packet: LANPacket, source_ip: String) {
+    let info = deserialize_game_info(packet, source_ip)
+    info.last_seen = browser.current_time
+
+    // Check version compatibility
+    if info.game_version != browser.game_version {
+        return
+    }
+
+    // Add or update game
+    if !browser.games.has(info.game_id) {
+        browser.game_order.add(info.game_id)
+    }
+    browser.games.set(info.game_id, info)
+}
+
+/// Get available games
+fn get_games(browser: LANBrowser) -> Collection<LANGameInfo> {
+    let result = Collection<LANGameInfo>{}
+    for game_id in browser.game_order {
+        if browser.games.has(game_id) {
+            result.add(browser.games.get(game_id))
+        }
+    }
+    return result
+}
+
+/// Get game count
+fn get_game_count(browser: LANBrowser) -> Int {
+    return browser.game_order.len()
+}
+
+/// Get game by ID
+fn get_game(browser: LANBrowser, game_id: Int) -> LANGameInfo {
+    if browser.games.has(game_id) {
+        return browser.games.get(game_id)
+    }
+    return create_lan_game_info()
+}
+
+// ============================================================================
+// LAN Advertiser (Host Side)
+// ============================================================================
+
+struct LANAdvertiser {
+    game_info: LANGameInfo,
+    is_advertising: Bool,
+    current_time: Int,
+    last_broadcast_time: Int,
+}
+
+fn create_lan_advertiser() -> LANAdvertiser {
+    return LANAdvertiser {
+        game_info: create_lan_game_info(),
+        is_advertising: false,
+        current_time: 0,
+        last_broadcast_time: 0,
+    }
+}
+
+/// Start advertising game
+fn start_advertising(adv: LANAdvertiser, info: LANGameInfo) {
+    adv.game_info = copy_game_info(info)
+    adv.is_advertising = true
+}
+
+/// Stop advertising
+fn stop_advertising(adv: LANAdvertiser) {
+    adv.is_advertising = false
+}
+
+/// Update advertiser
+fn update_advertiser(adv: LANAdvertiser, delta_ms: Int) -> Bool {
+    adv.current_time = adv.current_time + delta_ms
+
+    if !adv.is_advertising {
+        return false
+    }
+
+    // Should broadcast?
+    if adv.current_time - adv.last_broadcast_time > LAN_BROADCAST_INTERVAL {
+        adv.last_broadcast_time = adv.current_time
+        return true
+    }
+
+    return false
+}
+
+/// Create broadcast packet
+fn create_broadcast_packet(adv: LANAdvertiser) -> LANPacket {
+    return serialize_game_info(adv.game_info)
+}
+
+/// Update player count
+fn update_player_count(adv: LANAdvertiser, count: Int) {
+    adv.game_info.current_players = count
+}
+
+/// Update map
+fn update_map(adv: LANAdvertiser, map_name: String) {
+    adv.game_info.map_name = map_name
+}
+
+// ============================================================================
+// LAN Connection Manager
+// ============================================================================
+
+struct LANConnection {
+    browser: LANBrowser,
+    advertiser: LANAdvertiser,
+    is_host: Bool,
+    local_player_name: String,
+    join_state: Int,  // 0=none, 1=joining, 2=joined, 3=rejected
+    reject_reason: JoinRejectReason,
+}
+
+fn create_lan_connection() -> LANConnection {
+    return LANConnection {
+        browser: create_lan_browser(),
+        advertiser: create_lan_advertiser(),
+        is_host: false,
+        local_player_name: "Player",
+        join_state: 0,
+        reject_reason: JoinRejectReason::GameFull,
+    }
+}
+
+/// Host a new game
+fn host_game(conn: LANConnection, player_name: String, game_name: String, map_name: String) -> Bool {
+    let info = create_lan_game_info()
+    info.game_id = generate_game_id(game_name)
+    info.host_name = game_name
+    info.map_name = map_name
+    info.current_players = 1
+
+    start_advertising(conn.advertiser, info)
+    conn.is_host = true
+    conn.local_player_name = player_name
+
+    return true
+}
+
+/// Request to join a game
+fn request_join(conn: LANConnection, game_id: Int, player_name: String, password: String) -> LANPacket {
+    conn.local_player_name = player_name
+    conn.join_state = 1
+
+    let packet = create_lan_packet(LANPacketType::JoinRequest, game_id)
+    lan_write_string(packet, player_name)
+    lan_write_string(packet, password)
+
+    return packet
+}
+
+/// Handle join request (host)
+fn handle_join_request(conn: LANConnection, packet: LANPacket, source_ip: String) -> LANPacket {
+    if !conn.is_host {
+        return create_lan_packet(LANPacketType::JoinReject, packet.game_id)
+    }
+
+    let offset = 0
+    let (player_name, offset1) = lan_read_string(packet, offset)
+    let (password, _) = lan_read_string(packet, offset1)
+
+    // Check if can join
+    let info = conn.advertiser.game_info
+    if info.current_players >= info.max_players {
+        let reject = create_lan_packet(LANPacketType::JoinReject, packet.game_id)
+        lan_write_int(reject, JoinRejectReason::GameFull as Int)
+        return reject
+    }
+
+    // Accept
+    let accept = create_lan_packet(LANPacketType::JoinAccept, packet.game_id)
+    let assigned_id = info.current_players + 1
+    lan_write_int(accept, assigned_id)
+    update_player_count(conn.advertiser, info.current_players + 1)
+
+    return accept
+}
+
+/// Handle join response (client)
+fn handle_join_response(conn: LANConnection, packet: LANPacket) -> Int {
+    if packet.packet_type == LANPacketType::JoinAccept {
+        conn.join_state = 2
+        return lan_read_int(packet, 0)  // assigned player ID
+    } else if packet.packet_type == LANPacketType::JoinReject {
+        conn.join_state = 3
+        conn.reject_reason = lan_read_int(packet, 0) as JoinRejectReason
+        return -1
+    }
+    return 0
+}
+
+/// Update connection
+fn update_connection(conn: LANConnection, delta_ms: Int) {
+    update_browser(conn.browser, delta_ms)
+    update_advertiser(conn.advertiser, delta_ms)
+}
+
+/// Generate game ID from name
+fn generate_game_id(name: String) -> Int {
+    let hash = 5381
+    for i in 0..name.len() {
+        hash = ((hash << 5) + hash) + name.char_at(i)
+    }
+    return hash & 0x7FFFFFFF
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_game_info() -> Bool {
+    let info = create_lan_game_info()
+    info.game_id = 12345
+    info.host_name = "TestGame"
+    info.map_name = "Tournament Desert"
+    info.current_players = 3
+    info.max_players = 8
+
+    let packet = serialize_game_info(info)
+    let restored = deserialize_game_info(packet, "192.168.1.100")
+
+    assert(restored.game_id == 12345, "Game ID should match")
+    assert(restored.host_name == "TestGame", "Host name should match")
+    assert(restored.map_name == "Tournament Desert", "Map should match")
+    assert(restored.current_players == 3, "Player count should match")
+
+    return true
+}
+
+fn test_browser() -> Bool {
+    let browser = create_lan_browser()
+    start_scan(browser)
+
+    assert(browser.is_scanning == true, "Should be scanning")
+    assert(get_game_count(browser) == 0, "Should have no games")
+
+    // Simulate game announcement
+    let info = create_lan_game_info()
+    info.game_id = 1
+    info.host_name = "Game1"
+    let packet = serialize_game_info(info)
+    on_game_announce(browser, packet, "192.168.1.1")
+
+    assert(get_game_count(browser) == 1, "Should have 1 game")
+
+    return true
+}
+
+fn test_advertiser() -> Bool {
+    let adv = create_lan_advertiser()
+
+    let info = create_lan_game_info()
+    info.host_name = "My Game"
+    info.map_name = "Test Map"
+
+    start_advertising(adv, info)
+    assert(adv.is_advertising == true, "Should be advertising")
+
+    update_player_count(adv, 4)
+    assert(adv.game_info.current_players == 4, "Should have 4 players")
+
+    stop_advertising(adv)
+    assert(adv.is_advertising == false, "Should stop advertising")
+
+    return true
+}
+
+fn test_connection() -> Bool {
+    let conn = create_lan_connection()
+
+    host_game(conn, "HostPlayer", "My LAN Game", "Desert Map")
+    assert(conn.is_host == true, "Should be host")
+    assert(conn.advertiser.is_advertising == true, "Should be advertising")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_game_info(), "Game info test failed")
+    assert(test_browser(), "Browser test failed")
+    assert(test_advertiser(), "Advertiser test failed")
+    assert(test_connection(), "Connection test failed")
+    return true
+}

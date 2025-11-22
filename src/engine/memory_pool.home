@@ -1,0 +1,603 @@
+// Memory Pool System - High-Performance Pool Allocator
+// Based on Thyme engine memory management architecture
+// Provides fast allocation/deallocation for fixed-size objects
+
+from basics import Collection, Map
+
+// ============================================================================
+// Memory Block Types
+// ============================================================================
+
+// Block header flags
+const BLOCK_FLAG_FREE: Int = 0
+const BLOCK_FLAG_USED: Int = 1
+const BLOCK_FLAG_SENTINEL: Int = 2
+
+// Pool configuration limits
+const MAX_BLOCK_SIZE: Int = 65536
+const MIN_BLOCK_SIZE: Int = 8
+const DEFAULT_BLOCKS_PER_CHUNK: Int = 64
+const MAX_POOLS: Int = 256
+
+// ============================================================================
+// Memory Block
+// ============================================================================
+
+struct MemBlock {
+    next_free: Int,     // Index of next free block (-1 if none)
+    flags: Int,         // Block state flags
+    pool_id: Int,       // Which pool owns this block
+    alloc_id: Int,      // Allocation ID for debugging
+}
+
+/// Create empty block
+fn create_block() -> MemBlock {
+    return MemBlock {
+        next_free: -1,
+        flags: BLOCK_FLAG_FREE,
+        pool_id: 0,
+        alloc_id: 0,
+    }
+}
+
+// ============================================================================
+// Memory Chunk (Collection of blocks)
+// ============================================================================
+
+struct MemChunk {
+    blocks: Collection<MemBlock>,
+    data: Collection<Int>,  // Simulated memory storage
+    block_size: Int,
+    block_count: Int,
+    first_free: Int,
+    used_count: Int,
+    chunk_id: Int,
+}
+
+/// Create new chunk
+fn create_chunk(block_size: Int, block_count: Int, chunk_id: Int) -> MemChunk {
+    let chunk = MemChunk {
+        blocks: Collection<MemBlock>{},
+        data: Collection<Int>{},
+        block_size: block_size,
+        block_count: block_count,
+        first_free: 0,
+        used_count: 0,
+        chunk_id: chunk_id,
+    }
+
+    // Initialize blocks as free list
+    for i in 0..block_count {
+        let block = create_block()
+        block.flags = BLOCK_FLAG_FREE
+        if i < block_count - 1 {
+            block.next_free = i + 1
+        } else {
+            block.next_free = -1  // Last block
+        }
+        chunk.blocks.add(block)
+
+        // Initialize data storage
+        for j in 0..block_size {
+            chunk.data.add(0)
+        }
+    }
+
+    return chunk
+}
+
+/// Allocate block from chunk
+fn chunk_alloc(chunk: MemChunk) -> Int {
+    if chunk.first_free < 0 {
+        return -1  // No free blocks
+    }
+
+    let block_index = chunk.first_free
+    let block = chunk.blocks.get(block_index)
+
+    // Update free list
+    chunk.first_free = block.next_free
+    block.next_free = -1
+    block.flags = BLOCK_FLAG_USED
+    chunk.used_count = chunk.used_count + 1
+
+    return block_index
+}
+
+/// Free block in chunk
+fn chunk_free(chunk: MemChunk, block_index: Int) -> Bool {
+    if block_index < 0 || block_index >= chunk.block_count {
+        return false
+    }
+
+    let block = chunk.blocks.get(block_index)
+    if block.flags != BLOCK_FLAG_USED {
+        return false  // Double free or invalid
+    }
+
+    // Add to free list
+    block.flags = BLOCK_FLAG_FREE
+    block.next_free = chunk.first_free
+    chunk.first_free = block_index
+    chunk.used_count = chunk.used_count - 1
+
+    // Clear data
+    let data_start = block_index * chunk.block_size
+    for i in 0..chunk.block_size {
+        chunk.data.set(data_start + i, 0)
+    }
+
+    return true
+}
+
+/// Check if chunk has free blocks
+fn chunk_has_free(chunk: MemChunk) -> Bool {
+    return chunk.first_free >= 0
+}
+
+/// Get block data offset
+fn chunk_get_data_offset(chunk: MemChunk, block_index: Int) -> Int {
+    return block_index * chunk.block_size
+}
+
+// ============================================================================
+// Memory Pool
+// ============================================================================
+
+struct MemoryPool {
+    name: String,
+    block_size: Int,
+    blocks_per_chunk: Int,
+    chunks: Collection<MemChunk>,
+    total_allocated: Int,
+    total_freed: Int,
+    peak_usage: Int,
+    pool_id: Int,
+    next_alloc_id: Int,
+    allow_growth: Bool,
+}
+
+/// Create new memory pool
+fn create_pool(name: String, block_size: Int, blocks_per_chunk: Int, pool_id: Int) -> MemoryPool {
+    // Ensure minimum block size
+    let actual_size = block_size
+    if actual_size < MIN_BLOCK_SIZE {
+        actual_size = MIN_BLOCK_SIZE
+    }
+
+    let pool = MemoryPool {
+        name: name,
+        block_size: actual_size,
+        blocks_per_chunk: blocks_per_chunk,
+        chunks: Collection<MemChunk>{},
+        total_allocated: 0,
+        total_freed: 0,
+        peak_usage: 0,
+        pool_id: pool_id,
+        next_alloc_id: 1,
+        allow_growth: true,
+    }
+
+    // Create initial chunk
+    let chunk = create_chunk(actual_size, blocks_per_chunk, 0)
+    pool.chunks.add(chunk)
+
+    return pool
+}
+
+/// Allocate from pool
+fn pool_alloc(pool: MemoryPool) -> (Int, Int) {  // Returns (chunk_id, block_index)
+    // Find chunk with free space
+    for i in 0..pool.chunks.len() {
+        let chunk = pool.chunks.get(i)
+        if chunk_has_free(chunk) {
+            let block_index = chunk_alloc(chunk)
+            if block_index >= 0 {
+                pool.total_allocated = pool.total_allocated + 1
+                let current_usage = pool.total_allocated - pool.total_freed
+                if current_usage > pool.peak_usage {
+                    pool.peak_usage = current_usage
+                }
+
+                // Set allocation ID
+                let block = chunk.blocks.get(block_index)
+                block.alloc_id = pool.next_alloc_id
+                block.pool_id = pool.pool_id
+                pool.next_alloc_id = pool.next_alloc_id + 1
+
+                return (i, block_index)
+            }
+        }
+    }
+
+    // No free space - grow if allowed
+    if pool.allow_growth {
+        let new_chunk_id = pool.chunks.len()
+        let new_chunk = create_chunk(pool.block_size, pool.blocks_per_chunk, new_chunk_id)
+        pool.chunks.add(new_chunk)
+
+        let block_index = chunk_alloc(new_chunk)
+        if block_index >= 0 {
+            pool.total_allocated = pool.total_allocated + 1
+            let current_usage = pool.total_allocated - pool.total_freed
+            if current_usage > pool.peak_usage {
+                pool.peak_usage = current_usage
+            }
+
+            let block = new_chunk.blocks.get(block_index)
+            block.alloc_id = pool.next_alloc_id
+            block.pool_id = pool.pool_id
+            pool.next_alloc_id = pool.next_alloc_id + 1
+
+            return (new_chunk_id, block_index)
+        }
+    }
+
+    return (-1, -1)  // Allocation failed
+}
+
+/// Free back to pool
+fn pool_free(pool: MemoryPool, chunk_id: Int, block_index: Int) -> Bool {
+    if chunk_id < 0 || chunk_id >= pool.chunks.len() {
+        return false
+    }
+
+    let chunk = pool.chunks.get(chunk_id)
+    if chunk_free(chunk, block_index) {
+        pool.total_freed = pool.total_freed + 1
+        return true
+    }
+    return false
+}
+
+/// Get current usage
+fn pool_usage(pool: MemoryPool) -> Int {
+    return pool.total_allocated - pool.total_freed
+}
+
+/// Get total capacity
+fn pool_capacity(pool: MemoryPool) -> Int {
+    return pool.chunks.len() * pool.blocks_per_chunk
+}
+
+/// Reset pool (free all)
+fn pool_reset(pool: MemoryPool) {
+    pool.chunks = Collection<MemChunk>{}
+    let chunk = create_chunk(pool.block_size, pool.blocks_per_chunk, 0)
+    pool.chunks.add(chunk)
+    pool.total_allocated = 0
+    pool.total_freed = 0
+    pool.next_alloc_id = 1
+}
+
+/// Get pool statistics
+fn pool_stats(pool: MemoryPool) -> (Int, Int, Int, Int) {
+    // Returns (usage, capacity, peak, chunks)
+    return (
+        pool_usage(pool),
+        pool_capacity(pool),
+        pool.peak_usage,
+        pool.chunks.len()
+    )
+}
+
+// ============================================================================
+// Pool Handle - User-facing allocation handle
+// ============================================================================
+
+struct PoolHandle {
+    pool_id: Int,
+    chunk_id: Int,
+    block_index: Int,
+    alloc_id: Int,
+    valid: Bool,
+}
+
+/// Create invalid handle
+fn invalid_handle() -> PoolHandle {
+    return PoolHandle {
+        pool_id: -1,
+        chunk_id: -1,
+        block_index: -1,
+        alloc_id: 0,
+        valid: false,
+    }
+}
+
+/// Create valid handle
+fn create_handle(pool_id: Int, chunk_id: Int, block_index: Int, alloc_id: Int) -> PoolHandle {
+    return PoolHandle {
+        pool_id: pool_id,
+        chunk_id: chunk_id,
+        block_index: block_index,
+        alloc_id: alloc_id,
+        valid: true,
+    }
+}
+
+/// Check if handle is valid
+fn handle_valid(h: PoolHandle) -> Bool {
+    return h.valid && h.pool_id >= 0 && h.chunk_id >= 0 && h.block_index >= 0
+}
+
+// ============================================================================
+// Typed Memory Pool
+// ============================================================================
+
+struct TypedPool<T> {
+    pool: MemoryPool,
+    type_name: String,
+}
+
+/// Create typed pool
+fn create_typed_pool<T>(name: String, blocks_per_chunk: Int, pool_id: Int, type_size: Int) -> TypedPool<T> {
+    return TypedPool<T> {
+        pool: create_pool(name, type_size, blocks_per_chunk, pool_id),
+        type_name: name,
+    }
+}
+
+/// Allocate typed object
+fn typed_alloc<T>(tpool: TypedPool<T>) -> PoolHandle {
+    let (chunk_id, block_index) = pool_alloc(tpool.pool)
+    if chunk_id < 0 {
+        return invalid_handle()
+    }
+
+    let chunk = tpool.pool.chunks.get(chunk_id)
+    let block = chunk.blocks.get(block_index)
+
+    return create_handle(tpool.pool.pool_id, chunk_id, block_index, block.alloc_id)
+}
+
+/// Free typed object
+fn typed_free<T>(tpool: TypedPool<T>, handle: PoolHandle) -> Bool {
+    if !handle_valid(handle) || handle.pool_id != tpool.pool.pool_id {
+        return false
+    }
+    return pool_free(tpool.pool, handle.chunk_id, handle.block_index)
+}
+
+// ============================================================================
+// Global Memory Pool Manager
+// ============================================================================
+
+struct PoolManager {
+    pools: Map<String, MemoryPool>,
+    pool_by_id: Map<Int, MemoryPool>,
+    next_pool_id: Int,
+    total_memory: Int,
+    debug_enabled: Bool,
+}
+
+/// Create pool manager
+fn create_pool_manager() -> PoolManager {
+    return PoolManager {
+        pools: Map<String, MemoryPool>{},
+        pool_by_id: Map<Int, MemoryPool>{},
+        next_pool_id: 1,
+        total_memory: 0,
+        debug_enabled: false,
+    }
+}
+
+/// Register new pool
+fn register_pool(mgr: PoolManager, name: String, block_size: Int, blocks_per_chunk: Int) -> MemoryPool {
+    if mgr.pools.has(name) {
+        return mgr.pools.get(name)
+    }
+
+    let pool = create_pool(name, block_size, blocks_per_chunk, mgr.next_pool_id)
+    mgr.pools.set(name, pool)
+    mgr.pool_by_id.set(mgr.next_pool_id, pool)
+    mgr.next_pool_id = mgr.next_pool_id + 1
+
+    return pool
+}
+
+/// Get pool by name
+fn get_pool(mgr: PoolManager, name: String) -> MemoryPool {
+    if mgr.pools.has(name) {
+        return mgr.pools.get(name)
+    }
+    // Return empty pool
+    return create_pool("invalid", 8, 1, 0)
+}
+
+/// Get pool by ID
+fn get_pool_by_id(mgr: PoolManager, id: Int) -> MemoryPool {
+    if mgr.pool_by_id.has(id) {
+        return mgr.pool_by_id.get(id)
+    }
+    return create_pool("invalid", 8, 1, 0)
+}
+
+/// Check if pool exists
+fn has_pool(mgr: PoolManager, name: String) -> Bool {
+    return mgr.pools.has(name)
+}
+
+/// Get total memory usage across all pools
+fn total_usage(mgr: PoolManager) -> Int {
+    let total = 0
+    for name in mgr.pools.keys() {
+        let pool = mgr.pools.get(name)
+        total = total + pool_usage(pool) * pool.block_size
+    }
+    return total
+}
+
+/// Get memory statistics
+fn memory_stats(mgr: PoolManager) -> Map<String, Int> {
+    let stats = Map<String, Int>{}
+    let total_used = 0
+    let total_cap = 0
+    let total_peak = 0
+
+    for name in mgr.pools.keys() {
+        let pool = mgr.pools.get(name)
+        let (usage, cap, peak, chunks) = pool_stats(pool)
+        stats.set(name + "_usage", usage)
+        stats.set(name + "_capacity", cap)
+        stats.set(name + "_peak", peak)
+        total_used = total_used + usage
+        total_cap = total_cap + cap
+        total_peak = total_peak + peak
+    }
+
+    stats.set("total_usage", total_used)
+    stats.set("total_capacity", total_cap)
+    stats.set("total_peak", total_peak)
+    stats.set("pool_count", mgr.pools.len())
+
+    return stats
+}
+
+/// Reset all pools
+fn reset_all(mgr: PoolManager) {
+    for name in mgr.pools.keys() {
+        let pool = mgr.pools.get(name)
+        pool_reset(pool)
+    }
+}
+
+// ============================================================================
+// Pre-configured Pools for Common Types
+// ============================================================================
+
+/// Create standard game object pools
+fn create_game_pools(mgr: PoolManager) {
+    // Entity pool (most common)
+    register_pool(mgr, "Entity", 256, 256)
+
+    // Projectile pool (many projectiles)
+    register_pool(mgr, "Projectile", 128, 512)
+
+    // Particle pool (very many particles)
+    register_pool(mgr, "Particle", 64, 1024)
+
+    // Command pool
+    register_pool(mgr, "Command", 64, 128)
+
+    // Message pool
+    register_pool(mgr, "Message", 128, 256)
+
+    // Path node pool
+    register_pool(mgr, "PathNode", 32, 1024)
+
+    // AI state pool
+    register_pool(mgr, "AIState", 96, 256)
+
+    // Effect pool
+    register_pool(mgr, "Effect", 64, 256)
+
+    // Sound instance pool
+    register_pool(mgr, "Sound", 48, 128)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_chunk() -> Bool {
+    let chunk = create_chunk(64, 10, 0)
+    assert(chunk.block_count == 10, "Should have 10 blocks")
+    assert(chunk.first_free == 0, "First free should be 0")
+
+    // Allocate all
+    for i in 0..10 {
+        let idx = chunk_alloc(chunk)
+        assert(idx == i, "Should allocate in order")
+    }
+
+    assert(!chunk_has_free(chunk), "Should be full")
+
+    // Free one
+    assert(chunk_free(chunk, 5), "Should free block 5")
+    assert(chunk_has_free(chunk), "Should have free")
+
+    // Allocate again
+    let idx = chunk_alloc(chunk)
+    assert(idx == 5, "Should reuse block 5")
+
+    return true
+}
+
+fn test_pool() -> Bool {
+    let pool = create_pool("test", 32, 8, 1)
+
+    // Allocate several
+    let handles = Collection<(Int, Int)>{}
+    for i in 0..8 {
+        let (c, b) = pool_alloc(pool)
+        assert(c >= 0 && b >= 0, "Allocation should succeed")
+        handles.add((c, b))
+    }
+
+    assert(pool_usage(pool) == 8, "Usage should be 8")
+
+    // Free half
+    for i in 0..4 {
+        let (c, b) = handles.get(i)
+        assert(pool_free(pool, c, b), "Free should succeed")
+    }
+
+    assert(pool_usage(pool) == 4, "Usage should be 4")
+
+    return true
+}
+
+fn test_pool_growth() -> Bool {
+    let pool = create_pool("growth", 16, 4, 1)
+
+    // Allocate more than one chunk
+    for i in 0..10 {
+        let (c, b) = pool_alloc(pool)
+        assert(c >= 0 && b >= 0, "Should grow and allocate")
+    }
+
+    assert(pool.chunks.len() > 1, "Should have multiple chunks")
+    assert(pool_usage(pool) == 10, "Usage should be 10")
+
+    return true
+}
+
+fn test_manager() -> Bool {
+    let mgr = create_pool_manager()
+
+    register_pool(mgr, "entities", 128, 64)
+    register_pool(mgr, "particles", 32, 256)
+
+    assert(has_pool(mgr, "entities"), "Should have entities pool")
+    assert(has_pool(mgr, "particles"), "Should have particles pool")
+
+    let ent_pool = get_pool(mgr, "entities")
+    let (c, b) = pool_alloc(ent_pool)
+    assert(c >= 0 && b >= 0, "Should allocate from entities")
+
+    let stats = memory_stats(mgr)
+    assert(stats.has("pool_count"), "Stats should have pool count")
+
+    return true
+}
+
+fn test_handle() -> Bool {
+    let h = create_handle(1, 2, 3, 100)
+    assert(handle_valid(h), "Handle should be valid")
+    assert(h.pool_id == 1, "Pool ID should match")
+    assert(h.alloc_id == 100, "Alloc ID should match")
+
+    let invalid = invalid_handle()
+    assert(!handle_valid(invalid), "Invalid handle should be invalid")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_chunk(), "Chunk test failed")
+    assert(test_pool(), "Pool test failed")
+    assert(test_pool_growth(), "Pool growth test failed")
+    assert(test_manager(), "Manager test failed")
+    assert(test_handle(), "Handle test failed")
+    return true
+}

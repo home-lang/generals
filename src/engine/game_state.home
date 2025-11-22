@@ -1,0 +1,684 @@
+// Game State - Complete Game State Management
+// Based on Thyme engine game state serialization
+// Handles save/load, network sync, and replay recording
+
+from basics import Collection, Map
+from xfer import XferBuffer, XferMode, create_xfer_buffer, write_int, write_float, write_bool, write_string
+from xfer import read_int, read_float, read_bool, read_string, get_crc
+
+// ============================================================================
+// Game State Constants
+// ============================================================================
+
+const MAX_PLAYERS: Int = 8
+const MAX_OBJECTS: Int = 8192
+const MAX_TEAMS: Int = 16
+const GAME_STATE_VERSION: Int = 1
+
+// ============================================================================
+// Player State
+// ============================================================================
+
+struct PlayerState {
+    player_id: Int,
+    name: String,
+    faction: String,
+    color: Int,
+    team: Int,
+    money: Int,
+    power_produced: Int,
+    power_consumed: Int,
+    generals_points: Int,
+    is_defeated: Bool,
+    is_human: Bool,
+    buildings_built: Int,
+    units_built: Int,
+    units_killed: Int,
+    units_lost: Int,
+    score: Int,
+}
+
+fn create_player_state(id: Int) -> PlayerState {
+    return PlayerState {
+        player_id: id,
+        name: "",
+        faction: "",
+        color: id,
+        team: 0,
+        money: 0,
+        power_produced: 0,
+        power_consumed: 0,
+        generals_points: 0,
+        is_defeated: false,
+        is_human: true,
+        buildings_built: 0,
+        units_built: 0,
+        units_killed: 0,
+        units_lost: 0,
+        score: 0,
+    }
+}
+
+/// Serialize player state
+fn serialize_player(buf: XferBuffer, player: PlayerState) {
+    write_int(buf, player.player_id)
+    write_string(buf, player.name)
+    write_string(buf, player.faction)
+    write_int(buf, player.color)
+    write_int(buf, player.team)
+    write_int(buf, player.money)
+    write_int(buf, player.power_produced)
+    write_int(buf, player.power_consumed)
+    write_int(buf, player.generals_points)
+    write_bool(buf, player.is_defeated)
+    write_bool(buf, player.is_human)
+    write_int(buf, player.buildings_built)
+    write_int(buf, player.units_built)
+    write_int(buf, player.units_killed)
+    write_int(buf, player.units_lost)
+    write_int(buf, player.score)
+}
+
+/// Deserialize player state
+fn deserialize_player(buf: XferBuffer) -> PlayerState {
+    let player = create_player_state(read_int(buf))
+    player.name = read_string(buf)
+    player.faction = read_string(buf)
+    player.color = read_int(buf)
+    player.team = read_int(buf)
+    player.money = read_int(buf)
+    player.power_produced = read_int(buf)
+    player.power_consumed = read_int(buf)
+    player.generals_points = read_int(buf)
+    player.is_defeated = read_bool(buf)
+    player.is_human = read_bool(buf)
+    player.buildings_built = read_int(buf)
+    player.units_built = read_int(buf)
+    player.units_killed = read_int(buf)
+    player.units_lost = read_int(buf)
+    player.score = read_int(buf)
+    return player
+}
+
+// ============================================================================
+// Object State
+// ============================================================================
+
+struct ObjectState {
+    object_id: Int,
+    object_type: String,
+    owner_id: Int,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    rotation: Float,
+    health: Float,
+    max_health: Float,
+    veterancy: Int,
+    status_flags: Int,
+    target_id: Int,
+    current_command: Int,
+}
+
+fn create_object_state(id: Int) -> ObjectState {
+    return ObjectState {
+        object_id: id,
+        object_type: "",
+        owner_id: 0,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        rotation: 0.0,
+        health: 100.0,
+        max_health: 100.0,
+        veterancy: 0,
+        status_flags: 0,
+        target_id: 0,
+        current_command: 0,
+    }
+}
+
+/// Serialize object state
+fn serialize_object(buf: XferBuffer, obj: ObjectState) {
+    write_int(buf, obj.object_id)
+    write_string(buf, obj.object_type)
+    write_int(buf, obj.owner_id)
+    write_float(buf, obj.position_x)
+    write_float(buf, obj.position_y)
+    write_float(buf, obj.position_z)
+    write_float(buf, obj.rotation)
+    write_float(buf, obj.health)
+    write_float(buf, obj.max_health)
+    write_int(buf, obj.veterancy)
+    write_int(buf, obj.status_flags)
+    write_int(buf, obj.target_id)
+    write_int(buf, obj.current_command)
+}
+
+/// Deserialize object state
+fn deserialize_object(buf: XferBuffer) -> ObjectState {
+    let obj = create_object_state(read_int(buf))
+    obj.object_type = read_string(buf)
+    obj.owner_id = read_int(buf)
+    obj.position_x = read_float(buf)
+    obj.position_y = read_float(buf)
+    obj.position_z = read_float(buf)
+    obj.rotation = read_float(buf)
+    obj.health = read_float(buf)
+    obj.max_health = read_float(buf)
+    obj.veterancy = read_int(buf)
+    obj.status_flags = read_int(buf)
+    obj.target_id = read_int(buf)
+    obj.current_command = read_int(buf)
+    return obj
+}
+
+// ============================================================================
+// Team State
+// ============================================================================
+
+struct TeamState {
+    team_id: Int,
+    name: String,
+    player_ids: Collection<Int>,
+    shared_vision: Bool,
+    shared_resources: Bool,
+    is_defeated: Bool,
+}
+
+fn create_team_state(id: Int) -> TeamState {
+    return TeamState {
+        team_id: id,
+        name: "",
+        player_ids: Collection<Int>{},
+        shared_vision: true,
+        shared_resources: false,
+        is_defeated: false,
+    }
+}
+
+/// Serialize team state
+fn serialize_team(buf: XferBuffer, team: TeamState) {
+    write_int(buf, team.team_id)
+    write_string(buf, team.name)
+    write_int(buf, team.player_ids.len())
+    for pid in team.player_ids {
+        write_int(buf, pid)
+    }
+    write_bool(buf, team.shared_vision)
+    write_bool(buf, team.shared_resources)
+    write_bool(buf, team.is_defeated)
+}
+
+/// Deserialize team state
+fn deserialize_team(buf: XferBuffer) -> TeamState {
+    let team = create_team_state(read_int(buf))
+    team.name = read_string(buf)
+    let count = read_int(buf)
+    for i in 0..count {
+        team.player_ids.add(read_int(buf))
+    }
+    team.shared_vision = read_bool(buf)
+    team.shared_resources = read_bool(buf)
+    team.is_defeated = read_bool(buf)
+    return team
+}
+
+// ============================================================================
+// Map State
+// ============================================================================
+
+struct MapState {
+    map_name: String,
+    map_size_x: Int,
+    map_size_y: Int,
+    shroud_data: Collection<Int>,  // Per-player shroud
+    terrain_modifications: Collection<(Int, Int, Int)>,  // x, y, new_terrain
+}
+
+fn create_map_state() -> MapState {
+    return MapState {
+        map_name: "",
+        map_size_x: 0,
+        map_size_y: 0,
+        shroud_data: Collection<Int>{},
+        terrain_modifications: Collection<(Int, Int, Int)>{},
+    }
+}
+
+/// Serialize map state
+fn serialize_map(buf: XferBuffer, map: MapState) {
+    write_string(buf, map.map_name)
+    write_int(buf, map.map_size_x)
+    write_int(buf, map.map_size_y)
+
+    // Shroud data (compressed would be better)
+    write_int(buf, map.shroud_data.len())
+    for s in map.shroud_data {
+        write_int(buf, s)
+    }
+
+    // Terrain modifications
+    write_int(buf, map.terrain_modifications.len())
+    for mod in map.terrain_modifications {
+        let (x, y, t) = mod
+        write_int(buf, x)
+        write_int(buf, y)
+        write_int(buf, t)
+    }
+}
+
+/// Deserialize map state
+fn deserialize_map(buf: XferBuffer) -> MapState {
+    let map = create_map_state()
+    map.map_name = read_string(buf)
+    map.map_size_x = read_int(buf)
+    map.map_size_y = read_int(buf)
+
+    let shroud_count = read_int(buf)
+    for i in 0..shroud_count {
+        map.shroud_data.add(read_int(buf))
+    }
+
+    let mod_count = read_int(buf)
+    for i in 0..mod_count {
+        let x = read_int(buf)
+        let y = read_int(buf)
+        let t = read_int(buf)
+        map.terrain_modifications.add((x, y, t))
+    }
+
+    return map
+}
+
+// ============================================================================
+// Complete Game State
+// ============================================================================
+
+struct GameState {
+    // Version
+    version: Int,
+
+    // Timing
+    current_frame: Int,
+    game_time: Float,
+    random_seed: Int,
+
+    // Settings
+    game_speed: Int,
+    difficulty: Int,
+    superweapons_enabled: Bool,
+    generals_exp_enabled: Bool,
+
+    // Players
+    players: Collection<PlayerState>,
+    local_player_id: Int,
+
+    // Teams
+    teams: Collection<TeamState>,
+
+    // Objects
+    objects: Collection<ObjectState>,
+    next_object_id: Int,
+
+    // Map
+    map_state: MapState,
+
+    // Checksum for sync verification
+    checksum: Int,
+}
+
+fn create_game_state() -> GameState {
+    return GameState {
+        version: GAME_STATE_VERSION,
+        current_frame: 0,
+        game_time: 0.0,
+        random_seed: 0,
+        game_speed: 30,
+        difficulty: 1,
+        superweapons_enabled: true,
+        generals_exp_enabled: true,
+        players: Collection<PlayerState>{},
+        local_player_id: 0,
+        teams: Collection<TeamState>{},
+        objects: Collection<ObjectState>{},
+        next_object_id: 1,
+        map_state: create_map_state(),
+        checksum: 0,
+    }
+}
+
+/// Serialize complete game state
+fn serialize_game_state(state: GameState) -> XferBuffer {
+    let buf = create_xfer_buffer(XferMode::Save)
+
+    // Header
+    write_int(buf, 0x47535456)  // "GSTV" magic
+    write_int(buf, state.version)
+
+    // Timing
+    write_int(buf, state.current_frame)
+    write_float(buf, state.game_time)
+    write_int(buf, state.random_seed)
+
+    // Settings
+    write_int(buf, state.game_speed)
+    write_int(buf, state.difficulty)
+    write_bool(buf, state.superweapons_enabled)
+    write_bool(buf, state.generals_exp_enabled)
+    write_int(buf, state.local_player_id)
+
+    // Players
+    write_int(buf, state.players.len())
+    for player in state.players {
+        serialize_player(buf, player)
+    }
+
+    // Teams
+    write_int(buf, state.teams.len())
+    for team in state.teams {
+        serialize_team(buf, team)
+    }
+
+    // Objects
+    write_int(buf, state.objects.len())
+    for obj in state.objects {
+        serialize_object(buf, obj)
+    }
+    write_int(buf, state.next_object_id)
+
+    // Map
+    serialize_map(buf, state.map_state)
+
+    // Checksum
+    state.checksum = get_crc(buf)
+    write_int(buf, state.checksum)
+
+    return buf
+}
+
+/// Deserialize complete game state
+fn deserialize_game_state(buf: XferBuffer) -> GameState {
+    let state = create_game_state()
+
+    // Header
+    let magic = read_int(buf)
+    if magic != 0x47535456 {
+        return state  // Invalid
+    }
+    state.version = read_int(buf)
+
+    // Timing
+    state.current_frame = read_int(buf)
+    state.game_time = read_float(buf)
+    state.random_seed = read_int(buf)
+
+    // Settings
+    state.game_speed = read_int(buf)
+    state.difficulty = read_int(buf)
+    state.superweapons_enabled = read_bool(buf)
+    state.generals_exp_enabled = read_bool(buf)
+    state.local_player_id = read_int(buf)
+
+    // Players
+    let player_count = read_int(buf)
+    for i in 0..player_count {
+        state.players.add(deserialize_player(buf))
+    }
+
+    // Teams
+    let team_count = read_int(buf)
+    for i in 0..team_count {
+        state.teams.add(deserialize_team(buf))
+    }
+
+    // Objects
+    let object_count = read_int(buf)
+    for i in 0..object_count {
+        state.objects.add(deserialize_object(buf))
+    }
+    state.next_object_id = read_int(buf)
+
+    // Map
+    state.map_state = deserialize_map(buf)
+
+    // Checksum
+    state.checksum = read_int(buf)
+
+    return state
+}
+
+// ============================================================================
+// Game State Manager
+// ============================================================================
+
+struct GameStateManager {
+    current_state: GameState,
+    snapshots: Map<Int, GameState>,  // Frame -> State
+    max_snapshots: Int,
+    autosave_interval: Int,
+    last_autosave_frame: Int,
+}
+
+fn create_state_manager() -> GameStateManager {
+    return GameStateManager {
+        current_state: create_game_state(),
+        snapshots: Map<Int, GameState>{},
+        max_snapshots: 10,
+        autosave_interval: 1800,  // 1 minute at 30fps
+        last_autosave_frame: 0,
+    }
+}
+
+/// Initialize new game
+fn init_new_game(mgr: GameStateManager, map_name: String, random_seed: Int) {
+    mgr.current_state = create_game_state()
+    mgr.current_state.random_seed = random_seed
+    mgr.current_state.map_state.map_name = map_name
+    mgr.snapshots = Map<Int, GameState>{}
+}
+
+/// Add player
+fn add_player(mgr: GameStateManager, name: String, faction: String, is_human: Bool) -> Int {
+    let id = mgr.current_state.players.len() + 1
+    let player = create_player_state(id)
+    player.name = name
+    player.faction = faction
+    player.is_human = is_human
+    mgr.current_state.players.add(player)
+    return id
+}
+
+/// Get player state
+fn get_player_state(mgr: GameStateManager, player_id: Int) -> PlayerState {
+    for player in mgr.current_state.players {
+        if player.player_id == player_id {
+            return player
+        }
+    }
+    return create_player_state(0)
+}
+
+/// Add object
+fn add_object(mgr: GameStateManager, obj_type: String, owner_id: Int, x: Float, y: Float) -> Int {
+    let id = mgr.current_state.next_object_id
+    mgr.current_state.next_object_id = mgr.current_state.next_object_id + 1
+
+    let obj = create_object_state(id)
+    obj.object_type = obj_type
+    obj.owner_id = owner_id
+    obj.position_x = x
+    obj.position_y = y
+
+    mgr.current_state.objects.add(obj)
+    return id
+}
+
+/// Remove object
+fn remove_object(mgr: GameStateManager, object_id: Int) {
+    // Would filter collection to remove object
+}
+
+/// Get object state
+fn get_object_state(mgr: GameStateManager, object_id: Int) -> ObjectState {
+    for obj in mgr.current_state.objects {
+        if obj.object_id == object_id {
+            return obj
+        }
+    }
+    return create_object_state(0)
+}
+
+/// Advance frame
+fn advance_frame(mgr: GameStateManager) {
+    mgr.current_state.current_frame = mgr.current_state.current_frame + 1
+    mgr.current_state.game_time = mgr.current_state.game_time + (1.0 / 30.0)
+
+    // Check autosave
+    if mgr.current_state.current_frame - mgr.last_autosave_frame >= mgr.autosave_interval {
+        create_snapshot(mgr)
+        mgr.last_autosave_frame = mgr.current_state.current_frame
+    }
+}
+
+/// Create snapshot at current frame
+fn create_snapshot(mgr: GameStateManager) {
+    // Would deep copy current state
+    // mgr.snapshots.set(mgr.current_state.current_frame, copy_state(mgr.current_state))
+}
+
+/// Restore from snapshot
+fn restore_snapshot(mgr: GameStateManager, frame: Int) -> Bool {
+    if mgr.snapshots.has(frame) {
+        // Would copy snapshot to current
+        return true
+    }
+    return false
+}
+
+/// Get checksum for sync verification
+fn get_state_checksum(mgr: GameStateManager) -> Int {
+    let buf = serialize_game_state(mgr.current_state)
+    return get_crc(buf)
+}
+
+/// Get object count
+fn get_object_count(mgr: GameStateManager) -> Int {
+    return mgr.current_state.objects.len()
+}
+
+/// Get player count
+fn get_player_count(mgr: GameStateManager) -> Int {
+    return mgr.current_state.players.len()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_player_state() -> Bool {
+    let buf = create_xfer_buffer(XferMode::Save)
+
+    let player = create_player_state(1)
+    player.name = "TestPlayer"
+    player.faction = "USA"
+    player.money = 5000
+    player.is_human = true
+
+    serialize_player(buf, player)
+
+    buf.mode = XferMode::Load
+    buf.position = 0
+    buf.crc = 0xFFFFFFFF
+
+    let loaded = deserialize_player(buf)
+
+    assert(loaded.player_id == 1, "ID should match")
+    assert(loaded.name == "TestPlayer", "Name should match")
+    assert(loaded.faction == "USA", "Faction should match")
+    assert(loaded.money == 5000, "Money should match")
+
+    return true
+}
+
+fn test_object_state() -> Bool {
+    let buf = create_xfer_buffer(XferMode::Save)
+
+    let obj = create_object_state(100)
+    obj.object_type = "AmericaTank"
+    obj.owner_id = 1
+    obj.position_x = 100.5
+    obj.position_y = 200.75
+    obj.health = 80.0
+
+    serialize_object(buf, obj)
+
+    buf.mode = XferMode::Load
+    buf.position = 0
+    buf.crc = 0xFFFFFFFF
+
+    let loaded = deserialize_object(buf)
+
+    assert(loaded.object_id == 100, "ID should match")
+    assert(loaded.object_type == "AmericaTank", "Type should match")
+    assert(loaded.owner_id == 1, "Owner should match")
+
+    return true
+}
+
+fn test_game_state() -> Bool {
+    let state = create_game_state()
+    state.current_frame = 1000
+    state.random_seed = 42
+
+    let player = create_player_state(1)
+    player.name = "Player1"
+    state.players.add(player)
+
+    let obj = create_object_state(1)
+    obj.object_type = "Building"
+    state.objects.add(obj)
+
+    let buf = serialize_game_state(state)
+
+    buf.mode = XferMode::Load
+    buf.position = 0
+    buf.crc = 0xFFFFFFFF
+
+    let loaded = deserialize_game_state(buf)
+
+    assert(loaded.current_frame == 1000, "Frame should match")
+    assert(loaded.random_seed == 42, "Seed should match")
+    assert(loaded.players.len() == 1, "Should have 1 player")
+    assert(loaded.objects.len() == 1, "Should have 1 object")
+
+    return true
+}
+
+fn test_state_manager() -> Bool {
+    let mgr = create_state_manager()
+    init_new_game(mgr, "Test Map", 12345)
+
+    let p1 = add_player(mgr, "Human", "USA", true)
+    let p2 = add_player(mgr, "CPU", "China", false)
+
+    assert(get_player_count(mgr) == 2, "Should have 2 players")
+
+    let obj1 = add_object(mgr, "Tank", p1, 100.0, 100.0)
+    let obj2 = add_object(mgr, "Building", p1, 200.0, 200.0)
+
+    assert(get_object_count(mgr) == 2, "Should have 2 objects")
+
+    advance_frame(mgr)
+    assert(mgr.current_state.current_frame == 1, "Frame should be 1")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_player_state(), "Player state test failed")
+    assert(test_object_state(), "Object state test failed")
+    assert(test_game_state(), "Game state test failed")
+    assert(test_state_manager(), "State manager test failed")
+    return true
+}

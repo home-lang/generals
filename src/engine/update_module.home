@@ -1,0 +1,605 @@
+// Update Module - Base Class for Frame-Based Updates
+// Based on Thyme engine update module architecture
+// Handles per-frame logic for game objects
+
+from basics import Collection, Map
+from behavior_module import ModuleData, create_module_data, get_property, get_property_int, get_property_float
+
+// ============================================================================
+// Update Module Types
+// ============================================================================
+
+enum UpdateType {
+    Generic,
+    AI,
+    Physics,
+    Locomotor,
+    Weapon,
+    Ability,
+    Stealth,
+    Production,
+    Upgrade,
+    Harvest,
+    Dock,
+    Heal,
+    Damage,
+    Projectile,
+    Particle,
+    Animation,
+    Audio,
+}
+
+// Update priority levels
+enum UpdatePriority {
+    First,      // Physics, collision
+    Early,      // AI decisions
+    Normal,     // General updates
+    Late,       // Visual updates
+    Last,       // Cleanup, audio
+}
+
+// ============================================================================
+// Update Module Base
+// ============================================================================
+
+struct UpdateModule {
+    // Identity
+    module_id: Int,
+    tag: String,
+    update_type: UpdateType,
+    priority: UpdatePriority,
+
+    // Owner
+    owner_id: Int,
+
+    // State
+    is_enabled: Bool,
+    is_sleeping: Bool,
+    sleep_until_frame: Int,
+
+    // Timing
+    update_interval: Int,       // Frames between updates
+    last_update_frame: Int,
+    accumulated_time: Float,
+
+    // Configuration
+    data: ModuleData,
+}
+
+/// Create update module
+fn create_update_module(tag: String, update_type: UpdateType) -> UpdateModule {
+    return UpdateModule {
+        module_id: 0,
+        tag: tag,
+        update_type: update_type,
+        priority: UpdatePriority::Normal,
+        owner_id: 0,
+        is_enabled: true,
+        is_sleeping: false,
+        sleep_until_frame: 0,
+        update_interval: 1,
+        last_update_frame: 0,
+        accumulated_time: 0.0,
+        data: create_module_data("", tag),
+    }
+}
+
+/// Initialize from data
+fn init_update_module(module: UpdateModule, data: ModuleData) {
+    module.data = data
+    module.tag = data.tag
+
+    if data.properties.has("UpdateInterval") {
+        module.update_interval = get_property_int(data, "UpdateInterval")
+    }
+}
+
+/// Check if should update this frame
+fn should_update(module: UpdateModule, current_frame: Int) -> Bool {
+    if !module.is_enabled {
+        return false
+    }
+    if module.is_sleeping && current_frame < module.sleep_until_frame {
+        return false
+    }
+    if module.update_interval > 1 {
+        return (current_frame - module.last_update_frame) >= module.update_interval
+    }
+    return true
+}
+
+/// Sleep for frames
+fn sleep_for_frames(module: UpdateModule, frames: Int, current_frame: Int) {
+    module.is_sleeping = true
+    module.sleep_until_frame = current_frame + frames
+}
+
+/// Wake immediately
+fn wake_update_module(module: UpdateModule) {
+    module.is_sleeping = false
+    module.sleep_until_frame = 0
+}
+
+// ============================================================================
+// Specialized Update Modules
+// ============================================================================
+
+// AI Update
+struct AIUpdateModule {
+    base: UpdateModule,
+    target_id: Int,
+    threat_level: Float,
+    aggression: Float,
+    last_command_frame: Int,
+    current_task: String,
+    task_progress: Float,
+}
+
+fn create_ai_update(tag: String) -> AIUpdateModule {
+    return AIUpdateModule {
+        base: create_update_module(tag, UpdateType::AI),
+        target_id: 0,
+        threat_level: 0.0,
+        aggression: 1.0,
+        last_command_frame: 0,
+        current_task: "",
+        task_progress: 0.0,
+    }
+}
+
+// Physics Update
+struct PhysicsUpdateModule {
+    base: UpdateModule,
+    velocity_x: Float,
+    velocity_y: Float,
+    velocity_z: Float,
+    acceleration_x: Float,
+    acceleration_y: Float,
+    acceleration_z: Float,
+    mass: Float,
+    friction: Float,
+    bounce: Float,
+    gravity_scale: Float,
+}
+
+fn create_physics_update(tag: String) -> PhysicsUpdateModule {
+    return PhysicsUpdateModule {
+        base: create_update_module(tag, UpdateType::Physics),
+        velocity_x: 0.0,
+        velocity_y: 0.0,
+        velocity_z: 0.0,
+        acceleration_x: 0.0,
+        acceleration_y: 0.0,
+        acceleration_z: 0.0,
+        mass: 1.0,
+        friction: 0.1,
+        bounce: 0.0,
+        gravity_scale: 1.0,
+    }
+}
+
+/// Apply gravity
+fn apply_gravity(physics: PhysicsUpdateModule, delta: Float) {
+    let gravity = -9.8 * physics.gravity_scale
+    physics.velocity_z = physics.velocity_z + gravity * delta
+}
+
+/// Apply friction
+fn apply_friction(physics: PhysicsUpdateModule, delta: Float) {
+    let friction_factor = 1.0 - physics.friction * delta
+    if friction_factor < 0.0 {
+        friction_factor = 0.0
+    }
+    physics.velocity_x = physics.velocity_x * friction_factor
+    physics.velocity_y = physics.velocity_y * friction_factor
+}
+
+/// Get speed
+fn get_speed(physics: PhysicsUpdateModule) -> Float {
+    let vx = physics.velocity_x
+    let vy = physics.velocity_y
+    let vz = physics.velocity_z
+    return sqrt(vx * vx + vy * vy + vz * vz)
+}
+
+// Stealth Update
+struct StealthUpdateModule {
+    base: UpdateModule,
+    is_stealthed: Bool,
+    stealth_delay: Float,
+    detection_range: Float,
+    stealth_timer: Float,
+    detected_by: Collection<Int>,
+}
+
+fn create_stealth_update(tag: String) -> StealthUpdateModule {
+    return StealthUpdateModule {
+        base: create_update_module(tag, UpdateType::Stealth),
+        is_stealthed: false,
+        stealth_delay: 2.0,
+        detection_range: 100.0,
+        stealth_timer: 0.0,
+        detected_by: Collection<Int>{},
+    }
+}
+
+/// Try to enter stealth
+fn try_enter_stealth(stealth: StealthUpdateModule, delta: Float) -> Bool {
+    stealth.stealth_timer = stealth.stealth_timer + delta
+    if stealth.stealth_timer >= stealth.stealth_delay {
+        stealth.is_stealthed = true
+        return true
+    }
+    return false
+}
+
+/// Break stealth
+fn break_stealth(stealth: StealthUpdateModule) {
+    stealth.is_stealthed = false
+    stealth.stealth_timer = 0.0
+    stealth.detected_by = Collection<Int>{}
+}
+
+// Production Update
+struct ProductionUpdateModule {
+    base: UpdateModule,
+    queue: Collection<String>,
+    current_item: String,
+    progress: Float,
+    build_rate: Float,
+    rally_x: Float,
+    rally_y: Float,
+    is_paused: Bool,
+}
+
+fn create_production_update(tag: String) -> ProductionUpdateModule {
+    return ProductionUpdateModule {
+        base: create_update_module(tag, UpdateType::Production),
+        queue: Collection<String>{},
+        current_item: "",
+        progress: 0.0,
+        build_rate: 1.0,
+        rally_x: 0.0,
+        rally_y: 0.0,
+        is_paused: false,
+    }
+}
+
+/// Add to queue
+fn queue_production(prod: ProductionUpdateModule, item: String) {
+    prod.queue.add(item)
+    if prod.current_item == "" {
+        start_next_production(prod)
+    }
+}
+
+/// Start next item
+fn start_next_production(prod: ProductionUpdateModule) {
+    if prod.queue.len() > 0 {
+        prod.current_item = prod.queue.get(0)
+        prod.progress = 0.0
+        // Remove from queue (simplified)
+    } else {
+        prod.current_item = ""
+    }
+}
+
+/// Update production
+fn update_production(prod: ProductionUpdateModule, delta: Float) -> Bool {
+    if prod.is_paused || prod.current_item == "" {
+        return false
+    }
+
+    prod.progress = prod.progress + delta * prod.build_rate
+
+    if prod.progress >= 1.0 {
+        // Item complete
+        let completed = prod.current_item
+        start_next_production(prod)
+        return true
+    }
+
+    return false
+}
+
+// Harvest Update
+struct HarvestUpdateModule {
+    base: UpdateModule,
+    cargo: Int,
+    max_cargo: Int,
+    harvest_rate: Float,
+    resource_type: String,
+    target_resource_id: Int,
+    target_refinery_id: Int,
+}
+
+fn create_harvest_update(tag: String) -> HarvestUpdateModule {
+    return HarvestUpdateModule {
+        base: create_update_module(tag, UpdateType::Harvest),
+        cargo: 0,
+        max_cargo: 100,
+        harvest_rate: 10.0,
+        resource_type: "SUPPLY",
+        target_resource_id: 0,
+        target_refinery_id: 0,
+    }
+}
+
+/// Harvest resources
+fn harvest(harv: HarvestUpdateModule, delta: Float) -> Int {
+    if harv.cargo >= harv.max_cargo {
+        return 0
+    }
+
+    let amount = (harv.harvest_rate * delta) as Int
+    let space = harv.max_cargo - harv.cargo
+    if amount > space {
+        amount = space
+    }
+
+    harv.cargo = harv.cargo + amount
+    return amount
+}
+
+/// Deposit cargo
+fn deposit_cargo(harv: HarvestUpdateModule) -> Int {
+    let amount = harv.cargo
+    harv.cargo = 0
+    return amount
+}
+
+/// Is full
+fn is_cargo_full(harv: HarvestUpdateModule) -> Bool {
+    return harv.cargo >= harv.max_cargo
+}
+
+// Special Ability Update
+struct AbilityUpdateModule {
+    base: UpdateModule,
+    ability_name: String,
+    cooldown: Float,
+    max_cooldown: Float,
+    is_ready: Bool,
+    auto_cast: Bool,
+    energy_cost: Int,
+}
+
+fn create_ability_update(tag: String) -> AbilityUpdateModule {
+    return AbilityUpdateModule {
+        base: create_update_module(tag, UpdateType::Ability),
+        ability_name: "",
+        cooldown: 0.0,
+        max_cooldown: 30.0,
+        is_ready: true,
+        auto_cast: false,
+        energy_cost: 0,
+    }
+}
+
+/// Update cooldown
+fn update_ability(ability: AbilityUpdateModule, delta: Float) {
+    if ability.cooldown > 0.0 {
+        ability.cooldown = ability.cooldown - delta
+        if ability.cooldown <= 0.0 {
+            ability.cooldown = 0.0
+            ability.is_ready = true
+        }
+    }
+}
+
+/// Use ability
+fn use_ability(ability: AbilityUpdateModule) -> Bool {
+    if !ability.is_ready {
+        return false
+    }
+
+    ability.is_ready = false
+    ability.cooldown = ability.max_cooldown
+    return true
+}
+
+/// Get cooldown percent
+fn get_cooldown_percent(ability: AbilityUpdateModule) -> Float {
+    if ability.max_cooldown <= 0.0 {
+        return 0.0
+    }
+    return ability.cooldown / ability.max_cooldown
+}
+
+// ============================================================================
+// Update Module Manager
+// ============================================================================
+
+struct UpdateModuleManager {
+    modules: Map<Int, UpdateModule>,
+    by_priority: Map<Int, Collection<Int>>,  // Priority value -> module IDs
+    by_owner: Map<Int, Collection<Int>>,
+    next_id: Int,
+}
+
+fn create_update_manager() -> UpdateModuleManager {
+    return UpdateModuleManager {
+        modules: Map<Int, UpdateModule>{},
+        by_priority: Map<Int, Collection<Int>>{},
+        by_owner: Map<Int, Collection<Int>>{},
+        next_id: 1,
+    }
+}
+
+/// Get priority value
+fn priority_to_int(p: UpdatePriority) -> Int {
+    if p == UpdatePriority::First { return 0 }
+    else if p == UpdatePriority::Early { return 1 }
+    else if p == UpdatePriority::Normal { return 2 }
+    else if p == UpdatePriority::Late { return 3 }
+    else if p == UpdatePriority::Last { return 4 }
+    return 2
+}
+
+/// Register update module
+fn register_update(mgr: UpdateModuleManager, module: UpdateModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    module.module_id = id
+
+    mgr.modules.set(id, module)
+
+    // Index by priority
+    let pval = priority_to_int(module.priority)
+    if !mgr.by_priority.has(pval) {
+        mgr.by_priority.set(pval, Collection<Int>{})
+    }
+    mgr.by_priority.get(pval).add(id)
+
+    // Index by owner
+    if !mgr.by_owner.has(module.owner_id) {
+        mgr.by_owner.set(module.owner_id, Collection<Int>{})
+    }
+    mgr.by_owner.get(module.owner_id).add(id)
+
+    return id
+}
+
+/// Update all modules in priority order
+fn update_all(mgr: UpdateModuleManager, current_frame: Int, delta: Float) {
+    // Process in priority order
+    for priority in 0..5 {
+        if mgr.by_priority.has(priority) {
+            let ids = mgr.by_priority.get(priority)
+            for id in ids {
+                if mgr.modules.has(id) {
+                    let module = mgr.modules.get(id)
+                    if should_update(module, current_frame) {
+                        module.last_update_frame = current_frame
+                        module.accumulated_time = module.accumulated_time + delta
+                        // Virtual update would be called here
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Get modules for owner
+fn get_owner_updates(mgr: UpdateModuleManager, owner_id: Int) -> Collection<UpdateModule> {
+    let result = Collection<UpdateModule>{}
+    if mgr.by_owner.has(owner_id) {
+        for id in mgr.by_owner.get(owner_id) {
+            if mgr.modules.has(id) {
+                result.add(mgr.modules.get(id))
+            }
+        }
+    }
+    return result
+}
+
+// ============================================================================
+// Helper
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_update_module() -> Bool {
+    let module = create_update_module("TestUpdate", UpdateType::Generic)
+    assert(module.is_enabled == true, "Should be enabled")
+    assert(should_update(module, 0) == true, "Should update")
+
+    sleep_for_frames(module, 10, 0)
+    assert(should_update(module, 5) == false, "Should be sleeping")
+    assert(should_update(module, 15) == true, "Should wake up")
+
+    return true
+}
+
+fn test_physics_update() -> Bool {
+    let physics = create_physics_update("Physics")
+    physics.velocity_x = 10.0
+    physics.velocity_z = 5.0
+
+    apply_gravity(physics, 1.0)
+    assert(physics.velocity_z < 5.0, "Gravity should reduce z velocity")
+
+    apply_friction(physics, 1.0)
+    assert(physics.velocity_x < 10.0, "Friction should reduce x velocity")
+
+    return true
+}
+
+fn test_production_update() -> Bool {
+    let prod = create_production_update("Factory")
+    prod.build_rate = 0.5
+
+    queue_production(prod, "Tank")
+    assert(prod.current_item == "Tank", "Should start building tank")
+    assert(prod.progress == 0.0, "Progress should be 0")
+
+    // Update halfway
+    update_production(prod, 1.0)
+    assert(prod.progress == 0.5, "Progress should be 0.5")
+
+    // Complete
+    let done = update_production(prod, 1.0)
+    assert(done == true, "Should complete")
+
+    return true
+}
+
+fn test_ability_update() -> Bool {
+    let ability = create_ability_update("Special")
+    ability.max_cooldown = 10.0
+
+    assert(ability.is_ready == true, "Should be ready")
+
+    use_ability(ability)
+    assert(ability.is_ready == false, "Should not be ready")
+    assert(ability.cooldown == 10.0, "Cooldown should be max")
+
+    update_ability(ability, 5.0)
+    assert(ability.cooldown == 5.0, "Cooldown should decrease")
+    assert(ability.is_ready == false, "Still not ready")
+
+    update_ability(ability, 5.0)
+    assert(ability.is_ready == true, "Should be ready again")
+
+    return true
+}
+
+fn test_harvest_update() -> Bool {
+    let harv = create_harvest_update("Harvester")
+    harv.harvest_rate = 20.0
+    harv.max_cargo = 100
+
+    harvest(harv, 2.0)
+    assert(harv.cargo == 40, "Should harvest 40")
+
+    harvest(harv, 4.0)
+    assert(harv.cargo == 100, "Should be full at 100")
+
+    assert(is_cargo_full(harv) == true, "Should be full")
+
+    let deposited = deposit_cargo(harv)
+    assert(deposited == 100, "Should deposit 100")
+    assert(harv.cargo == 0, "Cargo should be empty")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_update_module(), "Update module test failed")
+    assert(test_physics_update(), "Physics update test failed")
+    assert(test_production_update(), "Production update test failed")
+    assert(test_ability_update(), "Ability update test failed")
+    assert(test_harvest_update(), "Harvest update test failed")
+    return true
+}

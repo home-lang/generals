@@ -1,0 +1,591 @@
+// Contain Module - Base Container Logic for Transports and Garrisons
+// Based on Thyme engine contain module architecture
+// Handles unit containment, transports, garrisons, and tunnel networks
+
+from basics import Collection, Map
+from behavior_module import ModuleData, create_module_data, get_property_int, get_property_float, get_property_bool
+
+// ============================================================================
+// Contain Types
+// ============================================================================
+
+enum ContainType {
+    Transport,      // Standard transport (helicopter, APC)
+    OpenTop,        // Open-top transport (can fire from inside)
+    Garrison,       // Building garrison
+    TunnelNetwork,  // GLA tunnel system
+    Heal,           // Healing container (ambulance)
+    Paradrop,       // Paradrop container (aircraft)
+    Bunker,         // Defensive bunker
+}
+
+// Passenger flags
+const PASSENGER_FLAG_NONE: Int = 0
+const PASSENGER_FLAG_CAN_FIRE: Int = 1
+const PASSENGER_FLAG_IS_HEALING: Int = 2
+const PASSENGER_FLAG_IS_PILOT: Int = 4
+
+// ============================================================================
+// Passenger Data
+// ============================================================================
+
+struct Passenger {
+    object_id: Int,
+    object_type: String,
+    slot_index: Int,
+    enter_frame: Int,
+    flags: Int,
+    health_on_enter: Float,
+}
+
+fn create_passenger(object_id: Int, slot: Int) -> Passenger {
+    return Passenger {
+        object_id: object_id,
+        object_type: "",
+        slot_index: slot,
+        enter_frame: 0,
+        flags: PASSENGER_FLAG_NONE,
+        health_on_enter: 100.0,
+    }
+}
+
+// ============================================================================
+// Base Contain Module
+// ============================================================================
+
+struct ContainModule {
+    // Identity
+    module_id: Int,
+    tag: String,
+    contain_type: ContainType,
+
+    // Owner
+    owner_id: Int,
+
+    // Capacity
+    max_slots: Int,
+    used_slots: Int,
+    slot_size: Int,  // Size per slot (some units take multiple)
+
+    // Passengers
+    passengers: Collection<Passenger>,
+    allowed_types: Collection<String>,
+    forbidden_types: Collection<String>,
+
+    // Behavior
+    heal_rate: Float,
+    enter_time: Float,
+    exit_time: Float,
+    damage_fraction: Float,  // Damage passed to passengers
+
+    // State
+    is_locked: Bool,
+    allow_allies: Bool,
+    allow_enemies: Bool,
+
+    // Fire ports (for open contain)
+    fire_port_count: Int,
+    fire_ports_in_use: Int,
+}
+
+/// Create base contain module
+fn create_contain_module(tag: String, contain_type: ContainType) -> ContainModule {
+    return ContainModule {
+        module_id: 0,
+        tag: tag,
+        contain_type: contain_type,
+        owner_id: 0,
+        max_slots: 5,
+        used_slots: 0,
+        slot_size: 1,
+        passengers: Collection<Passenger>{},
+        allowed_types: Collection<String>{},
+        forbidden_types: Collection<String>{},
+        heal_rate: 0.0,
+        enter_time: 0.5,
+        exit_time: 0.5,
+        damage_fraction: 0.0,
+        is_locked: false,
+        allow_allies: true,
+        allow_enemies: false,
+        fire_port_count: 0,
+        fire_ports_in_use: 0,
+    }
+}
+
+/// Initialize from data
+fn init_contain_module(module: ContainModule, data: ModuleData) {
+    module.tag = data.tag
+
+    if data.properties.has("MaxSlots") {
+        module.max_slots = get_property_int(data, "MaxSlots")
+    }
+    if data.properties.has("SlotSize") {
+        module.slot_size = get_property_int(data, "SlotSize")
+    }
+    if data.properties.has("HealRate") {
+        module.heal_rate = get_property_float(data, "HealRate")
+    }
+    if data.properties.has("EnterTime") {
+        module.enter_time = get_property_float(data, "EnterTime")
+    }
+    if data.properties.has("ExitTime") {
+        module.exit_time = get_property_float(data, "ExitTime")
+    }
+    if data.properties.has("DamagePercentToUnits") {
+        module.damage_fraction = get_property_float(data, "DamagePercentToUnits") / 100.0
+    }
+    if data.properties.has("FirePortCount") {
+        module.fire_port_count = get_property_int(data, "FirePortCount")
+    }
+    if data.properties.has("AllowAllies") {
+        module.allow_allies = get_property_bool(data, "AllowAllies")
+    }
+    if data.properties.has("AllowEnemies") {
+        module.allow_enemies = get_property_bool(data, "AllowEnemies")
+    }
+}
+
+// ============================================================================
+// Contain Operations
+// ============================================================================
+
+/// Check if can accept object
+fn can_contain(module: ContainModule, object_id: Int, object_type: String, slots_needed: Int) -> Bool {
+    if module.is_locked {
+        return false
+    }
+
+    // Check capacity
+    if module.used_slots + slots_needed > module.max_slots {
+        return false
+    }
+
+    // Check forbidden types
+    for forbidden in module.forbidden_types {
+        if object_type == forbidden {
+            return false
+        }
+    }
+
+    // Check allowed types (if specified, must be in list)
+    if module.allowed_types.len() > 0 {
+        let found = false
+        for allowed in module.allowed_types {
+            if object_type == allowed {
+                found = true
+                break
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+
+    return true
+}
+
+/// Add passenger
+fn add_passenger(module: ContainModule, object_id: Int, object_type: String, slots: Int, frame: Int) -> Bool {
+    if !can_contain(module, object_id, object_type, slots) {
+        return false
+    }
+
+    let passenger = create_passenger(object_id, module.used_slots)
+    passenger.object_type = object_type
+    passenger.enter_frame = frame
+
+    module.passengers.add(passenger)
+    module.used_slots = module.used_slots + slots
+
+    return true
+}
+
+/// Remove passenger by ID
+fn remove_passenger(module: ContainModule, object_id: Int) -> Bool {
+    for i in 0..module.passengers.len() {
+        let p = module.passengers.get(i)
+        if p.object_id == object_id {
+            // Would need actual remove, mark as removed
+            module.used_slots = module.used_slots - 1
+            return true
+        }
+    }
+    return false
+}
+
+/// Get passenger by ID
+fn get_passenger(module: ContainModule, object_id: Int) -> Passenger {
+    for p in module.passengers {
+        if p.object_id == object_id {
+            return p
+        }
+    }
+    return create_passenger(0, -1)
+}
+
+/// Check if contains object
+fn contains_object(module: ContainModule, object_id: Int) -> Bool {
+    for p in module.passengers {
+        if p.object_id == object_id {
+            return true
+        }
+    }
+    return false
+}
+
+/// Get passenger count
+fn get_passenger_count(module: ContainModule) -> Int {
+    return module.passengers.len()
+}
+
+/// Get available slots
+fn get_available_slots(module: ContainModule) -> Int {
+    return module.max_slots - module.used_slots
+}
+
+/// Is empty
+fn is_empty(module: ContainModule) -> Bool {
+    return module.used_slots == 0
+}
+
+/// Is full
+fn is_full(module: ContainModule) -> Bool {
+    return module.used_slots >= module.max_slots
+}
+
+/// Lock/unlock container
+fn set_locked(module: ContainModule, locked: Bool) {
+    module.is_locked = locked
+}
+
+/// Evacuate all passengers
+fn evacuate_all(module: ContainModule) -> Collection<Int> {
+    let evacuated = Collection<Int>{}
+    for p in module.passengers {
+        evacuated.add(p.object_id)
+    }
+    module.passengers = Collection<Passenger>{}
+    module.used_slots = 0
+    return evacuated
+}
+
+// ============================================================================
+// Specialized Containers
+// ============================================================================
+
+// Open Container (can fire from inside)
+struct OpenContainModule {
+    base: ContainModule,
+    weapon_bonus_percent: Float,
+    experience_shared: Bool,
+}
+
+fn create_open_contain(tag: String) -> OpenContainModule {
+    let module = OpenContainModule {
+        base: create_contain_module(tag, ContainType::OpenTop),
+        weapon_bonus_percent: 0.0,
+        experience_shared: true,
+    }
+    module.base.fire_port_count = 5
+    return module
+}
+
+/// Get active fire ports
+fn get_active_fire_ports(module: OpenContainModule) -> Int {
+    // Fire ports = min(passengers, max_ports)
+    let ports = module.base.passengers.len()
+    if ports > module.base.fire_port_count {
+        ports = module.base.fire_port_count
+    }
+    return ports
+}
+
+// Garrison Container (building garrison)
+struct GarrisonContainModule {
+    base: ContainModule,
+    garrison_health_bonus: Float,
+    garrison_range_bonus: Float,
+    fire_positions: Collection<(Float, Float, Float)>,
+}
+
+fn create_garrison_contain(tag: String) -> GarrisonContainModule {
+    let module = GarrisonContainModule {
+        base: create_contain_module(tag, ContainType::Garrison),
+        garrison_health_bonus: 1.5,
+        garrison_range_bonus: 1.25,
+        fire_positions: Collection<(Float, Float, Float)>{},
+    }
+    return module
+}
+
+/// Add fire position
+fn add_fire_position(module: GarrisonContainModule, x: Float, y: Float, z: Float) {
+    module.fire_positions.add((x, y, z))
+    module.base.fire_port_count = module.fire_positions.len()
+}
+
+// Heal Container (ambulance)
+struct HealContainModule {
+    base: ContainModule,
+    heal_per_second: Float,
+    heal_all_at_once: Bool,
+}
+
+fn create_heal_contain(tag: String) -> HealContainModule {
+    let module = HealContainModule {
+        base: create_contain_module(tag, ContainType::Heal),
+        heal_per_second: 10.0,
+        heal_all_at_once: true,
+    }
+    module.base.heal_rate = 10.0
+    return module
+}
+
+/// Update healing
+fn update_healing(module: HealContainModule, delta: Float) -> Collection<(Int, Float)> {
+    let healed = Collection<(Int, Float)>{}
+
+    if module.heal_all_at_once {
+        let heal_amount = module.heal_per_second * delta
+        for p in module.base.passengers {
+            healed.add((p.object_id, heal_amount))
+        }
+    } else {
+        // Heal only first passenger
+        if module.base.passengers.len() > 0 {
+            let p = module.base.passengers.get(0)
+            let heal_amount = module.heal_per_second * delta
+            healed.add((p.object_id, heal_amount))
+        }
+    }
+
+    return healed
+}
+
+// Tunnel Network Container
+struct TunnelContainModule {
+    base: ContainModule,
+    network_id: Int,
+    linked_tunnels: Collection<Int>,
+    instant_transport: Bool,
+}
+
+fn create_tunnel_contain(tag: String) -> TunnelContainModule {
+    return TunnelContainModule {
+        base: create_contain_module(tag, ContainType::TunnelNetwork),
+        network_id: 0,
+        linked_tunnels: Collection<Int>{},
+        instant_transport: true,
+    }
+}
+
+/// Link to another tunnel
+fn link_tunnel(module: TunnelContainModule, tunnel_id: Int) {
+    module.linked_tunnels.add(tunnel_id)
+}
+
+/// Get linked tunnel count
+fn get_linked_count(module: TunnelContainModule) -> Int {
+    return module.linked_tunnels.len()
+}
+
+// Paradrop Container
+struct ParadropContainModule {
+    base: ContainModule,
+    drop_height: Float,
+    drop_spacing: Float,
+    drop_speed: Float,
+}
+
+fn create_paradrop_contain(tag: String) -> ParadropContainModule {
+    return ParadropContainModule {
+        base: create_contain_module(tag, ContainType::Paradrop),
+        drop_height: 200.0,
+        drop_spacing: 20.0,
+        drop_speed: 50.0,
+    }
+}
+
+/// Calculate drop positions
+fn calculate_drop_positions(module: ParadropContainModule, start_x: Float, start_y: Float, direction: Float) -> Collection<(Float, Float)> {
+    let positions = Collection<(Float, Float)>{}
+    let count = module.base.passengers.len()
+
+    let cos_dir = cos_approx(direction)
+    let sin_dir = sin_approx(direction)
+
+    for i in 0..count {
+        let offset = (i as Float) * module.drop_spacing
+        let x = start_x + offset * cos_dir
+        let y = start_y + offset * sin_dir
+        positions.add((x, y))
+    }
+
+    return positions
+}
+
+// ============================================================================
+// Contain Manager
+// ============================================================================
+
+struct ContainManager {
+    modules: Map<Int, ContainModule>,
+    by_owner: Map<Int, Int>,
+    tunnel_networks: Map<Int, Collection<Int>>,
+    next_id: Int,
+}
+
+fn create_contain_manager() -> ContainManager {
+    return ContainManager {
+        modules: Map<Int, ContainModule>{},
+        by_owner: Map<Int, Int>{},
+        tunnel_networks: Map<Int, Collection<Int>>{},
+        next_id: 1,
+    }
+}
+
+/// Register contain module
+fn register_contain(mgr: ContainManager, module: ContainModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    module.module_id = id
+
+    mgr.modules.set(id, module)
+    mgr.by_owner.set(module.owner_id, id)
+
+    return id
+}
+
+/// Get module for owner
+fn get_contain_for_owner(mgr: ContainManager, owner_id: Int) -> ContainModule {
+    if mgr.by_owner.has(owner_id) {
+        let id = mgr.by_owner.get(owner_id)
+        if mgr.modules.has(id) {
+            return mgr.modules.get(id)
+        }
+    }
+    return create_contain_module("", ContainType::Transport)
+}
+
+/// Find object container
+fn find_container(mgr: ContainManager, object_id: Int) -> ContainModule {
+    for id in mgr.modules.keys() {
+        let module = mgr.modules.get(id)
+        if contains_object(module, object_id) {
+            return module
+        }
+    }
+    return create_contain_module("", ContainType::Transport)
+}
+
+// ============================================================================
+// Math Helpers
+// ============================================================================
+
+fn cos_approx(angle: Float) -> Float {
+    // Simple approximation
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return 1.0 - x * x / 2.0 + x * x * x * x / 24.0
+}
+
+fn sin_approx(angle: Float) -> Float {
+    // Simple approximation
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_basic_contain() -> Bool {
+    let module = create_contain_module("Transport", ContainType::Transport)
+    module.max_slots = 5
+
+    assert(can_contain(module, 1, "Infantry", 1) == true, "Should accept")
+    assert(is_empty(module) == true, "Should be empty")
+
+    add_passenger(module, 100, "Infantry", 1, 0)
+    assert(get_passenger_count(module) == 1, "Should have 1 passenger")
+    assert(contains_object(module, 100) == true, "Should contain object 100")
+
+    add_passenger(module, 101, "Infantry", 1, 0)
+    add_passenger(module, 102, "Infantry", 1, 0)
+    assert(get_passenger_count(module) == 3, "Should have 3 passengers")
+    assert(get_available_slots(module) == 2, "Should have 2 slots left")
+
+    remove_passenger(module, 101)
+    assert(get_available_slots(module) == 3, "Should have 3 slots after remove")
+
+    return true
+}
+
+fn test_capacity_limit() -> Bool {
+    let module = create_contain_module("Small", ContainType::Transport)
+    module.max_slots = 2
+
+    add_passenger(module, 1, "Unit", 1, 0)
+    add_passenger(module, 2, "Unit", 1, 0)
+    assert(is_full(module) == true, "Should be full")
+
+    assert(can_contain(module, 3, "Unit", 1) == false, "Should reject")
+
+    return true
+}
+
+fn test_heal_contain() -> Bool {
+    let module = create_heal_contain("Ambulance")
+    module.heal_per_second = 20.0
+
+    add_passenger(module.base, 1, "Infantry", 1, 0)
+    add_passenger(module.base, 2, "Infantry", 1, 0)
+
+    let healed = update_healing(module, 0.5)
+    assert(healed.len() == 2, "Should heal both")
+
+    let (id, amount) = healed.get(0)
+    assert(amount == 10.0, "Should heal 10 per 0.5 sec")
+
+    return true
+}
+
+fn test_tunnel_contain() -> Bool {
+    let module = create_tunnel_contain("Tunnel")
+    module.network_id = 1
+
+    link_tunnel(module, 100)
+    link_tunnel(module, 101)
+    link_tunnel(module, 102)
+
+    assert(get_linked_count(module) == 3, "Should have 3 linked tunnels")
+
+    return true
+}
+
+fn test_evacuate() -> Bool {
+    let module = create_contain_module("APC", ContainType::Transport)
+
+    add_passenger(module, 10, "Infantry", 1, 0)
+    add_passenger(module, 11, "Infantry", 1, 0)
+    add_passenger(module, 12, "Infantry", 1, 0)
+
+    let evacuated = evacuate_all(module)
+    assert(evacuated.len() == 3, "Should evacuate 3")
+    assert(is_empty(module) == true, "Should be empty after evacuate")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_basic_contain(), "Basic contain test failed")
+    assert(test_capacity_limit(), "Capacity limit test failed")
+    assert(test_heal_contain(), "Heal contain test failed")
+    assert(test_tunnel_contain(), "Tunnel contain test failed")
+    assert(test_evacuate(), "Evacuate test failed")
+    return true
+}

@@ -1,0 +1,516 @@
+// Projectile Stream Update - Continuous Projectile Streams
+// Based on Thyme engine ProjectileStreamUpdate
+// Handles Gatling guns, miniguns, and other rapid-fire weapons
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Stream Configuration
+// ============================================================================
+
+enum StreamType {
+    Gatling,        // Spinning barrel (USA)
+    MiniGun,        // Fixed barrel rapid fire
+    ChainGun,       // Chain-fed
+    FlakCannon,     // Anti-air burst
+    RocketPods,     // Multiple rocket launch
+}
+
+struct StreamConfig {
+    stream_type: StreamType,
+    rounds_per_second: Float,
+    damage_per_round: Float,
+    spread_angle: Float,        // Bullet spread in degrees
+    max_range: Float,
+    spin_up_time: Float,        // Time to reach full fire rate
+    spin_down_time: Float,
+    barrel_count: Int,          // For Gatling
+    muzzle_velocity: Float,
+    tracer_frequency: Int,      // Every N rounds is a tracer
+    fx_per_shot: String,
+    sound_loop: String,
+}
+
+fn default_stream_config() -> StreamConfig {
+    return StreamConfig {
+        stream_type: StreamType::Gatling,
+        rounds_per_second: 30.0,
+        damage_per_round: 5.0,
+        spread_angle: 3.0,
+        max_range: 200.0,
+        spin_up_time: 1.0,
+        spin_down_time: 0.5,
+        barrel_count: 6,
+        muzzle_velocity: 1000.0,
+        tracer_frequency: 5,
+        fx_per_shot: "FX_MuzzleFlash",
+        sound_loop: "GatlingLoop",
+    }
+}
+
+// ============================================================================
+// Projectile in Stream
+// ============================================================================
+
+struct StreamProjectile {
+    id: Int,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    velocity_x: Float,
+    velocity_y: Float,
+    velocity_z: Float,
+    damage: Float,
+    target_id: Int,
+    is_tracer: Bool,
+    lifetime: Float,
+    max_lifetime: Float,
+}
+
+fn create_stream_projectile(id: Int) -> StreamProjectile {
+    return StreamProjectile {
+        id: id,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        velocity_x: 0.0,
+        velocity_y: 0.0,
+        velocity_z: 0.0,
+        damage: 0.0,
+        target_id: 0,
+        is_tracer: false,
+        lifetime: 0.0,
+        max_lifetime: 2.0,
+    }
+}
+
+/// Update projectile position
+fn update_projectile(proj: StreamProjectile, delta: Float) -> Bool {
+    proj.position_x = proj.position_x + proj.velocity_x * delta
+    proj.position_y = proj.position_y + proj.velocity_y * delta
+    proj.position_z = proj.position_z + proj.velocity_z * delta
+
+    // Apply gravity (slight)
+    proj.velocity_z = proj.velocity_z - 9.8 * delta * 0.1
+
+    proj.lifetime = proj.lifetime + delta
+    return proj.lifetime < proj.max_lifetime
+}
+
+/// Check if projectile hit target
+fn check_projectile_hit(proj: StreamProjectile, target_x: Float, target_y: Float, target_z: Float, target_radius: Float) -> Bool {
+    let dx = proj.position_x - target_x
+    let dy = proj.position_y - target_y
+    let dz = proj.position_z - target_z
+    let dist_sq = dx * dx + dy * dy + dz * dz
+    return dist_sq <= target_radius * target_radius
+}
+
+// ============================================================================
+// Projectile Stream Update Module
+// ============================================================================
+
+struct ProjectileStreamUpdateModule {
+    base: UpdateModule,
+    config: StreamConfig,
+
+    // State
+    is_firing: Bool,
+    spin_progress: Float,       // 0.0 to 1.0
+    current_fire_rate: Float,   // Actual rounds per second
+    time_since_last_shot: Float,
+    barrel_rotation: Float,     // For Gatling visual
+
+    // Target
+    target_id: Int,
+    target_x: Float,
+    target_y: Float,
+    target_z: Float,
+
+    // Source position
+    source_x: Float,
+    source_y: Float,
+    source_z: Float,
+    source_angle: Float,
+
+    // Projectiles
+    projectiles: Collection<StreamProjectile>,
+    next_projectile_id: Int,
+    rounds_fired: Int,
+    hits: Int,
+    total_damage: Float,
+}
+
+fn create_projectile_stream(tag: String) -> ProjectileStreamUpdateModule {
+    return ProjectileStreamUpdateModule {
+        base: create_update_module(tag, UpdateType::Weapon),
+        config: default_stream_config(),
+        is_firing: false,
+        spin_progress: 0.0,
+        current_fire_rate: 0.0,
+        time_since_last_shot: 0.0,
+        barrel_rotation: 0.0,
+        target_id: 0,
+        target_x: 0.0,
+        target_y: 0.0,
+        target_z: 0.0,
+        source_x: 0.0,
+        source_y: 0.0,
+        source_z: 0.0,
+        source_angle: 0.0,
+        projectiles: Collection<StreamProjectile>{},
+        next_projectile_id: 1,
+        rounds_fired: 0,
+        hits: 0,
+        total_damage: 0.0,
+    }
+}
+
+/// Set source position
+fn set_stream_source(stream: ProjectileStreamUpdateModule, x: Float, y: Float, z: Float, angle: Float) {
+    stream.source_x = x
+    stream.source_y = y
+    stream.source_z = z
+    stream.source_angle = angle
+}
+
+/// Start firing at target
+fn start_stream(stream: ProjectileStreamUpdateModule, target_id: Int, target_x: Float, target_y: Float, target_z: Float) {
+    stream.is_firing = true
+    stream.target_id = target_id
+    stream.target_x = target_x
+    stream.target_y = target_y
+    stream.target_z = target_z
+}
+
+/// Stop firing
+fn stop_stream(stream: ProjectileStreamUpdateModule) {
+    stream.is_firing = false
+}
+
+/// Update target position
+fn update_stream_target(stream: ProjectileStreamUpdateModule, x: Float, y: Float, z: Float) {
+    stream.target_x = x
+    stream.target_y = y
+    stream.target_z = z
+}
+
+/// Get current fire rate
+fn get_current_fire_rate(stream: ProjectileStreamUpdateModule) -> Float {
+    return stream.current_fire_rate
+}
+
+/// Get barrel rotation (for visual)
+fn get_barrel_rotation(stream: ProjectileStreamUpdateModule) -> Float {
+    return stream.barrel_rotation
+}
+
+/// Spawn a projectile
+fn spawn_stream_projectile(stream: ProjectileStreamUpdateModule, random_spread_x: Float, random_spread_y: Float) {
+    let proj = create_stream_projectile(stream.next_projectile_id)
+    stream.next_projectile_id = stream.next_projectile_id + 1
+
+    proj.position_x = stream.source_x
+    proj.position_y = stream.source_y
+    proj.position_z = stream.source_z
+    proj.damage = stream.config.damage_per_round
+    proj.target_id = stream.target_id
+
+    // Calculate direction to target with spread
+    let dx = stream.target_x - stream.source_x
+    let dy = stream.target_y - stream.source_y
+    let dz = stream.target_z - stream.source_z
+    let dist = sqrt(dx * dx + dy * dy + dz * dz)
+
+    if dist > 0.0 {
+        // Normalize
+        dx = dx / dist
+        dy = dy / dist
+        dz = dz / dist
+
+        // Apply spread
+        let spread_rad = stream.config.spread_angle * 0.0174533  // deg to rad
+        dx = dx + random_spread_x * spread_rad
+        dy = dy + random_spread_y * spread_rad
+
+        // Re-normalize
+        let len = sqrt(dx * dx + dy * dy + dz * dz)
+        dx = dx / len
+        dy = dy / len
+        dz = dz / len
+    }
+
+    proj.velocity_x = dx * stream.config.muzzle_velocity
+    proj.velocity_y = dy * stream.config.muzzle_velocity
+    proj.velocity_z = dz * stream.config.muzzle_velocity
+
+    // Check if tracer
+    proj.is_tracer = (stream.rounds_fired % stream.config.tracer_frequency) == 0
+
+    // Calculate lifetime based on range
+    proj.max_lifetime = stream.config.max_range / stream.config.muzzle_velocity
+
+    stream.projectiles.add(proj)
+    stream.rounds_fired = stream.rounds_fired + 1
+}
+
+/// Update stream
+fn update_stream(stream: ProjectileStreamUpdateModule, delta: Float, random_x: Float, random_y: Float) -> Collection<(Int, Float)> {
+    // Returns list of (target_id, damage) for hits
+    let hits = Collection<(Int, Float)>{}
+
+    // Update spin
+    if stream.is_firing {
+        stream.spin_progress = stream.spin_progress + delta / stream.config.spin_up_time
+        if stream.spin_progress > 1.0 {
+            stream.spin_progress = 1.0
+        }
+    } else {
+        stream.spin_progress = stream.spin_progress - delta / stream.config.spin_down_time
+        if stream.spin_progress < 0.0 {
+            stream.spin_progress = 0.0
+        }
+    }
+
+    // Calculate current fire rate based on spin
+    stream.current_fire_rate = stream.config.rounds_per_second * stream.spin_progress
+
+    // Update barrel rotation
+    if stream.config.stream_type == StreamType::Gatling {
+        stream.barrel_rotation = stream.barrel_rotation + stream.spin_progress * delta * 10.0
+        if stream.barrel_rotation > 6.28318 {
+            stream.barrel_rotation = stream.barrel_rotation - 6.28318
+        }
+    }
+
+    // Fire projectiles
+    if stream.is_firing && stream.current_fire_rate > 0.0 {
+        stream.time_since_last_shot = stream.time_since_last_shot + delta
+
+        let time_per_shot = 1.0 / stream.current_fire_rate
+        while stream.time_since_last_shot >= time_per_shot {
+            stream.time_since_last_shot = stream.time_since_last_shot - time_per_shot
+            spawn_stream_projectile(stream, random_x, random_y)
+        }
+    }
+
+    // Update existing projectiles
+    let active_projectiles = Collection<StreamProjectile>{}
+    for proj in stream.projectiles {
+        if update_projectile(proj, delta) {
+            // Check for hit (simplified - in real game would use ray/sphere intersection)
+            if check_projectile_hit(proj, stream.target_x, stream.target_y, stream.target_z, 10.0) {
+                hits.add((proj.target_id, proj.damage))
+                stream.hits = stream.hits + 1
+                stream.total_damage = stream.total_damage + proj.damage
+                // Projectile consumed
+            } else {
+                active_projectiles.add(proj)
+            }
+        }
+        // Else projectile expired
+    }
+    stream.projectiles = active_projectiles
+
+    return hits
+}
+
+/// Get projectile count
+fn get_projectile_count(stream: ProjectileStreamUpdateModule) -> Int {
+    return stream.projectiles.len()
+}
+
+/// Get accuracy
+fn get_accuracy(stream: ProjectileStreamUpdateModule) -> Float {
+    if stream.rounds_fired == 0 {
+        return 0.0
+    }
+    return (stream.hits as Float) / (stream.rounds_fired as Float) * 100.0
+}
+
+/// Reset stream
+fn reset_stream(stream: ProjectileStreamUpdateModule) {
+    stream.is_firing = false
+    stream.spin_progress = 0.0
+    stream.current_fire_rate = 0.0
+    stream.time_since_last_shot = 0.0
+    stream.barrel_rotation = 0.0
+    stream.projectiles = Collection<StreamProjectile>{}
+    stream.rounds_fired = 0
+    stream.hits = 0
+    stream.total_damage = 0.0
+}
+
+// ============================================================================
+// Stream Manager
+// ============================================================================
+
+struct StreamManager {
+    streams: Map<Int, ProjectileStreamUpdateModule>,
+    next_id: Int,
+}
+
+fn create_stream_manager() -> StreamManager {
+    return StreamManager {
+        streams: Map<Int, ProjectileStreamUpdateModule>{},
+        next_id: 1,
+    }
+}
+
+/// Register stream
+fn register_stream(mgr: StreamManager, stream: ProjectileStreamUpdateModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    stream.base.module_id = id
+    mgr.streams.set(id, stream)
+    return id
+}
+
+/// Get stream
+fn get_stream(mgr: StreamManager, id: Int) -> ProjectileStreamUpdateModule {
+    if mgr.streams.has(id) {
+        return mgr.streams.get(id)
+    }
+    return create_projectile_stream("")
+}
+
+/// Update all streams
+fn update_all_streams(mgr: StreamManager, delta: Float) -> Collection<(Int, Float)> {
+    let all_hits = Collection<(Int, Float)>{}
+
+    for id in mgr.streams.keys() {
+        let stream = mgr.streams.get(id)
+        // Would need random values per stream
+        let stream_hits = update_stream(stream, delta, 0.0, 0.0)
+        for hit in stream_hits {
+            all_hits.add(hit)
+        }
+    }
+
+    return all_hits
+}
+
+/// Get total projectile count
+fn get_total_projectiles(mgr: StreamManager) -> Int {
+    let total = 0
+    for id in mgr.streams.keys() {
+        let stream = mgr.streams.get(id)
+        total = total + get_projectile_count(stream)
+    }
+    return total
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_stream_basic() -> Bool {
+    let stream = create_projectile_stream("TestGatling")
+    stream.config.rounds_per_second = 10.0
+    stream.config.spin_up_time = 1.0
+
+    assert(stream.is_firing == false, "Should not be firing")
+    assert(stream.spin_progress == 0.0, "Spin should be 0")
+
+    set_stream_source(stream, 0.0, 0.0, 10.0, 0.0)
+    start_stream(stream, 100, 100.0, 0.0, 10.0)
+
+    assert(stream.is_firing == true, "Should be firing")
+    assert(stream.target_id == 100, "Target should be set")
+
+    return true
+}
+
+fn test_stream_spinup() -> Bool {
+    let stream = create_projectile_stream("SpinTest")
+    stream.config.spin_up_time = 2.0
+    stream.config.rounds_per_second = 20.0
+
+    start_stream(stream, 1, 100.0, 0.0, 0.0)
+
+    // Half spin
+    update_stream(stream, 1.0, 0.0, 0.0)
+    assert(stream.spin_progress == 0.5, "Should be 50% spun up")
+    assert(stream.current_fire_rate == 10.0, "Should be at 10 rps")
+
+    // Full spin
+    update_stream(stream, 1.0, 0.0, 0.0)
+    assert(stream.spin_progress == 1.0, "Should be fully spun up")
+    assert(stream.current_fire_rate == 20.0, "Should be at 20 rps")
+
+    return true
+}
+
+fn test_stream_spindown() -> Bool {
+    let stream = create_projectile_stream("SpinDownTest")
+    stream.config.spin_up_time = 0.0  // Instant
+    stream.config.spin_down_time = 1.0
+
+    start_stream(stream, 1, 100.0, 0.0, 0.0)
+    update_stream(stream, 0.1, 0.0, 0.0)  // Quick spin up
+    stream.spin_progress = 1.0
+
+    stop_stream(stream)
+    update_stream(stream, 0.5, 0.0, 0.0)
+    assert(stream.spin_progress == 0.5, "Should be 50% spun down")
+
+    update_stream(stream, 0.5, 0.0, 0.0)
+    assert(stream.spin_progress == 0.0, "Should be stopped")
+
+    return true
+}
+
+fn test_projectile_spawn() -> Bool {
+    let stream = create_projectile_stream("SpawnTest")
+    stream.config.rounds_per_second = 100.0
+    stream.config.spin_up_time = 0.0
+    stream.config.muzzle_velocity = 500.0
+
+    set_stream_source(stream, 0.0, 0.0, 0.0, 0.0)
+    start_stream(stream, 1, 100.0, 0.0, 0.0)
+    stream.spin_progress = 1.0
+
+    update_stream(stream, 0.1, 0.0, 0.0)  // Should fire ~10 rounds
+    assert(stream.rounds_fired >= 9 && stream.rounds_fired <= 11, "Should fire ~10 rounds")
+    assert(get_projectile_count(stream) > 0, "Should have active projectiles")
+
+    return true
+}
+
+fn test_barrel_rotation() -> Bool {
+    let stream = create_projectile_stream("BarrelTest")
+    stream.config.stream_type = StreamType::Gatling
+    stream.config.spin_up_time = 0.0
+
+    start_stream(stream, 1, 100.0, 0.0, 0.0)
+    stream.spin_progress = 1.0
+
+    let initial = stream.barrel_rotation
+    update_stream(stream, 1.0, 0.0, 0.0)
+    assert(stream.barrel_rotation > initial, "Barrel should rotate")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_stream_basic(), "Stream basic test failed")
+    assert(test_stream_spinup(), "Stream spinup test failed")
+    assert(test_stream_spindown(), "Stream spindown test failed")
+    assert(test_projectile_spawn(), "Projectile spawn test failed")
+    assert(test_barrel_rotation(), "Barrel rotation test failed")
+    return true
+}

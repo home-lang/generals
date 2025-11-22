@@ -1,0 +1,671 @@
+// Xfer System - Game State Serialization
+// Based on Thyme engine Xfer (transfer) architecture
+// Handles save/load, network sync, and replays
+
+from basics import Collection, Map
+
+// ============================================================================
+// Xfer Constants and Types
+// ============================================================================
+
+enum XferMode {
+    Save,       // Writing data
+    Load,       // Reading data
+    CRC,        // Calculating checksum only
+}
+
+enum XferVersion {
+    V1,         // Original
+    V2,         // Extended
+    Current,    // Latest
+}
+
+// Data type tags for type safety
+const XFER_TAG_INT: Int = 1
+const XFER_TAG_FLOAT: Int = 2
+const XFER_TAG_BOOL: Int = 3
+const XFER_TAG_STRING: Int = 4
+const XFER_TAG_BYTES: Int = 5
+const XFER_TAG_ARRAY: Int = 6
+const XFER_TAG_OBJECT: Int = 7
+
+// ============================================================================
+// Xfer Buffer
+// ============================================================================
+
+struct XferBuffer {
+    data: Collection<Int>,
+    position: Int,
+    size: Int,
+    mode: XferMode,
+    version: XferVersion,
+    crc: Int,
+}
+
+fn create_xfer_buffer(mode: XferMode) -> XferBuffer {
+    return XferBuffer {
+        data: Collection<Int>{},
+        position: 0,
+        size: 0,
+        mode: mode,
+        version: XferVersion::Current,
+        crc: 0xFFFFFFFF,
+    }
+}
+
+/// Create buffer for loading
+fn create_load_buffer(data: Collection<Int>) -> XferBuffer {
+    let buf = create_xfer_buffer(XferMode::Load)
+    buf.data = data
+    buf.size = data.len()
+    return buf
+}
+
+/// Get remaining bytes
+fn remaining(buf: XferBuffer) -> Int {
+    return buf.size - buf.position
+}
+
+/// Is at end
+fn is_eof(buf: XferBuffer) -> Bool {
+    return buf.position >= buf.size
+}
+
+/// Reset position
+fn reset_position(buf: XferBuffer) {
+    buf.position = 0
+}
+
+/// Get current CRC
+fn get_crc(buf: XferBuffer) -> Int {
+    return buf.crc ^ 0xFFFFFFFF
+}
+
+/// Update CRC with byte
+fn update_crc(buf: XferBuffer, byte: Int) {
+    // Simple CRC update (CRC-32 polynomial)
+    buf.crc = buf.crc ^ byte
+    for i in 0..8 {
+        if (buf.crc & 1) != 0 {
+            buf.crc = (buf.crc >> 1) ^ 0xEDB88320
+        } else {
+            buf.crc = buf.crc >> 1
+        }
+    }
+}
+
+// ============================================================================
+// Basic Write Operations
+// ============================================================================
+
+/// Write single byte
+fn write_byte(buf: XferBuffer, value: Int) {
+    let byte = value & 0xFF
+    buf.data.add(byte)
+    buf.size = buf.size + 1
+    update_crc(buf, byte)
+}
+
+/// Write int (4 bytes, big endian)
+fn write_int(buf: XferBuffer, value: Int) {
+    write_byte(buf, (value >> 24) & 0xFF)
+    write_byte(buf, (value >> 16) & 0xFF)
+    write_byte(buf, (value >> 8) & 0xFF)
+    write_byte(buf, value & 0xFF)
+}
+
+/// Write float as fixed point
+fn write_float(buf: XferBuffer, value: Float) {
+    // Convert to fixed point (16.16)
+    let fixed = (value * 65536.0) as Int
+    write_int(buf, fixed)
+}
+
+/// Write bool
+fn write_bool(buf: XferBuffer, value: Bool) {
+    write_byte(buf, if value { 1 } else { 0 })
+}
+
+/// Write string
+fn write_string(buf: XferBuffer, value: String) {
+    write_int(buf, value.len())
+    for i in 0..value.len() {
+        write_byte(buf, value.char_at(i))
+    }
+}
+
+/// Write bytes
+fn write_bytes(buf: XferBuffer, bytes: Collection<Int>) {
+    write_int(buf, bytes.len())
+    for b in bytes {
+        write_byte(buf, b)
+    }
+}
+
+// ============================================================================
+// Basic Read Operations
+// ============================================================================
+
+/// Read single byte
+fn read_byte(buf: XferBuffer) -> Int {
+    if buf.position >= buf.size {
+        return 0
+    }
+    let byte = buf.data.get(buf.position)
+    buf.position = buf.position + 1
+    update_crc(buf, byte)
+    return byte
+}
+
+/// Read int
+fn read_int(buf: XferBuffer) -> Int {
+    let b0 = read_byte(buf)
+    let b1 = read_byte(buf)
+    let b2 = read_byte(buf)
+    let b3 = read_byte(buf)
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+/// Read float
+fn read_float(buf: XferBuffer) -> Float {
+    let fixed = read_int(buf)
+    return (fixed as Float) / 65536.0
+}
+
+/// Read bool
+fn read_bool(buf: XferBuffer) -> Bool {
+    return read_byte(buf) != 0
+}
+
+/// Read string
+fn read_string(buf: XferBuffer) -> String {
+    let len = read_int(buf)
+    let result = ""
+    for i in 0..len {
+        result = result + String::char_from_code(read_byte(buf))
+    }
+    return result
+}
+
+/// Read bytes
+fn read_bytes(buf: XferBuffer) -> Collection<Int> {
+    let len = read_int(buf)
+    let result = Collection<Int>{}
+    for i in 0..len {
+        result.add(read_byte(buf))
+    }
+    return result
+}
+
+// ============================================================================
+// Tagged Operations (with type safety)
+// ============================================================================
+
+/// Write tagged int
+fn xfer_int(buf: XferBuffer, name: String, value: Int) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_INT)
+        write_string(buf, name)
+        write_int(buf, value)
+    }
+}
+
+/// Read tagged int
+fn xfer_int_load(buf: XferBuffer, name: String) -> Int {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_INT {
+            return 0  // Type mismatch
+        }
+        let read_name = read_string(buf)
+        return read_int(buf)
+    }
+    return 0
+}
+
+/// Write tagged float
+fn xfer_float(buf: XferBuffer, name: String, value: Float) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_FLOAT)
+        write_string(buf, name)
+        write_float(buf, value)
+    }
+}
+
+/// Read tagged float
+fn xfer_float_load(buf: XferBuffer, name: String) -> Float {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_FLOAT {
+            return 0.0
+        }
+        let read_name = read_string(buf)
+        return read_float(buf)
+    }
+    return 0.0
+}
+
+/// Write tagged string
+fn xfer_string(buf: XferBuffer, name: String, value: String) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_STRING)
+        write_string(buf, name)
+        write_string(buf, value)
+    }
+}
+
+/// Read tagged string
+fn xfer_string_load(buf: XferBuffer, name: String) -> String {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_STRING {
+            return ""
+        }
+        let read_name = read_string(buf)
+        return read_string(buf)
+    }
+    return ""
+}
+
+/// Write tagged bool
+fn xfer_bool(buf: XferBuffer, name: String, value: Bool) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_BOOL)
+        write_string(buf, name)
+        write_bool(buf, value)
+    }
+}
+
+/// Read tagged bool
+fn xfer_bool_load(buf: XferBuffer, name: String) -> Bool {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_BOOL {
+            return false
+        }
+        let read_name = read_string(buf)
+        return read_bool(buf)
+    }
+    return false
+}
+
+// ============================================================================
+// Array Operations
+// ============================================================================
+
+/// Begin array write
+fn begin_array(buf: XferBuffer, name: String, count: Int) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_ARRAY)
+        write_string(buf, name)
+        write_int(buf, count)
+    }
+}
+
+/// Begin array read
+fn begin_array_load(buf: XferBuffer, name: String) -> Int {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_ARRAY {
+            return 0
+        }
+        let read_name = read_string(buf)
+        return read_int(buf)
+    }
+    return 0
+}
+
+// ============================================================================
+// Object Operations
+// ============================================================================
+
+/// Begin object write
+fn begin_object(buf: XferBuffer, name: String) {
+    if buf.mode == XferMode::Save {
+        write_byte(buf, XFER_TAG_OBJECT)
+        write_string(buf, name)
+    }
+}
+
+/// Begin object read
+fn begin_object_load(buf: XferBuffer, name: String) -> Bool {
+    if buf.mode == XferMode::Load {
+        let tag = read_byte(buf)
+        if tag != XFER_TAG_OBJECT {
+            return false
+        }
+        let read_name = read_string(buf)
+        return true
+    }
+    return false
+}
+
+/// End object (marker for validation)
+fn end_object(buf: XferBuffer) {
+    write_byte(buf, 0xFF)  // End marker
+}
+
+/// End object read
+fn end_object_load(buf: XferBuffer) -> Bool {
+    let marker = read_byte(buf)
+    return marker == 0xFF
+}
+
+// ============================================================================
+// Xfer Snapshot (Game State)
+// ============================================================================
+
+struct XferSnapshot {
+    buffer: XferBuffer,
+    frame: Int,
+    checksum: Int,
+    timestamp: Int,
+    player_count: Int,
+    object_count: Int,
+}
+
+fn create_snapshot() -> XferSnapshot {
+    return XferSnapshot {
+        buffer: create_xfer_buffer(XferMode::Save),
+        frame: 0,
+        checksum: 0,
+        timestamp: 0,
+        player_count: 0,
+        object_count: 0,
+    }
+}
+
+/// Begin snapshot
+fn begin_snapshot(snap: XferSnapshot, frame: Int, timestamp: Int) {
+    snap.frame = frame
+    snap.timestamp = timestamp
+
+    // Write header
+    write_int(snap.buffer, 0x534E4150)  // "SNAP" magic
+    write_int(snap.buffer, frame)
+    write_int(snap.buffer, timestamp)
+}
+
+/// End snapshot
+fn end_snapshot(snap: XferSnapshot) {
+    // Write footer
+    write_int(snap.buffer, snap.object_count)
+    snap.checksum = get_crc(snap.buffer)
+    write_int(snap.buffer, snap.checksum)
+}
+
+/// Load snapshot header
+fn load_snapshot_header(snap: XferSnapshot, data: Collection<Int>) -> Bool {
+    snap.buffer = create_load_buffer(data)
+
+    let magic = read_int(snap.buffer)
+    if magic != 0x534E4150 {
+        return false
+    }
+
+    snap.frame = read_int(snap.buffer)
+    snap.timestamp = read_int(snap.buffer)
+    return true
+}
+
+// ============================================================================
+// Save Game
+// ============================================================================
+
+struct SaveGame {
+    buffer: XferBuffer,
+    version: Int,
+    name: String,
+    timestamp: Int,
+    map_name: String,
+    player_names: Collection<String>,
+    difficulty: Int,
+}
+
+fn create_save_game(name: String) -> SaveGame {
+    return SaveGame {
+        buffer: create_xfer_buffer(XferMode::Save),
+        version: 1,
+        name: name,
+        timestamp: 0,
+        map_name: "",
+        player_names: Collection<String>{},
+        difficulty: 1,
+    }
+}
+
+/// Write save game header
+fn write_save_header(save: SaveGame) {
+    write_int(save.buffer, 0x53415645)  // "SAVE" magic
+    write_int(save.buffer, save.version)
+    write_string(save.buffer, save.name)
+    write_int(save.buffer, save.timestamp)
+    write_string(save.buffer, save.map_name)
+    write_int(save.buffer, save.difficulty)
+
+    // Write player names
+    write_int(save.buffer, save.player_names.len())
+    for name in save.player_names {
+        write_string(save.buffer, name)
+    }
+}
+
+/// Read save game header
+fn read_save_header(save: SaveGame, data: Collection<Int>) -> Bool {
+    save.buffer = create_load_buffer(data)
+
+    let magic = read_int(save.buffer)
+    if magic != 0x53415645 {
+        return false
+    }
+
+    save.version = read_int(save.buffer)
+    save.name = read_string(save.buffer)
+    save.timestamp = read_int(save.buffer)
+    save.map_name = read_string(save.buffer)
+    save.difficulty = read_int(save.buffer)
+
+    let player_count = read_int(save.buffer)
+    save.player_names = Collection<String>{}
+    for i in 0..player_count {
+        save.player_names.add(read_string(save.buffer))
+    }
+
+    return true
+}
+
+// ============================================================================
+// Replay
+// ============================================================================
+
+struct ReplayCommand {
+    frame: Int,
+    player_id: Int,
+    command_type: Int,
+    target_id: Int,
+    x: Float,
+    y: Float,
+}
+
+fn create_replay_command(frame: Int, player: Int, cmd: Int) -> ReplayCommand {
+    return ReplayCommand {
+        frame: frame,
+        player_id: player,
+        command_type: cmd,
+        target_id: 0,
+        x: 0.0,
+        y: 0.0,
+    }
+}
+
+struct Replay {
+    buffer: XferBuffer,
+    version: Int,
+    map_name: String,
+    player_names: Collection<String>,
+    random_seed: Int,
+    total_frames: Int,
+    commands: Collection<ReplayCommand>,
+}
+
+fn create_replay() -> Replay {
+    return Replay {
+        buffer: create_xfer_buffer(XferMode::Save),
+        version: 1,
+        map_name: "",
+        player_names: Collection<String>{},
+        random_seed: 0,
+        total_frames: 0,
+        commands: Collection<ReplayCommand>{},
+    }
+}
+
+/// Write replay header
+fn write_replay_header(replay: Replay) {
+    write_int(replay.buffer, 0x52504C59)  // "RPLY" magic
+    write_int(replay.buffer, replay.version)
+    write_string(replay.buffer, replay.map_name)
+    write_int(replay.buffer, replay.random_seed)
+
+    write_int(replay.buffer, replay.player_names.len())
+    for name in replay.player_names {
+        write_string(replay.buffer, name)
+    }
+}
+
+/// Write replay command
+fn write_replay_command(replay: Replay, cmd: ReplayCommand) {
+    write_int(replay.buffer, cmd.frame)
+    write_int(replay.buffer, cmd.player_id)
+    write_int(replay.buffer, cmd.command_type)
+    write_int(replay.buffer, cmd.target_id)
+    write_float(replay.buffer, cmd.x)
+    write_float(replay.buffer, cmd.y)
+    replay.commands.add(cmd)
+}
+
+/// Read replay command
+fn read_replay_command(replay: Replay) -> ReplayCommand {
+    let cmd = create_replay_command(0, 0, 0)
+    cmd.frame = read_int(replay.buffer)
+    cmd.player_id = read_int(replay.buffer)
+    cmd.command_type = read_int(replay.buffer)
+    cmd.target_id = read_int(replay.buffer)
+    cmd.x = read_float(replay.buffer)
+    cmd.y = read_float(replay.buffer)
+    return cmd
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_basic_io() -> Bool {
+    let buf = create_xfer_buffer(XferMode::Save)
+
+    write_int(buf, 12345)
+    write_float(buf, 3.14159)
+    write_bool(buf, true)
+    write_string(buf, "test string")
+
+    // Reset for reading
+    buf.mode = XferMode::Load
+    reset_position(buf)
+    buf.crc = 0xFFFFFFFF
+
+    assert(read_int(buf) == 12345, "Int should match")
+    let f = read_float(buf)
+    assert(f > 3.14 && f < 3.15, "Float should be ~3.14")
+    assert(read_bool(buf) == true, "Bool should be true")
+    assert(read_string(buf) == "test string", "String should match")
+
+    return true
+}
+
+fn test_crc() -> Bool {
+    let buf1 = create_xfer_buffer(XferMode::Save)
+    write_int(buf1, 100)
+    write_string(buf1, "hello")
+    let crc1 = get_crc(buf1)
+
+    let buf2 = create_xfer_buffer(XferMode::Save)
+    write_int(buf2, 100)
+    write_string(buf2, "hello")
+    let crc2 = get_crc(buf2)
+
+    assert(crc1 == crc2, "Same data should have same CRC")
+
+    let buf3 = create_xfer_buffer(XferMode::Save)
+    write_int(buf3, 100)
+    write_string(buf3, "world")
+    let crc3 = get_crc(buf3)
+
+    assert(crc1 != crc3, "Different data should have different CRC")
+
+    return true
+}
+
+fn test_snapshot() -> Bool {
+    let snap = create_snapshot()
+    begin_snapshot(snap, 100, 1234567)
+
+    xfer_int(snap.buffer, "player_money", 5000)
+    xfer_float(snap.buffer, "camera_x", 100.5)
+    xfer_string(snap.buffer, "map", "Desert")
+
+    snap.object_count = 50
+    end_snapshot(snap)
+
+    assert(snap.checksum != 0, "Checksum should be calculated")
+    assert(snap.frame == 100, "Frame should be 100")
+
+    return true
+}
+
+fn test_save_game() -> Bool {
+    let save = create_save_game("QuickSave")
+    save.map_name = "Tournament Desert"
+    save.difficulty = 2
+    save.player_names.add("Player1")
+    save.player_names.add("CPU")
+
+    write_save_header(save)
+
+    // Simulate reload
+    let loaded = create_save_game("")
+    read_save_header(loaded, save.buffer.data)
+
+    assert(loaded.name == "QuickSave", "Name should match")
+    assert(loaded.map_name == "Tournament Desert", "Map should match")
+    assert(loaded.player_names.len() == 2, "Should have 2 players")
+
+    return true
+}
+
+fn test_replay() -> Bool {
+    let replay = create_replay()
+    replay.map_name = "Test Map"
+    replay.random_seed = 42
+    replay.player_names.add("P1")
+    replay.player_names.add("P2")
+
+    write_replay_header(replay)
+
+    let cmd = create_replay_command(10, 1, 5)
+    cmd.x = 100.0
+    cmd.y = 200.0
+    write_replay_command(replay, cmd)
+
+    assert(replay.commands.len() == 1, "Should have 1 command")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_basic_io(), "Basic IO test failed")
+    assert(test_crc(), "CRC test failed")
+    assert(test_snapshot(), "Snapshot test failed")
+    assert(test_save_game(), "Save game test failed")
+    assert(test_replay(), "Replay test failed")
+    return true
+}

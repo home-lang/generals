@@ -1,0 +1,364 @@
+// Overcharge Behavior - Power Plant Overcharge Ability
+// Based on Thyme engine OverchargeBehavior
+// China power plants can overcharge for extra power but risk explosion
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, ModuleData, create_behavior_module, ModuleType
+
+// ============================================================================
+// Overcharge Configuration
+// ============================================================================
+
+enum OverchargeState {
+    Idle,
+    Charging,
+    Overcharged,
+    Exploding,
+    Destroyed,
+}
+
+struct OverchargeConfig {
+    power_bonus: Float,         // Extra power when overcharged (e.g., 2.0 = 100% more)
+    max_overcharge_time: Float, // Max time before explosion risk
+    explosion_chance_base: Float,  // Starting explosion chance
+    explosion_chance_growth: Float, // Chance increase per second
+    damage_radius: Float,       // Explosion damage radius
+    damage_amount: Float,       // Explosion damage
+    cooldown_time: Float,       // Time before can overcharge again
+    visual_fx: String,          // Overcharge visual effect
+    explosion_fx: String,       // Explosion effect
+}
+
+fn default_overcharge_config() -> OverchargeConfig {
+    return OverchargeConfig {
+        power_bonus: 2.0,
+        max_overcharge_time: 60.0,
+        explosion_chance_base: 0.01,
+        explosion_chance_growth: 0.005,
+        damage_radius: 100.0,
+        damage_amount: 500.0,
+        cooldown_time: 30.0,
+        visual_fx: "FX_OverchargeActive",
+        explosion_fx: "FX_PowerPlantExplosion",
+    }
+}
+
+// ============================================================================
+// Overcharge Behavior
+// ============================================================================
+
+struct OverchargeBehavior {
+    base: BehaviorModule,
+    config: OverchargeConfig,
+
+    // State
+    state: OverchargeState,
+    overcharge_time: Float,
+    cooldown_remaining: Float,
+    current_explosion_chance: Float,
+
+    // Statistics
+    times_overcharged: Int,
+    times_exploded: Int,
+    total_bonus_power: Float,
+}
+
+/// Create overcharge behavior
+fn create_overcharge_behavior(tag: String) -> OverchargeBehavior {
+    return OverchargeBehavior {
+        base: create_behavior_module(tag, ModuleType::Overcharge),
+        config: default_overcharge_config(),
+        state: OverchargeState::Idle,
+        overcharge_time: 0.0,
+        cooldown_remaining: 0.0,
+        current_explosion_chance: 0.0,
+        times_overcharged: 0,
+        times_exploded: 0,
+        total_bonus_power: 0.0,
+    }
+}
+
+/// Initialize from data
+fn init_overcharge(behavior: OverchargeBehavior, data: ModuleData) {
+    if data.properties.has("PowerBonus") {
+        behavior.config.power_bonus = parse_float(data.properties.get("PowerBonus"))
+    }
+    if data.properties.has("MaxOverchargeTime") {
+        behavior.config.max_overcharge_time = parse_float(data.properties.get("MaxOverchargeTime"))
+    }
+    if data.properties.has("ExplosionChance") {
+        behavior.config.explosion_chance_base = parse_float(data.properties.get("ExplosionChance"))
+    }
+    if data.properties.has("DamageRadius") {
+        behavior.config.damage_radius = parse_float(data.properties.get("DamageRadius"))
+    }
+    if data.properties.has("DamageAmount") {
+        behavior.config.damage_amount = parse_float(data.properties.get("DamageAmount"))
+    }
+}
+
+/// Start overcharging
+fn start_overcharge(behavior: OverchargeBehavior) -> Bool {
+    if behavior.state != OverchargeState::Idle {
+        return false
+    }
+    if behavior.cooldown_remaining > 0.0 {
+        return false
+    }
+
+    behavior.state = OverchargeState::Overcharged
+    behavior.overcharge_time = 0.0
+    behavior.current_explosion_chance = behavior.config.explosion_chance_base
+    behavior.times_overcharged = behavior.times_overcharged + 1
+
+    return true
+}
+
+/// Stop overcharging
+fn stop_overcharge(behavior: OverchargeBehavior) -> Bool {
+    if behavior.state != OverchargeState::Overcharged {
+        return false
+    }
+
+    behavior.state = OverchargeState::Idle
+    behavior.cooldown_remaining = behavior.config.cooldown_time
+
+    return true
+}
+
+/// Check if can overcharge
+fn can_overcharge(behavior: OverchargeBehavior) -> Bool {
+    return behavior.state == OverchargeState::Idle && behavior.cooldown_remaining <= 0.0
+}
+
+/// Check if currently overcharged
+fn is_overcharged(behavior: OverchargeBehavior) -> Bool {
+    return behavior.state == OverchargeState::Overcharged
+}
+
+/// Get current power bonus multiplier
+fn get_power_multiplier(behavior: OverchargeBehavior) -> Float {
+    if behavior.state == OverchargeState::Overcharged {
+        return behavior.config.power_bonus
+    }
+    return 1.0
+}
+
+/// Update behavior (returns true if exploded)
+fn update_overcharge(behavior: OverchargeBehavior, delta: Float, random_value: Float) -> Bool {
+    // Update cooldown
+    if behavior.cooldown_remaining > 0.0 {
+        behavior.cooldown_remaining = behavior.cooldown_remaining - delta
+        if behavior.cooldown_remaining < 0.0 {
+            behavior.cooldown_remaining = 0.0
+        }
+    }
+
+    if behavior.state != OverchargeState::Overcharged {
+        return false
+    }
+
+    // Update overcharge time
+    behavior.overcharge_time = behavior.overcharge_time + delta
+    behavior.total_bonus_power = behavior.total_bonus_power + delta * (behavior.config.power_bonus - 1.0)
+
+    // Increase explosion chance
+    behavior.current_explosion_chance = behavior.config.explosion_chance_base +
+        behavior.config.explosion_chance_growth * behavior.overcharge_time
+
+    // Cap at 100%
+    if behavior.current_explosion_chance > 1.0 {
+        behavior.current_explosion_chance = 1.0
+    }
+
+    // Check for explosion (random check per frame)
+    let check_chance = behavior.current_explosion_chance * delta
+    if random_value < check_chance {
+        // KABOOM!
+        behavior.state = OverchargeState::Exploding
+        behavior.times_exploded = behavior.times_exploded + 1
+        return true
+    }
+
+    // Force explosion if over max time
+    if behavior.overcharge_time >= behavior.config.max_overcharge_time {
+        behavior.state = OverchargeState::Exploding
+        behavior.times_exploded = behavior.times_exploded + 1
+        return true
+    }
+
+    return false
+}
+
+/// Get explosion data
+fn get_explosion_data(behavior: OverchargeBehavior) -> (Float, Float, String) {
+    // Returns (radius, damage, fx)
+    return (
+        behavior.config.damage_radius,
+        behavior.config.damage_amount,
+        behavior.config.explosion_fx
+    )
+}
+
+/// Get time until forced explosion
+fn get_time_remaining(behavior: OverchargeBehavior) -> Float {
+    if behavior.state != OverchargeState::Overcharged {
+        return 0.0
+    }
+    let remaining = behavior.config.max_overcharge_time - behavior.overcharge_time
+    if remaining < 0.0 {
+        return 0.0
+    }
+    return remaining
+}
+
+/// Get current explosion chance
+fn get_explosion_chance(behavior: OverchargeBehavior) -> Float {
+    return behavior.current_explosion_chance
+}
+
+/// Get cooldown remaining
+fn get_cooldown(behavior: OverchargeBehavior) -> Float {
+    return behavior.cooldown_remaining
+}
+
+/// Mark as destroyed (after explosion)
+fn mark_destroyed(behavior: OverchargeBehavior) {
+    behavior.state = OverchargeState::Destroyed
+}
+
+/// Reset behavior
+fn reset_overcharge(behavior: OverchargeBehavior) {
+    behavior.state = OverchargeState::Idle
+    behavior.overcharge_time = 0.0
+    behavior.cooldown_remaining = 0.0
+    behavior.current_explosion_chance = 0.0
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_float(s: String) -> Float {
+    let int_part = 0
+    let frac_part = 0.0
+    let frac_divisor = 1.0
+    let in_frac = false
+
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c == 46 {
+            in_frac = true
+        } else if c >= 48 && c <= 57 {
+            if in_frac {
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + ((c - 48) as Float) / frac_divisor
+            } else {
+                int_part = int_part * 10 + (c - 48)
+            }
+        }
+    }
+
+    return (int_part as Float) + frac_part
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_overcharge_basic() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.power_bonus = 2.0
+
+    assert(can_overcharge(behavior) == true, "Should be able to overcharge")
+    assert(get_power_multiplier(behavior) == 1.0, "Should have 1x power")
+
+    start_overcharge(behavior)
+    assert(is_overcharged(behavior) == true, "Should be overcharged")
+    assert(get_power_multiplier(behavior) == 2.0, "Should have 2x power")
+
+    return true
+}
+
+fn test_overcharge_stop() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.cooldown_time = 10.0
+
+    start_overcharge(behavior)
+    stop_overcharge(behavior)
+
+    assert(is_overcharged(behavior) == false, "Should not be overcharged")
+    assert(get_cooldown(behavior) == 10.0, "Should have cooldown")
+    assert(can_overcharge(behavior) == false, "Should not be able to overcharge during cooldown")
+
+    // Wait for cooldown
+    update_overcharge(behavior, 10.0, 1.0)  // random=1.0 means no explosion
+    assert(can_overcharge(behavior) == true, "Should be able after cooldown")
+
+    return true
+}
+
+fn test_explosion_chance() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.explosion_chance_base = 0.01
+    behavior.config.explosion_chance_growth = 0.01
+
+    start_overcharge(behavior)
+
+    // No explosion with high random value
+    let exploded = update_overcharge(behavior, 1.0, 1.0)
+    assert(exploded == false, "Should not explode")
+    assert(behavior.current_explosion_chance > 0.01, "Chance should increase")
+
+    return true
+}
+
+fn test_forced_explosion() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.max_overcharge_time = 5.0
+
+    start_overcharge(behavior)
+
+    // Advance time to force explosion
+    let exploded = update_overcharge(behavior, 5.0, 1.0)
+    assert(exploded == true, "Should explode at max time")
+
+    return true
+}
+
+fn test_explosion_data() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.damage_radius = 150.0
+    behavior.config.damage_amount = 1000.0
+    behavior.config.explosion_fx = "TestFX"
+
+    let (radius, damage, fx) = get_explosion_data(behavior)
+    assert(radius == 150.0, "Radius should be 150")
+    assert(damage == 1000.0, "Damage should be 1000")
+    assert(fx == "TestFX", "FX should match")
+
+    return true
+}
+
+fn test_statistics() -> Bool {
+    let behavior = create_overcharge_behavior("PowerPlant")
+    behavior.config.max_overcharge_time = 1.0
+
+    start_overcharge(behavior)
+    assert(behavior.times_overcharged == 1, "Should count overcharge")
+
+    update_overcharge(behavior, 1.0, 1.0)  // Force explosion
+    assert(behavior.times_exploded == 1, "Should count explosion")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_overcharge_basic(), "Overcharge basic test failed")
+    assert(test_overcharge_stop(), "Overcharge stop test failed")
+    assert(test_explosion_chance(), "Explosion chance test failed")
+    assert(test_forced_explosion(), "Forced explosion test failed")
+    assert(test_explosion_data(), "Explosion data test failed")
+    assert(test_statistics(), "Statistics test failed")
+    return true
+}

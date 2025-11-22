@@ -1,0 +1,484 @@
+// Laser Update - Laser Weapon Rendering and Logic
+// Based on Thyme engine LaserUpdate
+// Handles laser beam drawing, damage over time, and visual effects
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Laser Configuration
+// ============================================================================
+
+enum LaserType {
+    Continuous,     // Constant beam (China laser)
+    Pulse,          // Pulsed beam
+    Charge,         // Charge-up then fire
+    Sweep,          // Sweeping beam
+}
+
+struct LaserConfig {
+    laser_type: LaserType,
+    damage_per_second: Float,
+    max_range: Float,
+    beam_width: Float,
+    warm_up_time: Float,
+    cool_down_time: Float,
+    scatter_target: Bool,       // Does damage scatter around target
+    scatter_radius: Float,
+    primary_color_r: Float,
+    primary_color_g: Float,
+    primary_color_b: Float,
+    secondary_color_r: Float,
+    secondary_color_g: Float,
+    secondary_color_b: Float,
+    inner_beam_width: Float,
+    outer_beam_width: Float,
+    pulse_frequency: Float,
+    fx_on_hit: String,
+}
+
+fn default_laser_config() -> LaserConfig {
+    return LaserConfig {
+        laser_type: LaserType::Continuous,
+        damage_per_second: 50.0,
+        max_range: 200.0,
+        beam_width: 2.0,
+        warm_up_time: 0.5,
+        cool_down_time: 0.5,
+        scatter_target: false,
+        scatter_radius: 10.0,
+        primary_color_r: 1.0,
+        primary_color_g: 0.0,
+        primary_color_b: 0.0,
+        secondary_color_r: 1.0,
+        secondary_color_g: 0.5,
+        secondary_color_b: 0.0,
+        inner_beam_width: 1.0,
+        outer_beam_width: 3.0,
+        pulse_frequency: 10.0,
+        fx_on_hit: "FX_LaserHit",
+    }
+}
+
+// ============================================================================
+// Laser State
+// ============================================================================
+
+enum LaserState {
+    Idle,
+    WarmingUp,
+    Firing,
+    CoolingDown,
+}
+
+struct LaserBeam {
+    start_x: Float,
+    start_y: Float,
+    start_z: Float,
+    end_x: Float,
+    end_y: Float,
+    end_z: Float,
+    intensity: Float,       // 0.0 to 1.0
+    pulse_phase: Float,
+}
+
+fn create_laser_beam() -> LaserBeam {
+    return LaserBeam {
+        start_x: 0.0,
+        start_y: 0.0,
+        start_z: 0.0,
+        end_x: 0.0,
+        end_y: 0.0,
+        end_z: 0.0,
+        intensity: 0.0,
+        pulse_phase: 0.0,
+    }
+}
+
+// ============================================================================
+// Laser Update Module
+// ============================================================================
+
+struct LaserUpdateModule {
+    base: UpdateModule,
+    config: LaserConfig,
+
+    // State
+    state: LaserState,
+    target_id: Int,
+    warm_up_progress: Float,
+    cool_down_progress: Float,
+    firing_time: Float,
+    total_damage_dealt: Float,
+
+    // Beam data
+    beam: LaserBeam,
+
+    // Position (from owner)
+    source_x: Float,
+    source_y: Float,
+    source_z: Float,
+}
+
+fn create_laser_update(tag: String) -> LaserUpdateModule {
+    return LaserUpdateModule {
+        base: create_update_module(tag, UpdateType::Weapon),
+        config: default_laser_config(),
+        state: LaserState::Idle,
+        target_id: 0,
+        warm_up_progress: 0.0,
+        cool_down_progress: 0.0,
+        firing_time: 0.0,
+        total_damage_dealt: 0.0,
+        beam: create_laser_beam(),
+        source_x: 0.0,
+        source_y: 0.0,
+        source_z: 0.0,
+    }
+}
+
+/// Set source position
+fn set_laser_source(laser: LaserUpdateModule, x: Float, y: Float, z: Float) {
+    laser.source_x = x
+    laser.source_y = y
+    laser.source_z = z
+    laser.beam.start_x = x
+    laser.beam.start_y = y
+    laser.beam.start_z = z
+}
+
+/// Set target position
+fn set_laser_target_pos(laser: LaserUpdateModule, x: Float, y: Float, z: Float) {
+    laser.beam.end_x = x
+    laser.beam.end_y = y
+    laser.beam.end_z = z
+}
+
+/// Start firing at target
+fn start_firing(laser: LaserUpdateModule, target_id: Int, target_x: Float, target_y: Float, target_z: Float) {
+    laser.target_id = target_id
+    set_laser_target_pos(laser, target_x, target_y, target_z)
+
+    if laser.state == LaserState::Idle {
+        laser.state = LaserState::WarmingUp
+        laser.warm_up_progress = 0.0
+    }
+}
+
+/// Stop firing
+fn stop_firing(laser: LaserUpdateModule) {
+    if laser.state == LaserState::Firing {
+        laser.state = LaserState::CoolingDown
+        laser.cool_down_progress = 0.0
+    } else if laser.state == LaserState::WarmingUp {
+        laser.state = LaserState::Idle
+        laser.warm_up_progress = 0.0
+    }
+    laser.target_id = 0
+}
+
+/// Check if firing
+fn is_laser_firing(laser: LaserUpdateModule) -> Bool {
+    return laser.state == LaserState::Firing
+}
+
+/// Check if can fire
+fn can_laser_fire(laser: LaserUpdateModule) -> Bool {
+    return laser.state == LaserState::Idle || laser.state == LaserState::Firing
+}
+
+/// Get beam intensity
+fn get_beam_intensity(laser: LaserUpdateModule) -> Float {
+    return laser.beam.intensity
+}
+
+/// Update laser
+fn update_laser(laser: LaserUpdateModule, delta: Float, target_x: Float, target_y: Float, target_z: Float) -> Float {
+    // Update target position
+    if laser.target_id > 0 {
+        set_laser_target_pos(laser, target_x, target_y, target_z)
+    }
+
+    let damage = 0.0
+
+    if laser.state == LaserState::Idle {
+        laser.beam.intensity = 0.0
+
+    } else if laser.state == LaserState::WarmingUp {
+        laser.warm_up_progress = laser.warm_up_progress + delta / laser.config.warm_up_time
+        laser.beam.intensity = laser.warm_up_progress
+
+        if laser.warm_up_progress >= 1.0 {
+            laser.state = LaserState::Firing
+            laser.warm_up_progress = 1.0
+            laser.beam.intensity = 1.0
+        }
+
+    } else if laser.state == LaserState::Firing {
+        laser.firing_time = laser.firing_time + delta
+        laser.beam.intensity = 1.0
+
+        // Calculate damage
+        damage = laser.config.damage_per_second * delta
+        laser.total_damage_dealt = laser.total_damage_dealt + damage
+
+        // Handle pulsing
+        if laser.config.laser_type == LaserType::Pulse {
+            laser.beam.pulse_phase = laser.beam.pulse_phase + delta * laser.config.pulse_frequency
+            if laser.beam.pulse_phase > 1.0 {
+                laser.beam.pulse_phase = laser.beam.pulse_phase - 1.0
+            }
+            // Pulse intensity
+            laser.beam.intensity = 0.5 + 0.5 * sin_approx(laser.beam.pulse_phase * 6.28318)
+            damage = damage * laser.beam.intensity
+        }
+
+    } else if laser.state == LaserState::CoolingDown {
+        laser.cool_down_progress = laser.cool_down_progress + delta / laser.config.cool_down_time
+        laser.beam.intensity = 1.0 - laser.cool_down_progress
+
+        if laser.cool_down_progress >= 1.0 {
+            laser.state = LaserState::Idle
+            laser.cool_down_progress = 0.0
+            laser.beam.intensity = 0.0
+        }
+    }
+
+    return damage
+}
+
+/// Get beam length
+fn get_beam_length(laser: LaserUpdateModule) -> Float {
+    let dx = laser.beam.end_x - laser.beam.start_x
+    let dy = laser.beam.end_y - laser.beam.start_y
+    let dz = laser.beam.end_z - laser.beam.start_z
+    return sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+/// Check if target in range
+fn is_target_in_range(laser: LaserUpdateModule, target_x: Float, target_y: Float, target_z: Float) -> Bool {
+    let dx = target_x - laser.source_x
+    let dy = target_y - laser.source_y
+    let dz = target_z - laser.source_z
+    let dist = sqrt(dx * dx + dy * dy + dz * dz)
+    return dist <= laser.config.max_range
+}
+
+/// Get scatter position (for scatter damage)
+fn get_scatter_position(laser: LaserUpdateModule, random_angle: Float, random_dist: Float) -> (Float, Float) {
+    if !laser.config.scatter_target {
+        return (laser.beam.end_x, laser.beam.end_y)
+    }
+
+    let dist = random_dist * laser.config.scatter_radius
+    let x = laser.beam.end_x + cos_approx(random_angle) * dist
+    let y = laser.beam.end_y + sin_approx(random_angle) * dist
+    return (x, y)
+}
+
+/// Get beam color (interpolated by intensity)
+fn get_beam_color(laser: LaserUpdateModule) -> (Float, Float, Float) {
+    let intensity = laser.beam.intensity
+    let r = laser.config.secondary_color_r + (laser.config.primary_color_r - laser.config.secondary_color_r) * intensity
+    let g = laser.config.secondary_color_g + (laser.config.primary_color_g - laser.config.secondary_color_g) * intensity
+    let b = laser.config.secondary_color_b + (laser.config.primary_color_b - laser.config.secondary_color_b) * intensity
+    return (r, g, b)
+}
+
+/// Get beam width for rendering
+fn get_render_beam_width(laser: LaserUpdateModule) -> (Float, Float) {
+    let intensity = laser.beam.intensity
+    let inner = laser.config.inner_beam_width * intensity
+    let outer = laser.config.outer_beam_width * intensity
+    return (inner, outer)
+}
+
+/// Reset laser
+fn reset_laser(laser: LaserUpdateModule) {
+    laser.state = LaserState::Idle
+    laser.target_id = 0
+    laser.warm_up_progress = 0.0
+    laser.cool_down_progress = 0.0
+    laser.firing_time = 0.0
+    laser.total_damage_dealt = 0.0
+    laser.beam.intensity = 0.0
+}
+
+// ============================================================================
+// Laser Manager
+// ============================================================================
+
+struct LaserManager {
+    lasers: Map<Int, LaserUpdateModule>,
+    active_lasers: Collection<Int>,
+    next_id: Int,
+}
+
+fn create_laser_manager() -> LaserManager {
+    return LaserManager {
+        lasers: Map<Int, LaserUpdateModule>{},
+        active_lasers: Collection<Int>{},
+        next_id: 1,
+    }
+}
+
+/// Register laser
+fn register_laser(mgr: LaserManager, laser: LaserUpdateModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    laser.base.module_id = id
+    mgr.lasers.set(id, laser)
+    return id
+}
+
+/// Get laser
+fn get_laser(mgr: LaserManager, id: Int) -> LaserUpdateModule {
+    if mgr.lasers.has(id) {
+        return mgr.lasers.get(id)
+    }
+    return create_laser_update("")
+}
+
+/// Update all lasers
+fn update_all_lasers(mgr: LaserManager, delta: Float) -> Collection<(Int, Int, Float)> {
+    // Returns (laser_id, target_id, damage) for each firing laser
+    let damage_events = Collection<(Int, Int, Float)>{}
+
+    mgr.active_lasers = Collection<Int>{}
+
+    for id in mgr.lasers.keys() {
+        let laser = mgr.lasers.get(id)
+        if laser.state != LaserState::Idle {
+            let damage = update_laser(laser, delta, laser.beam.end_x, laser.beam.end_y, laser.beam.end_z)
+            if damage > 0.0 && laser.target_id > 0 {
+                damage_events.add((id, laser.target_id, damage))
+            }
+            mgr.active_lasers.add(id)
+        }
+    }
+
+    return damage_events
+}
+
+/// Get active laser count
+fn get_active_laser_count(mgr: LaserManager) -> Int {
+    return mgr.active_lasers.len()
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+fn cos_approx(angle: Float) -> Float {
+    return sin_approx(angle + 1.5708)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_laser_basic() -> Bool {
+    let laser = create_laser_update("TestLaser")
+    laser.config.damage_per_second = 100.0
+    laser.config.warm_up_time = 0.5
+    laser.config.max_range = 200.0
+
+    set_laser_source(laser, 0.0, 0.0, 10.0)
+    assert(laser.state == LaserState::Idle, "Should be idle")
+
+    start_firing(laser, 100, 50.0, 50.0, 10.0)
+    assert(laser.state == LaserState::WarmingUp, "Should be warming up")
+    assert(laser.target_id == 100, "Target should be set")
+
+    return true
+}
+
+fn test_laser_warmup() -> Bool {
+    let laser = create_laser_update("WarmupTest")
+    laser.config.warm_up_time = 1.0
+
+    start_firing(laser, 1, 100.0, 0.0, 0.0)
+
+    // Halfway through warmup
+    update_laser(laser, 0.5, 100.0, 0.0, 0.0)
+    assert(laser.state == LaserState::WarmingUp, "Should still be warming up")
+    assert(laser.beam.intensity > 0.4 && laser.beam.intensity < 0.6, "Intensity should be ~0.5")
+
+    // Complete warmup
+    update_laser(laser, 0.5, 100.0, 0.0, 0.0)
+    assert(laser.state == LaserState::Firing, "Should be firing")
+    assert(laser.beam.intensity == 1.0, "Intensity should be 1.0")
+
+    return true
+}
+
+fn test_laser_damage() -> Bool {
+    let laser = create_laser_update("DamageTest")
+    laser.config.damage_per_second = 100.0
+    laser.config.warm_up_time = 0.0  // Instant fire
+
+    start_firing(laser, 1, 100.0, 0.0, 0.0)
+    update_laser(laser, 0.0, 100.0, 0.0, 0.0)  // Start firing
+
+    let damage = update_laser(laser, 1.0, 100.0, 0.0, 0.0)
+    assert(damage == 100.0, "Should deal 100 damage in 1 second")
+
+    return true
+}
+
+fn test_laser_range() -> Bool {
+    let laser = create_laser_update("RangeTest")
+    laser.config.max_range = 100.0
+    set_laser_source(laser, 0.0, 0.0, 0.0)
+
+    assert(is_target_in_range(laser, 50.0, 0.0, 0.0) == true, "Should be in range")
+    assert(is_target_in_range(laser, 150.0, 0.0, 0.0) == false, "Should be out of range")
+
+    return true
+}
+
+fn test_laser_cooldown() -> Bool {
+    let laser = create_laser_update("CooldownTest")
+    laser.config.warm_up_time = 0.0
+    laser.config.cool_down_time = 1.0
+
+    start_firing(laser, 1, 100.0, 0.0, 0.0)
+    update_laser(laser, 0.0, 100.0, 0.0, 0.0)  // Start firing
+
+    stop_firing(laser)
+    assert(laser.state == LaserState::CoolingDown, "Should be cooling down")
+
+    update_laser(laser, 0.5, 100.0, 0.0, 0.0)
+    assert(laser.beam.intensity > 0.4 && laser.beam.intensity < 0.6, "Intensity should be ~0.5")
+
+    update_laser(laser, 0.5, 100.0, 0.0, 0.0)
+    assert(laser.state == LaserState::Idle, "Should be idle")
+    assert(laser.beam.intensity == 0.0, "Intensity should be 0")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_laser_basic(), "Laser basic test failed")
+    assert(test_laser_warmup(), "Laser warmup test failed")
+    assert(test_laser_damage(), "Laser damage test failed")
+    assert(test_laser_range(), "Laser range test failed")
+    assert(test_laser_cooldown(), "Laser cooldown test failed")
+    return true
+}

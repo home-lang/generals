@@ -1,0 +1,705 @@
+// Network Manager - Core Network Session Management
+// Based on Thyme engine network architecture
+// Handles multiplayer game sessions, connections, and synchronization
+
+from basics import Collection, Map
+
+// ============================================================================
+// Network Constants
+// ============================================================================
+
+const NET_PROTOCOL_VERSION: Int = 1
+const NET_MAX_PLAYERS: Int = 8
+const NET_MAX_PACKET_SIZE: Int = 1400
+const NET_TIMEOUT_MS: Int = 30000
+const NET_KEEPALIVE_MS: Int = 5000
+const NET_SYNC_FRAMES: Int = 10
+
+// ============================================================================
+// Network Types
+// ============================================================================
+
+enum NetworkState {
+    Disconnected,
+    Connecting,
+    Connected,
+    InLobby,
+    Loading,
+    InGame,
+    Disconnecting,
+}
+
+enum NetworkRole {
+    None,
+    Host,
+    Client,
+    Observer,
+}
+
+enum PacketType {
+    // Connection
+    Connect,
+    ConnectAck,
+    Disconnect,
+    Keepalive,
+
+    // Lobby
+    LobbyState,
+    PlayerJoin,
+    PlayerLeave,
+    PlayerReady,
+    ChatMessage,
+    MapChange,
+    SettingsChange,
+
+    // Game
+    GameStart,
+    GameCommand,
+    GameSync,
+    GamePause,
+    GameResume,
+    GameEnd,
+
+    // Sync
+    SyncRequest,
+    SyncState,
+    SyncChecksum,
+}
+
+// ============================================================================
+// Network Packet
+// ============================================================================
+
+struct NetworkPacket {
+    packet_type: PacketType,
+    sender_id: Int,
+    sequence: Int,
+    timestamp: Int,
+    data: Collection<Int>,  // Raw byte data
+    reliable: Bool,
+    acknowledged: Bool,
+}
+
+fn create_packet(ptype: PacketType, sender: Int) -> NetworkPacket {
+    return NetworkPacket {
+        packet_type: ptype,
+        sender_id: sender,
+        sequence: 0,
+        timestamp: 0,
+        data: Collection<Int>{},
+        reliable: false,
+        acknowledged: false,
+    }
+}
+
+/// Set packet as reliable (needs ACK)
+fn set_reliable(packet: NetworkPacket) {
+    packet.reliable = true
+}
+
+/// Add int to packet data
+fn write_int(packet: NetworkPacket, value: Int) {
+    // Write as 4 bytes (big endian)
+    packet.data.add((value >> 24) & 0xFF)
+    packet.data.add((value >> 16) & 0xFF)
+    packet.data.add((value >> 8) & 0xFF)
+    packet.data.add(value & 0xFF)
+}
+
+/// Add string to packet data
+fn write_string(packet: NetworkPacket, value: String) {
+    write_int(packet, value.len())
+    for i in 0..value.len() {
+        packet.data.add(value.char_at(i))
+    }
+}
+
+/// Read int from packet data
+fn read_int(packet: NetworkPacket, offset: Int) -> Int {
+    if offset + 4 > packet.data.len() {
+        return 0
+    }
+    let b0 = packet.data.get(offset)
+    let b1 = packet.data.get(offset + 1)
+    let b2 = packet.data.get(offset + 2)
+    let b3 = packet.data.get(offset + 3)
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+/// Read string from packet data
+fn read_string(packet: NetworkPacket, offset: Int) -> (String, Int) {
+    let len = read_int(packet, offset)
+    let str = ""
+    for i in 0..len {
+        str = str + String::char_from_code(packet.data.get(offset + 4 + i))
+    }
+    return (str, offset + 4 + len)
+}
+
+// ============================================================================
+// Network Player
+// ============================================================================
+
+struct NetworkPlayer {
+    id: Int,
+    name: String,
+    ip_address: String,
+    port: Int,
+    ping: Int,
+    is_ready: Bool,
+    is_host: Bool,
+    team: Int,
+    faction: String,
+    color: Int,
+    last_packet_time: Int,
+    packets_sent: Int,
+    packets_received: Int,
+}
+
+fn create_network_player(id: Int, name: String) -> NetworkPlayer {
+    return NetworkPlayer {
+        id: id,
+        name: name,
+        ip_address: "",
+        port: 0,
+        ping: 0,
+        is_ready: false,
+        is_host: false,
+        team: 0,
+        faction: "",
+        color: id,
+        last_packet_time: 0,
+        packets_sent: 0,
+        packets_received: 0,
+    }
+}
+
+/// Set player address
+fn set_player_address(player: NetworkPlayer, ip: String, port: Int) {
+    player.ip_address = ip
+    player.port = port
+}
+
+/// Update player ping
+fn update_ping(player: NetworkPlayer, rtt_ms: Int) {
+    // Smooth ping average
+    player.ping = (player.ping * 7 + rtt_ms) / 8
+}
+
+// ============================================================================
+// Game Settings
+// ============================================================================
+
+struct GameSettings {
+    map_name: String,
+    game_speed: Int,
+    starting_cash: Int,
+    max_players: Int,
+    allow_observers: Bool,
+    superweapons: Bool,
+    fog_of_war: Bool,
+    shroud: Bool,
+    crates: Bool,
+    generals_exp: Bool,
+}
+
+fn default_game_settings() -> GameSettings {
+    return GameSettings {
+        map_name: "",
+        game_speed: 30,
+        starting_cash: 10000,
+        max_players: 8,
+        allow_observers: true,
+        superweapons: true,
+        fog_of_war: true,
+        shroud: true,
+        crates: false,
+        generals_exp: true,
+    }
+}
+
+// ============================================================================
+// Network Manager
+// ============================================================================
+
+struct NetworkManager {
+    // State
+    state: NetworkState,
+    role: NetworkRole,
+    local_player_id: Int,
+
+    // Players
+    players: Map<Int, NetworkPlayer>,
+    player_order: Collection<Int>,
+
+    // Session
+    session_id: Int,
+    game_settings: GameSettings,
+
+    // Network stats
+    bytes_sent: Int,
+    bytes_received: Int,
+    packets_lost: Int,
+
+    // Sequence numbers
+    next_sequence: Int,
+    last_ack_sequence: Int,
+
+    // Queues
+    outgoing_packets: Collection<NetworkPacket>,
+    incoming_packets: Collection<NetworkPacket>,
+    pending_reliable: Collection<NetworkPacket>,
+
+    // Timing
+    current_time: Int,
+    last_keepalive: Int,
+
+    // Game sync
+    sync_frame: Int,
+    local_checksum: Int,
+}
+
+/// Create network manager
+fn create_network_manager() -> NetworkManager {
+    return NetworkManager {
+        state: NetworkState::Disconnected,
+        role: NetworkRole::None,
+        local_player_id: 0,
+        players: Map<Int, NetworkPlayer>{},
+        player_order: Collection<Int>{},
+        session_id: 0,
+        game_settings: default_game_settings(),
+        bytes_sent: 0,
+        bytes_received: 0,
+        packets_lost: 0,
+        next_sequence: 1,
+        last_ack_sequence: 0,
+        outgoing_packets: Collection<NetworkPacket>{},
+        incoming_packets: Collection<NetworkPacket>{},
+        pending_reliable: Collection<NetworkPacket>{},
+        current_time: 0,
+        last_keepalive: 0,
+        sync_frame: 0,
+        local_checksum: 0,
+    }
+}
+
+/// Initialize as host
+fn init_as_host(mgr: NetworkManager, player_name: String, session_id: Int) -> Bool {
+    if mgr.state != NetworkState::Disconnected {
+        return false
+    }
+
+    mgr.role = NetworkRole::Host
+    mgr.session_id = session_id
+    mgr.local_player_id = 1
+    mgr.state = NetworkState::InLobby
+
+    // Add local player
+    let player = create_network_player(1, player_name)
+    player.is_host = true
+    player.is_ready = true
+    mgr.players.set(1, player)
+    mgr.player_order.add(1)
+
+    return true
+}
+
+/// Initialize as client
+fn init_as_client(mgr: NetworkManager, player_name: String) -> Bool {
+    if mgr.state != NetworkState::Disconnected {
+        return false
+    }
+
+    mgr.role = NetworkRole::Client
+    mgr.state = NetworkState::Connecting
+    mgr.local_player_id = 0  // Assigned by host
+
+    return true
+}
+
+/// Connect to host
+fn connect_to_host(mgr: NetworkManager, host_ip: String, host_port: Int) {
+    let packet = create_packet(PacketType::Connect, mgr.local_player_id)
+    set_reliable(packet)
+    write_int(packet, NET_PROTOCOL_VERSION)
+    queue_packet(mgr, packet, host_ip, host_port)
+}
+
+/// Queue outgoing packet
+fn queue_packet(mgr: NetworkManager, packet: NetworkPacket, ip: String, port: Int) {
+    packet.sequence = mgr.next_sequence
+    mgr.next_sequence = mgr.next_sequence + 1
+    packet.timestamp = mgr.current_time
+
+    mgr.outgoing_packets.add(packet)
+
+    if packet.reliable {
+        mgr.pending_reliable.add(packet)
+    }
+}
+
+/// Broadcast packet to all players
+fn broadcast_packet(mgr: NetworkManager, packet: NetworkPacket) {
+    for id in mgr.player_order {
+        if id != mgr.local_player_id {
+            let player = mgr.players.get(id)
+            queue_packet(mgr, packet, player.ip_address, player.port)
+        }
+    }
+}
+
+/// Handle incoming packet
+fn handle_packet(mgr: NetworkManager, packet: NetworkPacket) {
+    mgr.bytes_received = mgr.bytes_received + packet.data.len()
+
+    if packet.packet_type == PacketType::Connect {
+        handle_connect(mgr, packet)
+    } else if packet.packet_type == PacketType::ConnectAck {
+        handle_connect_ack(mgr, packet)
+    } else if packet.packet_type == PacketType::Disconnect {
+        handle_disconnect(mgr, packet)
+    } else if packet.packet_type == PacketType::Keepalive {
+        handle_keepalive(mgr, packet)
+    } else if packet.packet_type == PacketType::PlayerJoin {
+        handle_player_join(mgr, packet)
+    } else if packet.packet_type == PacketType::PlayerLeave {
+        handle_player_leave(mgr, packet)
+    } else if packet.packet_type == PacketType::PlayerReady {
+        handle_player_ready(mgr, packet)
+    } else if packet.packet_type == PacketType::GameStart {
+        handle_game_start(mgr, packet)
+    } else if packet.packet_type == PacketType::GameCommand {
+        handle_game_command(mgr, packet)
+    } else if packet.packet_type == PacketType::GameSync {
+        handle_game_sync(mgr, packet)
+    }
+}
+
+/// Handle connect request (host only)
+fn handle_connect(mgr: NetworkManager, packet: NetworkPacket) {
+    if mgr.role != NetworkRole::Host {
+        return
+    }
+
+    let protocol = read_int(packet, 0)
+    if protocol != NET_PROTOCOL_VERSION {
+        // Version mismatch - reject
+        return
+    }
+
+    // Assign new player ID
+    let new_id = mgr.player_order.len() + 1
+    if new_id > NET_MAX_PLAYERS {
+        // Server full
+        return
+    }
+
+    // Create player (name would come from packet)
+    let player = create_network_player(new_id, "Player" + int_to_string(new_id))
+    mgr.players.set(new_id, player)
+    mgr.player_order.add(new_id)
+
+    // Send ack with assigned ID
+    let ack = create_packet(PacketType::ConnectAck, mgr.local_player_id)
+    set_reliable(ack)
+    write_int(ack, new_id)
+    // Would send to specific player
+}
+
+/// Handle connect acknowledgment (client)
+fn handle_connect_ack(mgr: NetworkManager, packet: NetworkPacket) {
+    if mgr.role != NetworkRole::Client {
+        return
+    }
+
+    let assigned_id = read_int(packet, 0)
+    mgr.local_player_id = assigned_id
+    mgr.state = NetworkState::InLobby
+}
+
+/// Handle disconnect
+fn handle_disconnect(mgr: NetworkManager, packet: NetworkPacket) {
+    let player_id = packet.sender_id
+    if mgr.players.has(player_id) {
+        // Remove player
+        // Would need proper collection remove
+    }
+}
+
+/// Handle keepalive
+fn handle_keepalive(mgr: NetworkManager, packet: NetworkPacket) {
+    if mgr.players.has(packet.sender_id) {
+        let player = mgr.players.get(packet.sender_id)
+        player.last_packet_time = mgr.current_time
+    }
+}
+
+/// Handle player join notification
+fn handle_player_join(mgr: NetworkManager, packet: NetworkPacket) {
+    let player_id = read_int(packet, 0)
+    let (name, _) = read_string(packet, 4)
+
+    if !mgr.players.has(player_id) {
+        let player = create_network_player(player_id, name)
+        mgr.players.set(player_id, player)
+        mgr.player_order.add(player_id)
+    }
+}
+
+/// Handle player leave notification
+fn handle_player_leave(mgr: NetworkManager, packet: NetworkPacket) {
+    let player_id = read_int(packet, 0)
+    // Would remove from players map
+}
+
+/// Handle player ready status
+fn handle_player_ready(mgr: NetworkManager, packet: NetworkPacket) {
+    let player_id = read_int(packet, 0)
+    let ready = read_int(packet, 4) != 0
+
+    if mgr.players.has(player_id) {
+        let player = mgr.players.get(player_id)
+        player.is_ready = ready
+    }
+}
+
+/// Handle game start
+fn handle_game_start(mgr: NetworkManager, packet: NetworkPacket) {
+    mgr.state = NetworkState::Loading
+    // Game would begin loading
+}
+
+/// Handle game command
+fn handle_game_command(mgr: NetworkManager, packet: NetworkPacket) {
+    // Commands are processed by game engine
+    mgr.incoming_packets.add(packet)
+}
+
+/// Handle game sync
+fn handle_game_sync(mgr: NetworkManager, packet: NetworkPacket) {
+    let frame = read_int(packet, 0)
+    let checksum = read_int(packet, 4)
+
+    // Verify sync
+    if frame == mgr.sync_frame && checksum != mgr.local_checksum {
+        // DESYNC DETECTED!
+        // Would trigger resync or disconnect
+    }
+}
+
+/// Update network manager
+fn update_network(mgr: NetworkManager, delta_ms: Int) {
+    mgr.current_time = mgr.current_time + delta_ms
+
+    // Send keepalives
+    if mgr.current_time - mgr.last_keepalive > NET_KEEPALIVE_MS {
+        if mgr.state == NetworkState::InLobby || mgr.state == NetworkState::InGame {
+            let keepalive = create_packet(PacketType::Keepalive, mgr.local_player_id)
+            broadcast_packet(mgr, keepalive)
+            mgr.last_keepalive = mgr.current_time
+        }
+    }
+
+    // Check for timeouts
+    for id in mgr.player_order {
+        if id != mgr.local_player_id {
+            let player = mgr.players.get(id)
+            if mgr.current_time - player.last_packet_time > NET_TIMEOUT_MS {
+                // Player timed out
+                // Would trigger disconnect
+            }
+        }
+    }
+
+    // Resend unacknowledged reliable packets
+    for packet in mgr.pending_reliable {
+        if !packet.acknowledged {
+            if mgr.current_time - packet.timestamp > 500 {
+                // Resend
+                packet.timestamp = mgr.current_time
+                // Would resend packet
+            }
+        }
+    }
+}
+
+/// Set player ready status
+fn set_ready(mgr: NetworkManager, ready: Bool) {
+    if mgr.players.has(mgr.local_player_id) {
+        let player = mgr.players.get(mgr.local_player_id)
+        player.is_ready = ready
+
+        // Broadcast ready status
+        let packet = create_packet(PacketType::PlayerReady, mgr.local_player_id)
+        set_reliable(packet)
+        write_int(packet, mgr.local_player_id)
+        write_int(packet, if ready { 1 } else { 0 })
+        broadcast_packet(mgr, packet)
+    }
+}
+
+/// Check if all players ready (host only)
+fn all_players_ready(mgr: NetworkManager) -> Bool {
+    for id in mgr.player_order {
+        let player = mgr.players.get(id)
+        if !player.is_ready {
+            return false
+        }
+    }
+    return true
+}
+
+/// Start game (host only)
+fn start_game(mgr: NetworkManager) -> Bool {
+    if mgr.role != NetworkRole::Host {
+        return false
+    }
+    if !all_players_ready(mgr) {
+        return false
+    }
+
+    let packet = create_packet(PacketType::GameStart, mgr.local_player_id)
+    set_reliable(packet)
+    write_int(packet, mgr.session_id)
+    broadcast_packet(mgr, packet)
+
+    mgr.state = NetworkState::Loading
+    return true
+}
+
+/// Send game command
+fn send_game_command(mgr: NetworkManager, command_type: Int, target_id: Int, x: Float, y: Float) {
+    let packet = create_packet(PacketType::GameCommand, mgr.local_player_id)
+    set_reliable(packet)
+    write_int(packet, mgr.sync_frame)
+    write_int(packet, command_type)
+    write_int(packet, target_id)
+    write_int(packet, (x * 100.0) as Int)  // Fixed point
+    write_int(packet, (y * 100.0) as Int)
+    broadcast_packet(mgr, packet)
+}
+
+/// Set sync state
+fn set_sync_state(mgr: NetworkManager, frame: Int, checksum: Int) {
+    mgr.sync_frame = frame
+    mgr.local_checksum = checksum
+
+    // Broadcast sync
+    if frame % NET_SYNC_FRAMES == 0 {
+        let packet = create_packet(PacketType::GameSync, mgr.local_player_id)
+        write_int(packet, frame)
+        write_int(packet, checksum)
+        broadcast_packet(mgr, packet)
+    }
+}
+
+/// Get player count
+fn get_player_count(mgr: NetworkManager) -> Int {
+    return mgr.player_order.len()
+}
+
+/// Get player by ID
+fn get_player(mgr: NetworkManager, id: Int) -> NetworkPlayer {
+    if mgr.players.has(id) {
+        return mgr.players.get(id)
+    }
+    return create_network_player(0, "")
+}
+
+/// Disconnect
+fn disconnect(mgr: NetworkManager) {
+    if mgr.state == NetworkState::Disconnected {
+        return
+    }
+
+    let packet = create_packet(PacketType::Disconnect, mgr.local_player_id)
+    set_reliable(packet)
+    broadcast_packet(mgr, packet)
+
+    mgr.state = NetworkState::Disconnecting
+}
+
+/// Reset manager
+fn reset_network(mgr: NetworkManager) {
+    mgr.state = NetworkState::Disconnected
+    mgr.role = NetworkRole::None
+    mgr.players = Map<Int, NetworkPlayer>{}
+    mgr.player_order = Collection<Int>{}
+    mgr.outgoing_packets = Collection<NetworkPacket>{}
+    mgr.incoming_packets = Collection<NetworkPacket>{}
+    mgr.pending_reliable = Collection<NetworkPacket>{}
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn int_to_string(n: Int) -> String {
+    if n == 0 { return "0" }
+    let result = ""
+    let num = n
+    while num > 0 {
+        result = String::char_from_code(48 + (num % 10)) + result
+        num = num / 10
+    }
+    return result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_host_init() -> Bool {
+    let mgr = create_network_manager()
+    init_as_host(mgr, "HostPlayer", 12345)
+
+    assert(mgr.role == NetworkRole::Host, "Should be host")
+    assert(mgr.state == NetworkState::InLobby, "Should be in lobby")
+    assert(mgr.local_player_id == 1, "Host should be player 1")
+    assert(get_player_count(mgr) == 1, "Should have 1 player")
+
+    return true
+}
+
+fn test_packet_write() -> Bool {
+    let packet = create_packet(PacketType::GameCommand, 1)
+    write_int(packet, 12345)
+    write_string(packet, "test")
+
+    assert(packet.data.len() == 12, "Should have 12 bytes (4+4+4)")
+
+    let val = read_int(packet, 0)
+    assert(val == 12345, "Should read 12345")
+
+    let (str, _) = read_string(packet, 4)
+    assert(str == "test", "Should read 'test'")
+
+    return true
+}
+
+fn test_player_ready() -> Bool {
+    let mgr = create_network_manager()
+    init_as_host(mgr, "Host", 1)
+
+    assert(all_players_ready(mgr) == true, "Host should be ready")
+
+    // Add another player
+    let p2 = create_network_player(2, "Player2")
+    mgr.players.set(2, p2)
+    mgr.player_order.add(2)
+
+    assert(all_players_ready(mgr) == false, "P2 not ready")
+
+    p2.is_ready = true
+    assert(all_players_ready(mgr) == true, "All ready now")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_host_init(), "Host init test failed")
+    assert(test_packet_write(), "Packet write test failed")
+    assert(test_player_ready(), "Player ready test failed")
+    return true
+}

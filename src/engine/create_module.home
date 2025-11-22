@@ -1,0 +1,585 @@
+// Create Module - Object Creation and Initialization
+// Based on Thyme engine create module architecture
+// Handles object spawning, initial state, and creation effects
+
+from basics import Collection, Map
+from behavior_module import ModuleData, create_module_data, get_property, get_property_int, get_property_float, get_property_bool
+
+// ============================================================================
+// Create Types
+// ============================================================================
+
+enum CreateType {
+    Default,        // Standard creation
+    VeterancyGain,  // Created with veterancy
+    SpawnFromDeath, // Spawned when another dies
+    Production,     // Built by building
+    Paradrop,       // Paradroped from aircraft
+    Reinforcement,  // Called in reinforcements
+    Upgrade,        // Created through upgrade
+}
+
+// Creation flags
+const CREATE_FLAG_NONE: Int = 0
+const CREATE_FLAG_INHERIT_VETERANCY: Int = 1
+const CREATE_FLAG_START_HIDDEN: Int = 2
+const CREATE_FLAG_START_POWERED_DOWN: Int = 4
+const CREATE_FLAG_NO_ANNOUNCE: Int = 8
+const CREATE_FLAG_PLACE_AT_RALLY: Int = 16
+
+// ============================================================================
+// Creation Data
+// ============================================================================
+
+struct CreationData {
+    object_type: String,
+    spawn_position_x: Float,
+    spawn_position_y: Float,
+    spawn_position_z: Float,
+    spawn_angle: Float,
+    team_id: Int,
+    player_id: Int,
+    initial_health: Float,
+    initial_veterancy: Int,
+    flags: Int,
+    source_id: Int,
+    creation_type: CreateType,
+}
+
+fn create_creation_data(object_type: String) -> CreationData {
+    return CreationData {
+        object_type: object_type,
+        spawn_position_x: 0.0,
+        spawn_position_y: 0.0,
+        spawn_position_z: 0.0,
+        spawn_angle: 0.0,
+        team_id: 0,
+        player_id: 0,
+        initial_health: 100.0,
+        initial_veterancy: 0,
+        flags: CREATE_FLAG_NONE,
+        source_id: 0,
+        creation_type: CreateType::Default,
+    }
+}
+
+/// Set spawn position
+fn set_spawn_position(data: CreationData, x: Float, y: Float, z: Float) {
+    data.spawn_position_x = x
+    data.spawn_position_y = y
+    data.spawn_position_z = z
+}
+
+/// Set spawn angle
+fn set_spawn_angle(data: CreationData, angle: Float) {
+    data.spawn_angle = angle
+}
+
+/// Set ownership
+fn set_ownership(data: CreationData, player_id: Int, team_id: Int) {
+    data.player_id = player_id
+    data.team_id = team_id
+}
+
+// ============================================================================
+// Base Create Module
+// ============================================================================
+
+struct CreateModule {
+    // Identity
+    module_id: Int,
+    tag: String,
+    create_type: CreateType,
+
+    // Owner
+    owner_id: Int,
+
+    // Configuration
+    data: ModuleData,
+
+    // Initial state
+    initial_health_percent: Float,
+    initial_veterancy_level: Int,
+    start_animation: String,
+    construction_complete_sound: String,
+
+    // Spawn behavior
+    spawn_offset_x: Float,
+    spawn_offset_y: Float,
+    spawn_offset_z: Float,
+    random_offset_radius: Float,
+    face_towards_target: Bool,
+
+    // OCL (Object Creation List)
+    creation_list: Collection<String>,
+}
+
+/// Create base create module
+fn create_create_module(tag: String, create_type: CreateType) -> CreateModule {
+    return CreateModule {
+        module_id: 0,
+        tag: tag,
+        create_type: create_type,
+        owner_id: 0,
+        data: create_module_data("", tag),
+        initial_health_percent: 100.0,
+        initial_veterancy_level: 0,
+        start_animation: "",
+        construction_complete_sound: "",
+        spawn_offset_x: 0.0,
+        spawn_offset_y: 0.0,
+        spawn_offset_z: 0.0,
+        random_offset_radius: 0.0,
+        face_towards_target: false,
+        creation_list: Collection<String>{},
+    }
+}
+
+/// Initialize from data
+fn init_create_module(module: CreateModule, data: ModuleData) {
+    module.data = data
+    module.tag = data.tag
+
+    if data.properties.has("InitialHealth") {
+        module.initial_health_percent = get_property_float(data, "InitialHealth")
+    }
+    if data.properties.has("StartVeterancy") {
+        module.initial_veterancy_level = get_property_int(data, "StartVeterancy")
+    }
+    if data.properties.has("StartAnimation") {
+        module.start_animation = get_property(data, "StartAnimation")
+    }
+    if data.properties.has("SpawnOffsetX") {
+        module.spawn_offset_x = get_property_float(data, "SpawnOffsetX")
+    }
+    if data.properties.has("SpawnOffsetY") {
+        module.spawn_offset_y = get_property_float(data, "SpawnOffsetY")
+    }
+    if data.properties.has("SpawnOffsetZ") {
+        module.spawn_offset_z = get_property_float(data, "SpawnOffsetZ")
+    }
+    if data.properties.has("RandomOffsetRadius") {
+        module.random_offset_radius = get_property_float(data, "RandomOffsetRadius")
+    }
+    if data.properties.has("FaceTowardsTarget") {
+        module.face_towards_target = get_property_bool(data, "FaceTowardsTarget")
+    }
+}
+
+/// Calculate spawn position with offsets
+fn calculate_spawn_position(module: CreateModule, base_x: Float, base_y: Float, base_z: Float, angle: Float, random_seed: Int) -> (Float, Float, Float) {
+    let x = base_x + module.spawn_offset_x
+    let y = base_y + module.spawn_offset_y
+    let z = base_z + module.spawn_offset_z
+
+    // Apply random offset
+    if module.random_offset_radius > 0.0 {
+        let rand_angle = ((random_seed % 360) as Float) * 0.0174533  // deg to rad
+        let rand_dist = ((random_seed % 100) as Float) / 100.0 * module.random_offset_radius
+        x = x + cos_approx(rand_angle) * rand_dist
+        y = y + sin_approx(rand_angle) * rand_dist
+    }
+
+    return (x, y, z)
+}
+
+// ============================================================================
+// Specialized Create Modules
+// ============================================================================
+
+// Veterancy Gain Create
+struct VeterancyGainCreateModule {
+    base: CreateModule,
+    veterancy_level: Int,
+    science_points: Int,
+    inherit_from_producer: Bool,
+}
+
+fn create_veterancy_gain_create(tag: String) -> VeterancyGainCreateModule {
+    let module = VeterancyGainCreateModule {
+        base: create_create_module(tag, CreateType::VeterancyGain),
+        veterancy_level: 0,
+        science_points: 0,
+        inherit_from_producer: false,
+    }
+    return module
+}
+
+/// Get initial veterancy
+fn get_initial_veterancy(module: VeterancyGainCreateModule, producer_vet: Int) -> Int {
+    if module.inherit_from_producer {
+        return producer_vet
+    }
+    return module.veterancy_level
+}
+
+// Spawn From Death Create
+struct SpawnFromDeathCreateModule {
+    base: CreateModule,
+    spawn_count: Int,
+    spawn_type: String,
+    spawn_radius: Float,
+    inherit_team: Bool,
+}
+
+fn create_spawn_from_death(tag: String) -> SpawnFromDeathCreateModule {
+    return SpawnFromDeathCreateModule {
+        base: create_create_module(tag, CreateType::SpawnFromDeath),
+        spawn_count: 1,
+        spawn_type: "",
+        spawn_radius: 10.0,
+        inherit_team: true,
+    }
+}
+
+/// Generate spawn positions
+fn generate_spawn_positions(module: SpawnFromDeathCreateModule, center_x: Float, center_y: Float, center_z: Float) -> Collection<(Float, Float, Float)> {
+    let positions = Collection<(Float, Float, Float)>{}
+
+    for i in 0..module.spawn_count {
+        let angle = ((i as Float) / (module.spawn_count as Float)) * 6.28318
+        let x = center_x + cos_approx(angle) * module.spawn_radius
+        let y = center_y + sin_approx(angle) * module.spawn_radius
+        positions.add((x, y, center_z))
+    }
+
+    return positions
+}
+
+// Production Create (for buildings)
+struct ProductionCreateModule {
+    base: CreateModule,
+    exit_bone: String,
+    rally_point_x: Float,
+    rally_point_y: Float,
+    natural_rally_x: Float,
+    natural_rally_y: Float,
+    production_queue_max: Int,
+}
+
+fn create_production_create(tag: String) -> ProductionCreateModule {
+    return ProductionCreateModule {
+        base: create_create_module(tag, CreateType::Production),
+        exit_bone: "YOURBONE01",
+        rally_point_x: 0.0,
+        rally_point_y: 0.0,
+        natural_rally_x: 0.0,
+        natural_rally_y: 50.0,
+        production_queue_max: 10,
+    }
+}
+
+/// Set rally point
+fn set_rally_point(module: ProductionCreateModule, x: Float, y: Float) {
+    module.rally_point_x = x
+    module.rally_point_y = y
+}
+
+/// Get exit position
+fn get_exit_position(module: ProductionCreateModule, building_x: Float, building_y: Float, building_z: Float) -> (Float, Float, Float) {
+    // Would use bone position, fallback to offset
+    return (building_x + module.natural_rally_x, building_y + module.natural_rally_y, building_z)
+}
+
+// Paradrop Create
+struct ParadropCreateModule {
+    base: CreateModule,
+    drop_altitude: Float,
+    parachute_open_height: Float,
+    drop_velocity: Float,
+    land_animation: String,
+}
+
+fn create_paradrop_create(tag: String) -> ParadropCreateModule {
+    return ParadropCreateModule {
+        base: create_create_module(tag, CreateType::Paradrop),
+        drop_altitude: 200.0,
+        parachute_open_height: 150.0,
+        drop_velocity: -20.0,
+        land_animation: "PARACHUTE_LAND",
+    }
+}
+
+/// Calculate drop start position
+fn get_drop_start(module: ParadropCreateModule, x: Float, y: Float) -> (Float, Float, Float) {
+    return (x, y, module.drop_altitude)
+}
+
+// Upgrade Create (object transformation)
+struct UpgradeCreateModule {
+    base: CreateModule,
+    upgrade_name: String,
+    replace_original: Bool,
+    copy_health_percent: Bool,
+    copy_veterancy: Bool,
+    fx_on_upgrade: String,
+}
+
+fn create_upgrade_create(tag: String) -> UpgradeCreateModule {
+    return UpgradeCreateModule {
+        base: create_create_module(tag, CreateType::Upgrade),
+        upgrade_name: "",
+        replace_original: true,
+        copy_health_percent: true,
+        copy_veterancy: true,
+        fx_on_upgrade: "",
+    }
+}
+
+/// Get replacement data
+fn get_replacement_data(module: UpgradeCreateModule, original_health: Float, original_max_health: Float, original_vet: Int) -> (Float, Int) {
+    let health_percent = 100.0
+    let vet = 0
+
+    if module.copy_health_percent {
+        if original_max_health > 0.0 {
+            health_percent = (original_health / original_max_health) * 100.0
+        }
+    }
+
+    if module.copy_veterancy {
+        vet = original_vet
+    }
+
+    return (health_percent, vet)
+}
+
+// ============================================================================
+// Object Creation List (OCL)
+// ============================================================================
+
+struct OCLEntry {
+    object_type: String,
+    count: Int,
+    offset_x: Float,
+    offset_y: Float,
+    offset_z: Float,
+    inherit_velocity: Bool,
+    conditions: Collection<String>,
+}
+
+fn create_ocl_entry(object_type: String) -> OCLEntry {
+    return OCLEntry {
+        object_type: object_type,
+        count: 1,
+        offset_x: 0.0,
+        offset_y: 0.0,
+        offset_z: 0.0,
+        inherit_velocity: false,
+        conditions: Collection<String>{},
+    }
+}
+
+struct ObjectCreationList {
+    name: String,
+    entries: Collection<OCLEntry>,
+    spawn_delay: Float,
+    at_bone: String,
+}
+
+fn create_ocl(name: String) -> ObjectCreationList {
+    return ObjectCreationList {
+        name: name,
+        entries: Collection<OCLEntry>{},
+        spawn_delay: 0.0,
+        at_bone: "",
+    }
+}
+
+/// Add entry to OCL
+fn add_ocl_entry(ocl: ObjectCreationList, entry: OCLEntry) {
+    ocl.entries.add(entry)
+}
+
+/// Get total spawn count
+fn get_total_spawn_count(ocl: ObjectCreationList) -> Int {
+    let total = 0
+    for entry in ocl.entries {
+        total = total + entry.count
+    }
+    return total
+}
+
+// ============================================================================
+// Create Module Manager
+// ============================================================================
+
+struct CreateModuleManager {
+    modules: Map<Int, CreateModule>,
+    ocls: Map<String, ObjectCreationList>,
+    next_id: Int,
+    creation_queue: Collection<CreationData>,
+}
+
+fn create_create_manager() -> CreateModuleManager {
+    return CreateModuleManager {
+        modules: Map<Int, CreateModule>{},
+        ocls: Map<String, ObjectCreationList>{},
+        next_id: 1,
+        creation_queue: Collection<CreationData>{},
+    }
+}
+
+/// Register create module
+fn register_create(mgr: CreateModuleManager, module: CreateModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    module.module_id = id
+    mgr.modules.set(id, module)
+    return id
+}
+
+/// Register OCL
+fn register_ocl(mgr: CreateModuleManager, ocl: ObjectCreationList) {
+    mgr.ocls.set(ocl.name, ocl)
+}
+
+/// Get OCL by name
+fn get_ocl(mgr: CreateModuleManager, name: String) -> ObjectCreationList {
+    if mgr.ocls.has(name) {
+        return mgr.ocls.get(name)
+    }
+    return create_ocl("")
+}
+
+/// Queue creation
+fn queue_creation(mgr: CreateModuleManager, data: CreationData) {
+    mgr.creation_queue.add(data)
+}
+
+/// Process creation queue
+fn process_creation_queue(mgr: CreateModuleManager) -> Collection<CreationData> {
+    let to_create = mgr.creation_queue
+    mgr.creation_queue = Collection<CreationData>{}
+    return to_create
+}
+
+/// Execute OCL at position
+fn execute_ocl(mgr: CreateModuleManager, ocl_name: String, x: Float, y: Float, z: Float, player_id: Int, team_id: Int) {
+    if !mgr.ocls.has(ocl_name) {
+        return
+    }
+
+    let ocl = mgr.ocls.get(ocl_name)
+    for entry in ocl.entries {
+        for i in 0..entry.count {
+            let data = create_creation_data(entry.object_type)
+            set_spawn_position(data, x + entry.offset_x, y + entry.offset_y, z + entry.offset_z)
+            set_ownership(data, player_id, team_id)
+            queue_creation(mgr, data)
+        }
+    }
+}
+
+// ============================================================================
+// Math Helpers
+// ============================================================================
+
+fn cos_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return 1.0 - x * x / 2.0 + x * x * x * x / 24.0
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_creation_data() -> Bool {
+    let data = create_creation_data("AmericaTank")
+    set_spawn_position(data, 100.0, 200.0, 0.0)
+    set_ownership(data, 1, 0)
+
+    assert(data.object_type == "AmericaTank", "Type should match")
+    assert(data.spawn_position_x == 100.0, "X should be 100")
+    assert(data.player_id == 1, "Player should be 1")
+
+    return true
+}
+
+fn test_spawn_position() -> Bool {
+    let module = create_create_module("Spawner", CreateType::Default)
+    module.spawn_offset_x = 10.0
+    module.spawn_offset_y = 20.0
+
+    let (x, y, z) = calculate_spawn_position(module, 100.0, 100.0, 0.0, 0.0, 0)
+    assert(x == 110.0, "X should include offset")
+    assert(y == 120.0, "Y should include offset")
+
+    return true
+}
+
+fn test_veterancy_create() -> Bool {
+    let module = create_veterancy_gain_create("VetCreate")
+    module.veterancy_level = 2
+    module.inherit_from_producer = false
+
+    assert(get_initial_veterancy(module, 3) == 2, "Should use module vet")
+
+    module.inherit_from_producer = true
+    assert(get_initial_veterancy(module, 3) == 3, "Should inherit producer vet")
+
+    return true
+}
+
+fn test_spawn_from_death() -> Bool {
+    let module = create_spawn_from_death("DeathSpawn")
+    module.spawn_count = 4
+    module.spawn_radius = 20.0
+
+    let positions = generate_spawn_positions(module, 0.0, 0.0, 0.0)
+    assert(positions.len() == 4, "Should have 4 positions")
+
+    return true
+}
+
+fn test_ocl() -> Bool {
+    let ocl = create_ocl("TestOCL")
+
+    let entry1 = create_ocl_entry("Infantry")
+    entry1.count = 3
+    add_ocl_entry(ocl, entry1)
+
+    let entry2 = create_ocl_entry("Tank")
+    entry2.count = 2
+    add_ocl_entry(ocl, entry2)
+
+    assert(get_total_spawn_count(ocl) == 5, "Should spawn 5 total")
+
+    return true
+}
+
+fn test_create_manager() -> Bool {
+    let mgr = create_create_manager()
+
+    let ocl = create_ocl("SpawnSquad")
+    let entry = create_ocl_entry("Infantry")
+    entry.count = 5
+    add_ocl_entry(ocl, entry)
+    register_ocl(mgr, ocl)
+
+    execute_ocl(mgr, "SpawnSquad", 100.0, 100.0, 0.0, 1, 0)
+
+    let to_create = process_creation_queue(mgr)
+    assert(to_create.len() == 5, "Should queue 5 creations")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_creation_data(), "Creation data test failed")
+    assert(test_spawn_position(), "Spawn position test failed")
+    assert(test_veterancy_create(), "Veterancy create test failed")
+    assert(test_spawn_from_death(), "Spawn from death test failed")
+    assert(test_ocl(), "OCL test failed")
+    assert(test_create_manager(), "Create manager test failed")
+    return true
+}

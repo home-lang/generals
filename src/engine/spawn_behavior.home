@@ -1,0 +1,431 @@
+// Spawn Behavior - Unit Spawning from Buildings
+// Based on Thyme engine SpawnBehavior
+// Buildings with this behavior spawn units at intervals
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, ModuleData, create_behavior_module, ModuleType
+
+// ============================================================================
+// Spawn Configuration
+// ============================================================================
+
+enum SpawnTrigger {
+    Timer,          // Spawn on timer
+    OnCreate,       // Spawn when building created
+    OnDeath,        // Spawn when destroyed
+    OnCommand,      // Spawn on player command
+    OnUpgrade,      // Spawn when upgraded
+}
+
+struct SpawnEntry {
+    object_type: String,
+    count: Int,
+    delay: Float,           // Delay before this entry spawns
+    offset_x: Float,
+    offset_y: Float,
+    offset_z: Float,
+}
+
+fn create_spawn_entry(object_type: String, count: Int) -> SpawnEntry {
+    return SpawnEntry {
+        object_type: object_type,
+        count: count,
+        delay: 0.0,
+        offset_x: 0.0,
+        offset_y: 0.0,
+        offset_z: 0.0,
+    }
+}
+
+struct SpawnConfig {
+    spawn_entries: Collection<SpawnEntry>,
+    spawn_delay: Float,         // Time between spawns
+    initial_delay: Float,       // Delay before first spawn
+    max_spawned: Int,           // Max alive at once
+    respawn_delay: Float,       // Delay before respawning dead units
+    triggered_by: SpawnTrigger,
+    rally_to_position: Bool,
+    inherit_veterancy: Bool,
+    one_shot: Bool,             // Only spawn once
+    spawn_inside: Bool,         // Spawn inside container
+}
+
+fn default_spawn_config() -> SpawnConfig {
+    return SpawnConfig {
+        spawn_entries: Collection<SpawnEntry>{},
+        spawn_delay: 5.0,
+        initial_delay: 0.0,
+        max_spawned: 0,
+        respawn_delay: 10.0,
+        triggered_by: SpawnTrigger::Timer,
+        rally_to_position: true,
+        inherit_veterancy: false,
+        one_shot: false,
+        spawn_inside: false,
+    }
+}
+
+// ============================================================================
+// Spawn Behavior
+// ============================================================================
+
+struct SpawnBehavior {
+    base: BehaviorModule,
+    config: SpawnConfig,
+
+    // State
+    time_since_spawn: Float,
+    spawned_ids: Collection<Int>,
+    total_spawned: Int,
+    is_active: Bool,
+    has_spawned_once: Bool,
+
+    // Rally point
+    rally_x: Float,
+    rally_y: Float,
+    use_custom_rally: Bool,
+}
+
+/// Create spawn behavior
+fn create_spawn_behavior(tag: String) -> SpawnBehavior {
+    return SpawnBehavior {
+        base: create_behavior_module(tag, ModuleType::Spawn),
+        config: default_spawn_config(),
+        time_since_spawn: 0.0,
+        spawned_ids: Collection<Int>{},
+        total_spawned: 0,
+        is_active: true,
+        has_spawned_once: false,
+        rally_x: 0.0,
+        rally_y: 0.0,
+        use_custom_rally: false,
+    }
+}
+
+/// Initialize from data
+fn init_spawn_behavior(behavior: SpawnBehavior, data: ModuleData) {
+    if data.properties.has("SpawnDelay") {
+        behavior.config.spawn_delay = parse_float(data.properties.get("SpawnDelay"))
+    }
+    if data.properties.has("InitialBurst") {
+        behavior.config.initial_delay = 0.0
+    }
+    if data.properties.has("SpawnNumber") {
+        let count = parse_int(data.properties.get("SpawnNumber"))
+        if data.properties.has("SpawnedTemplate") {
+            let template = data.properties.get("SpawnedTemplate")
+            let entry = create_spawn_entry(template, count)
+            behavior.config.spawn_entries.add(entry)
+        }
+    }
+    if data.properties.has("MaxSpawned") {
+        behavior.config.max_spawned = parse_int(data.properties.get("MaxSpawned"))
+    }
+}
+
+/// Add spawn entry
+fn add_spawn_entry(behavior: SpawnBehavior, entry: SpawnEntry) {
+    behavior.config.spawn_entries.add(entry)
+}
+
+/// Set rally point
+fn set_spawn_rally(behavior: SpawnBehavior, x: Float, y: Float) {
+    behavior.rally_x = x
+    behavior.rally_y = y
+    behavior.use_custom_rally = true
+}
+
+/// Clear rally point
+fn clear_spawn_rally(behavior: SpawnBehavior) {
+    behavior.use_custom_rally = false
+}
+
+/// Get current spawned count (alive units)
+fn get_alive_count(behavior: SpawnBehavior) -> Int {
+    return behavior.spawned_ids.len()
+}
+
+/// Check if at max capacity
+fn is_at_max_capacity(behavior: SpawnBehavior) -> Bool {
+    if behavior.config.max_spawned <= 0 {
+        return false
+    }
+    return get_alive_count(behavior) >= behavior.config.max_spawned
+}
+
+/// Report spawned unit death
+fn on_spawned_died(behavior: SpawnBehavior, unit_id: Int) {
+    // Would remove from spawned_ids - simplified
+    // Real impl would filter the collection
+}
+
+/// Update spawn behavior
+fn update_spawn(behavior: SpawnBehavior, delta: Float) -> Collection<SpawnEntry> {
+    let to_spawn = Collection<SpawnEntry>{}
+
+    if !behavior.is_active {
+        return to_spawn
+    }
+
+    // Check one-shot
+    if behavior.config.one_shot && behavior.has_spawned_once {
+        return to_spawn
+    }
+
+    // Check max capacity
+    if is_at_max_capacity(behavior) {
+        return to_spawn
+    }
+
+    // Update timer
+    behavior.time_since_spawn = behavior.time_since_spawn + delta
+
+    // Check spawn delay
+    let delay = behavior.config.spawn_delay
+    if !behavior.has_spawned_once {
+        delay = behavior.config.initial_delay
+    }
+
+    if behavior.time_since_spawn < delay {
+        return to_spawn
+    }
+
+    // Spawn!
+    behavior.time_since_spawn = 0.0
+    behavior.has_spawned_once = true
+
+    // Calculate how many we can spawn
+    let space = behavior.config.max_spawned - get_alive_count(behavior)
+    if behavior.config.max_spawned <= 0 {
+        space = 999
+    }
+
+    for entry in behavior.config.spawn_entries {
+        let spawn_count = entry.count
+        if spawn_count > space {
+            spawn_count = space
+        }
+        if spawn_count > 0 {
+            let spawn_entry = create_spawn_entry(entry.object_type, spawn_count)
+            spawn_entry.offset_x = entry.offset_x
+            spawn_entry.offset_y = entry.offset_y
+            spawn_entry.offset_z = entry.offset_z
+            to_spawn.add(spawn_entry)
+            space = space - spawn_count
+        }
+        if space <= 0 {
+            break
+        }
+    }
+
+    return to_spawn
+}
+
+/// Get spawn position
+fn get_spawn_position(behavior: SpawnBehavior, base_x: Float, base_y: Float, base_z: Float, entry: SpawnEntry, index: Int) -> (Float, Float, Float) {
+    // Calculate position with some spread for multiple spawns
+    let angle = (index as Float) * 0.628  // Spread units in arc
+    let spread_radius = 10.0
+
+    let x = base_x + entry.offset_x + cos_approx(angle) * spread_radius
+    let y = base_y + entry.offset_y + sin_approx(angle) * spread_radius
+    let z = base_z + entry.offset_z
+
+    return (x, y, z)
+}
+
+/// Get rally position
+fn get_rally_position(behavior: SpawnBehavior, default_x: Float, default_y: Float) -> (Float, Float) {
+    if behavior.use_custom_rally {
+        return (behavior.rally_x, behavior.rally_y)
+    }
+    return (default_x, default_y)
+}
+
+/// Activate spawning
+fn activate_spawn(behavior: SpawnBehavior) {
+    behavior.is_active = true
+}
+
+/// Deactivate spawning
+fn deactivate_spawn(behavior: SpawnBehavior) {
+    behavior.is_active = false
+}
+
+/// Reset behavior
+fn reset_spawn(behavior: SpawnBehavior) {
+    behavior.time_since_spawn = 0.0
+    behavior.spawned_ids = Collection<Int>{}
+    behavior.total_spawned = 0
+    behavior.has_spawned_once = false
+    behavior.is_active = true
+}
+
+/// Register spawned unit
+fn register_spawned(behavior: SpawnBehavior, unit_id: Int) {
+    behavior.spawned_ids.add(unit_id)
+    behavior.total_spawned = behavior.total_spawned + 1
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_float(s: String) -> Float {
+    let int_part = 0
+    let frac_part = 0.0
+    let frac_divisor = 1.0
+    let in_frac = false
+
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c == 46 {
+            in_frac = true
+        } else if c >= 48 && c <= 57 {
+            if in_frac {
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + ((c - 48) as Float) / frac_divisor
+            } else {
+                int_part = int_part * 10 + (c - 48)
+            }
+        }
+    }
+
+    return (int_part as Float) + frac_part
+}
+
+fn parse_int(s: String) -> Int {
+    let result = 0
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        if c >= 48 && c <= 57 {
+            result = result * 10 + (c - 48)
+        }
+    }
+    return result
+}
+
+fn cos_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return 1.0 - x * x / 2.0 + x * x * x * x / 24.0
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_spawn_basic() -> Bool {
+    let behavior = create_spawn_behavior("TestSpawn")
+    behavior.config.spawn_delay = 1.0
+    behavior.config.initial_delay = 0.0
+    behavior.config.max_spawned = 10
+
+    let entry = create_spawn_entry("Infantry", 3)
+    add_spawn_entry(behavior, entry)
+
+    // Update should trigger spawn immediately
+    let spawns = update_spawn(behavior, 0.0)
+    assert(spawns.len() == 1, "Should have 1 spawn entry")
+
+    let spawn = spawns.get(0)
+    assert(spawn.object_type == "Infantry", "Should spawn Infantry")
+    assert(spawn.count == 3, "Should spawn 3")
+
+    return true
+}
+
+fn test_spawn_delay() -> Bool {
+    let behavior = create_spawn_behavior("DelayedSpawn")
+    behavior.config.spawn_delay = 5.0
+    behavior.config.initial_delay = 0.0
+
+    let entry = create_spawn_entry("Tank", 1)
+    add_spawn_entry(behavior, entry)
+
+    // First spawn immediate
+    let spawn1 = update_spawn(behavior, 0.0)
+    assert(spawn1.len() == 1, "Should spawn first")
+    assert(behavior.has_spawned_once == true, "Should mark as spawned")
+
+    // Second spawn should wait
+    let spawn2 = update_spawn(behavior, 2.0)
+    assert(spawn2.len() == 0, "Should wait")
+
+    let spawn3 = update_spawn(behavior, 3.0)
+    assert(spawn3.len() == 1, "Should spawn after delay")
+
+    return true
+}
+
+fn test_max_capacity() -> Bool {
+    let behavior = create_spawn_behavior("CapacitySpawn")
+    behavior.config.max_spawned = 5
+
+    let entry = create_spawn_entry("Unit", 3)
+    add_spawn_entry(behavior, entry)
+
+    // Simulate some alive units
+    register_spawned(behavior, 1)
+    register_spawned(behavior, 2)
+    register_spawned(behavior, 3)
+
+    // Should only spawn 2 more
+    let spawns = update_spawn(behavior, 0.0)
+    if spawns.len() > 0 {
+        let spawn = spawns.get(0)
+        assert(spawn.count == 2, "Should only spawn 2 to reach max")
+    }
+
+    return true
+}
+
+fn test_one_shot() -> Bool {
+    let behavior = create_spawn_behavior("OneShotSpawn")
+    behavior.config.one_shot = true
+
+    let entry = create_spawn_entry("Unit", 1)
+    add_spawn_entry(behavior, entry)
+
+    let spawn1 = update_spawn(behavior, 0.0)
+    assert(spawn1.len() == 1, "Should spawn once")
+
+    let spawn2 = update_spawn(behavior, 10.0)
+    assert(spawn2.len() == 0, "Should not spawn again")
+
+    return true
+}
+
+fn test_rally_point() -> Bool {
+    let behavior = create_spawn_behavior("RallySpawn")
+
+    let (rx, ry) = get_rally_position(behavior, 100.0, 100.0)
+    assert(rx == 100.0 && ry == 100.0, "Should use default rally")
+
+    set_spawn_rally(behavior, 200.0, 300.0)
+    let (rx2, ry2) = get_rally_position(behavior, 100.0, 100.0)
+    assert(rx2 == 200.0 && ry2 == 300.0, "Should use custom rally")
+
+    clear_spawn_rally(behavior)
+    let (rx3, ry3) = get_rally_position(behavior, 100.0, 100.0)
+    assert(rx3 == 100.0 && ry3 == 100.0, "Should use default after clear")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_spawn_basic(), "Spawn basic test failed")
+    assert(test_spawn_delay(), "Spawn delay test failed")
+    assert(test_max_capacity(), "Max capacity test failed")
+    assert(test_one_shot(), "One shot test failed")
+    assert(test_rally_point(), "Rally point test failed")
+    return true
+}

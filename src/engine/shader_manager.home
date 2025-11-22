@@ -1,0 +1,640 @@
+// Shader Manager - GPU Shader Compilation and Management
+// Based on Thyme engine shader system
+// Handles shader loading, compilation, and uniform management
+
+from basics import Collection, Map
+
+// ============================================================================
+// Shader Constants
+// ============================================================================
+
+enum ShaderType {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+enum ShaderStage {
+    Terrain,
+    Water,
+    Shroud,
+    Cloud,
+    Unit,
+    Building,
+    Particle,
+    UI,
+    PostProcess,
+}
+
+// Uniform types
+enum UniformType {
+    Float,
+    Vec2,
+    Vec3,
+    Vec4,
+    Mat3,
+    Mat4,
+    Sampler2D,
+    SamplerCube,
+    Int,
+}
+
+// ============================================================================
+// Shader Source
+// ============================================================================
+
+struct ShaderSource {
+    name: String,
+    shader_type: ShaderType,
+    source_code: String,
+    entry_point: String,
+    defines: Map<String, String>,
+}
+
+fn create_shader_source(name: String, stype: ShaderType) -> ShaderSource {
+    return ShaderSource {
+        name: name,
+        shader_type: stype,
+        source_code: "",
+        entry_point: "main",
+        defines: Map<String, String>{},
+    }
+}
+
+/// Add preprocessor define
+fn add_define(shader: ShaderSource, name: String, value: String) {
+    shader.defines.set(name, value)
+}
+
+/// Set source code
+fn set_source(shader: ShaderSource, code: String) {
+    shader.source_code = code
+}
+
+// ============================================================================
+// Shader Uniform
+// ============================================================================
+
+struct ShaderUniform {
+    name: String,
+    uniform_type: UniformType,
+    location: Int,
+    array_size: Int,
+    value_float: Float,
+    value_vec4: (Float, Float, Float, Float),
+    value_int: Int,
+    is_dirty: Bool,
+}
+
+fn create_uniform(name: String, utype: UniformType) -> ShaderUniform {
+    return ShaderUniform {
+        name: name,
+        uniform_type: utype,
+        location: -1,
+        array_size: 1,
+        value_float: 0.0,
+        value_vec4: (0.0, 0.0, 0.0, 0.0),
+        value_int: 0,
+        is_dirty: true,
+    }
+}
+
+/// Set float value
+fn set_uniform_float(uniform: ShaderUniform, value: Float) {
+    uniform.value_float = value
+    uniform.is_dirty = true
+}
+
+/// Set vec4 value
+fn set_uniform_vec4(uniform: ShaderUniform, x: Float, y: Float, z: Float, w: Float) {
+    uniform.value_vec4 = (x, y, z, w)
+    uniform.is_dirty = true
+}
+
+/// Set int value
+fn set_uniform_int(uniform: ShaderUniform, value: Int) {
+    uniform.value_int = value
+    uniform.is_dirty = true
+}
+
+// ============================================================================
+// Shader Program
+// ============================================================================
+
+struct ShaderProgram {
+    name: String,
+    program_id: Int,
+    vertex_shader: ShaderSource,
+    fragment_shader: ShaderSource,
+    uniforms: Map<String, ShaderUniform>,
+    is_compiled: Bool,
+    compile_error: String,
+    stage: ShaderStage,
+}
+
+fn create_shader_program(name: String, stage: ShaderStage) -> ShaderProgram {
+    return ShaderProgram {
+        name: name,
+        program_id: 0,
+        vertex_shader: create_shader_source(name + "_vert", ShaderType::Vertex),
+        fragment_shader: create_shader_source(name + "_frag", ShaderType::Fragment),
+        uniforms: Map<String, ShaderUniform>{},
+        is_compiled: false,
+        compile_error: "",
+        stage: stage,
+    }
+}
+
+/// Set vertex shader source
+fn set_vertex_source(program: ShaderProgram, code: String) {
+    program.vertex_shader.source_code = code
+    program.is_compiled = false
+}
+
+/// Set fragment shader source
+fn set_fragment_source(program: ShaderProgram, code: String) {
+    program.fragment_shader.source_code = code
+    program.is_compiled = false
+}
+
+/// Register uniform
+fn register_uniform(program: ShaderProgram, name: String, utype: UniformType) {
+    let uniform = create_uniform(name, utype)
+    program.uniforms.set(name, uniform)
+}
+
+/// Get uniform
+fn get_uniform(program: ShaderProgram, name: String) -> ShaderUniform {
+    if program.uniforms.has(name) {
+        return program.uniforms.get(name)
+    }
+    return create_uniform("", UniformType::Float)
+}
+
+/// Set program uniform float
+fn set_program_float(program: ShaderProgram, name: String, value: Float) {
+    if program.uniforms.has(name) {
+        set_uniform_float(program.uniforms.get(name), value)
+    }
+}
+
+/// Set program uniform vec4
+fn set_program_vec4(program: ShaderProgram, name: String, x: Float, y: Float, z: Float, w: Float) {
+    if program.uniforms.has(name) {
+        set_uniform_vec4(program.uniforms.get(name), x, y, z, w)
+    }
+}
+
+/// Compile shader (simulation)
+fn compile_program(program: ShaderProgram) -> Bool {
+    // In real implementation, would compile using Metal/OpenGL
+    if program.vertex_shader.source_code.len() == 0 {
+        program.compile_error = "Missing vertex shader"
+        return false
+    }
+    if program.fragment_shader.source_code.len() == 0 {
+        program.compile_error = "Missing fragment shader"
+        return false
+    }
+
+    program.is_compiled = true
+    program.compile_error = ""
+    return true
+}
+
+// ============================================================================
+// Shader Manager
+// ============================================================================
+
+struct ShaderManager {
+    programs: Map<String, ShaderProgram>,
+    active_program: String,
+    shader_cache: Map<String, String>,  // Compiled shader cache
+    global_defines: Map<String, String>,
+    hot_reload_enabled: Bool,
+    compile_count: Int,
+}
+
+fn create_shader_manager() -> ShaderManager {
+    return ShaderManager {
+        programs: Map<String, ShaderProgram>{},
+        active_program: "",
+        shader_cache: Map<String, String>{},
+        global_defines: Map<String, String>{},
+        hot_reload_enabled: false,
+        compile_count: 0,
+    }
+}
+
+/// Register shader program
+fn register_program(mgr: ShaderManager, program: ShaderProgram) {
+    mgr.programs.set(program.name, program)
+}
+
+/// Get shader program
+fn get_program(mgr: ShaderManager, name: String) -> ShaderProgram {
+    if mgr.programs.has(name) {
+        return mgr.programs.get(name)
+    }
+    return create_shader_program("", ShaderStage::Unit)
+}
+
+/// Has shader program
+fn has_program(mgr: ShaderManager, name: String) -> Bool {
+    return mgr.programs.has(name)
+}
+
+/// Use shader program
+fn use_program(mgr: ShaderManager, name: String) -> Bool {
+    if !mgr.programs.has(name) {
+        return false
+    }
+
+    let program = mgr.programs.get(name)
+    if !program.is_compiled {
+        if !compile_program(program) {
+            return false
+        }
+        mgr.compile_count = mgr.compile_count + 1
+    }
+
+    mgr.active_program = name
+    return true
+}
+
+/// Get active program
+fn get_active(mgr: ShaderManager) -> ShaderProgram {
+    return get_program(mgr, mgr.active_program)
+}
+
+/// Set global define
+fn set_global_define(mgr: ShaderManager, name: String, value: String) {
+    mgr.global_defines.set(name, value)
+}
+
+/// Reload all shaders
+fn reload_all(mgr: ShaderManager) {
+    for name in mgr.programs.keys() {
+        let program = mgr.programs.get(name)
+        program.is_compiled = false
+    }
+}
+
+/// Get program count
+fn get_program_count(mgr: ShaderManager) -> Int {
+    return mgr.programs.len()
+}
+
+// ============================================================================
+// Built-in Shader Templates
+// ============================================================================
+
+/// Create terrain shader
+fn create_terrain_shader() -> ShaderProgram {
+    let program = create_shader_program("terrain", ShaderStage::Terrain)
+
+    set_vertex_source(program, """
+        // Terrain vertex shader
+        uniform mat4 u_viewProjection;
+        uniform vec4 u_terrainParams;
+
+        in vec3 a_position;
+        in vec2 a_texCoord;
+        in vec3 a_normal;
+
+        out vec2 v_texCoord;
+        out vec3 v_normal;
+        out vec3 v_worldPos;
+
+        void main() {
+            v_texCoord = a_texCoord;
+            v_normal = a_normal;
+            v_worldPos = a_position;
+            gl_Position = u_viewProjection * vec4(a_position, 1.0);
+        }
+    """)
+
+    set_fragment_source(program, """
+        // Terrain fragment shader
+        uniform sampler2D u_texture0;  // Base terrain
+        uniform sampler2D u_texture1;  // Blend terrain
+        uniform sampler2D u_blendMap;
+        uniform vec4 u_lightDir;
+        uniform vec4 u_lightColor;
+
+        in vec2 v_texCoord;
+        in vec3 v_normal;
+        in vec3 v_worldPos;
+
+        out vec4 fragColor;
+
+        void main() {
+            vec4 base = texture(u_texture0, v_texCoord);
+            vec4 blend = texture(u_texture1, v_texCoord);
+            float blendFactor = texture(u_blendMap, v_texCoord).r;
+
+            vec4 color = mix(base, blend, blendFactor);
+
+            float ndotl = max(dot(v_normal, u_lightDir.xyz), 0.0);
+            color.rgb *= u_lightColor.rgb * ndotl + 0.3;
+
+            fragColor = color;
+        }
+    """)
+
+    // Register uniforms
+    register_uniform(program, "u_viewProjection", UniformType::Mat4)
+    register_uniform(program, "u_terrainParams", UniformType::Vec4)
+    register_uniform(program, "u_lightDir", UniformType::Vec4)
+    register_uniform(program, "u_lightColor", UniformType::Vec4)
+    register_uniform(program, "u_texture0", UniformType::Sampler2D)
+    register_uniform(program, "u_texture1", UniformType::Sampler2D)
+    register_uniform(program, "u_blendMap", UniformType::Sampler2D)
+
+    return program
+}
+
+/// Create shroud shader
+fn create_shroud_shader() -> ShaderProgram {
+    let program = create_shader_program("shroud", ShaderStage::Shroud)
+
+    set_vertex_source(program, """
+        uniform mat4 u_viewProjection;
+
+        in vec3 a_position;
+        in vec2 a_texCoord;
+
+        out vec2 v_texCoord;
+
+        void main() {
+            v_texCoord = a_texCoord;
+            gl_Position = u_viewProjection * vec4(a_position, 1.0);
+        }
+    """)
+
+    set_fragment_source(program, """
+        uniform sampler2D u_shroudTexture;
+        uniform vec4 u_shroudColor;
+        uniform float u_edgeBlend;
+
+        in vec2 v_texCoord;
+        out vec4 fragColor;
+
+        void main() {
+            float shroud = texture(u_shroudTexture, v_texCoord).r;
+
+            // Smooth edge blending
+            shroud = smoothstep(0.0, u_edgeBlend, shroud);
+
+            fragColor = vec4(u_shroudColor.rgb, u_shroudColor.a * (1.0 - shroud));
+        }
+    """)
+
+    register_uniform(program, "u_viewProjection", UniformType::Mat4)
+    register_uniform(program, "u_shroudTexture", UniformType::Sampler2D)
+    register_uniform(program, "u_shroudColor", UniformType::Vec4)
+    register_uniform(program, "u_edgeBlend", UniformType::Float)
+
+    return program
+}
+
+/// Create water shader
+fn create_water_shader() -> ShaderProgram {
+    let program = create_shader_program("water", ShaderStage::Water)
+
+    set_vertex_source(program, """
+        uniform mat4 u_viewProjection;
+        uniform float u_time;
+        uniform vec4 u_waveParams;  // amplitude, frequency, speed, unused
+
+        in vec3 a_position;
+        in vec2 a_texCoord;
+
+        out vec2 v_texCoord;
+        out vec3 v_worldPos;
+        out float v_wave;
+
+        void main() {
+            vec3 pos = a_position;
+
+            // Simple wave animation
+            float wave = sin(pos.x * u_waveParams.y + u_time * u_waveParams.z) *
+                         cos(pos.y * u_waveParams.y + u_time * u_waveParams.z);
+            pos.z += wave * u_waveParams.x;
+            v_wave = wave;
+
+            v_texCoord = a_texCoord;
+            v_worldPos = pos;
+            gl_Position = u_viewProjection * vec4(pos, 1.0);
+        }
+    """)
+
+    set_fragment_source(program, """
+        uniform sampler2D u_normalMap;
+        uniform sampler2D u_reflectionMap;
+        uniform vec4 u_waterColor;
+        uniform vec4 u_lightDir;
+        uniform float u_time;
+
+        in vec2 v_texCoord;
+        in vec3 v_worldPos;
+        in float v_wave;
+
+        out vec4 fragColor;
+
+        void main() {
+            vec2 distortedUV = v_texCoord + vec2(sin(u_time + v_texCoord.x * 10.0) * 0.01,
+                                                   cos(u_time + v_texCoord.y * 10.0) * 0.01);
+
+            vec3 normal = texture(u_normalMap, distortedUV).xyz * 2.0 - 1.0;
+
+            float fresnel = pow(1.0 - max(dot(normal, vec3(0, 0, 1)), 0.0), 3.0);
+            vec4 reflection = texture(u_reflectionMap, distortedUV);
+
+            vec4 color = mix(u_waterColor, reflection, fresnel * 0.5);
+
+            float specular = pow(max(dot(reflect(-u_lightDir.xyz, normal), vec3(0, 0, 1)), 0.0), 32.0);
+            color.rgb += vec3(specular);
+
+            fragColor = color;
+        }
+    """)
+
+    register_uniform(program, "u_viewProjection", UniformType::Mat4)
+    register_uniform(program, "u_time", UniformType::Float)
+    register_uniform(program, "u_waveParams", UniformType::Vec4)
+    register_uniform(program, "u_waterColor", UniformType::Vec4)
+    register_uniform(program, "u_lightDir", UniformType::Vec4)
+    register_uniform(program, "u_normalMap", UniformType::Sampler2D)
+    register_uniform(program, "u_reflectionMap", UniformType::Sampler2D)
+
+    return program
+}
+
+/// Create cloud shadow shader
+fn create_cloud_shader() -> ShaderProgram {
+    let program = create_shader_program("cloud", ShaderStage::Cloud)
+
+    set_vertex_source(program, """
+        uniform mat4 u_viewProjection;
+
+        in vec3 a_position;
+        in vec2 a_texCoord;
+
+        out vec2 v_texCoord;
+
+        void main() {
+            v_texCoord = a_texCoord;
+            gl_Position = u_viewProjection * vec4(a_position, 1.0);
+        }
+    """)
+
+    set_fragment_source(program, """
+        uniform sampler2D u_cloudTexture;
+        uniform vec2 u_cloudOffset;
+        uniform float u_cloudDensity;
+
+        in vec2 v_texCoord;
+        out vec4 fragColor;
+
+        void main() {
+            vec2 scrolledUV = v_texCoord + u_cloudOffset;
+            float cloud = texture(u_cloudTexture, scrolledUV).r;
+            cloud = smoothstep(0.3, 0.7, cloud) * u_cloudDensity;
+            fragColor = vec4(0.0, 0.0, 0.0, cloud);
+        }
+    """)
+
+    register_uniform(program, "u_viewProjection", UniformType::Mat4)
+    register_uniform(program, "u_cloudTexture", UniformType::Sampler2D)
+    register_uniform(program, "u_cloudOffset", UniformType::Vec2)
+    register_uniform(program, "u_cloudDensity", UniformType::Float)
+
+    return program
+}
+
+/// Create unit shader
+fn create_unit_shader() -> ShaderProgram {
+    let program = create_shader_program("unit", ShaderStage::Unit)
+
+    set_vertex_source(program, """
+        uniform mat4 u_viewProjection;
+        uniform mat4 u_model;
+
+        in vec3 a_position;
+        in vec2 a_texCoord;
+        in vec3 a_normal;
+
+        out vec2 v_texCoord;
+        out vec3 v_normal;
+
+        void main() {
+            v_texCoord = a_texCoord;
+            v_normal = mat3(u_model) * a_normal;
+            gl_Position = u_viewProjection * u_model * vec4(a_position, 1.0);
+        }
+    """)
+
+    set_fragment_source(program, """
+        uniform sampler2D u_diffuse;
+        uniform vec4 u_teamColor;
+        uniform vec4 u_lightDir;
+        uniform float u_selected;
+
+        in vec2 v_texCoord;
+        in vec3 v_normal;
+
+        out vec4 fragColor;
+
+        void main() {
+            vec4 diffuse = texture(u_diffuse, v_texCoord);
+
+            // Apply team color where alpha indicates team color region
+            if (diffuse.a < 1.0 && diffuse.a > 0.5) {
+                diffuse.rgb = mix(diffuse.rgb, u_teamColor.rgb, 0.7);
+            }
+
+            float ndotl = max(dot(normalize(v_normal), u_lightDir.xyz), 0.0);
+            diffuse.rgb *= ndotl * 0.7 + 0.3;
+
+            // Selection highlight
+            if (u_selected > 0.5) {
+                diffuse.rgb += vec3(0.1, 0.1, 0.0);
+            }
+
+            fragColor = diffuse;
+        }
+    """)
+
+    register_uniform(program, "u_viewProjection", UniformType::Mat4)
+    register_uniform(program, "u_model", UniformType::Mat4)
+    register_uniform(program, "u_teamColor", UniformType::Vec4)
+    register_uniform(program, "u_lightDir", UniformType::Vec4)
+    register_uniform(program, "u_selected", UniformType::Float)
+    register_uniform(program, "u_diffuse", UniformType::Sampler2D)
+
+    return program
+}
+
+/// Initialize shader manager with default shaders
+fn init_default_shaders(mgr: ShaderManager) {
+    register_program(mgr, create_terrain_shader())
+    register_program(mgr, create_shroud_shader())
+    register_program(mgr, create_water_shader())
+    register_program(mgr, create_cloud_shader())
+    register_program(mgr, create_unit_shader())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_shader_source() -> Bool {
+    let src = create_shader_source("test", ShaderType::Vertex)
+    add_define(src, "USE_LIGHTING", "1")
+    set_source(src, "void main() {}")
+
+    assert(src.defines.has("USE_LIGHTING"), "Should have define")
+    assert(src.source_code.len() > 0, "Should have source")
+
+    return true
+}
+
+fn test_shader_program() -> Bool {
+    let program = create_shader_program("test", ShaderStage::Unit)
+    set_vertex_source(program, "vertex code")
+    set_fragment_source(program, "fragment code")
+
+    register_uniform(program, "u_time", UniformType::Float)
+    set_program_float(program, "u_time", 1.5)
+
+    let uniform = get_uniform(program, "u_time")
+    assert(uniform.value_float == 1.5, "Uniform should be 1.5")
+
+    assert(compile_program(program) == true, "Should compile")
+    assert(program.is_compiled == true, "Should be compiled")
+
+    return true
+}
+
+fn test_shader_manager() -> Bool {
+    let mgr = create_shader_manager()
+    init_default_shaders(mgr)
+
+    assert(get_program_count(mgr) == 5, "Should have 5 programs")
+    assert(has_program(mgr, "terrain"), "Should have terrain")
+    assert(has_program(mgr, "water"), "Should have water")
+    assert(has_program(mgr, "shroud"), "Should have shroud")
+
+    use_program(mgr, "terrain")
+    assert(mgr.active_program == "terrain", "Should be terrain")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_shader_source(), "Shader source test failed")
+    assert(test_shader_program(), "Shader program test failed")
+    assert(test_shader_manager(), "Shader manager test failed")
+    return true
+}

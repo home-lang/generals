@@ -1,0 +1,778 @@
+// AI States - AI-Specific State Machine States
+// Based on Thyme engine AI state definitions
+// Defines all states used by game AI (units, buildings, etc.)
+
+from basics import Collection, Map
+from state_machine import State, StateCondition, StateTransition, StateAction
+from state_machine import ConditionType, create_state, create_condition, create_transition, create_action
+from state_machine import StateMachineDefinition, create_definition, add_state
+
+// ============================================================================
+// AI State Types
+// ============================================================================
+
+enum AIStateType {
+    // Basic States
+    Idle,
+    Moving,
+    Attacking,
+    Dying,
+    Dead,
+
+    // Combat States
+    Guarding,
+    Patrolling,
+    Pursuing,
+    Fleeing,
+    TakingCover,
+
+    // Construction States
+    Constructing,
+    Repairing,
+    Upgrading,
+    Unpacking,
+    Packing,
+
+    // Resource States
+    Harvesting,
+    Returning,
+    Docking,
+
+    // Transport States
+    Boarding,
+    Unloading,
+    Paradropping,
+
+    // Special States
+    UsingAbility,
+    CastingPower,
+    Stunned,
+    Disabled,
+    Garrisoned,
+
+    // Air States
+    TakingOff,
+    Landing,
+    Hovering,
+    Bombing,
+
+    // Stealth States
+    Cloaking,
+    Decloaking,
+    Infiltrating,
+}
+
+// AI behavior priority levels
+enum AIPriority {
+    VeryLow,
+    Low,
+    Normal,
+    High,
+    VeryHigh,
+    Critical,
+}
+
+// ============================================================================
+// AI State Data
+// ============================================================================
+
+struct AIStateData {
+    state_type: AIStateType,
+    priority: AIPriority,
+    interruptible: Bool,
+    can_attack: Bool,
+    can_move: Bool,
+    preserve_target: Bool,
+    animation_name: String,
+    min_duration: Float,
+    max_duration: Float,
+}
+
+/// Create AI state data with defaults
+fn create_ai_state_data(state_type: AIStateType) -> AIStateData {
+    return AIStateData {
+        state_type: state_type,
+        priority: AIPriority::Normal,
+        interruptible: true,
+        can_attack: false,
+        can_move: false,
+        preserve_target: false,
+        animation_name: "",
+        min_duration: 0.0,
+        max_duration: 0.0,
+    }
+}
+
+// ============================================================================
+// AI State Definitions
+// ============================================================================
+
+/// Get state data for a given AI state type
+fn get_state_data(state_type: AIStateType) -> AIStateData {
+    let data = create_ai_state_data(state_type)
+
+    if state_type == AIStateType::Idle {
+        data.priority = AIPriority::VeryLow
+        data.interruptible = true
+        data.can_attack = true
+        data.can_move = true
+        data.animation_name = "IDLE"
+    } else if state_type == AIStateType::Moving {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = true
+        data.animation_name = "RUN"
+    } else if state_type == AIStateType::Attacking {
+        data.priority = AIPriority::High
+        data.interruptible = false
+        data.can_attack = true
+        data.can_move = false
+        data.preserve_target = true
+        data.animation_name = "ATTACK"
+        data.min_duration = 0.5
+    } else if state_type == AIStateType::Dying {
+        data.priority = AIPriority::Critical
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "DYING"
+    } else if state_type == AIStateType::Dead {
+        data.priority = AIPriority::Critical
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "DEAD"
+    } else if state_type == AIStateType::Guarding {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = true
+        data.can_move = false
+        data.animation_name = "IDLE"
+    } else if state_type == AIStateType::Patrolling {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = true
+        data.can_move = true
+        data.animation_name = "RUN"
+    } else if state_type == AIStateType::Pursuing {
+        data.priority = AIPriority::High
+        data.interruptible = true
+        data.can_attack = true
+        data.can_move = true
+        data.preserve_target = true
+        data.animation_name = "RUN"
+    } else if state_type == AIStateType::Fleeing {
+        data.priority = AIPriority::VeryHigh
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = true
+        data.animation_name = "RUN"
+    } else if state_type == AIStateType::TakingCover {
+        data.priority = AIPriority::High
+        data.interruptible = true
+        data.can_attack = true
+        data.can_move = false
+        data.animation_name = "PRONE"
+    } else if state_type == AIStateType::Constructing {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "BUILD"
+    } else if state_type == AIStateType::Repairing {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "REPAIR"
+    } else if state_type == AIStateType::Harvesting {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "HARVEST"
+    } else if state_type == AIStateType::Returning {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = true
+        data.animation_name = "RUN"
+    } else if state_type == AIStateType::UsingAbility {
+        data.priority = AIPriority::High
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "SPECIAL"
+        data.min_duration = 1.0
+    } else if state_type == AIStateType::Stunned {
+        data.priority = AIPriority::Critical
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "STUNNED"
+    } else if state_type == AIStateType::TakingOff {
+        data.priority = AIPriority::High
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "TAKEOFF"
+    } else if state_type == AIStateType::Landing {
+        data.priority = AIPriority::High
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "LANDING"
+    } else if state_type == AIStateType::Cloaking {
+        data.priority = AIPriority::Normal
+        data.interruptible = true
+        data.can_attack = false
+        data.can_move = true
+        data.animation_name = "CLOAK"
+        data.min_duration = 0.5
+    } else if state_type == AIStateType::Decloaking {
+        data.priority = AIPriority::High
+        data.interruptible = false
+        data.can_attack = false
+        data.can_move = false
+        data.animation_name = "DECLOAK"
+        data.min_duration = 0.3
+    }
+
+    return data
+}
+
+/// Get state name string from type
+fn state_type_to_string(state_type: AIStateType) -> String {
+    if state_type == AIStateType::Idle { return "Idle" }
+    else if state_type == AIStateType::Moving { return "Moving" }
+    else if state_type == AIStateType::Attacking { return "Attacking" }
+    else if state_type == AIStateType::Dying { return "Dying" }
+    else if state_type == AIStateType::Dead { return "Dead" }
+    else if state_type == AIStateType::Guarding { return "Guarding" }
+    else if state_type == AIStateType::Patrolling { return "Patrolling" }
+    else if state_type == AIStateType::Pursuing { return "Pursuing" }
+    else if state_type == AIStateType::Fleeing { return "Fleeing" }
+    else if state_type == AIStateType::TakingCover { return "TakingCover" }
+    else if state_type == AIStateType::Constructing { return "Constructing" }
+    else if state_type == AIStateType::Repairing { return "Repairing" }
+    else if state_type == AIStateType::Upgrading { return "Upgrading" }
+    else if state_type == AIStateType::Unpacking { return "Unpacking" }
+    else if state_type == AIStateType::Packing { return "Packing" }
+    else if state_type == AIStateType::Harvesting { return "Harvesting" }
+    else if state_type == AIStateType::Returning { return "Returning" }
+    else if state_type == AIStateType::Docking { return "Docking" }
+    else if state_type == AIStateType::Boarding { return "Boarding" }
+    else if state_type == AIStateType::Unloading { return "Unloading" }
+    else if state_type == AIStateType::Paradropping { return "Paradropping" }
+    else if state_type == AIStateType::UsingAbility { return "UsingAbility" }
+    else if state_type == AIStateType::CastingPower { return "CastingPower" }
+    else if state_type == AIStateType::Stunned { return "Stunned" }
+    else if state_type == AIStateType::Disabled { return "Disabled" }
+    else if state_type == AIStateType::Garrisoned { return "Garrisoned" }
+    else if state_type == AIStateType::TakingOff { return "TakingOff" }
+    else if state_type == AIStateType::Landing { return "Landing" }
+    else if state_type == AIStateType::Hovering { return "Hovering" }
+    else if state_type == AIStateType::Bombing { return "Bombing" }
+    else if state_type == AIStateType::Cloaking { return "Cloaking" }
+    else if state_type == AIStateType::Decloaking { return "Decloaking" }
+    else if state_type == AIStateType::Infiltrating { return "Infiltrating" }
+    return "Unknown"
+}
+
+/// Get priority value for sorting
+fn priority_value(priority: AIPriority) -> Int {
+    if priority == AIPriority::VeryLow { return 0 }
+    else if priority == AIPriority::Low { return 1 }
+    else if priority == AIPriority::Normal { return 2 }
+    else if priority == AIPriority::High { return 3 }
+    else if priority == AIPriority::VeryHigh { return 4 }
+    else if priority == AIPriority::Critical { return 5 }
+    return 2
+}
+
+// ============================================================================
+// Pre-built AI State Machines
+// ============================================================================
+
+/// Create basic unit AI state machine
+fn create_basic_unit_ai() -> StateMachineDefinition {
+    let def = create_definition("BasicUnitAI")
+
+    // Idle state
+    let idle = create_state("Idle")
+    idle.is_initial = true
+
+    // Transition to Moving when has move order
+    let to_moving = create_transition("Moving")
+    let move_cond = create_condition(ConditionType::Flag)
+    move_cond.flag_name = "has_move_order"
+    to_moving.conditions.add(move_cond)
+    to_moving.priority = 1
+    idle.transitions.add(to_moving)
+
+    // Transition to Attacking when has target
+    let to_attack = create_transition("Attacking")
+    let attack_cond = create_condition(ConditionType::Flag)
+    attack_cond.flag_name = "has_target"
+    to_attack.conditions.add(attack_cond)
+    to_attack.priority = 2
+    idle.transitions.add(to_attack)
+
+    // Transition to Dying when health <= 0
+    let to_dying = create_transition("Dying")
+    let dying_cond = create_condition(ConditionType::Health)
+    dying_cond.threshold = 0.0
+    dying_cond.comparison = "le"
+    to_dying.conditions.add(dying_cond)
+    to_dying.priority = 10
+    idle.transitions.add(to_dying)
+
+    add_state(def, idle)
+
+    // Moving state
+    let moving = create_state("Moving")
+
+    // Back to Idle when reached destination
+    let to_idle_move = create_transition("Idle")
+    let reached_cond = create_condition(ConditionType::Flag)
+    reached_cond.flag_name = "reached_destination"
+    to_idle_move.conditions.add(reached_cond)
+    moving.transitions.add(to_idle_move)
+
+    // To Attacking if attacked
+    let to_attack_move = create_transition("Attacking")
+    let attack_move_cond = create_condition(ConditionType::Flag)
+    attack_move_cond.flag_name = "has_target"
+    to_attack_move.conditions.add(attack_move_cond)
+    to_attack_move.priority = 2
+    moving.transitions.add(to_attack_move)
+
+    // Transition to Dying
+    let to_dying_move = create_transition("Dying")
+    let dying_move_cond = create_condition(ConditionType::Health)
+    dying_move_cond.threshold = 0.0
+    dying_move_cond.comparison = "le"
+    to_dying_move.conditions.add(dying_move_cond)
+    to_dying_move.priority = 10
+    moving.transitions.add(to_dying_move)
+
+    add_state(def, moving)
+
+    // Attacking state
+    let attacking = create_state("Attacking")
+
+    // Back to Idle when target dead or out of range
+    let to_idle_attack = create_transition("Idle")
+    let no_target_cond = create_condition(ConditionType::Flag)
+    no_target_cond.flag_name = "has_target"
+    // Note: This would need "not" logic - handled differently in real impl
+    to_idle_attack.conditions.add(no_target_cond)
+    attacking.transitions.add(to_idle_attack)
+
+    // To Pursuing if target moves away
+    let to_pursue = create_transition("Pursuing")
+    let pursue_cond = create_condition(ConditionType::Flag)
+    pursue_cond.flag_name = "target_out_of_range"
+    to_pursue.conditions.add(pursue_cond)
+    attacking.transitions.add(to_pursue)
+
+    // Transition to Dying
+    let to_dying_attack = create_transition("Dying")
+    let dying_attack_cond = create_condition(ConditionType::Health)
+    dying_attack_cond.threshold = 0.0
+    dying_attack_cond.comparison = "le"
+    to_dying_attack.conditions.add(dying_attack_cond)
+    to_dying_attack.priority = 10
+    attacking.transitions.add(to_dying_attack)
+
+    add_state(def, attacking)
+
+    // Pursuing state
+    let pursuing = create_state("Pursuing")
+
+    // Back to Attacking when in range
+    let to_attack_pursue = create_transition("Attacking")
+    let in_range_cond = create_condition(ConditionType::Flag)
+    in_range_cond.flag_name = "target_in_range"
+    to_attack_pursue.conditions.add(in_range_cond)
+    pursuing.transitions.add(to_attack_pursue)
+
+    // Back to Idle if lost target
+    let to_idle_pursue = create_transition("Idle")
+    let lost_cond = create_condition(ConditionType::Flag)
+    lost_cond.flag_name = "lost_target"
+    to_idle_pursue.conditions.add(lost_cond)
+    pursuing.transitions.add(to_idle_pursue)
+
+    // Transition to Dying
+    let to_dying_pursue = create_transition("Dying")
+    let dying_pursue_cond = create_condition(ConditionType::Health)
+    dying_pursue_cond.threshold = 0.0
+    dying_pursue_cond.comparison = "le"
+    to_dying_pursue.conditions.add(dying_pursue_cond)
+    to_dying_pursue.priority = 10
+    pursuing.transitions.add(to_dying_pursue)
+
+    add_state(def, pursuing)
+
+    // Dying state
+    let dying = create_state("Dying")
+
+    // To Dead after animation
+    let to_dead = create_transition("Dead")
+    let dead_timer = create_condition(ConditionType::Timer)
+    dead_timer.flag_name = "state_time"
+    dead_timer.threshold = 2.0  // Death animation time
+    dead_timer.comparison = "ge"
+    to_dead.conditions.add(dead_timer)
+    dying.transitions.add(to_dead)
+
+    add_state(def, dying)
+
+    // Dead state (final)
+    let dead = create_state("Dead")
+    dead.is_final = true
+    add_state(def, dead)
+
+    return def
+}
+
+/// Create harvester AI state machine
+fn create_harvester_ai() -> StateMachineDefinition {
+    let def = create_definition("HarvesterAI")
+
+    // Idle state
+    let idle = create_state("Idle")
+    idle.is_initial = true
+
+    // To Harvesting when has resource target
+    let to_harvest = create_transition("Harvesting")
+    let harvest_cond = create_condition(ConditionType::Flag)
+    harvest_cond.flag_name = "has_resource_target"
+    to_harvest.conditions.add(harvest_cond)
+    idle.transitions.add(to_harvest)
+
+    add_state(def, idle)
+
+    // Moving to Resources state
+    let moving_to = create_state("MovingToResources")
+
+    let arrived = create_transition("Harvesting")
+    let arrived_cond = create_condition(ConditionType::Flag)
+    arrived_cond.flag_name = "at_resource"
+    arrived.conditions.add(arrived_cond)
+    moving_to.transitions.add(arrived)
+
+    add_state(def, moving_to)
+
+    // Harvesting state
+    let harvesting = create_state("Harvesting")
+
+    // To Returning when full
+    let to_return = create_transition("Returning")
+    let full_cond = create_condition(ConditionType::Flag)
+    full_cond.flag_name = "cargo_full"
+    to_return.conditions.add(full_cond)
+    harvesting.transitions.add(to_return)
+
+    // To MovingToResources if resource depleted
+    let to_find = create_transition("MovingToResources")
+    let depleted_cond = create_condition(ConditionType::Flag)
+    depleted_cond.flag_name = "resource_depleted"
+    to_find.conditions.add(depleted_cond)
+    harvesting.transitions.add(to_find)
+
+    add_state(def, harvesting)
+
+    // Returning state
+    let returning = create_state("Returning")
+
+    // To Docking when at base
+    let to_dock = create_transition("Docking")
+    let at_base = create_condition(ConditionType::Flag)
+    at_base.flag_name = "at_refinery"
+    to_dock.conditions.add(at_base)
+    returning.transitions.add(to_dock)
+
+    add_state(def, returning)
+
+    // Docking state
+    let docking = create_state("Docking")
+
+    // Back to MovingToResources after unloading
+    let to_harvest_again = create_transition("MovingToResources")
+    let unloaded = create_condition(ConditionType::Flag)
+    unloaded.flag_name = "cargo_empty"
+    to_harvest_again.conditions.add(unloaded)
+    docking.transitions.add(to_harvest_again)
+
+    add_state(def, docking)
+
+    return def
+}
+
+/// Create aircraft AI state machine
+fn create_aircraft_ai() -> StateMachineDefinition {
+    let def = create_definition("AircraftAI")
+
+    // Grounded state (initial)
+    let grounded = create_state("Grounded")
+    grounded.is_initial = true
+
+    let to_takeoff = create_transition("TakingOff")
+    let takeoff_cond = create_condition(ConditionType::Flag)
+    takeoff_cond.flag_name = "launch_order"
+    to_takeoff.conditions.add(takeoff_cond)
+    grounded.transitions.add(to_takeoff)
+
+    add_state(def, grounded)
+
+    // Taking Off state
+    let takeoff = create_state("TakingOff")
+
+    let to_flying = create_transition("Flying")
+    let airborne = create_condition(ConditionType::Flag)
+    airborne.flag_name = "airborne"
+    to_flying.conditions.add(airborne)
+    takeoff.transitions.add(to_flying)
+
+    add_state(def, takeoff)
+
+    // Flying state
+    let flying = create_state("Flying")
+
+    // To Attacking
+    let to_attack = create_transition("Attacking")
+    let attack_cond = create_condition(ConditionType::Flag)
+    attack_cond.flag_name = "has_target"
+    to_attack.conditions.add(attack_cond)
+    flying.transitions.add(to_attack)
+
+    // To Landing
+    let to_land = create_transition("Landing")
+    let land_cond = create_condition(ConditionType::Flag)
+    land_cond.flag_name = "return_to_base"
+    to_land.conditions.add(land_cond)
+    flying.transitions.add(to_land)
+
+    // Low fuel emergency land
+    let to_land_fuel = create_transition("Landing")
+    let fuel_cond = create_condition(ConditionType::Custom)
+    fuel_cond.flag_name = "fuel"
+    fuel_cond.threshold = 10.0
+    fuel_cond.comparison = "lt"
+    to_land_fuel.priority = 5
+    to_land_fuel.conditions.add(fuel_cond)
+    flying.transitions.add(to_land_fuel)
+
+    add_state(def, flying)
+
+    // Attacking state
+    let attacking = create_state("Attacking")
+
+    let to_flying_done = create_transition("Flying")
+    let no_target = create_condition(ConditionType::Flag)
+    no_target.flag_name = "target_destroyed"
+    to_flying_done.conditions.add(no_target)
+    attacking.transitions.add(to_flying_done)
+
+    add_state(def, attacking)
+
+    // Landing state
+    let landing = create_state("Landing")
+
+    let to_grounded = create_transition("Grounded")
+    let landed = create_condition(ConditionType::Flag)
+    landed.flag_name = "landed"
+    to_grounded.conditions.add(landed)
+    landing.transitions.add(to_grounded)
+
+    add_state(def, landing)
+
+    return def
+}
+
+/// Create building AI state machine
+fn create_building_ai() -> StateMachineDefinition {
+    let def = create_definition("BuildingAI")
+
+    // Construction state (initial)
+    let construction = create_state("Construction")
+    construction.is_initial = true
+
+    let to_idle = create_transition("Idle")
+    let built_cond = create_condition(ConditionType::Flag)
+    built_cond.flag_name = "construction_complete"
+    to_idle.conditions.add(built_cond)
+    construction.transitions.add(to_idle)
+
+    add_state(def, construction)
+
+    // Idle state
+    let idle = create_state("Idle")
+
+    // To Producing
+    let to_produce = create_transition("Producing")
+    let produce_cond = create_condition(ConditionType::Flag)
+    produce_cond.flag_name = "has_production_queue"
+    to_produce.conditions.add(produce_cond)
+    idle.transitions.add(to_produce)
+
+    // To Upgrading
+    let to_upgrade = create_transition("Upgrading")
+    let upgrade_cond = create_condition(ConditionType::Flag)
+    upgrade_cond.flag_name = "upgrading"
+    to_upgrade.conditions.add(upgrade_cond)
+    idle.transitions.add(to_upgrade)
+
+    // To Dying
+    let to_dying = create_transition("Dying")
+    let dying_cond = create_condition(ConditionType::Health)
+    dying_cond.threshold = 0.0
+    dying_cond.comparison = "le"
+    to_dying.priority = 10
+    to_dying.conditions.add(dying_cond)
+    idle.transitions.add(to_dying)
+
+    add_state(def, idle)
+
+    // Producing state
+    let producing = create_state("Producing")
+
+    let to_idle_prod = create_transition("Idle")
+    let queue_empty = create_condition(ConditionType::Flag)
+    queue_empty.flag_name = "queue_empty"
+    to_idle_prod.conditions.add(queue_empty)
+    producing.transitions.add(to_idle_prod)
+
+    // Transition to Dying
+    let to_dying_prod = create_transition("Dying")
+    let dying_prod_cond = create_condition(ConditionType::Health)
+    dying_prod_cond.threshold = 0.0
+    dying_prod_cond.comparison = "le"
+    to_dying_prod.priority = 10
+    to_dying_prod.conditions.add(dying_prod_cond)
+    producing.transitions.add(to_dying_prod)
+
+    add_state(def, producing)
+
+    // Upgrading state
+    let upgrading = create_state("Upgrading")
+
+    let to_idle_upgrade = create_transition("Idle")
+    let upgrade_done = create_condition(ConditionType::Flag)
+    upgrade_done.flag_name = "upgrade_complete"
+    to_idle_upgrade.conditions.add(upgrade_done)
+    upgrading.transitions.add(to_idle_upgrade)
+
+    add_state(def, upgrading)
+
+    // Dying state
+    let dying = create_state("Dying")
+
+    let to_rubble = create_transition("Rubble")
+    let collapse_done = create_condition(ConditionType::Timer)
+    collapse_done.flag_name = "state_time"
+    collapse_done.threshold = 3.0
+    collapse_done.comparison = "ge"
+    to_rubble.conditions.add(collapse_done)
+    dying.transitions.add(to_rubble)
+
+    add_state(def, dying)
+
+    // Rubble state (final)
+    let rubble = create_state("Rubble")
+    rubble.is_final = true
+    add_state(def, rubble)
+
+    return def
+}
+
+// ============================================================================
+// AI State Machine Manager
+// ============================================================================
+
+struct AIStateMachineManager {
+    templates: Map<String, StateMachineDefinition>,
+
+    fn init() -> AIStateMachineManager {
+        let mgr = AIStateMachineManager {
+            templates: Map<String, StateMachineDefinition>{},
+        }
+
+        // Register built-in templates
+        mgr.templates.set("BasicUnit", create_basic_unit_ai())
+        mgr.templates.set("Harvester", create_harvester_ai())
+        mgr.templates.set("Aircraft", create_aircraft_ai())
+        mgr.templates.set("Building", create_building_ai())
+
+        return mgr
+    }
+
+    fn get_template(self, name: String) -> StateMachineDefinition {
+        if self.templates.has(name) {
+            return self.templates.get(name)
+        }
+        return create_definition("")
+    }
+
+    fn has_template(self, name: String) -> Bool {
+        return self.templates.has(name)
+    }
+
+    fn register_template(self, name: String, def: StateMachineDefinition) {
+        self.templates.set(name, def)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_state_data() -> Bool {
+    let idle_data = get_state_data(AIStateType::Idle)
+    assert(idle_data.can_attack == true, "Idle should allow attack")
+    assert(idle_data.can_move == true, "Idle should allow move")
+
+    let attack_data = get_state_data(AIStateType::Attacking)
+    assert(attack_data.can_attack == true, "Attacking should allow attack")
+    assert(attack_data.can_move == false, "Attacking should not allow move")
+    assert(attack_data.preserve_target == true, "Attacking should preserve target")
+
+    let dying_data = get_state_data(AIStateType::Dying)
+    assert(dying_data.interruptible == false, "Dying should not be interruptible")
+
+    return true
+}
+
+fn test_state_name() -> Bool {
+    assert(state_type_to_string(AIStateType::Idle) == "Idle", "Should be Idle")
+    assert(state_type_to_string(AIStateType::Attacking) == "Attacking", "Should be Attacking")
+    assert(state_type_to_string(AIStateType::Harvesting) == "Harvesting", "Should be Harvesting")
+    return true
+}
+
+fn test_basic_unit_ai() -> Bool {
+    let def = create_basic_unit_ai()
+    assert(def.name == "BasicUnitAI", "Name should match")
+    assert(def.initial_state == "Idle", "Should start in Idle")
+    return true
+}
+
+fn test_manager() -> Bool {
+    let mgr = AIStateMachineManager::init()
+    assert(mgr.has_template("BasicUnit"), "Should have BasicUnit")
+    assert(mgr.has_template("Harvester"), "Should have Harvester")
+    assert(mgr.has_template("Aircraft"), "Should have Aircraft")
+    assert(mgr.has_template("Building"), "Should have Building")
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_state_data(), "State data test failed")
+    assert(test_state_name(), "State name test failed")
+    assert(test_basic_unit_ai(), "Basic unit AI test failed")
+    assert(test_manager(), "Manager test failed")
+    return true
+}
