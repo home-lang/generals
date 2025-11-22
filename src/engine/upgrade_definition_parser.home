@@ -1,0 +1,328 @@
+// Upgrade Definition Parser - Parses upgrade INI files for C&C Generals
+// Handles Upgrade blocks from Data/INI/Upgrade.ini
+
+use std::collections::HashMap
+
+// Upgrade types matching Thyme
+enum UpgradeType {
+    Player,      // Player-wide upgrades
+    Object,      // Object-specific upgrades
+}
+
+// Upgrade status
+enum UpgradeStatus {
+    Invalid,
+    Disabled,
+    Available,
+    InProgress,
+    Complete,
+}
+
+// Single upgrade definition
+struct UpgradeDefinition {
+    name: string,
+    display_name: string,
+    upgrade_type: UpgradeType,
+
+    // Cost and time
+    build_cost: u32,
+    build_time: u32,
+    research_sound: string,
+
+    // UI
+    button_image: string,
+    cursor_name: string,
+    description: string,
+
+    // Requirements
+    prerequisite_upgrade: string,
+    prerequisite_science: string,
+    build_on_hold: bool,
+
+    // Granting
+    granted_by: [string; 8],
+    granted_by_count: u32,
+    researchable: bool,
+    persist_across_missions: bool,
+
+    // Triggers/effects
+    triggered_by: [string; 4],
+    triggered_by_count: u32,
+    conflicting_upgrades: [string; 4],
+    conflicting_upgrade_count: u32,
+
+    is_valid: bool,
+}
+
+const MAX_UPGRADES: u32 = 512
+
+struct UpgradeDefinitionParser {
+    upgrades: [UpgradeDefinition; MAX_UPGRADES],
+    upgrade_count: u32,
+    upgrade_name_to_index: HashMap<string, u32>,
+
+    // Parse state
+    current_upgrade: u32,
+    in_upgrade_block: bool,
+
+    // Error tracking
+    parse_errors: [string; 64],
+    error_count: u32,
+}
+
+impl UpgradeDefinitionParser {
+    fn new() -> Self {
+        let parser = UpgradeDefinitionParser {
+            upgrades: [UpgradeDefinition::default(); MAX_UPGRADES],
+            upgrade_count: 0,
+            upgrade_name_to_index: HashMap::new(),
+            current_upgrade: 0,
+            in_upgrade_block: false,
+            parse_errors: [string::default(); 64],
+            error_count: 0,
+        }
+        parser
+    }
+
+    fn parse_file(&mut self, file_path: string) -> bool {
+        let content = std::fs::read_to_string(file_path)
+        if content.is_empty() {
+            self.add_error("Failed to read file: " + file_path)
+            return false
+        }
+
+        let lines = content.split('\n')
+        let line_num: u32 = 0
+
+        for line in lines {
+            line_num += 1
+            let trimmed = line.trim()
+
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue
+            }
+
+            if !self.parse_line(trimmed, line_num) {
+                return false
+            }
+        }
+
+        true
+    }
+
+    fn parse_line(&mut self, line: string, line_num: u32) -> bool {
+        if line.starts_with("Upgrade ") {
+            return self.begin_upgrade_block(line)
+        }
+
+        if line == "End" {
+            return self.end_upgrade_block()
+        }
+
+        if self.in_upgrade_block {
+            return self.parse_upgrade_property(line)
+        }
+
+        true
+    }
+
+    fn begin_upgrade_block(&mut self, line: string) -> bool {
+        if self.upgrade_count >= MAX_UPGRADES {
+            self.add_error("Maximum upgrade count exceeded")
+            return false
+        }
+
+        // Parse: "Upgrade UpgradeName" or "Upgrade UpgradeName : ParentUpgrade"
+        let parts = line.split(' ')
+        if parts.len() < 2 {
+            self.add_error("Invalid upgrade declaration")
+            return false
+        }
+
+        let mut upgrade_name = parts[1].trim()
+        let mut parent_name: string = ""
+
+        if line.contains(':') {
+            let inherit_parts = line.split(':')
+            if inherit_parts.len() >= 2 {
+                upgrade_name = inherit_parts[0].split(' ')[1].trim()
+                parent_name = inherit_parts[1].trim()
+            }
+        }
+
+        self.current_upgrade = self.upgrade_count
+        self.upgrades[self.current_upgrade] = UpgradeDefinition::default()
+        self.upgrades[self.current_upgrade].name = upgrade_name.to_string()
+        self.upgrades[self.current_upgrade].is_valid = true
+
+        if !parent_name.is_empty() {
+            self.inherit_from(parent_name)
+        }
+
+        self.upgrade_name_to_index.insert(upgrade_name.to_string(), self.current_upgrade)
+        self.upgrade_count += 1
+        self.in_upgrade_block = true
+
+        true
+    }
+
+    fn inherit_from(&mut self, parent_name: string) {
+        if let Some(parent_idx) = self.upgrade_name_to_index.get(&parent_name) {
+            let parent = &self.upgrades[*parent_idx]
+            let current = &mut self.upgrades[self.current_upgrade]
+
+            current.upgrade_type = parent.upgrade_type
+            current.build_cost = parent.build_cost
+            current.build_time = parent.build_time
+            current.button_image = parent.button_image.clone()
+            current.description = parent.description.clone()
+            current.researchable = parent.researchable
+        }
+    }
+
+    fn end_upgrade_block(&mut self) -> bool {
+        self.in_upgrade_block = false
+        true
+    }
+
+    fn parse_upgrade_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let upgrade = &mut self.upgrades[self.current_upgrade]
+
+        match key.as_str() {
+            "DisplayName" => upgrade.display_name = value,
+            "Type" => upgrade.upgrade_type = self.parse_upgrade_type(value),
+            "BuildCost" => upgrade.build_cost = self.parse_u32(value),
+            "BuildTime" => upgrade.build_time = self.parse_u32(value),
+            "ResearchSound" => upgrade.research_sound = value,
+            "ButtonImage" => upgrade.button_image = value,
+            "Cursor" => upgrade.cursor_name = value,
+            "Description" => upgrade.description = value,
+            "RequiredUpgrade" => upgrade.prerequisite_upgrade = value,
+            "RequiredScience" => upgrade.prerequisite_science = value,
+            "BuildOnHold" => upgrade.build_on_hold = self.parse_bool(value),
+            "Researchable" => upgrade.researchable = self.parse_bool(value),
+            "PersistsAcrossMissions" => upgrade.persist_across_missions = self.parse_bool(value),
+            "GrantedBy" => self.add_granted_by(upgrade, value),
+            "TriggeredBy" => self.add_triggered_by(upgrade, value),
+            "ConflictsWith" => self.add_conflict(upgrade, value),
+            _ => {},
+        }
+
+        true
+    }
+
+    fn add_granted_by(&self, upgrade: &mut UpgradeDefinition, value: string) {
+        if upgrade.granted_by_count < 8 {
+            upgrade.granted_by[upgrade.granted_by_count as usize] = value
+            upgrade.granted_by_count += 1
+        }
+    }
+
+    fn add_triggered_by(&self, upgrade: &mut UpgradeDefinition, value: string) {
+        if upgrade.triggered_by_count < 4 {
+            upgrade.triggered_by[upgrade.triggered_by_count as usize] = value
+            upgrade.triggered_by_count += 1
+        }
+    }
+
+    fn add_conflict(&self, upgrade: &mut UpgradeDefinition, value: string) {
+        if upgrade.conflicting_upgrade_count < 4 {
+            upgrade.conflicting_upgrades[upgrade.conflicting_upgrade_count as usize] = value
+            upgrade.conflicting_upgrade_count += 1
+        }
+    }
+
+    fn parse_upgrade_type(&self, value: string) -> UpgradeType {
+        match value.to_uppercase().as_str() {
+            "PLAYER" => UpgradeType::Player,
+            "OBJECT" => UpgradeType::Object,
+            _ => UpgradeType::Object,
+        }
+    }
+
+    fn split_property(&self, line: string) -> (string, string) {
+        let eq_pos = line.find('=')
+        if eq_pos.is_some() {
+            let idx = eq_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        let space_pos = line.find(' ')
+        if space_pos.is_some() {
+            let idx = space_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        (line, "".to_string())
+    }
+
+    fn parse_u32(&self, value: string) -> u32 {
+        value.trim().parse::<u32>().unwrap_or(0)
+    }
+
+    fn parse_bool(&self, value: string) -> bool {
+        let v = value.to_uppercase()
+        v == "YES" || v == "TRUE" || v == "1"
+    }
+
+    fn add_error(&mut self, msg: string) {
+        if self.error_count < 64 {
+            self.parse_errors[self.error_count as usize] = msg
+            self.error_count += 1
+        }
+    }
+
+    // Public API
+    fn get_upgrade(&self, name: string) -> Option<&UpgradeDefinition> {
+        if let Some(idx) = self.upgrade_name_to_index.get(&name) {
+            return Some(&self.upgrades[*idx as usize])
+        }
+        None
+    }
+
+    fn get_upgrade_by_index(&self, index: u32) -> Option<&UpgradeDefinition> {
+        if index < self.upgrade_count {
+            return Some(&self.upgrades[index as usize])
+        }
+        None
+    }
+
+    fn get_upgrade_count(&self) -> u32 {
+        self.upgrade_count
+    }
+}
+
+impl Default for UpgradeDefinition {
+    fn default() -> Self {
+        UpgradeDefinition {
+            name: "".to_string(),
+            display_name: "".to_string(),
+            upgrade_type: UpgradeType::Object,
+            build_cost: 0,
+            build_time: 0,
+            research_sound: "".to_string(),
+            button_image: "".to_string(),
+            cursor_name: "".to_string(),
+            description: "".to_string(),
+            prerequisite_upgrade: "".to_string(),
+            prerequisite_science: "".to_string(),
+            build_on_hold: false,
+            granted_by: [string::default(); 8],
+            granted_by_count: 0,
+            researchable: true,
+            persist_across_missions: false,
+            triggered_by: [string::default(); 4],
+            triggered_by_count: 0,
+            conflicting_upgrades: [string::default(); 4],
+            conflicting_upgrade_count: 0,
+            is_valid: false,
+        }
+    }
+}

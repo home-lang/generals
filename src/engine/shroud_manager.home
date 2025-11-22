@@ -1,0 +1,540 @@
+// Shroud Manager - Fog of War and Shroud system
+// Implements C&C Generals vision and shroud mechanics
+
+// Cell visibility states
+enum ShroudState {
+    Unexplored,  // Never seen (black shroud)
+    Fogged,      // Was seen but not currently visible (semi-transparent)
+    Visible,     // Currently visible
+}
+
+// Vision source type
+enum VisionSourceType {
+    Unit,
+    Structure,
+    Radar,
+    Aircraft,
+    Garrison,
+    SpecialPower,
+}
+
+// Individual vision source
+struct VisionSource {
+    id: u32,
+    owner_player: u32,
+    position_x: f32,
+    position_y: f32,
+    vision_range: f32,
+    shroud_clearing_range: f32,
+    source_type: VisionSourceType,
+    is_active: bool,
+}
+
+// Shroud cell data
+struct ShroudCell {
+    state: ShroudState,
+    visibility_count: u32,  // Number of vision sources seeing this cell
+    last_seen_frame: u32,   // Frame when last visible
+    reveal_player_mask: u32, // Bit mask of which players have revealed this
+}
+
+// Position
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+const MAX_VISION_SOURCES: u32 = 2048
+const MAX_PLAYERS: u32 = 8
+
+struct ShroudManager {
+    // Shroud grid per player
+    shroud_grids: [[Vec<ShroudCell>; MAX_PLAYERS as usize]; 1],
+    grid_width: u32,
+    grid_height: u32,
+    cell_size: f32,
+
+    // Vision sources
+    vision_sources: [VisionSource; MAX_VISION_SOURCES],
+    vision_source_count: u32,
+    next_vision_id: u32,
+
+    // Per-player shroud state
+    player_shroud_enabled: [bool; MAX_PLAYERS as usize],
+    player_allies: [u32; MAX_PLAYERS as usize], // Bit mask of allied players
+
+    // GPU texture for rendering shroud
+    shroud_textures: [u64; MAX_PLAYERS as usize],
+    shroud_texture_dirty: [bool; MAX_PLAYERS as usize],
+
+    // Update batching
+    dirty_cells: Vec<(u32, u32)>,
+    needs_full_update: bool,
+
+    // Current frame
+    current_frame: u32,
+
+    // Settings
+    fog_of_war_enabled: bool,
+    shroud_enabled: bool,
+    reveal_all: bool,
+
+    // Precomputed circle masks for vision
+    vision_circle_offsets: Vec<(i32, i32)>,
+    max_vision_radius: u32,
+}
+
+impl ShroudManager {
+    fn new(width: u32, height: u32, cell_size: f32) -> Self {
+        let grid_size = (width * height) as usize
+
+        // Initialize shroud grids for all players
+        let mut shroud_grids = [Vec::new(); MAX_PLAYERS as usize]
+        for i in 0..MAX_PLAYERS as usize {
+            shroud_grids[i] = vec![ShroudCell::default(); grid_size]
+        }
+
+        let mut manager = ShroudManager {
+            shroud_grids: [shroud_grids],
+            grid_width: width,
+            grid_height: height,
+            cell_size: cell_size,
+            vision_sources: [VisionSource::default(); MAX_VISION_SOURCES as usize],
+            vision_source_count: 0,
+            next_vision_id: 1,
+            player_shroud_enabled: [true; MAX_PLAYERS as usize],
+            player_allies: [0; MAX_PLAYERS as usize],
+            shroud_textures: [0; MAX_PLAYERS as usize],
+            shroud_texture_dirty: [true; MAX_PLAYERS as usize],
+            dirty_cells: Vec::new(),
+            needs_full_update: true,
+            current_frame: 0,
+            fog_of_war_enabled: true,
+            shroud_enabled: true,
+            reveal_all: false,
+            vision_circle_offsets: Vec::new(),
+            max_vision_radius: 20,
+        }
+
+        manager.precompute_vision_circles()
+        manager
+    }
+
+    // Precompute circle offsets for different vision ranges
+    fn precompute_vision_circles(&mut self) {
+        self.vision_circle_offsets.clear()
+
+        // For each possible radius, store which cells are within range
+        let max_r = self.max_vision_radius as i32
+
+        for dy in -max_r..=max_r {
+            for dx in -max_r..=max_r {
+                let dist_sq = dx * dx + dy * dy
+                if dist_sq <= max_r * max_r {
+                    self.vision_circle_offsets.push((dx, dy))
+                }
+            }
+        }
+    }
+
+    // Add a vision source
+    fn add_vision_source(&mut self, owner: u32, x: f32, y: f32,
+                         vision_range: f32, shroud_range: f32,
+                         source_type: VisionSourceType) -> u32 {
+        if self.vision_source_count >= MAX_VISION_SOURCES {
+            return 0
+        }
+
+        // Find free slot
+        let mut slot: i32 = -1
+        for i in 0..MAX_VISION_SOURCES as usize {
+            if !self.vision_sources[i].is_active {
+                slot = i as i32
+                break
+            }
+        }
+
+        if slot < 0 {
+            return 0
+        }
+
+        let id = self.next_vision_id
+        self.next_vision_id += 1
+
+        self.vision_sources[slot as usize] = VisionSource {
+            id: id,
+            owner_player: owner,
+            position_x: x,
+            position_y: y,
+            vision_range: vision_range,
+            shroud_clearing_range: shroud_range,
+            source_type: source_type,
+            is_active: true,
+        }
+
+        self.vision_source_count += 1
+
+        // Apply vision immediately
+        self.apply_vision_source(slot as usize)
+
+        id
+    }
+
+    fn remove_vision_source(&mut self, id: u32) {
+        for i in 0..MAX_VISION_SOURCES as usize {
+            if self.vision_sources[i].id == id && self.vision_sources[i].is_active {
+                // Remove vision contribution
+                self.remove_vision_contribution(i)
+
+                self.vision_sources[i].is_active = false
+                self.vision_source_count -= 1
+                break
+            }
+        }
+    }
+
+    fn update_vision_source_position(&mut self, id: u32, new_x: f32, new_y: f32) {
+        for i in 0..MAX_VISION_SOURCES as usize {
+            if self.vision_sources[i].id == id && self.vision_sources[i].is_active {
+                let old_x = self.vision_sources[i].position_x
+                let old_y = self.vision_sources[i].position_y
+
+                // Only update if position changed significantly
+                let dx = new_x - old_x
+                let dy = new_y - old_y
+                if dx * dx + dy * dy > self.cell_size * self.cell_size * 0.25 {
+                    // Remove old vision
+                    self.remove_vision_contribution(i)
+
+                    // Update position
+                    self.vision_sources[i].position_x = new_x
+                    self.vision_sources[i].position_y = new_y
+
+                    // Apply new vision
+                    self.apply_vision_source(i)
+                }
+                break
+            }
+        }
+    }
+
+    fn apply_vision_source(&mut self, source_idx: usize) {
+        let source = &self.vision_sources[source_idx]
+        let owner = source.owner_player
+        let range = source.vision_range / self.cell_size
+        let shroud_range = source.shroud_clearing_range / self.cell_size
+
+        let center_x = (source.position_x / self.cell_size) as i32
+        let center_y = (source.position_y / self.cell_size) as i32
+
+        let range_i = range as i32
+        let shroud_range_i = shroud_range as i32
+
+        // Get allied players mask
+        let allies = self.player_allies[owner as usize] | (1 << owner)
+
+        for dy in -range_i.max(shroud_range_i)..=range_i.max(shroud_range_i) {
+            for dx in -range_i.max(shroud_range_i)..=range_i.max(shroud_range_i) {
+                let dist_sq = (dx * dx + dy * dy) as f32
+
+                let gx = center_x + dx
+                let gy = center_y + dy
+
+                if gx < 0 || gx >= self.grid_width as i32 ||
+                   gy < 0 || gy >= self.grid_height as i32 {
+                    continue
+                }
+
+                let idx = (gy as u32 * self.grid_width + gx as u32) as usize
+
+                // Apply shroud clearing (permanent reveal)
+                if dist_sq <= (shroud_range * shroud_range) {
+                    for player in 0..MAX_PLAYERS {
+                        if (allies & (1 << player)) != 0 {
+                            let cell = &mut self.shroud_grids[0][player as usize][idx]
+                            cell.reveal_player_mask |= 1 << owner
+                        }
+                    }
+                }
+
+                // Apply visibility (current sight)
+                if dist_sq <= (range * range) {
+                    for player in 0..MAX_PLAYERS {
+                        if (allies & (1 << player)) != 0 {
+                            let cell = &mut self.shroud_grids[0][player as usize][idx]
+                            cell.visibility_count += 1
+                            cell.state = ShroudState::Visible
+                            cell.last_seen_frame = self.current_frame
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mark dirty for texture update
+        for player in 0..MAX_PLAYERS as usize {
+            if (allies & (1 << player)) != 0 {
+                self.shroud_texture_dirty[player] = true
+            }
+        }
+    }
+
+    fn remove_vision_contribution(&mut self, source_idx: usize) {
+        let source = &self.vision_sources[source_idx]
+        let owner = source.owner_player
+        let range = source.vision_range / self.cell_size
+
+        let center_x = (source.position_x / self.cell_size) as i32
+        let center_y = (source.position_y / self.cell_size) as i32
+
+        let range_i = range as i32
+        let allies = self.player_allies[owner as usize] | (1 << owner)
+
+        for dy in -range_i..=range_i {
+            for dx in -range_i..=range_i {
+                let dist_sq = (dx * dx + dy * dy) as f32
+
+                if dist_sq > range * range {
+                    continue
+                }
+
+                let gx = center_x + dx
+                let gy = center_y + dy
+
+                if gx < 0 || gx >= self.grid_width as i32 ||
+                   gy < 0 || gy >= self.grid_height as i32 {
+                    continue
+                }
+
+                let idx = (gy as u32 * self.grid_width + gx as u32) as usize
+
+                for player in 0..MAX_PLAYERS {
+                    if (allies & (1 << player)) != 0 {
+                        let cell = &mut self.shroud_grids[0][player as usize][idx]
+                        if cell.visibility_count > 0 {
+                            cell.visibility_count -= 1
+                        }
+
+                        // Update state based on visibility
+                        if cell.visibility_count == 0 {
+                            if cell.reveal_player_mask != 0 {
+                                cell.state = ShroudState::Fogged
+                            } else {
+                                cell.state = ShroudState::Unexplored
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mark dirty
+        for player in 0..MAX_PLAYERS as usize {
+            if (allies & (1 << player)) != 0 {
+                self.shroud_texture_dirty[player] = true
+            }
+        }
+    }
+
+    // Update shroud state (called each frame)
+    fn update(&mut self) {
+        self.current_frame += 1
+
+        // Full update if needed
+        if self.needs_full_update {
+            self.recalculate_all_vision()
+            self.needs_full_update = false
+        }
+    }
+
+    fn recalculate_all_vision(&mut self) {
+        // Clear all visibility counts
+        for player in 0..MAX_PLAYERS as usize {
+            for cell in &mut self.shroud_grids[0][player] {
+                cell.visibility_count = 0
+                if cell.reveal_player_mask != 0 || cell.state == ShroudState::Visible {
+                    cell.state = ShroudState::Fogged
+                }
+            }
+        }
+
+        // Reapply all active vision sources
+        for i in 0..MAX_VISION_SOURCES as usize {
+            if self.vision_sources[i].is_active {
+                self.apply_vision_source(i)
+            }
+        }
+
+        // Mark all textures dirty
+        for player in 0..MAX_PLAYERS as usize {
+            self.shroud_texture_dirty[player] = true
+        }
+    }
+
+    // Query functions
+    fn is_visible(&self, player: u32, world_x: f32, world_y: f32) -> bool {
+        if self.reveal_all || !self.fog_of_war_enabled {
+            return true
+        }
+
+        let gx = (world_x / self.cell_size) as u32
+        let gy = (world_y / self.cell_size) as u32
+
+        if gx >= self.grid_width || gy >= self.grid_height {
+            return false
+        }
+
+        let idx = (gy * self.grid_width + gx) as usize
+        let cell = &self.shroud_grids[0][player as usize][idx]
+
+        cell.state == ShroudState::Visible
+    }
+
+    fn is_explored(&self, player: u32, world_x: f32, world_y: f32) -> bool {
+        if self.reveal_all || !self.shroud_enabled {
+            return true
+        }
+
+        let gx = (world_x / self.cell_size) as u32
+        let gy = (world_y / self.cell_size) as u32
+
+        if gx >= self.grid_width || gy >= self.grid_height {
+            return false
+        }
+
+        let idx = (gy * self.grid_width + gx) as usize
+        let cell = &self.shroud_grids[0][player as usize][idx]
+
+        cell.state != ShroudState::Unexplored
+    }
+
+    fn get_shroud_state(&self, player: u32, world_x: f32, world_y: f32) -> ShroudState {
+        if self.reveal_all {
+            return ShroudState::Visible
+        }
+
+        let gx = (world_x / self.cell_size) as u32
+        let gy = (world_y / self.cell_size) as u32
+
+        if gx >= self.grid_width || gy >= self.grid_height {
+            return ShroudState::Unexplored
+        }
+
+        let idx = (gy * self.grid_width + gx) as usize
+        self.shroud_grids[0][player as usize][idx].state
+    }
+
+    // Set allies for shared vision
+    fn set_allies(&mut self, player: u32, allies_mask: u32) {
+        self.player_allies[player as usize] = allies_mask
+        self.needs_full_update = true
+    }
+
+    // Reveal area (for special powers, etc.)
+    fn reveal_area(&mut self, player: u32, center_x: f32, center_y: f32,
+                   radius: f32, duration_frames: u32) {
+        let cx = (center_x / self.cell_size) as i32
+        let cy = (center_y / self.cell_size) as i32
+        let r = (radius / self.cell_size) as i32
+
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue
+                }
+
+                let gx = cx + dx
+                let gy = cy + dy
+
+                if gx < 0 || gx >= self.grid_width as i32 ||
+                   gy < 0 || gy >= self.grid_height as i32 {
+                    continue
+                }
+
+                let idx = (gy as u32 * self.grid_width + gx as u32) as usize
+                let cell = &mut self.shroud_grids[0][player as usize][idx]
+
+                cell.reveal_player_mask |= 1 << player
+                cell.state = ShroudState::Visible
+                cell.visibility_count += 1 // Temporary
+            }
+        }
+
+        self.shroud_texture_dirty[player as usize] = true
+    }
+
+    // Generate shroud texture for rendering
+    fn update_shroud_texture(&mut self, player: u32) -> Vec<u8> {
+        let size = (self.grid_width * self.grid_height) as usize
+        let mut texture_data = vec![0u8; size]
+
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let idx = (y * self.grid_width + x) as usize
+                let cell = &self.shroud_grids[0][player as usize][idx]
+
+                texture_data[idx] = match cell.state {
+                    ShroudState::Unexplored => 0,   // Full black
+                    ShroudState::Fogged => 128,    // Half transparent
+                    ShroudState::Visible => 255,   // Fully visible
+                }
+            }
+        }
+
+        self.shroud_texture_dirty[player as usize] = false
+        texture_data
+    }
+
+    fn is_texture_dirty(&self, player: u32) -> bool {
+        self.shroud_texture_dirty[player as usize]
+    }
+
+    // Enable/disable features
+    fn set_fog_of_war_enabled(&mut self, enabled: bool) {
+        self.fog_of_war_enabled = enabled
+        self.needs_full_update = true
+    }
+
+    fn set_shroud_enabled(&mut self, enabled: bool) {
+        self.shroud_enabled = enabled
+        self.needs_full_update = true
+    }
+
+    fn set_reveal_all(&mut self, reveal: bool) {
+        self.reveal_all = reveal
+    }
+
+    fn get_grid_dimensions(&self) -> (u32, u32) {
+        (self.grid_width, self.grid_height)
+    }
+
+    fn get_cell_size(&self) -> f32 {
+        self.cell_size
+    }
+}
+
+impl Default for ShroudCell {
+    fn default() -> Self {
+        ShroudCell {
+            state: ShroudState::Unexplored,
+            visibility_count: 0,
+            last_seen_frame: 0,
+            reveal_player_mask: 0,
+        }
+    }
+}
+
+impl Default for VisionSource {
+    fn default() -> Self {
+        VisionSource {
+            id: 0,
+            owner_player: 0,
+            position_x: 0.0,
+            position_y: 0.0,
+            vision_range: 0.0,
+            shroud_clearing_range: 0.0,
+            source_type: VisionSourceType::Unit,
+            is_active: false,
+        }
+    }
+}

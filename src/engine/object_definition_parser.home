@@ -1,0 +1,1006 @@
+// object_definition_parser.home - Parse Object definitions from INI files
+// Loads all unit/building definitions from game INI files
+
+const MAX_PARSE_ERRORS: u32 = 100
+
+// ============================================================================
+// INI Token Types
+// ============================================================================
+
+enum TokenType {
+    Identifier,
+    String,
+    Number,
+    Equals,
+    Semicolon,
+    OpenBrace,
+    CloseBrace,
+    Newline,
+    EOF
+}
+
+struct Token {
+    token_type: TokenType,
+    text: string,
+    line: u32,
+    column: u32
+}
+
+// ============================================================================
+// Parse Context
+// ============================================================================
+
+struct ParseError {
+    message: string,
+    file: string,
+    line: u32,
+    column: u32
+}
+
+struct ParseContext {
+    current_file: string,
+    line: u32,
+    column: u32,
+    errors: [ParseError; MAX_PARSE_ERRORS],
+    error_count: u32
+}
+
+impl ParseContext {
+    fn new() -> ParseContext {
+        ParseContext {
+            current_file: "",
+            line: 1,
+            column: 1,
+            errors: undefined,
+            error_count: 0
+        }
+    }
+
+    fn add_error(&mut self, message: string) {
+        if self.error_count >= MAX_PARSE_ERRORS {
+            return
+        }
+
+        self.errors[self.error_count] = ParseError {
+            message: message,
+            file: self.current_file,
+            line: self.line,
+            column: self.column
+        }
+        self.error_count += 1
+    }
+}
+
+// ============================================================================
+// Object Definition Parser
+// ============================================================================
+
+struct ObjectDefinitionParser {
+    context: ParseContext,
+
+    // Registered parsers for sub-blocks
+    module_parsers: [ModuleParser; 64],
+    module_parser_count: u32
+}
+
+struct ModuleParser {
+    module_type: string,
+    parse_fn: fn(&mut ParseContext, &mut INIReader) -> ModuleTemplate
+}
+
+impl ObjectDefinitionParser {
+    fn new() -> ObjectDefinitionParser {
+        var parser = ObjectDefinitionParser {
+            context: ParseContext::new(),
+            module_parsers: undefined,
+            module_parser_count: 0
+        }
+
+        // Register built-in module parsers
+        parser.register_module_parser("Body", parse_body_module)
+        parser.register_module_parser("Draw", parse_draw_module)
+        parser.register_module_parser("Behavior", parse_behavior_module)
+        parser.register_module_parser("ArmorSet", parse_armor_set)
+        parser.register_module_parser("WeaponSet", parse_weapon_set)
+        parser.register_module_parser("LocomotorSet", parse_locomotor_set)
+
+        return parser
+    }
+
+    fn register_module_parser(&mut self, module_type: string, parse_fn: fn(&mut ParseContext, &mut INIReader) -> ModuleTemplate) {
+        if self.module_parser_count >= 64 {
+            return
+        }
+
+        self.module_parsers[self.module_parser_count] = ModuleParser {
+            module_type: module_type,
+            parse_fn: parse_fn
+        }
+        self.module_parser_count += 1
+    }
+
+    // ========================================================================
+    // Main Parse Functions
+    // ========================================================================
+
+    fn parse_file(&mut self, file_path: string, factory: &mut ThingFactory) -> bool {
+        self.context.current_file = file_path
+        self.context.line = 1
+        self.context.column = 1
+
+        let content = read_file_to_string(file_path)
+        if content.len() == 0 {
+            self.context.add_error("Failed to read file")
+            return false
+        }
+
+        var reader = INIReader::new(content)
+
+        while !reader.is_eof() {
+            let keyword = reader.read_identifier()
+
+            if keyword == "Object" {
+                self.parse_object(&mut reader, factory)
+            } else if keyword == "ChildObject" {
+                self.parse_child_object(&mut reader, factory)
+            } else if keyword == "Include" {
+                // Recursively include another file
+                let include_path = reader.read_string()
+                self.parse_file(include_path, factory)
+            } else if keyword.len() > 0 {
+                // Skip unknown top-level blocks
+                reader.skip_block()
+            }
+
+            reader.skip_whitespace_and_comments()
+        }
+
+        return self.context.error_count == 0
+    }
+
+    fn parse_object(&mut self, reader: &mut INIReader, factory: &mut ThingFactory) {
+        var template = default_thing_template()
+
+        // Read object name
+        template.name = reader.read_identifier()
+
+        // Check for inheritance
+        let maybe_parent = reader.peek_identifier()
+        if maybe_parent.len() > 0 and reader.peek() != '{' {
+            // Has parent object
+            let parent_name = reader.read_identifier()
+            let parent = factory.get_template(parent_name)
+            if parent != null {
+                template = copy_template(parent.unwrap())
+                template.name = template.name  // Keep new name
+            }
+        }
+
+        reader.expect('{')
+
+        // Parse object body
+        while !reader.is_eof() and reader.peek() != '}' {
+            let field = reader.read_identifier()
+
+            if field == "End" {
+                break
+            }
+
+            self.parse_object_field(&mut template, field, reader)
+        }
+
+        reader.expect('}')
+
+        // Register the template
+        factory.register_template(template)
+    }
+
+    fn parse_child_object(&mut self, reader: &mut INIReader, factory: &mut ThingFactory) {
+        // Child objects inherit from a parent
+        let child_name = reader.read_identifier()
+        let parent_name = reader.read_identifier()
+
+        let parent = factory.get_template(parent_name)
+        if parent == null {
+            self.context.add_error("Parent object not found: " + parent_name)
+            reader.skip_block()
+            return
+        }
+
+        var template = copy_template(parent.unwrap())
+        template.name = child_name
+
+        reader.expect('{')
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let field = reader.read_identifier()
+            if field == "End" {
+                break
+            }
+            self.parse_object_field(&mut template, field, reader)
+        }
+
+        reader.expect('}')
+
+        factory.register_template(template)
+    }
+
+    fn parse_object_field(&mut self, template: &mut ThingTemplate, field: string, reader: &mut INIReader) {
+        reader.expect('=')
+
+        match field {
+            // Basic info
+            "DisplayName" => {
+                template.display_name = reader.read_string()
+            },
+            "Side" => {
+                template.side = reader.read_identifier()
+            },
+
+            // Visual
+            "Draw" => {
+                self.parse_draw_block(template, reader)
+            },
+            "SelectPortrait" => {
+                template.portrait_image = reader.read_string()
+            },
+            "ButtonImage" => {
+                template.button_image = reader.read_string()
+            },
+
+            // Kind flags
+            "KindOf" => {
+                self.parse_kind_of(template, reader)
+            },
+            "Buildable" => {
+                template.buildable = reader.read_bool()
+            },
+
+            // Stats
+            "BuildCost" => {
+                template.build_cost = reader.read_int() as u32
+            },
+            "BuildTime" => {
+                template.build_time = reader.read_float()
+            },
+            "MaxHealth" => {
+                template.max_health = reader.read_float()
+            },
+            "VisionRange" => {
+                template.vision_range = reader.read_float()
+            },
+            "ShroudClearingRange" => {
+                template.shroud_clearing_range = reader.read_float()
+            },
+
+            // Movement
+            "Speed" => {
+                template.speed = reader.read_float()
+            },
+            "TurnRate" => {
+                template.turn_rate = reader.read_float()
+            },
+
+            // Combat
+            "WeaponSet" => {
+                self.parse_weapon_set_block(template, reader)
+            },
+            "ArmorSet" => {
+                self.parse_armor_set_block(template, reader)
+            },
+
+            // Production
+            "CommandSet" => {
+                template.production_queue_type = reader.read_identifier()
+            },
+            "CanProduceUnits" => {
+                template.can_produce = reader.read_bool()
+            },
+
+            // Power
+            "EnergyProduction" => {
+                template.energy_production = reader.read_int()
+            },
+            "EnergyBonus" => {
+                template.energy_consumption = reader.read_int()
+            },
+
+            // Experience
+            "ExperienceValue" => {
+                template.experience_value = reader.read_int() as u32
+            },
+            "ExperienceRequired" => {
+                self.parse_experience_required(template, reader)
+            },
+
+            // Modules
+            "Body" => {
+                self.parse_module(template, "Body", reader)
+            },
+            "Behavior" => {
+                self.parse_module(template, "Behavior", reader)
+            },
+            "LocomotorSet" => {
+                self.parse_module(template, "LocomotorSet", reader)
+            },
+
+            // Audio
+            "VoiceSelect" => {
+                template.voice_select = reader.read_string()
+            },
+            "VoiceMove" => {
+                template.voice_move = reader.read_string()
+            },
+            "VoiceAttack" => {
+                template.voice_attack = reader.read_string()
+            },
+            "VoiceCreated" => {
+                template.voice_created = reader.read_string()
+            },
+            "SoundAmbient" => {
+                template.sound_ambient = reader.read_string()
+            },
+            "SoundDie" => {
+                template.sound_die = reader.read_string()
+            },
+
+            // Geometry
+            "Geometry" => {
+                template.geometry_type = parse_geometry_type(reader.read_identifier())
+            },
+            "GeometryMajorRadius" => {
+                template.geometry_major_radius = reader.read_float()
+            },
+            "GeometryMinorRadius" => {
+                template.geometry_minor_radius = reader.read_float()
+            },
+            "GeometryHeight" => {
+                template.geometry_height = reader.read_float()
+            },
+
+            // Prerequisites
+            "Prerequisites" => {
+                self.parse_prerequisites(template, reader)
+            },
+
+            // Scale
+            "Scale" => {
+                template.scale = reader.read_float()
+            },
+
+            _ => {
+                // Unknown field - skip value
+                reader.skip_to_newline()
+            }
+        }
+    }
+
+    fn parse_kind_of(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        template.kind_of_count = 0
+
+        while !reader.is_eol() {
+            let kind = reader.read_identifier()
+            if kind.len() == 0 {
+                break
+            }
+
+            let kind_enum = parse_kind_of_enum(kind)
+            if template.kind_of_count < 8 {
+                template.kind_of[template.kind_of_count] = kind_enum
+                template.kind_of_count += 1
+            }
+        }
+    }
+
+    fn parse_prerequisites(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        reader.expect('{')
+        template.prerequisite_count = 0
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let obj_name = reader.read_identifier()
+            if obj_name == "End" or obj_name.len() == 0 {
+                break
+            }
+
+            if template.prerequisite_count < 8 {
+                template.prerequisites[template.prerequisite_count] = obj_name
+                template.prerequisite_count += 1
+            }
+        }
+
+        reader.expect('}')
+    }
+
+    fn parse_experience_required(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        for i in 0..4 {
+            template.experience_required[i] = reader.read_int() as u32
+            if reader.is_eol() {
+                break
+            }
+        }
+    }
+
+    fn parse_draw_block(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        let draw_type = reader.read_identifier()
+
+        reader.expect('{')
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let field = reader.read_identifier()
+            if field == "End" {
+                break
+            }
+
+            reader.expect('=')
+
+            if field == "Model" {
+                template.model_name = reader.read_string()
+            } else {
+                reader.skip_to_newline()
+            }
+        }
+
+        reader.expect('}')
+    }
+
+    fn parse_weapon_set_block(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        reader.expect('{')
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let field = reader.read_identifier()
+            if field == "End" {
+                break
+            }
+
+            reader.expect('=')
+
+            if field == "Weapon" {
+                let slot = reader.read_identifier()
+                let weapon_name = reader.read_identifier()
+
+                if slot == "PRIMARY" {
+                    template.primary_weapon = weapon_name
+                } else if slot == "SECONDARY" {
+                    template.secondary_weapon = weapon_name
+                }
+            } else {
+                reader.skip_to_newline()
+            }
+        }
+
+        reader.expect('}')
+    }
+
+    fn parse_armor_set_block(&mut self, template: &mut ThingTemplate, reader: &mut INIReader) {
+        reader.expect('{')
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let field = reader.read_identifier()
+            if field == "End" {
+                break
+            }
+
+            reader.expect('=')
+
+            if field == "Armor" {
+                template.armor_set = reader.read_identifier()
+            } else {
+                reader.skip_to_newline()
+            }
+        }
+
+        reader.expect('}')
+    }
+
+    fn parse_module(&mut self, template: &mut ThingTemplate, module_type: string, reader: &mut INIReader) {
+        if template.module_count >= 32 {
+            reader.skip_block()
+            return
+        }
+
+        var module = ModuleTemplate {
+            module_type: module_type,
+            module_tag: reader.read_identifier(),
+            parameters: undefined,
+            param_count: 0
+        }
+
+        reader.expect('{')
+
+        while !reader.is_eof() and reader.peek() != '}' {
+            let param_name = reader.read_identifier()
+            if param_name == "End" or param_name.len() == 0 {
+                break
+            }
+
+            reader.expect('=')
+            let param_value = reader.read_value_as_string()
+
+            if module.param_count < 16 {
+                module.parameters[module.param_count] = ModuleParam {
+                    key: param_name,
+                    value: param_value
+                }
+                module.param_count += 1
+            }
+        }
+
+        reader.expect('}')
+
+        template.modules[template.module_count] = module
+        template.module_count += 1
+    }
+}
+
+// ============================================================================
+// INI Reader
+// ============================================================================
+
+struct INIReader {
+    content: string,
+    pos: u32,
+    length: u32
+}
+
+impl INIReader {
+    fn new(content: string) -> INIReader {
+        INIReader {
+            content: content,
+            pos: 0,
+            length: content.len() as u32
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        return self.pos >= self.length
+    }
+
+    fn is_eol(&self) -> bool {
+        if self.pos >= self.length {
+            return true
+        }
+        let c = self.content[self.pos]
+        return c == '\n' or c == '\r'
+    }
+
+    fn peek(&self) -> char {
+        if self.pos >= self.length {
+            return '\0'
+        }
+        return self.content[self.pos]
+    }
+
+    fn peek_identifier(&self) -> string {
+        var temp_pos = self.pos
+        self.skip_whitespace_internal(&mut temp_pos)
+
+        var result = ""
+        while temp_pos < self.length {
+            let c = self.content[temp_pos]
+            if is_identifier_char(c) {
+                result = result + c
+                temp_pos += 1
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    fn advance(&mut self) {
+        self.pos += 1
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+            if c == ' ' or c == '\t' {
+                self.pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn skip_whitespace_internal(&self, pos: &mut u32) {
+        while *pos < self.length {
+            let c = self.content[*pos]
+            if c == ' ' or c == '\t' {
+                *pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+
+            if c == ' ' or c == '\t' or c == '\n' or c == '\r' {
+                self.pos += 1
+            } else if c == ';' {
+                // Comment - skip to end of line
+                while self.pos < self.length and self.content[self.pos] != '\n' {
+                    self.pos += 1
+                }
+            } else {
+                break
+            }
+        }
+    }
+
+    fn skip_to_newline(&mut self) {
+        while self.pos < self.length and self.content[self.pos] != '\n' {
+            self.pos += 1
+        }
+        if self.pos < self.length {
+            self.pos += 1
+        }
+    }
+
+    fn skip_block(&mut self) {
+        var depth: i32 = 0
+
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+
+            if c == '{' {
+                depth += 1
+            } else if c == '}' {
+                depth -= 1
+                if depth <= 0 {
+                    self.pos += 1
+                    break
+                }
+            }
+
+            self.pos += 1
+        }
+    }
+
+    fn expect(&mut self, expected: char) -> bool {
+        self.skip_whitespace_and_comments()
+
+        if self.pos < self.length and self.content[self.pos] == expected {
+            self.pos += 1
+            return true
+        }
+        return false
+    }
+
+    fn read_identifier(&mut self) -> string {
+        self.skip_whitespace_and_comments()
+
+        var result = ""
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+            if is_identifier_char(c) {
+                result = result + c
+                self.pos += 1
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    fn read_string(&mut self) -> string {
+        self.skip_whitespace()
+
+        if self.pos >= self.length {
+            return ""
+        }
+
+        // Check for quoted string
+        if self.content[self.pos] == '"' {
+            self.pos += 1
+            var result = ""
+            while self.pos < self.length and self.content[self.pos] != '"' {
+                result = result + self.content[self.pos]
+                self.pos += 1
+            }
+            if self.pos < self.length {
+                self.pos += 1  // Skip closing quote
+            }
+            return result
+        }
+
+        // Unquoted - read until whitespace
+        return self.read_identifier()
+    }
+
+    fn read_int(&mut self) -> i32 {
+        self.skip_whitespace()
+
+        var result: i32 = 0
+        var negative = false
+
+        if self.pos < self.length and self.content[self.pos] == '-' {
+            negative = true
+            self.pos += 1
+        }
+
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+            if c >= '0' and c <= '9' {
+                result = result * 10 + (c as i32 - '0' as i32)
+                self.pos += 1
+            } else {
+                break
+            }
+        }
+
+        return if negative { -result } else { result }
+    }
+
+    fn read_float(&mut self) -> f32 {
+        self.skip_whitespace()
+
+        var result: f32 = 0.0
+        var negative = false
+        var decimal_place: f32 = 0.0
+
+        if self.pos < self.length and self.content[self.pos] == '-' {
+            negative = true
+            self.pos += 1
+        }
+
+        // Integer part
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+            if c >= '0' and c <= '9' {
+                result = result * 10.0 + (c as i32 - '0' as i32) as f32
+                self.pos += 1
+            } else {
+                break
+            }
+        }
+
+        // Decimal part
+        if self.pos < self.length and self.content[self.pos] == '.' {
+            self.pos += 1
+            decimal_place = 0.1
+
+            while self.pos < self.length {
+                let c = self.content[self.pos]
+                if c >= '0' and c <= '9' {
+                    result = result + (c as i32 - '0' as i32) as f32 * decimal_place
+                    decimal_place *= 0.1
+                    self.pos += 1
+                } else {
+                    break
+                }
+            }
+        }
+
+        return if negative { -result } else { result }
+    }
+
+    fn read_bool(&mut self) -> bool {
+        let value = self.read_identifier()
+        return value == "Yes" or value == "yes" or value == "true" or value == "1"
+    }
+
+    fn read_value_as_string(&mut self) -> string {
+        self.skip_whitespace()
+
+        var result = ""
+        while self.pos < self.length {
+            let c = self.content[self.pos]
+            if c == '\n' or c == '\r' or c == ';' {
+                break
+            }
+            result = result + c
+            self.pos += 1
+        }
+
+        return result.trim()
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn is_identifier_char(c: char) -> bool {
+    return (c >= 'a' and c <= 'z') or
+           (c >= 'A' and c <= 'Z') or
+           (c >= '0' and c <= '9') or
+           c == '_' or c == ':'
+}
+
+fn parse_kind_of_enum(name: string) -> KindOf {
+    match name {
+        "INFANTRY" => KindOf::Infantry,
+        "VEHICLE" => KindOf::Vehicle,
+        "AIRCRAFT" => KindOf::Aircraft,
+        "STRUCTURE" => KindOf::Structure,
+        "BUILDING" => KindOf::Building,
+        "PROJECTILE" => KindOf::Projectile,
+        "CRATE" => KindOf::Crate,
+        "DEBRIS" => KindOf::Debris,
+        "BRIDGE" => KindOf::Bridge,
+        "PROP" => KindOf::Prop,
+        "SHRUBBERY" => KindOf::Shrubbery,
+        "CAN_ATTACK" => KindOf::Infantry,  // Simplified
+        _ => KindOf::Prop
+    }
+}
+
+fn parse_geometry_type(name: string) -> GeometryType {
+    match name {
+        "SPHERE" => GeometryType::Sphere,
+        "CYLINDER" => GeometryType::Cylinder,
+        "BOX" => GeometryType::Box,
+        _ => GeometryType::Cylinder
+    }
+}
+
+fn copy_template(src: &ThingTemplate) -> ThingTemplate {
+    // Deep copy template
+    var dest = *src
+    return dest
+}
+
+fn default_thing_template() -> ThingTemplate {
+    ThingTemplate {
+        name: "",
+        display_name: "",
+        side: "Civilian",
+        model_name: "",
+        portrait_image: "",
+        button_image: "",
+        selection_decal: "decals/selection.tga",
+        kind_of: undefined,
+        kind_of_count: 0,
+        buildable: false,
+        prerequisite_count: 0,
+        prerequisites: undefined,
+        build_cost: 0,
+        build_time: 0.0,
+        max_health: 100.0,
+        armor_set: "None",
+        vision_range: 200.0,
+        shroud_clearing_range: 200.0,
+        locomotor: "",
+        speed: 0.0,
+        turn_rate: 180.0,
+        weapon_set: "",
+        primary_weapon: "",
+        secondary_weapon: "",
+        attack_range: 0.0,
+        can_produce: false,
+        production_queue_type: "",
+        energy_production: 0,
+        energy_consumption: 0,
+        experience_value: 0,
+        experience_required: [0, 100, 200, 400],
+        modules: undefined,
+        module_count: 0,
+        voice_select: "",
+        voice_move: "",
+        voice_attack: "",
+        voice_created: "",
+        sound_ambient: "",
+        sound_die: "",
+        geometry_type: GeometryType::Cylinder,
+        geometry_major_radius: 10.0,
+        geometry_minor_radius: 10.0,
+        geometry_height: 20.0,
+        scale: 1.0,
+        draw_priority: 0
+    }
+}
+
+// Stub module parsers
+fn parse_body_module(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "Body", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+fn parse_draw_module(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "Draw", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+fn parse_behavior_module(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "Behavior", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+fn parse_armor_set(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "ArmorSet", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+fn parse_weapon_set(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "WeaponSet", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+fn parse_locomotor_set(ctx: &mut ParseContext, reader: &mut INIReader) -> ModuleTemplate {
+    ModuleTemplate { module_type: "LocomotorSet", module_tag: "", parameters: undefined, param_count: 0 }
+}
+
+// External functions
+extern fn read_file_to_string(path: string) -> string
+
+// Forward declarations from thing_factory.home
+enum KindOf {
+    Infantry, Vehicle, Aircraft, Building, Structure, Projectile,
+    Crate, Debris, Bridge, Prop, Shrubbery, Garrison, Tunnel
+}
+
+enum GeometryType {
+    Sphere, Cylinder, Box
+}
+
+struct ModuleTemplate {
+    module_type: string,
+    module_tag: string,
+    parameters: [ModuleParam; 16],
+    param_count: u32
+}
+
+struct ModuleParam {
+    key: string,
+    value: string
+}
+
+struct ThingTemplate {
+    name: string,
+    display_name: string,
+    side: string,
+    model_name: string,
+    portrait_image: string,
+    button_image: string,
+    selection_decal: string,
+    kind_of: [KindOf; 8],
+    kind_of_count: u32,
+    buildable: bool,
+    prerequisite_count: u32,
+    prerequisites: [string; 8],
+    build_cost: u32,
+    build_time: f32,
+    max_health: f32,
+    armor_set: string,
+    vision_range: f32,
+    shroud_clearing_range: f32,
+    locomotor: string,
+    speed: f32,
+    turn_rate: f32,
+    weapon_set: string,
+    primary_weapon: string,
+    secondary_weapon: string,
+    attack_range: f32,
+    can_produce: bool,
+    production_queue_type: string,
+    energy_production: i32,
+    energy_consumption: i32,
+    experience_value: u32,
+    experience_required: [u32; 4],
+    modules: [ModuleTemplate; 32],
+    module_count: u32,
+    voice_select: string,
+    voice_move: string,
+    voice_attack: string,
+    voice_created: string,
+    sound_ambient: string,
+    sound_die: string,
+    geometry_type: GeometryType,
+    geometry_major_radius: f32,
+    geometry_minor_radius: f32,
+    geometry_height: f32,
+    scale: f32,
+    draw_priority: u32
+}
+
+struct ThingFactory {
+    // Forward declaration
+}
+
+impl ThingFactory {
+    fn register_template(&mut self, template: ThingTemplate) -> u32 {
+        return 0
+    }
+
+    fn get_template(&self, name: string) -> ?&ThingTemplate {
+        return null
+    }
+}

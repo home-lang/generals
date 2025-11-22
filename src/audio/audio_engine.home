@@ -1,811 +1,594 @@
-// Audio Engine - Complete Audio System for C&C Generals
-// Implements: WAV/MP3 loading, 3D positional audio, music, voice, effects
+// C&C Generals Zero Hour - Home Port
+// Audio Engine (Core audio system)
+//
+// Original: GameAudio.cpp, WWAudio.cpp (Westwood Studios/EA)
+// Ported to Home with EA's audio architecture
+//
+// Audio file locations (matching EA's directory structure):
+// - Data/Audio/Sounds/      - Sound effects (.wav)
+// - Data/Audio/Music/        - Music tracks (.mp3)
+// - Data/Audio/Voice/        - Voice-overs, unit responses (.wav)
+//   - Data/Audio/Voice/US/   - English
+//   - Data/Audio/Voice/Chinese/ - Chinese
+//   - Data/Audio/Voice/GLA/  - GLA faction
+// - Data/Audio/Ambient/      - Ambient sounds
 
-// ============================================================================
-// Audio Configuration
-// ============================================================================
+import basics/allocator
+import basics/string
+import engine/math
 
-const MAX_CHANNELS: i32 = 64
-const MAX_SOUNDS: i32 = 512
-const MAX_MUSIC_TRACKS: i32 = 32
-const SAMPLE_RATE: i32 = 44100
-const DEFAULT_MASTER_VOLUME: f32 = 0.8
+// Audio type (from EA's AudioType enum)
+enum AudioType {
+    Music        // Background music (.mp3 files)
+    Streaming    // Streamed audio (cutscenes, voice)
+    SoundEffect  // Sound effects (.wav files)
+}
 
-// ============================================================================
-// Audio Types
-// ============================================================================
+// Audio priority (from EA's AudioPriority enum)
+enum AudioPriority {
+    Lowest
+    Low
+    Normal
+    High
+    Critical
+}
 
+// Sound type flags (from EA's SoundType enum)
 enum SoundType {
-    EFFECT,        // Short sound effects (gunfire, explosions)
-    VOICE,         // Unit voice responses
-    AMBIENT,       // Environmental sounds (wind, machinery)
-    MUSIC,         // Background music
-    UI,            // Interface sounds (clicks, alerts)
-    EVA,           // EVA announcer voice
+    UI           // UI sounds (button clicks, etc.)
+    World        // 3D positioned sounds in world
+    Shrouded     // Sounds in fog of war
+    Global       // Global sounds (not positional)
+    Voice        // Voice-overs
+    Player       // Only for local player
+    Allies       // Only for allies
+    Enemies      // Only for enemies
+    Everyone     // For all players
 }
 
-enum SoundState {
-    STOPPED,
-    PLAYING,
-    PAUSED,
-    FADING_IN,
-    FADING_OUT,
+// Audio control flags (from EA's AudioControl enum)
+enum AudioControl {
+    Loop         // Loop the sound
+    Random       // Randomly pick from sound list
+    All          // Play all sounds in sequence
+    PostDelay    // Delay before playing
+    Interrupt    // Can interrupt other sounds
 }
 
-// ============================================================================
-// Audio Buffer (Raw audio data)
-// ============================================================================
+// Audio handle (unique ID for playing sounds)
+type AudioHandle = u32
+const INVALID_AUDIO_HANDLE: AudioHandle = 0
 
-struct AudioBuffer {
-    id: i32,
-    name: String,
-    sample_rate: i32,
-    channels: i32,          // 1 = mono, 2 = stereo
-    bits_per_sample: i32,   // 8 or 16
-    data_size: i32,
-    data: [u8],
-    duration: f32,          // In seconds
-    is_loaded: Bool,
-}
+// Audio event definition (from EA's AudioEventInfo)
+struct AudioEventInfo {
+    audio_name: string  // Event name (e.g., "ButtonClick", "TankFire")
+    filename: string    // For music tracks
 
-fn create_audio_buffer(id: i32, name: String) -> AudioBuffer {
-    return AudioBuffer {
-        id: id,
-        name: name,
-        sample_rate: SAMPLE_RATE,
-        channels: 2,
-        bits_per_sample: 16,
-        data_size: 0,
-        data: [],
-        duration: 0.0,
-        is_loaded: false,
+    // Volume & pitch
+    volume: f32
+    volume_shift: f32   // Random volume variation
+    min_volume: f32
+    pitch_shift_min: f32
+    pitch_shift_max: f32
+
+    // Timing
+    delay_min: i32      // Milliseconds
+    delay_max: i32
+    loop_count: i32     // 0 = infinite loop
+
+    // Limits
+    limit: i32          // Max simultaneous instances
+
+    // Properties
+    priority: AudioPriority
+    sound_type: u32     // Bitmask of SoundType flags
+    control: u32        // Bitmask of AudioControl flags
+    audio_type: AudioType
+
+    // Time-of-day variants
+    sounds_morning: []string
+    sounds_default: []string
+    sounds_evening: []string
+    sounds_night: []string
+
+    // Attack/decay envelopes
+    attack_sounds: []string
+    decay_sounds: []string
+
+    // 3D audio
+    low_pass_freq: f32  // Low-pass filter frequency
+    min_distance: f32   // Minimum 3D distance
+    max_distance: f32   // Maximum 3D distance (attenuation)
+
+    fn init(name: string): AudioEventInfo {
+        return AudioEventInfo {
+            audio_name: name
+            filename: ""
+            volume: 1.0
+            volume_shift: 0.0
+            min_volume: 0.0
+            pitch_shift_min: 1.0
+            pitch_shift_max: 1.0
+            delay_min: 0
+            delay_max: 0
+            loop_count: 1
+            limit: 8
+            priority: AudioPriority.Normal
+            sound_type: 0
+            control: 0
+            audio_type: AudioType.SoundEffect
+            sounds_morning: []
+            sounds_default: []
+            sounds_evening: []
+            sounds_night: []
+            attack_sounds: []
+            decay_sounds: []
+            low_pass_freq: 1.0
+            min_distance: 10.0
+            max_distance: 100.0
+        }
+    }
+
+    fn is_looping(self): bool {
+        return (self.control & @enumToInt(AudioControl.Loop)) != 0 and self.loop_count == 0
     }
 }
 
-// ============================================================================
-// Sound Instance (Playing sound)
-// ============================================================================
-
-struct SoundInstance {
-    id: i32,
-    buffer_id: i32,
-    sound_type: SoundType,
-    state: SoundState,
-
-    // Volume control
-    volume: f32,
-    pan: f32,               // -1.0 (left) to 1.0 (right)
-    pitch: f32,             // 0.5 to 2.0
-
-    // 3D positioning
-    is_3d: Bool,
-    position: Vec3,
-    min_distance: f32,
-    max_distance: f32,
-    rolloff_factor: f32,
+// Audio event instance (from EA's AudioEventRTS)
+struct AudioEvent {
+    event_name: string
+    event_info: ?*AudioEventInfo
 
     // Playback state
-    playback_position: f32, // In seconds
-    loop_count: i32,        // -1 = infinite loop
-    loops_remaining: i32,
+    handle: AudioHandle
+    is_playing: bool
+    is_paused: bool
 
-    // Fading
-    fade_start_volume: f32,
-    fade_target_volume: f32,
-    fade_duration: f32,
-    fade_elapsed: f32,
+    // Positioning
+    position: Vec3
+    is_positional: bool
+    object_id: u32      // If attached to game object
 
-    // Priority (for channel management)
-    priority: i32,
+    // Playback parameters
+    volume: f32
+    pitch: f32
+    delay: f32
+    loop_count: i32
 
-    // Callbacks
-    on_complete: fn(i32),
-}
+    // Time-of-day
+    time_of_day: TimeOfDay
 
-fn create_sound_instance(id: i32, buffer_id: i32, sound_type: SoundType) -> SoundInstance {
-    return SoundInstance {
-        id: id,
-        buffer_id: buffer_id,
-        sound_type: sound_type,
-        state: SoundState::STOPPED,
-        volume: 1.0,
-        pan: 0.0,
-        pitch: 1.0,
-        is_3d: false,
-        position: vec3(0.0, 0.0, 0.0),
-        min_distance: 1.0,
-        max_distance: 100.0,
-        rolloff_factor: 1.0,
-        playback_position: 0.0,
-        loop_count: 0,
-        loops_remaining: 0,
-        fade_start_volume: 1.0,
-        fade_target_volume: 1.0,
-        fade_duration: 0.0,
-        fade_elapsed: 0.0,
-        priority: 0,
-        on_complete: null,
+    // Priority
+    priority: AudioPriority
+
+    fn init(name: string): AudioEvent {
+        return AudioEvent {
+            event_name: name
+            event_info: null
+            handle: INVALID_AUDIO_HANDLE
+            is_playing: false
+            is_paused: false
+            position: Vec3.init(0.0, 0.0, 0.0)
+            is_positional: false
+            object_id: 0
+            volume: 1.0
+            pitch: 1.0
+            delay: 0.0
+            loop_count: 1
+            time_of_day: TimeOfDay.Midday
+            priority: AudioPriority.Normal
+        }
+    }
+
+    fn generate_filename(mut self): string {
+        if !self.event_info {
+            return ""
+        }
+
+        let info = self.event_info.?
+
+        // Select sound list based on time of day
+        let sound_list = match self.time_of_day {
+            TimeOfDay.Morning => if info.sounds_morning.len > 0 { info.sounds_morning } else { info.sounds_default }
+            TimeOfDay.Evening => if info.sounds_evening.len > 0 { info.sounds_evening } else { info.sounds_default }
+            TimeOfDay.Night => if info.sounds_night.len > 0 { info.sounds_night } else { info.sounds_default }
+            _ => info.sounds_default
+        }
+
+        if sound_list.len == 0 {
+            return info.filename
+        }
+
+        // Select sound from list
+        let index: usize = 0
+        if (info.control & @enumToInt(AudioControl.Random)) != 0 {
+            // Random selection
+            index = random_range(0, sound_list.len)
+        } else {
+            // Sequential
+            index = 0  // TODO: Track playback index
+        }
+
+        return sound_list[index]
+    }
+
+    fn calculate_pitch_shift(self): f32 {
+        if !self.event_info {
+            return 1.0
+        }
+
+        let info = self.event_info.?
+        if info.pitch_shift_min == info.pitch_shift_max {
+            return info.pitch_shift_min
+        }
+
+        // Random pitch variation
+        return random_range_f32(info.pitch_shift_min, info.pitch_shift_max)
+    }
+
+    fn calculate_volume_shift(self): f32 {
+        if !self.event_info {
+            return self.volume
+        }
+
+        let info = self.event_info.?
+        let shifted = self.volume + random_range_f32(-info.volume_shift, info.volume_shift)
+
+        // Clamp to min volume
+        if shifted < info.min_volume {
+            return info.min_volume
+        }
+
+        return shifted
+    }
+
+    fn calculate_3d_volume(self, listener_pos: Vec3): f32 {
+        if !self.is_positional or !self.event_info {
+            return self.volume
+        }
+
+        let info = self.event_info.?
+        let distance = vec3_distance(self.position, listener_pos)
+
+        // Clamp to min/max distance
+        if distance < info.min_distance {
+            distance = info.min_distance
+        }
+
+        if distance > info.max_distance {
+            return 0.0  // Silent beyond max distance
+        }
+
+        // Linear falloff
+        let attenuation = 1.0 - (distance - info.min_distance) / (info.max_distance - info.min_distance)
+        return self.volume * attenuation
     }
 }
 
-// ============================================================================
-// Music Track
-// ============================================================================
-
-struct MusicTrack {
-    id: i32,
-    name: String,
-    file_path: String,
-    duration: f32,
-    is_loaded: Bool,
-    is_streaming: Bool,
-
-    // Streaming state
-    stream_position: i32,
-    buffer_id: i32,
+// Time of day enum
+enum TimeOfDay {
+    Morning   // Dawn
+    Midday    // Day
+    Evening   // Dusk
+    Night     // Night
 }
 
-fn create_music_track(id: i32, name: String, path: String) -> MusicTrack {
-    return MusicTrack {
-        id: id,
-        name: name,
-        file_path: path,
-        duration: 0.0,
-        is_loaded: false,
-        is_streaming: true,
-        stream_position: 0,
-        buffer_id: -1,
+// Audio channel (mixer channel)
+struct AudioChannel {
+    channel_id: u32
+    current_event: ?AudioEvent
+    volume: f32
+    is_active: bool
+
+    fn init(channel_id: u32): AudioChannel {
+        return AudioChannel {
+            channel_id: channel_id
+            current_event: null
+            volume: 1.0
+            is_active: false
+        }
+    }
+
+    fn play(mut self, event: AudioEvent) {
+        self.current_event = event
+        self.is_active = true
+
+        // TODO: Start actual audio playback via platform audio API
+    }
+
+    fn stop(mut self) {
+        self.current_event = null
+        self.is_active = false
+
+        // TODO: Stop platform audio
+    }
+
+    fn pause(mut self) {
+        if self.current_event {
+            self.current_event.?.is_paused = true
+        }
+
+        // TODO: Pause platform audio
+    }
+
+    fn resume(mut self) {
+        if self.current_event {
+            self.current_event.?.is_paused = false
+        }
+
+        // TODO: Resume platform audio
     }
 }
 
-// ============================================================================
-// Listener (Player's ears)
-// ============================================================================
-
-struct AudioListener {
-    position: Vec3,
-    velocity: Vec3,
-    forward: Vec3,
-    up: Vec3,
-}
-
-fn create_listener() -> AudioListener {
-    return AudioListener {
-        position: vec3(0.0, 0.0, 0.0),
-        velocity: vec3(0.0, 0.0, 0.0),
-        forward: vec3(0.0, 0.0, -1.0),
-        up: vec3(0.0, 1.0, 0.0),
-    }
-}
-
-// ============================================================================
-// Volume Settings
-// ============================================================================
-
-struct VolumeSettings {
-    master: f32,
-    music: f32,
-    effects: f32,
-    voice: f32,
-    ambient: f32,
-    ui: f32,
-    eva: f32,
-}
-
-fn default_volume_settings() -> VolumeSettings {
-    return VolumeSettings {
-        master: 0.8,
-        music: 0.7,
-        effects: 0.8,
-        voice: 0.9,
-        ambient: 0.6,
-        ui: 0.8,
-        eva: 1.0,
-    }
-}
-
-// ============================================================================
-// Audio Engine
-// ============================================================================
-
+// Audio engine
 struct AudioEngine {
-    is_initialized: Bool,
+    // Event registry
+    audio_events: []AudioEventInfo
+    event_count: usize
 
-    // Buffers (loaded sounds)
-    buffers: [AudioBuffer],
-    next_buffer_id: i32,
+    // Active channels
+    channels: []AudioChannel
+    channel_count: usize
+    max_channels: usize
 
-    // Active sound instances
-    instances: [SoundInstance],
-    next_instance_id: i32,
+    // Master volume controls
+    master_volume: f32
+    music_volume: f32
+    sfx_volume: f32
+    voice_volume: f32
 
-    // Music system
-    music_tracks: [MusicTrack],
-    current_music_id: i32,
-    next_music_id: i32,
-    music_crossfade_time: f32,
-    music_state: SoundState,
+    // Listener (camera) position for 3D audio
+    listener_position: Vec3
+    listener_forward: Vec3
 
-    // Listener (camera position)
-    listener: AudioListener,
+    // Current time of day
+    current_time_of_day: TimeOfDay
 
-    // Volume controls
-    volumes: VolumeSettings,
+    // Next handle ID
+    next_handle: AudioHandle
 
-    // EVA system
-    eva_queue: [i32],       // Queue of EVA message buffer IDs
-    eva_playing: Bool,
+    allocator: Allocator
 
-    // Hardware info
-    device_name: String,
-    supports_eax: Bool,
-}
-
-fn create_audio_engine() -> AudioEngine {
-    return AudioEngine {
-        is_initialized: false,
-        buffers: [],
-        next_buffer_id: 1,
-        instances: [],
-        next_instance_id: 1,
-        music_tracks: [],
-        current_music_id: -1,
-        next_music_id: 1,
-        music_crossfade_time: 2.0,
-        music_state: SoundState::STOPPED,
-        listener: create_listener(),
-        volumes: default_volume_settings(),
-        eva_queue: [],
-        eva_playing: false,
-        device_name: "",
-        supports_eax: false,
-    }
-}
-
-fn init_audio_engine(engine: AudioEngine) -> Bool {
-    // Initialize audio backend (OpenAL, macOS Audio, etc.)
-    // This would call platform-specific audio initialization
-
-    engine.is_initialized = true
-    engine.device_name = "Default Audio Device"
-
-    return true
-}
-
-fn shutdown_audio_engine(engine: AudioEngine) {
-    // Stop all sounds
-    stop_all_sounds(engine)
-
-    // Free all buffers
-    engine.buffers = []
-    engine.instances = []
-    engine.music_tracks = []
-
-    engine.is_initialized = false
-}
-
-// ============================================================================
-// Sound Loading
-// ============================================================================
-
-fn load_wav_file(engine: AudioEngine, name: String, path: String) -> i32 {
-    let buffer = create_audio_buffer(engine.next_buffer_id, name)
-    engine.next_buffer_id = engine.next_buffer_id + 1
-
-    // WAV file format:
-    // "RIFF" + file_size + "WAVE"
-    // "fmt " + format_chunk_size + format_data
-    // "data" + data_size + audio_data
-
-    // In production, would read and parse WAV file
-    buffer.is_loaded = true
-    engine.buffers = engine.buffers + [buffer]
-
-    return buffer.id
-}
-
-fn load_mp3_file(engine: AudioEngine, name: String, path: String) -> i32 {
-    let buffer = create_audio_buffer(engine.next_buffer_id, name)
-    engine.next_buffer_id = engine.next_buffer_id + 1
-
-    // MP3 decoding would use external library (minimp3, etc.)
-    buffer.is_loaded = true
-    engine.buffers = engine.buffers + [buffer]
-
-    return buffer.id
-}
-
-fn unload_buffer(engine: AudioEngine, buffer_id: i32) {
-    let new_buffers: [AudioBuffer] = []
-    for buf in engine.buffers {
-        if buf.id != buffer_id {
-            new_buffers = new_buffers + [buf]
+    fn init(allocator: Allocator, max_channels: usize): AudioEngine {
+        return AudioEngine {
+            audio_events: allocator.alloc(AudioEventInfo, 512)
+            event_count: 0
+            channels: allocator.alloc(AudioChannel, max_channels)
+            channel_count: 0
+            max_channels: max_channels
+            master_volume: 1.0
+            music_volume: 0.8
+            sfx_volume: 1.0
+            voice_volume: 1.0
+            listener_position: Vec3.init(0.0, 0.0, 0.0)
+            listener_forward: Vec3.init(0.0, 0.0, 1.0)
+            current_time_of_day: TimeOfDay.Midday
+            next_handle: 1
+            allocator: allocator
         }
     }
-    engine.buffers = new_buffers
-}
 
-fn get_buffer(engine: AudioEngine, buffer_id: i32) -> AudioBuffer {
-    for buf in engine.buffers {
-        if buf.id == buffer_id {
-            return buf
+    fn register_event(mut self, event_info: AudioEventInfo) {
+        if self.event_count >= self.audio_events.len {
+            return
         }
-    }
-    return create_audio_buffer(-1, "")
-}
 
-// ============================================================================
-// Sound Playback
-// ============================================================================
-
-fn play_sound(engine: AudioEngine, buffer_id: i32, sound_type: SoundType) -> i32 {
-    let instance = create_sound_instance(engine.next_instance_id, buffer_id, sound_type)
-    engine.next_instance_id = engine.next_instance_id + 1
-
-    instance.state = SoundState::PLAYING
-    instance.volume = get_type_volume(engine, sound_type)
-
-    engine.instances = engine.instances + [instance]
-
-    return instance.id
-}
-
-fn play_sound_3d(engine: AudioEngine, buffer_id: i32, position: Vec3, sound_type: SoundType) -> i32 {
-    let instance_id = play_sound(engine, buffer_id, sound_type)
-    let instance = get_instance(engine, instance_id)
-
-    if instance.id != -1 {
-        instance.is_3d = true
-        instance.position = position
+        self.audio_events[self.event_count] = event_info
+        self.event_count += 1
     }
 
-    return instance_id
-}
-
-fn play_sound_looped(engine: AudioEngine, buffer_id: i32, sound_type: SoundType, loop_count: i32) -> i32 {
-    let instance_id = play_sound(engine, buffer_id, sound_type)
-    let instance = get_instance(engine, instance_id)
-
-    if instance.id != -1 {
-        instance.loop_count = loop_count
-        instance.loops_remaining = loop_count
-    }
-
-    return instance_id
-}
-
-fn stop_sound(engine: AudioEngine, instance_id: i32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.state = SoundState::STOPPED
-        remove_instance(engine, instance_id)
-    }
-}
-
-fn pause_sound(engine: AudioEngine, instance_id: i32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 && instance.state == SoundState::PLAYING {
-        instance.state = SoundState::PAUSED
-    }
-}
-
-fn resume_sound(engine: AudioEngine, instance_id: i32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 && instance.state == SoundState::PAUSED {
-        instance.state = SoundState::PLAYING
-    }
-}
-
-fn stop_all_sounds(engine: AudioEngine) {
-    for instance in engine.instances {
-        instance.state = SoundState::STOPPED
-    }
-    engine.instances = []
-}
-
-fn stop_sounds_of_type(engine: AudioEngine, sound_type: SoundType) {
-    let remaining: [SoundInstance] = []
-    for instance in engine.instances {
-        if instance.sound_type == sound_type {
-            instance.state = SoundState::STOPPED
-        } else {
-            remaining = remaining + [instance]
-        }
-    }
-    engine.instances = remaining
-}
-
-// ============================================================================
-// Sound Properties
-// ============================================================================
-
-fn set_sound_volume(engine: AudioEngine, instance_id: i32, volume: f32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.volume = clamp(volume, 0.0, 1.0)
-    }
-}
-
-fn set_sound_pan(engine: AudioEngine, instance_id: i32, pan: f32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.pan = clamp(pan, -1.0, 1.0)
-    }
-}
-
-fn set_sound_pitch(engine: AudioEngine, instance_id: i32, pitch: f32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.pitch = clamp(pitch, 0.5, 2.0)
-    }
-}
-
-fn set_sound_position(engine: AudioEngine, instance_id: i32, position: Vec3) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.position = position
-    }
-}
-
-fn fade_sound(engine: AudioEngine, instance_id: i32, target_volume: f32, duration: f32) {
-    let instance = get_instance(engine, instance_id)
-    if instance.id != -1 {
-        instance.fade_start_volume = instance.volume
-        instance.fade_target_volume = target_volume
-        instance.fade_duration = duration
-        instance.fade_elapsed = 0.0
-
-        if target_volume > instance.volume {
-            instance.state = SoundState::FADING_IN
-        } else {
-            instance.state = SoundState::FADING_OUT
-        }
-    }
-}
-
-// ============================================================================
-// Music System
-// ============================================================================
-
-fn load_music_track(engine: AudioEngine, name: String, path: String) -> i32 {
-    let track = create_music_track(engine.next_music_id, name, path)
-    engine.next_music_id = engine.next_music_id + 1
-
-    track.is_loaded = true
-    engine.music_tracks = engine.music_tracks + [track]
-
-    return track.id
-}
-
-fn play_music(engine: AudioEngine, track_id: i32) {
-    // Crossfade from current track to new track
-    if engine.current_music_id != -1 {
-        // Fade out current music
-        engine.music_state = SoundState::FADING_OUT
-    }
-
-    engine.current_music_id = track_id
-    engine.music_state = SoundState::PLAYING
-}
-
-fn play_music_with_crossfade(engine: AudioEngine, track_id: i32, crossfade_time: f32) {
-    engine.music_crossfade_time = crossfade_time
-    play_music(engine, track_id)
-}
-
-fn stop_music(engine: AudioEngine) {
-    engine.music_state = SoundState::STOPPED
-    engine.current_music_id = -1
-}
-
-fn pause_music(engine: AudioEngine) {
-    if engine.music_state == SoundState::PLAYING {
-        engine.music_state = SoundState::PAUSED
-    }
-}
-
-fn resume_music(engine: AudioEngine) {
-    if engine.music_state == SoundState::PAUSED {
-        engine.music_state = SoundState::PLAYING
-    }
-}
-
-fn set_music_volume(engine: AudioEngine, volume: f32) {
-    engine.volumes.music = clamp(volume, 0.0, 1.0)
-}
-
-// ============================================================================
-// EVA System (Announcer Voice)
-// ============================================================================
-
-fn queue_eva_message(engine: AudioEngine, buffer_id: i32) {
-    engine.eva_queue = engine.eva_queue + [buffer_id]
-}
-
-fn play_eva_immediate(engine: AudioEngine, buffer_id: i32) {
-    // Stop current EVA and play this one immediately
-    if engine.eva_playing {
-        // Would stop current EVA sound
-    }
-
-    play_sound(engine, buffer_id, SoundType::EVA)
-    engine.eva_playing = true
-}
-
-fn update_eva_queue(engine: AudioEngine) {
-    if !engine.eva_playing && engine.eva_queue.length > 0 {
-        let next_message = engine.eva_queue[0]
-        // Remove from queue
-        let new_queue: [i32] = []
-        for i in 1..engine.eva_queue.length {
-            new_queue = new_queue + [engine.eva_queue[i]]
-        }
-        engine.eva_queue = new_queue
-
-        play_sound(engine, next_message, SoundType::EVA)
-        engine.eva_playing = true
-    }
-}
-
-// ============================================================================
-// Listener (Camera)
-// ============================================================================
-
-fn set_listener_position(engine: AudioEngine, position: Vec3) {
-    engine.listener.position = position
-}
-
-fn set_listener_orientation(engine: AudioEngine, forward: Vec3, up: Vec3) {
-    engine.listener.forward = forward
-    engine.listener.up = up
-}
-
-fn set_listener_velocity(engine: AudioEngine, velocity: Vec3) {
-    engine.listener.velocity = velocity
-}
-
-// ============================================================================
-// Volume Control
-// ============================================================================
-
-fn set_master_volume(engine: AudioEngine, volume: f32) {
-    engine.volumes.master = clamp(volume, 0.0, 1.0)
-}
-
-fn set_effects_volume(engine: AudioEngine, volume: f32) {
-    engine.volumes.effects = clamp(volume, 0.0, 1.0)
-}
-
-fn set_voice_volume(engine: AudioEngine, volume: f32) {
-    engine.volumes.voice = clamp(volume, 0.0, 1.0)
-}
-
-fn set_ambient_volume(engine: AudioEngine, volume: f32) {
-    engine.volumes.ambient = clamp(volume, 0.0, 1.0)
-}
-
-fn get_type_volume(engine: AudioEngine, sound_type: SoundType) -> f32 {
-    let base_volume = engine.volumes.master
-
-    if sound_type == SoundType::EFFECT {
-        return base_volume * engine.volumes.effects
-    } else if sound_type == SoundType::VOICE {
-        return base_volume * engine.volumes.voice
-    } else if sound_type == SoundType::AMBIENT {
-        return base_volume * engine.volumes.ambient
-    } else if sound_type == SoundType::MUSIC {
-        return base_volume * engine.volumes.music
-    } else if sound_type == SoundType::UI {
-        return base_volume * engine.volumes.ui
-    } else if sound_type == SoundType::EVA {
-        return base_volume * engine.volumes.eva
-    }
-
-    return base_volume
-}
-
-// ============================================================================
-// Update Loop
-// ============================================================================
-
-fn update_audio_engine(engine: AudioEngine, delta_time: f32) {
-    if !engine.is_initialized {
-        return
-    }
-
-    // Update all sound instances
-    let active_instances: [SoundInstance] = []
-    for instance in engine.instances {
-        update_sound_instance(engine, instance, delta_time)
-
-        if instance.state != SoundState::STOPPED {
-            active_instances = active_instances + [instance]
-        } else {
-            // Trigger completion callback
-            if instance.on_complete != null {
-                instance.on_complete(instance.id)
+    fn find_event_info(self, event_name: string): ?*AudioEventInfo {
+        for i in 0..self.event_count {
+            if self.audio_events[i].audio_name == event_name {
+                return &self.audio_events[i]
             }
         }
+        return null
     }
-    engine.instances = active_instances
 
-    // Update EVA queue
-    update_eva_queue(engine)
-
-    // Update 3D audio positioning
-    for instance in engine.instances {
-        if instance.is_3d {
-            update_3d_sound(engine, instance)
+    fn play_audio_event(mut self, event_name: string): AudioHandle {
+        let info = self.find_event_info(event_name)
+        if !info {
+            return INVALID_AUDIO_HANDLE
         }
-    }
-}
 
-fn update_sound_instance(engine: AudioEngine, instance: SoundInstance, delta_time: f32) {
-    // Update fading
-    if instance.state == SoundState::FADING_IN || instance.state == SoundState::FADING_OUT {
-        instance.fade_elapsed = instance.fade_elapsed + delta_time
+        let mut event = AudioEvent.init(event_name)
+        event.event_info = info
+        event.time_of_day = self.current_time_of_day
+        event.priority = info.?.priority
 
-        if instance.fade_elapsed >= instance.fade_duration {
-            instance.volume = instance.fade_target_volume
-            if instance.fade_target_volume <= 0.0 {
-                instance.state = SoundState::STOPPED
-            } else {
-                instance.state = SoundState::PLAYING
-            }
-        } else {
-            let t = instance.fade_elapsed / instance.fade_duration
-            instance.volume = lerp(instance.fade_start_volume, instance.fade_target_volume, t)
+        // Calculate random variations
+        event.pitch = event.calculate_pitch_shift()
+        event.volume = event.calculate_volume_shift()
+
+        // Assign handle
+        event.handle = self.next_handle
+        self.next_handle += 1
+
+        // Find free channel
+        let channel = self.find_free_channel(event.priority)
+        if channel {
+            channel.?.play(event)
         }
+
+        return event.handle
     }
 
-    // Update playback position
-    if instance.state == SoundState::PLAYING {
-        let buffer = get_buffer(engine, instance.buffer_id)
-        instance.playback_position = instance.playback_position + delta_time * instance.pitch
+    fn play_audio_event_3d(mut self, event_name: string, position: Vec3): AudioHandle {
+        let handle = self.play_audio_event(event_name)
 
-        // Check for end of sound
-        if instance.playback_position >= buffer.duration {
-            if instance.loops_remaining != 0 {
-                instance.playback_position = 0.0
-                if instance.loops_remaining > 0 {
-                    instance.loops_remaining = instance.loops_remaining - 1
+        // Update to positional
+        for i in 0..self.channel_count {
+            if self.channels[i].current_event {
+                if self.channels[i].current_event.?.handle == handle {
+                    self.channels[i].current_event.?.is_positional = true
+                    self.channels[i].current_event.?.position = position
                 }
-            } else {
-                instance.state = SoundState::STOPPED
+            }
+        }
+
+        return handle
+    }
+
+    fn find_free_channel(mut self, priority: AudioPriority): ?*AudioChannel {
+        // First, look for inactive channel
+        for i in 0..self.channel_count {
+            if !self.channels[i].is_active {
+                return &self.channels[i]
+            }
+        }
+
+        // No free channels, try to steal one with lower priority
+        for i in 0..self.channel_count {
+            if self.channels[i].current_event {
+                if @enumToInt(self.channels[i].current_event.?.priority) < @enumToInt(priority) {
+                    self.channels[i].stop()
+                    return &self.channels[i]
+                }
+            }
+        }
+
+        // All channels busy with higher priority
+        return null
+    }
+
+    fn stop_audio(mut self, handle: AudioHandle) {
+        for i in 0..self.channel_count {
+            if self.channels[i].current_event {
+                if self.channels[i].current_event.?.handle == handle {
+                    self.channels[i].stop()
+                    return
+                }
             }
         }
     }
-}
 
-fn update_3d_sound(engine: AudioEngine, instance: SoundInstance) {
-    // Calculate distance to listener
-    let dx = instance.position.x - engine.listener.position.x
-    let dy = instance.position.y - engine.listener.position.y
-    let dz = instance.position.z - engine.listener.position.z
-    let distance = sqrt(dx * dx + dy * dy + dz * dz)
-
-    // Calculate volume attenuation
-    let attenuation = 1.0
-    if distance > instance.min_distance {
-        if distance >= instance.max_distance {
-            attenuation = 0.0
-        } else {
-            let ratio = (distance - instance.min_distance) / (instance.max_distance - instance.min_distance)
-            attenuation = 1.0 - ratio * instance.rolloff_factor
-            attenuation = max(0.0, attenuation)
+    fn stop_all_audio(mut self) {
+        for i in 0..self.channel_count {
+            self.channels[i].stop()
         }
     }
 
-    // Calculate panning based on position relative to listener
-    // Project position onto listener's left-right axis
-    // This is simplified - full implementation would use dot products
-    let pan = clamp(dx / instance.max_distance, -1.0, 1.0)
+    fn update(mut self, delta_time: f32) {
+        // Update 3D audio volumes based on listener position
+        for i in 0..self.channel_count {
+            if self.channels[i].is_active and self.channels[i].current_event {
+                let event = &self.channels[i].current_event.?
 
-    // Apply calculated values (would send to audio backend)
-    // set_backend_volume(instance.id, instance.volume * attenuation)
-    // set_backend_pan(instance.id, pan)
-}
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-fn get_instance(engine: AudioEngine, instance_id: i32) -> SoundInstance {
-    for instance in engine.instances {
-        if instance.id == instance_id {
-            return instance
+                if event.is_positional {
+                    let volume_3d = event.calculate_3d_volume(self.listener_position)
+                    self.channels[i].volume = volume_3d
+                }
+            }
         }
+
+        // TODO: Update platform audio system
     }
-    return create_sound_instance(-1, -1, SoundType::EFFECT)
-}
 
-fn remove_instance(engine: AudioEngine, instance_id: i32) {
-    let remaining: [SoundInstance] = []
-    for instance in engine.instances {
-        if instance.id != instance_id {
-            remaining = remaining + [instance]
-        }
+    fn set_listener_position(mut self, position: Vec3, forward: Vec3) {
+        self.listener_position = position
+        self.listener_forward = vec3_normalize(forward)
     }
-    engine.instances = remaining
-}
 
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
-    return Vec3 { x: x, y: y, z: z }
-}
-
-fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
-    if x < min_val { return min_val }
-    if x > max_val { return max_val }
-    return x
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    return a + (b - a) * t
-}
-
-fn max(a: f32, b: f32) -> f32 {
-    if a > b { return a }
-    return b
-}
-
-fn sqrt(x: f32) -> f32 {
-    if x <= 0.0 { return 0.0 }
-    let guess = x / 2.0
-    let result = guess
-    for i in 0..5 {
-        result = (result + x / result) / 2.0
+    fn set_time_of_day(mut self, tod: TimeOfDay) {
+        self.current_time_of_day = tod
     }
-    return result
+
+    fn set_master_volume(mut self, volume: f32) {
+        self.master_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_music_volume(mut self, volume: f32) {
+        self.music_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_sfx_volume(mut self, volume: f32) {
+        self.sfx_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn set_voice_volume(mut self, volume: f32) {
+        self.voice_volume = clamp(volume, 0.0, 1.0)
+    }
+
+    fn deinit(mut self) {
+        self.stop_all_audio()
+        self.allocator.free(self.audio_events)
+        self.allocator.free(self.channels)
+    }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+// Helper functions
 
-fn test_audio_engine_creation() -> Bool {
-    let engine = create_audio_engine()
-
-    assert(!engine.is_initialized, "Should not be initialized")
-    assert(engine.buffers.length == 0, "Should have no buffers")
-    assert(engine.instances.length == 0, "Should have no instances")
-
-    return true
+fn random_range(min: usize, max: usize): usize {
+    // TODO: Proper random number generation
+    return min
 }
 
-fn test_volume_settings() -> Bool {
-    let engine = create_audio_engine()
-    init_audio_engine(engine)
-
-    set_master_volume(engine, 0.5)
-    assert(engine.volumes.master == 0.5, "Master should be 0.5")
-
-    set_effects_volume(engine, 1.0)
-    let effect_vol = get_type_volume(engine, SoundType::EFFECT)
-    assert(effect_vol == 0.5, "Effect volume should be 0.5 (master * effects)")
-
-    return true
+fn random_range_f32(min: f32, max: f32): f32 {
+    // TODO: Proper random number generation
+    return min
 }
 
-fn test_sound_loading() -> Bool {
-    let engine = create_audio_engine()
-    init_audio_engine(engine)
-
-    let buffer_id = load_wav_file(engine, "test_sound", "test.wav")
-    assert(buffer_id > 0, "Should return valid buffer ID")
-    assert(engine.buffers.length == 1, "Should have one buffer")
-
-    return true
+fn clamp(value: f32, min: f32, max: f32): f32 {
+    if value < min { return min }
+    if value > max { return max }
+    return value
 }
 
-fn run_all_tests() -> Bool {
-    assert(test_audio_engine_creation(), "Audio engine creation test failed")
-    assert(test_volume_settings(), "Volume settings test failed")
-    assert(test_sound_loading(), "Sound loading test failed")
-    return true
+// Global audio engine
+var g_audio_engine: ?AudioEngine = null
+
+export fn init_audio_engine(allocator: Allocator) {
+    g_audio_engine = AudioEngine.init(allocator, 32)  // 32 audio channels
+
+    // Initialize channels
+    for i in 0..32 {
+        g_audio_engine.?.channels[i] = AudioChannel.init(@intCast(u32, i))
+        g_audio_engine.?.channel_count += 1
+    }
+}
+
+export fn shutdown_audio_engine() {
+    if g_audio_engine {
+        g_audio_engine.?.deinit()
+        g_audio_engine = null
+    }
+}
+
+export fn update_audio(delta_time: f32) {
+    if g_audio_engine {
+        g_audio_engine.?.update(delta_time)
+    }
+}
+
+export fn play_sound(event_name: string): AudioHandle {
+    if g_audio_engine {
+        return g_audio_engine.?.play_audio_event(event_name)
+    }
+    return INVALID_AUDIO_HANDLE
+}
+
+export fn play_sound_3d(event_name: string, position: Vec3): AudioHandle {
+    if g_audio_engine {
+        return g_audio_engine.?.play_audio_event_3d(event_name, position)
+    }
+    return INVALID_AUDIO_HANDLE
+}
+
+export fn stop_sound(handle: AudioHandle) {
+    if g_audio_engine {
+        g_audio_engine.?.stop_audio(handle)
+    }
+}
+
+export fn audio_set_listener(position: Vec3, forward: Vec3) {
+    if g_audio_engine {
+        g_audio_engine.?.set_listener_position(position, forward)
+    }
+}
+
+export fn audio_register_event(event_info: AudioEventInfo) {
+    if g_audio_engine {
+        g_audio_engine.?.register_event(event_info)
+    }
 }

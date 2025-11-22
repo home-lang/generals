@@ -1,0 +1,425 @@
+// WND Window System - Base window types and hierarchy
+// Implements the C&C Generals WND (Window) UI system
+
+use std::collections::HashMap
+
+// Window status flags
+enum WindowStatus {
+    Hidden,
+    Enabled,
+    Destroyed,
+    Border,
+    Image,
+    NoInput,
+    SeeThru,
+    WrapText,
+    NoFocus,
+    RightClick,
+    CheckLike,
+    HotkeyText,
+    OneLeftClick,
+    OneRightClick,
+    Dragable,
+    TabStop,
+    HotkeyBorder,
+}
+
+// Window types
+enum WindowType {
+    GenericWindow,
+    PushButton,
+    CheckBox,
+    RadioButton,
+    ListBox,
+    ComboBox,
+    HorizontalSlider,
+    VerticalSlider,
+    ProgressBar,
+    StaticText,
+    EntryField,
+    ScrollListBox,
+    TabControl,
+    Image,
+    CommandButton,
+}
+
+// Text alignment
+enum TextAlignment {
+    Left,
+    Center,
+    Right,
+    Justified,
+}
+
+// Window draw data - appearance configuration
+struct WindowDrawData {
+    image: string,
+    color: u32,
+    border_color: u32,
+    enabled_color: u32,
+    disabled_color: u32,
+    hilite_color: u32,
+    hilite_border_color: u32,
+}
+
+// Single window element
+struct WndWindow {
+    // Identification
+    name: string,
+    window_type: WindowType,
+    id: u32,
+
+    // Hierarchy
+    parent_id: u32,
+    children: [u32; 64],
+    child_count: u32,
+
+    // Position/size (screen coordinates)
+    screen_rect: WndRect,
+
+    // Relative position (percentage of parent)
+    creation_rect: WndRect,
+
+    // Status flags
+    status: u32,
+
+    // Style
+    style: u32,
+
+    // Text
+    text: string,
+    text_color: u32,
+    font_name: string,
+    font_size: u32,
+    text_alignment: TextAlignment,
+
+    // Draw data for different states
+    enabled_draw: WindowDrawData,
+    disabled_draw: WindowDrawData,
+    hilite_draw: WindowDrawData,
+    selected_draw: WindowDrawData,
+
+    // Input state
+    is_mouse_over: bool,
+    is_pressed: bool,
+    is_selected: bool,
+    is_focused: bool,
+
+    // User data
+    user_data: u64,
+    header_template: string,
+
+    // Callbacks
+    system_callback: string,
+    input_callback: string,
+    tooltip_callback: string,
+    draw_callback: string,
+
+    // Tooltip
+    tooltip_text: string,
+    tooltip_delay: u32,
+
+    is_valid: bool,
+}
+
+// Rectangle
+struct WndRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+// List box item
+struct ListBoxItem {
+    text: string,
+    data: u64,
+    color: u32,
+    is_selected: bool,
+    is_enabled: bool,
+}
+
+// Combo box specific data
+struct ComboBoxData {
+    items: [ListBoxItem; 64],
+    item_count: u32,
+    selected_index: i32,
+    is_dropped: bool,
+    drop_height: i32,
+}
+
+// Slider specific data
+struct SliderData {
+    min_value: i32,
+    max_value: i32,
+    current_value: i32,
+    thumb_size: i32,
+    num_ticks: u32,
+}
+
+// Entry field specific data
+struct EntryFieldData {
+    text: string,
+    max_length: u32,
+    cursor_pos: u32,
+    selection_start: u32,
+    selection_end: u32,
+    is_password: bool,
+    is_numeric_only: bool,
+}
+
+// Progress bar specific data
+struct ProgressBarData {
+    min_value: f32,
+    max_value: f32,
+    current_value: f32,
+    bar_color: u32,
+    background_color: u32,
+}
+
+// Tab control specific data
+struct TabControlData {
+    tabs: [TabItem; 16],
+    tab_count: u32,
+    selected_tab: u32,
+}
+
+struct TabItem {
+    text: string,
+    page_window_id: u32,
+    is_enabled: bool,
+}
+
+const MAX_WINDOWS: u32 = 1024
+const MAX_CHILDREN: u32 = 64
+
+impl WndWindow {
+    fn new(name: string, window_type: WindowType) -> Self {
+        WndWindow {
+            name: name,
+            window_type: window_type,
+            id: 0,
+            parent_id: 0,
+            children: [0; MAX_CHILDREN as usize],
+            child_count: 0,
+            screen_rect: WndRect::default(),
+            creation_rect: WndRect::default(),
+            status: 0,
+            style: 0,
+            text: "".to_string(),
+            text_color: 0xFFFFFFFF,
+            font_name: "Arial".to_string(),
+            font_size: 12,
+            text_alignment: TextAlignment::Left,
+            enabled_draw: WindowDrawData::default(),
+            disabled_draw: WindowDrawData::default(),
+            hilite_draw: WindowDrawData::default(),
+            selected_draw: WindowDrawData::default(),
+            is_mouse_over: false,
+            is_pressed: false,
+            is_selected: false,
+            is_focused: false,
+            user_data: 0,
+            header_template: "".to_string(),
+            system_callback: "".to_string(),
+            input_callback: "".to_string(),
+            tooltip_callback: "".to_string(),
+            draw_callback: "".to_string(),
+            tooltip_text: "".to_string(),
+            tooltip_delay: 500,
+            is_valid: true,
+        }
+    }
+
+    fn set_status(&mut self, status: WindowStatus, value: bool) {
+        let flag = 1 << (status as u32)
+        if value {
+            self.status |= flag
+        } else {
+            self.status &= !flag
+        }
+    }
+
+    fn get_status(&self, status: WindowStatus) -> bool {
+        let flag = 1 << (status as u32)
+        (self.status & flag) != 0
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.get_status(WindowStatus::Hidden)
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.get_status(WindowStatus::Enabled)
+    }
+
+    fn set_hidden(&mut self, hidden: bool) {
+        self.set_status(WindowStatus::Hidden, hidden)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.set_status(WindowStatus::Enabled, enabled)
+    }
+
+    fn add_child(&mut self, child_id: u32) -> bool {
+        if self.child_count >= MAX_CHILDREN as u32 {
+            return false
+        }
+        self.children[self.child_count as usize] = child_id
+        self.child_count += 1
+        true
+    }
+
+    fn remove_child(&mut self, child_id: u32) -> bool {
+        for i in 0..self.child_count {
+            if self.children[i as usize] == child_id {
+                // Shift remaining children
+                for j in i..(self.child_count - 1) {
+                    self.children[j as usize] = self.children[(j + 1) as usize]
+                }
+                self.child_count -= 1
+                return true
+            }
+        }
+        false
+    }
+
+    fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.screen_rect.x &&
+        x < self.screen_rect.x + self.screen_rect.width &&
+        y >= self.screen_rect.y &&
+        y < self.screen_rect.y + self.screen_rect.height
+    }
+
+    fn get_local_point(&self, screen_x: i32, screen_y: i32) -> (i32, i32) {
+        (screen_x - self.screen_rect.x, screen_y - self.screen_rect.y)
+    }
+
+    fn set_text(&mut self, text: string) {
+        self.text = text
+    }
+
+    fn get_text(&self) -> string {
+        self.text.clone()
+    }
+
+    fn set_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        self.screen_rect.x = x
+        self.screen_rect.y = y
+        self.screen_rect.width = width
+        self.screen_rect.height = height
+    }
+}
+
+impl Default for WndRect {
+    fn default() -> Self {
+        WndRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+impl Default for WindowDrawData {
+    fn default() -> Self {
+        WindowDrawData {
+            image: "".to_string(),
+            color: 0xFFFFFFFF,
+            border_color: 0xFF808080,
+            enabled_color: 0xFFFFFFFF,
+            disabled_color: 0xFF808080,
+            hilite_color: 0xFFFFFF00,
+            hilite_border_color: 0xFFFFFF00,
+        }
+    }
+}
+
+impl Default for WndWindow {
+    fn default() -> Self {
+        WndWindow::new("".to_string(), WindowType::GenericWindow)
+    }
+}
+
+impl Default for ListBoxItem {
+    fn default() -> Self {
+        ListBoxItem {
+            text: "".to_string(),
+            data: 0,
+            color: 0xFFFFFFFF,
+            is_selected: false,
+            is_enabled: true,
+        }
+    }
+}
+
+impl Default for ComboBoxData {
+    fn default() -> Self {
+        ComboBoxData {
+            items: [ListBoxItem::default(); 64],
+            item_count: 0,
+            selected_index: -1,
+            is_dropped: false,
+            drop_height: 100,
+        }
+    }
+}
+
+impl Default for SliderData {
+    fn default() -> Self {
+        SliderData {
+            min_value: 0,
+            max_value: 100,
+            current_value: 0,
+            thumb_size: 20,
+            num_ticks: 0,
+        }
+    }
+}
+
+impl Default for EntryFieldData {
+    fn default() -> Self {
+        EntryFieldData {
+            text: "".to_string(),
+            max_length: 256,
+            cursor_pos: 0,
+            selection_start: 0,
+            selection_end: 0,
+            is_password: false,
+            is_numeric_only: false,
+        }
+    }
+}
+
+impl Default for ProgressBarData {
+    fn default() -> Self {
+        ProgressBarData {
+            min_value: 0.0,
+            max_value: 100.0,
+            current_value: 0.0,
+            bar_color: 0xFF00FF00,
+            background_color: 0xFF404040,
+        }
+    }
+}
+
+impl Default for TabControlData {
+    fn default() -> Self {
+        TabControlData {
+            tabs: [TabItem::default(); 16],
+            tab_count: 0,
+            selected_tab: 0,
+        }
+    }
+}
+
+impl Default for TabItem {
+    fn default() -> Self {
+        TabItem {
+            text: "".to_string(),
+            page_window_id: 0,
+            is_enabled: true,
+        }
+    }
+}

@@ -1,0 +1,691 @@
+// selection_manager.home - Unit selection and control groups
+// Handles click selection, box selection, and control groups 1-9
+
+const MAX_SELECTION: u32 = 100
+const MAX_CONTROL_GROUPS: u32 = 10
+
+// ============================================================================
+// Selection Types
+// ============================================================================
+
+struct Vec2 {
+    x: f32,
+    y: f32
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32
+}
+
+struct Ray {
+    origin: Vec3,
+    direction: Vec3
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3
+}
+
+struct SelectionBox {
+    start_screen: Vec2,
+    end_screen: Vec2,
+    is_active: bool
+}
+
+// ============================================================================
+// Selection Manager
+// ============================================================================
+
+struct ControlGroup {
+    thing_ids: [u32; MAX_SELECTION],
+    count: u32,
+    center: Vec3
+}
+
+struct SelectionManager {
+    // Current selection
+    selected_ids: [u32; MAX_SELECTION],
+    selection_count: u32,
+
+    // Control groups (0-9)
+    control_groups: [ControlGroup; MAX_CONTROL_GROUPS],
+
+    // Drag selection
+    selection_box: SelectionBox,
+    box_start_world: Vec3,
+
+    // Selection state
+    primary_selected: u32,          // First/primary selected unit
+    last_selection_time: f32,       // For double-click detection
+    last_selected_type: u32,        // Template index for double-click select all
+
+    // Filters
+    local_player: u32,
+    select_enemies: bool,           // Usually false
+
+    // Callbacks
+    on_selection_changed: fn(&[u32; MAX_SELECTION], u32),
+    on_primary_changed: fn(u32)
+}
+
+impl SelectionManager {
+    fn new(local_player: u32) -> SelectionManager {
+        var manager = SelectionManager {
+            selected_ids: [0; MAX_SELECTION],
+            selection_count: 0,
+            control_groups: undefined,
+            selection_box: SelectionBox {
+                start_screen: Vec2 { x: 0.0, y: 0.0 },
+                end_screen: Vec2 { x: 0.0, y: 0.0 },
+                is_active: false
+            },
+            box_start_world: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            primary_selected: 0,
+            last_selection_time: 0.0,
+            last_selected_type: 0,
+            local_player: local_player,
+            select_enemies: false,
+            on_selection_changed: null,
+            on_primary_changed: null
+        }
+
+        // Initialize control groups
+        for i in 0..MAX_CONTROL_GROUPS {
+            manager.control_groups[i] = ControlGroup {
+                thing_ids: [0; MAX_SELECTION],
+                count: 0,
+                center: Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+            }
+        }
+
+        return manager
+    }
+
+    // ========================================================================
+    // Click Selection
+    // ========================================================================
+
+    fn select_at_point(&mut self, screen_pos: Vec2, camera: &Camera, things: &ThingFactory, add_to_selection: bool, current_time: f32) {
+        // Cast ray from camera through screen point
+        let ray = camera.screen_to_ray(screen_pos)
+
+        // Find thing under cursor
+        var closest_id: u32 = 0
+        var closest_dist: f32 = 10000.0
+
+        things.for_each(|thing| {
+            if !self.can_select(thing) {
+                return
+            }
+
+            // Check ray-sphere intersection
+            let radius = 15.0   // Selection radius
+            let dist = ray_sphere_intersect(ray, thing.position, radius)
+
+            if dist > 0.0 and dist < closest_dist {
+                closest_dist = dist
+                closest_id = thing.id
+            }
+        })
+
+        if closest_id == 0 {
+            // Clicked on nothing
+            if !add_to_selection {
+                self.clear_selection()
+            }
+            return
+        }
+
+        // Check for double-click (select all of same type)
+        let thing = things.get_thing(closest_id)
+        if thing != null {
+            let t = thing.unwrap()
+
+            if current_time - self.last_selection_time < 0.3 and
+               t.template_index == self.last_selected_type {
+                // Double click - select all visible units of same type
+                self.select_all_of_type(t.template_index, things)
+                return
+            }
+
+            self.last_selection_time = current_time
+            self.last_selected_type = t.template_index
+        }
+
+        // Normal click selection
+        if add_to_selection {
+            if self.is_selected(closest_id) {
+                self.remove_from_selection(closest_id)
+            } else {
+                self.add_to_selection(closest_id)
+            }
+        } else {
+            self.clear_selection()
+            self.add_to_selection(closest_id)
+        }
+    }
+
+    fn can_select(&self, thing: &Thing) -> bool {
+        // Can't select dead things
+        if thing.status == ThingStatus::Dead or thing.status == ThingStatus::Dying {
+            return false
+        }
+
+        // Can't select enemy units (unless select_enemies is true)
+        if !self.select_enemies and thing.player_index != self.local_player {
+            return false
+        }
+
+        return true
+    }
+
+    // ========================================================================
+    // Box Selection
+    // ========================================================================
+
+    fn begin_box_select(&mut self, screen_pos: Vec2) {
+        self.selection_box.start_screen = screen_pos
+        self.selection_box.end_screen = screen_pos
+        self.selection_box.is_active = true
+    }
+
+    fn update_box_select(&mut self, screen_pos: Vec2) {
+        if !self.selection_box.is_active {
+            return
+        }
+        self.selection_box.end_screen = screen_pos
+    }
+
+    fn end_box_select(&mut self, camera: &Camera, things: &ThingFactory, add_to_selection: bool) {
+        if !self.selection_box.is_active {
+            return
+        }
+
+        self.selection_box.is_active = false
+
+        // Get box bounds in screen space
+        let min_x = min_f32(self.selection_box.start_screen.x, self.selection_box.end_screen.x)
+        let max_x = max_f32(self.selection_box.start_screen.x, self.selection_box.end_screen.x)
+        let min_y = min_f32(self.selection_box.start_screen.y, self.selection_box.end_screen.y)
+        let max_y = max_f32(self.selection_box.start_screen.y, self.selection_box.end_screen.y)
+
+        // Box too small - treat as click
+        if (max_x - min_x) < 5.0 and (max_y - min_y) < 5.0 {
+            return
+        }
+
+        if !add_to_selection {
+            self.clear_selection()
+        }
+
+        // Select all units in box
+        things.for_each(|thing| {
+            if !self.can_select(thing) {
+                return
+            }
+
+            // Project thing position to screen
+            let screen_pos = camera.world_to_screen(thing.position)
+
+            if screen_pos.x >= min_x and screen_pos.x <= max_x and
+               screen_pos.y >= min_y and screen_pos.y <= max_y {
+                self.add_to_selection(thing.id)
+            }
+        })
+    }
+
+    fn get_selection_box(&self) -> ?&SelectionBox {
+        if self.selection_box.is_active {
+            return &self.selection_box
+        }
+        return null
+    }
+
+    // ========================================================================
+    // Selection Management
+    // ========================================================================
+
+    fn add_to_selection(&mut self, thing_id: u32) {
+        if self.is_selected(thing_id) {
+            return
+        }
+
+        if self.selection_count >= MAX_SELECTION {
+            return
+        }
+
+        self.selected_ids[self.selection_count] = thing_id
+        self.selection_count += 1
+
+        // Set primary if first selection
+        if self.selection_count == 1 {
+            self.primary_selected = thing_id
+            if self.on_primary_changed != null {
+                self.on_primary_changed(thing_id)
+            }
+        }
+
+        self.notify_selection_changed()
+    }
+
+    fn remove_from_selection(&mut self, thing_id: u32) {
+        for i in 0..self.selection_count {
+            if self.selected_ids[i] == thing_id {
+                // Shift remaining
+                for j in i..(self.selection_count - 1) {
+                    self.selected_ids[j] = self.selected_ids[j + 1]
+                }
+                self.selection_count -= 1
+
+                // Update primary if removed
+                if self.primary_selected == thing_id {
+                    self.primary_selected = if self.selection_count > 0 {
+                        self.selected_ids[0]
+                    } else {
+                        0
+                    }
+                    if self.on_primary_changed != null {
+                        self.on_primary_changed(self.primary_selected)
+                    }
+                }
+
+                self.notify_selection_changed()
+                return
+            }
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_count = 0
+        self.primary_selected = 0
+        self.notify_selection_changed()
+
+        if self.on_primary_changed != null {
+            self.on_primary_changed(0)
+        }
+    }
+
+    fn is_selected(&self, thing_id: u32) -> bool {
+        for i in 0..self.selection_count {
+            if self.selected_ids[i] == thing_id {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn select_all_of_type(&mut self, template_index: u32, things: &ThingFactory) {
+        self.clear_selection()
+
+        things.for_each(|thing| {
+            if !self.can_select(thing) {
+                return
+            }
+
+            if thing.template_index == template_index {
+                self.add_to_selection(thing.id)
+            }
+        })
+    }
+
+    fn select_all_visible(&mut self, things: &ThingFactory) {
+        self.clear_selection()
+
+        things.for_each(|thing| {
+            if !self.can_select(thing) {
+                return
+            }
+
+            if thing.is_visible {
+                self.add_to_selection(thing.id)
+            }
+        })
+    }
+
+    fn get_selection(&self) -> (&[u32; MAX_SELECTION], u32) {
+        return (&self.selected_ids, self.selection_count)
+    }
+
+    fn get_primary(&self) -> u32 {
+        return self.primary_selected
+    }
+
+    fn set_primary(&mut self, thing_id: u32) {
+        if self.is_selected(thing_id) {
+            self.primary_selected = thing_id
+            if self.on_primary_changed != null {
+                self.on_primary_changed(thing_id)
+            }
+        }
+    }
+
+    fn notify_selection_changed(&self) {
+        if self.on_selection_changed != null {
+            self.on_selection_changed(&self.selected_ids, self.selection_count)
+        }
+    }
+
+    // ========================================================================
+    // Control Groups
+    // ========================================================================
+
+    fn assign_control_group(&mut self, group: u32) {
+        if group >= MAX_CONTROL_GROUPS {
+            return
+        }
+
+        // Copy current selection to control group
+        self.control_groups[group].count = self.selection_count
+        for i in 0..self.selection_count {
+            self.control_groups[group].thing_ids[i] = self.selected_ids[i]
+        }
+
+        self.update_group_center(group)
+    }
+
+    fn add_to_control_group(&mut self, group: u32) {
+        if group >= MAX_CONTROL_GROUPS {
+            return
+        }
+
+        let cg = &mut self.control_groups[group]
+
+        for i in 0..self.selection_count {
+            let id = self.selected_ids[i]
+
+            // Check if already in group
+            var found = false
+            for j in 0..cg.count {
+                if cg.thing_ids[j] == id {
+                    found = true
+                    break
+                }
+            }
+
+            if !found and cg.count < MAX_SELECTION {
+                cg.thing_ids[cg.count] = id
+                cg.count += 1
+            }
+        }
+
+        self.update_group_center(group)
+    }
+
+    fn select_control_group(&mut self, group: u32, add_to_selection: bool) {
+        if group >= MAX_CONTROL_GROUPS {
+            return
+        }
+
+        let cg = &self.control_groups[group]
+
+        if cg.count == 0 {
+            return
+        }
+
+        if !add_to_selection {
+            self.clear_selection()
+        }
+
+        for i in 0..cg.count {
+            self.add_to_selection(cg.thing_ids[i])
+        }
+    }
+
+    fn center_on_control_group(&self, group: u32) -> ?Vec3 {
+        if group >= MAX_CONTROL_GROUPS {
+            return null
+        }
+
+        let cg = &self.control_groups[group]
+        if cg.count == 0 {
+            return null
+        }
+
+        return cg.center
+    }
+
+    fn update_group_center(&mut self, group: u32) {
+        // Would need access to thing factory to compute center
+        // For now, just reset
+        self.control_groups[group].center = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn update_group_centers(&mut self, things: &ThingFactory) {
+        for g in 0..MAX_CONTROL_GROUPS {
+            let cg = &mut self.control_groups[g]
+
+            if cg.count == 0 {
+                continue
+            }
+
+            var center = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+            var valid_count: u32 = 0
+
+            for i in 0..cg.count {
+                let thing = things.get_thing(cg.thing_ids[i])
+                if thing != null {
+                    let t = thing.unwrap()
+                    center.x += t.position.x
+                    center.y += t.position.y
+                    center.z += t.position.z
+                    valid_count += 1
+                }
+            }
+
+            if valid_count > 0 {
+                let inv = 1.0 / valid_count as f32
+                cg.center = Vec3 {
+                    x: center.x * inv,
+                    y: center.y * inv,
+                    z: center.z * inv
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Selection Utilities
+    // ========================================================================
+
+    fn get_selection_center(&self, things: &ThingFactory) -> Vec3 {
+        if self.selection_count == 0 {
+            return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        }
+
+        var center = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        var valid_count: u32 = 0
+
+        for i in 0..self.selection_count {
+            let thing = things.get_thing(self.selected_ids[i])
+            if thing != null {
+                let t = thing.unwrap()
+                center.x += t.position.x
+                center.y += t.position.y
+                center.z += t.position.z
+                valid_count += 1
+            }
+        }
+
+        if valid_count > 0 {
+            let inv = 1.0 / valid_count as f32
+            return Vec3 {
+                x: center.x * inv,
+                y: center.y * inv,
+                z: center.z * inv
+            }
+        }
+
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn has_selection(&self) -> bool {
+        return self.selection_count > 0
+    }
+
+    fn is_single_selection(&self) -> bool {
+        return self.selection_count == 1
+    }
+
+    fn prune_dead(&mut self, things: &ThingFactory) {
+        var i: u32 = 0
+        while i < self.selection_count {
+            let thing = things.get_thing(self.selected_ids[i])
+            let should_remove = if thing == null {
+                true
+            } else {
+                let t = thing.unwrap()
+                t.status == ThingStatus::Dead or t.status == ThingStatus::Dying
+            }
+
+            if should_remove {
+                // Remove
+                for j in i..(self.selection_count - 1) {
+                    self.selected_ids[j] = self.selected_ids[j + 1]
+                }
+                self.selection_count -= 1
+            } else {
+                i += 1
+            }
+        }
+
+        // Update primary
+        if self.selection_count == 0 {
+            self.primary_selected = 0
+        } else if !self.is_selected(self.primary_selected) {
+            self.primary_selected = self.selected_ids[0]
+        }
+    }
+}
+
+// ============================================================================
+// Camera Interface (forward declaration)
+// ============================================================================
+
+struct Camera {
+    position: Vec3,
+    target: Vec3,
+    view_matrix: [f32; 16],
+    projection_matrix: [f32; 16],
+    screen_width: f32,
+    screen_height: f32
+}
+
+impl Camera {
+    fn screen_to_ray(&self, screen_pos: Vec2) -> Ray {
+        // Convert screen coordinates to normalized device coordinates
+        let ndc_x = (2.0 * screen_pos.x / self.screen_width) - 1.0
+        let ndc_y = 1.0 - (2.0 * screen_pos.y / self.screen_height)
+
+        // Unproject through inverse view-projection matrix
+        // Simplified - actual implementation would use full matrix math
+        let dir = Vec3 {
+            x: ndc_x,
+            y: ndc_y,
+            z: -1.0
+        }
+
+        return Ray {
+            origin: self.position,
+            direction: normalize_vec3(dir)
+        }
+    }
+
+    fn world_to_screen(&self, world_pos: Vec3) -> Vec2 {
+        // Project world position to screen
+        // Simplified - actual implementation would use full matrix multiplication
+        let dx = world_pos.x - self.position.x
+        let dz = world_pos.z - self.position.z
+
+        return Vec2 {
+            x: self.screen_width * 0.5 + dx * 2.0,
+            y: self.screen_height * 0.5 + dz * 2.0
+        }
+    }
+}
+
+// ============================================================================
+// Thing Factory Interface (forward declaration)
+// ============================================================================
+
+enum ThingStatus {
+    Alive,
+    Dying,
+    Dead,
+    BeingConstructed
+}
+
+struct Thing {
+    id: u32,
+    template_index: u32,
+    position: Vec3,
+    player_index: u32,
+    status: ThingStatus,
+    is_visible: bool
+}
+
+struct ThingFactory {
+    // Placeholder - actual implementation in thing_factory.home
+}
+
+impl ThingFactory {
+    fn for_each<F>(&self, func: F) where F: fn(&Thing) {
+        // Implementation in thing_factory.home
+    }
+
+    fn get_thing(&self, id: u32) -> ?&Thing {
+        // Implementation in thing_factory.home
+        return null
+    }
+}
+
+// ============================================================================
+// Math Helpers
+// ============================================================================
+
+fn ray_sphere_intersect(ray: Ray, center: Vec3, radius: f32) -> f32 {
+    let oc = Vec3 {
+        x: ray.origin.x - center.x,
+        y: ray.origin.y - center.y,
+        z: ray.origin.z - center.z
+    }
+
+    let a = dot_vec3(ray.direction, ray.direction)
+    let b = 2.0 * dot_vec3(oc, ray.direction)
+    let c = dot_vec3(oc, oc) - radius * radius
+
+    let discriminant = b * b - 4.0 * a * c
+
+    if discriminant < 0.0 {
+        return -1.0
+    }
+
+    return (-b - sqrt(discriminant)) / (2.0 * a)
+}
+
+fn dot_vec3(a: Vec3, b: Vec3) -> f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+fn normalize_vec3(v: Vec3) -> Vec3 {
+    let len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    if len < 0.0001 {
+        return Vec3 { x: 0.0, y: 0.0, z: 1.0 }
+    }
+    let inv = 1.0 / len
+    return Vec3 { x: v.x * inv, y: v.y * inv, z: v.z * inv }
+}
+
+fn min_f32(a: f32, b: f32) -> f32 {
+    if a < b { return a }
+    return b
+}
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a > b { return a }
+    return b
+}
+
+extern fn sqrt(x: f32) -> f32

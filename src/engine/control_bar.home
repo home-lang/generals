@@ -1,0 +1,829 @@
+// Control Bar - Main in-game UI panel at bottom of screen
+// Implements the C&C Generals control bar with command buttons, unit info, etc.
+
+use selection_manager::SelectionManager
+use thing_factory::{Thing, ThingFactory}
+
+// Control bar stages (different UI modes)
+enum ControlBarStage {
+    Default,           // Normal selection mode
+    SingleSelection,   // One unit selected
+    MultiSelection,    // Multiple units selected
+    BuildingPlacement, // Placing a building
+    SuperweaponTarget, // Targeting a superweapon
+    SellMode,          // Selling structures
+    RepairMode,        // Repairing structures
+    PowerMode,         // Power toggle mode
+}
+
+// Command button types
+enum CommandButtonType {
+    None,
+    DozerConstruct,
+    DozerConstructCancel,
+    UnitBuild,
+    UnitBuildCancel,
+    Upgrade,
+    UpgradeCancel,
+    SpecialPower,
+    SpecialPowerFromSelf,
+    SpecialPowerFromCommandCenter,
+    ObjectUpgrade,
+    PlayerUpgrade,
+    ExitContainer,
+    Evacuate,
+    EvacuateContainer,
+    ExecuteRailedTransport,
+    CombatDrop,
+    Guard,
+    GuardFlyover,
+    AttackMove,
+    Stop,
+    Scatter,
+    SetRallyPoint,
+    Sell,
+    CancelConstruction,
+    TogglePower,
+    ToggleWeapon,
+    ConvertToCarBomb,
+    ConvertToMobSpeaker,
+    Hijack,
+    HackInternet,
+    Sabotage,
+    SneakAttack,
+    ToggleStealthMode,
+    CheerAttack,
+    Defect,
+    CaptureBuilding,
+    DisarmMineDefect,
+    Booby_Trap,
+    RemoveBoobyTrap,
+    FireWeapon,
+    SwitchWeapon,
+    Dock,
+    SelectAll,
+    FormationMove,
+    SpecialMove,
+    EmptyAllContainersAtOnce,
+    ForceAttack,
+}
+
+// Single command button
+struct CommandButton {
+    button_type: CommandButtonType,
+    name: string,
+    display_name: string,
+    button_image: string,
+    button_border_type: string,
+    cursor_name: string,
+    invalid_cursor_name: string,
+
+    // Associated data
+    object_name: string,      // For build commands
+    upgrade_name: string,     // For upgrade commands
+    special_power_name: string, // For special power commands
+    science_name: string,     // For science requirements
+
+    // Requirements
+    required_upgrade: string,
+    conflicting_upgrade: string,
+    required_science: string,
+    prerequisite_objects: [string; 4],
+    prerequisite_count: u32,
+
+    // UI state
+    is_enabled: bool,
+    is_visible: bool,
+    is_purchasable: bool,
+    cooldown_percent: f32,
+    build_progress: f32,
+
+    // Position
+    slot_row: u32,
+    slot_column: u32,
+
+    is_valid: bool,
+}
+
+// Cameo (unit portrait) in selection display
+struct SelectionCameo {
+    thing_id: u32,
+    portrait_image: string,
+    health_percent: f32,
+    veterancy_level: u32,
+    is_selected: bool,
+    is_valid: bool,
+}
+
+// Control bar layout regions
+struct ControlBarRegion {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+const MAX_COMMAND_BUTTONS: u32 = 18  // 6x3 grid
+const MAX_SELECTION_CAMEOS: u32 = 20
+const MAX_QUEUE_SLOTS: u32 = 9
+
+// Main control bar structure
+struct ControlBar {
+    // Current state
+    stage: ControlBarStage,
+    is_visible: bool,
+
+    // Command buttons grid (3 rows x 6 columns)
+    command_buttons: [CommandButton; MAX_COMMAND_BUTTONS],
+    active_button_count: u32,
+
+    // Selection display
+    selection_cameos: [SelectionCameo; MAX_SELECTION_CAMEOS],
+    selection_count: u32,
+    primary_selection: u32,
+
+    // Build queue display
+    queue_slots: [QueueSlot; MAX_QUEUE_SLOTS],
+    queue_count: u32,
+
+    // Unit info panel
+    unit_name: string,
+    unit_health: f32,
+    unit_max_health: f32,
+    unit_portrait: string,
+    unit_veterancy: u32,
+
+    // Resource display
+    money: u32,
+    power_produced: i32,
+    power_consumed: i32,
+
+    // Layout regions
+    command_panel_region: ControlBarRegion,
+    selection_region: ControlBarRegion,
+    info_panel_region: ControlBarRegion,
+    minimap_region: ControlBarRegion,
+    resource_region: ControlBarRegion,
+
+    // Interaction state
+    hovered_button: i32,
+    pressed_button: i32,
+    tooltip_text: string,
+    tooltip_visible: bool,
+
+    // Callbacks
+    on_command_issued: fn(CommandButtonType, string),
+    on_build_requested: fn(string),
+    on_upgrade_requested: fn(string),
+
+    // References
+    selection_manager: &SelectionManager,
+    thing_factory: &ThingFactory,
+}
+
+// Build queue slot
+struct QueueSlot {
+    object_name: string,
+    portrait_image: string,
+    build_progress: f32,
+    queue_position: u32,
+    is_paused: bool,
+    is_valid: bool,
+}
+
+impl ControlBar {
+    fn new(selection_manager: &SelectionManager, thing_factory: &ThingFactory) -> Self {
+        let mut bar = ControlBar {
+            stage: ControlBarStage::Default,
+            is_visible: true,
+            command_buttons: [CommandButton::default(); MAX_COMMAND_BUTTONS],
+            active_button_count: 0,
+            selection_cameos: [SelectionCameo::default(); MAX_SELECTION_CAMEOS],
+            selection_count: 0,
+            primary_selection: 0,
+            queue_slots: [QueueSlot::default(); MAX_QUEUE_SLOTS],
+            queue_count: 0,
+            unit_name: "".to_string(),
+            unit_health: 0.0,
+            unit_max_health: 0.0,
+            unit_portrait: "".to_string(),
+            unit_veterancy: 0,
+            money: 0,
+            power_produced: 0,
+            power_consumed: 0,
+            command_panel_region: ControlBarRegion::default(),
+            selection_region: ControlBarRegion::default(),
+            info_panel_region: ControlBarRegion::default(),
+            minimap_region: ControlBarRegion::default(),
+            resource_region: ControlBarRegion::default(),
+            hovered_button: -1,
+            pressed_button: -1,
+            tooltip_text: "".to_string(),
+            tooltip_visible: false,
+            on_command_issued: |_t: CommandButtonType, _s: string| {},
+            on_build_requested: |_s: string| {},
+            on_upgrade_requested: |_s: string| {},
+            selection_manager: selection_manager,
+            thing_factory: thing_factory,
+        }
+        bar.setup_layout()
+        bar
+    }
+
+    fn setup_layout(&mut self) {
+        // Standard C&C Generals control bar layout
+        // Total bar: 800x200 at bottom of 800x600 window (scaled for other resolutions)
+
+        // Minimap: left side
+        self.minimap_region = ControlBarRegion {
+            x: 0.0,
+            y: 400.0,
+            width: 200.0,
+            height: 200.0,
+        }
+
+        // Resource display: top-right of minimap
+        self.resource_region = ControlBarRegion {
+            x: 200.0,
+            y: 400.0,
+            width: 150.0,
+            height: 50.0,
+        }
+
+        // Selection/Info panel: center
+        self.selection_region = ControlBarRegion {
+            x: 200.0,
+            y: 450.0,
+            width: 200.0,
+            height: 150.0,
+        }
+
+        self.info_panel_region = ControlBarRegion {
+            x: 200.0,
+            y: 450.0,
+            width: 200.0,
+            height: 150.0,
+        }
+
+        // Command buttons: right side (6 columns x 3 rows)
+        self.command_panel_region = ControlBarRegion {
+            x: 450.0,
+            y: 400.0,
+            width: 350.0,
+            height: 200.0,
+        }
+    }
+
+    // Update control bar based on current selection
+    fn update(&mut self, delta_time: f32) {
+        let selection_count = self.selection_manager.get_selection_count()
+
+        if selection_count == 0 {
+            self.stage = ControlBarStage::Default
+            self.clear_selection_display()
+            self.setup_default_buttons()
+        } else if selection_count == 1 {
+            self.stage = ControlBarStage::SingleSelection
+            self.update_single_selection()
+        } else {
+            self.stage = ControlBarStage::MultiSelection
+            self.update_multi_selection()
+        }
+
+        // Update build queue progress
+        self.update_build_queue(delta_time)
+
+        // Update button states (cooldowns, availability)
+        self.update_button_states()
+    }
+
+    fn clear_selection_display(&mut self) {
+        self.selection_count = 0
+        self.unit_name = "".to_string()
+        self.unit_health = 0.0
+        self.unit_max_health = 0.0
+        self.unit_portrait = "".to_string()
+        self.unit_veterancy = 0
+
+        for cameo in &mut self.selection_cameos {
+            cameo.is_valid = false
+        }
+    }
+
+    fn setup_default_buttons(&mut self) {
+        // Default buttons when nothing is selected
+        self.active_button_count = 0
+
+        // Add radar/diplomacy buttons if available
+        self.add_default_button(0, 0, CommandButtonType::SelectAll, "Select All Units")
+    }
+
+    fn update_single_selection(&mut self) {
+        let selected_ids = self.selection_manager.get_selected_ids()
+        if selected_ids.is_empty() {
+            return
+        }
+
+        let thing_id = selected_ids[0]
+        if let Some(thing) = self.thing_factory.get_thing(thing_id) {
+            // Update unit info
+            self.unit_name = thing.get_display_name()
+            self.unit_health = thing.get_health()
+            self.unit_max_health = thing.get_max_health()
+            self.unit_portrait = thing.get_portrait()
+            self.unit_veterancy = thing.get_veterancy_level()
+
+            // Update selection cameo
+            self.selection_count = 1
+            self.selection_cameos[0].thing_id = thing_id
+            self.selection_cameos[0].portrait_image = thing.get_portrait()
+            self.selection_cameos[0].health_percent = thing.get_health() / thing.get_max_health()
+            self.selection_cameos[0].veterancy_level = thing.get_veterancy_level()
+            self.selection_cameos[0].is_selected = true
+            self.selection_cameos[0].is_valid = true
+
+            // Setup command buttons for this unit type
+            self.setup_buttons_for_thing(thing)
+        }
+    }
+
+    fn update_multi_selection(&mut self) {
+        let selected_ids = self.selection_manager.get_selected_ids()
+        self.selection_count = 0
+
+        for id in selected_ids {
+            if self.selection_count >= MAX_SELECTION_CAMEOS as u32 {
+                break
+            }
+
+            if let Some(thing) = self.thing_factory.get_thing(*id) {
+                let idx = self.selection_count as usize
+                self.selection_cameos[idx].thing_id = *id
+                self.selection_cameos[idx].portrait_image = thing.get_portrait()
+                self.selection_cameos[idx].health_percent = thing.get_health() / thing.get_max_health()
+                self.selection_cameos[idx].veterancy_level = thing.get_veterancy_level()
+                self.selection_cameos[idx].is_selected = true
+                self.selection_cameos[idx].is_valid = true
+                self.selection_count += 1
+            }
+        }
+
+        // Use primary selection for unit info
+        if let Some(thing) = self.thing_factory.get_thing(selected_ids[0]) {
+            self.unit_name = thing.get_display_name() + " +" + (self.selection_count - 1).to_string()
+            self.unit_health = thing.get_health()
+            self.unit_max_health = thing.get_max_health()
+            self.unit_portrait = thing.get_portrait()
+
+            // Setup common command buttons
+            self.setup_multi_selection_buttons()
+        }
+    }
+
+    fn setup_buttons_for_thing(&mut self, thing: &Thing) {
+        self.active_button_count = 0
+
+        let thing_type = thing.get_kind_of()
+
+        match thing_type.as_str() {
+            "STRUCTURE" => self.setup_structure_buttons(thing),
+            "VEHICLE" => self.setup_vehicle_buttons(thing),
+            "INFANTRY" => self.setup_infantry_buttons(thing),
+            "AIRCRAFT" => self.setup_aircraft_buttons(thing),
+            _ => self.setup_generic_unit_buttons(thing),
+        }
+    }
+
+    fn setup_structure_buttons(&mut self, thing: &Thing) {
+        // Check if it's a production building
+        if thing.can_produce() {
+            // Add build buttons for produceable units
+            let produceable = thing.get_produceable_list()
+            let mut row: u32 = 0
+            let mut col: u32 = 0
+
+            for unit_name in produceable {
+                if col >= 6 {
+                    col = 0
+                    row += 1
+                }
+                if row >= 3 {
+                    break
+                }
+
+                self.add_build_button(row, col, unit_name.clone())
+                col += 1
+            }
+        }
+
+        // Sell button (always available for structures)
+        self.add_command_button(2, 5, CommandButtonType::Sell, "Sell", "SCCSell")
+
+        // Toggle power if applicable
+        if thing.has_power() {
+            self.add_command_button(2, 4, CommandButtonType::TogglePower, "Toggle Power", "SCCPower")
+        }
+    }
+
+    fn setup_vehicle_buttons(&mut self, thing: &Thing) {
+        // Standard movement commands
+        self.add_command_button(0, 0, CommandButtonType::AttackMove, "Attack Move", "SCCAttackMove")
+        self.add_command_button(0, 1, CommandButtonType::Stop, "Stop", "SCCStop")
+        self.add_command_button(0, 2, CommandButtonType::Guard, "Guard", "SCCGuard")
+        self.add_command_button(0, 3, CommandButtonType::Scatter, "Scatter", "SCCScatter")
+
+        // Add special abilities if unit has them
+        self.add_unit_special_abilities(thing, 1)
+    }
+
+    fn setup_infantry_buttons(&mut self, thing: &Thing) {
+        // Standard commands
+        self.add_command_button(0, 0, CommandButtonType::AttackMove, "Attack Move", "SCCAttackMove")
+        self.add_command_button(0, 1, CommandButtonType::Stop, "Stop", "SCCStop")
+        self.add_command_button(0, 2, CommandButtonType::Guard, "Guard", "SCCGuard")
+        self.add_command_button(0, 3, CommandButtonType::Scatter, "Scatter", "SCCScatter")
+
+        // Capture building for appropriate infantry
+        if thing.can_capture() {
+            self.add_command_button(1, 0, CommandButtonType::CaptureBuilding, "Capture Building", "SCCCapture")
+        }
+
+        // Add special abilities
+        self.add_unit_special_abilities(thing, 1)
+    }
+
+    fn setup_aircraft_buttons(&mut self, thing: &Thing) {
+        self.add_command_button(0, 0, CommandButtonType::AttackMove, "Attack Move", "SCCAttackMove")
+        self.add_command_button(0, 1, CommandButtonType::Stop, "Stop", "SCCStop")
+        self.add_command_button(0, 2, CommandButtonType::Guard, "Guard Guard", "SCCGuard")
+
+        // Guard flyover for bombers
+        if thing.is_bomber() {
+            self.add_command_button(0, 3, CommandButtonType::GuardFlyover, "Guard Flyover", "SCCGuardFlyover")
+        }
+
+        self.add_unit_special_abilities(thing, 1)
+    }
+
+    fn setup_generic_unit_buttons(&mut self, thing: &Thing) {
+        self.add_command_button(0, 0, CommandButtonType::AttackMove, "Attack Move", "SCCAttackMove")
+        self.add_command_button(0, 1, CommandButtonType::Stop, "Stop", "SCCStop")
+        self.add_command_button(0, 2, CommandButtonType::Guard, "Guard", "SCCGuard")
+    }
+
+    fn setup_multi_selection_buttons(&mut self) {
+        // Common commands for mixed selection
+        self.active_button_count = 0
+
+        self.add_command_button(0, 0, CommandButtonType::AttackMove, "Attack Move", "SCCAttackMove")
+        self.add_command_button(0, 1, CommandButtonType::Stop, "Stop", "SCCStop")
+        self.add_command_button(0, 2, CommandButtonType::Guard, "Guard", "SCCGuard")
+        self.add_command_button(0, 3, CommandButtonType::Scatter, "Scatter", "SCCScatter")
+        self.add_command_button(0, 4, CommandButtonType::FormationMove, "Formation Move", "SCCFormation")
+    }
+
+    fn add_unit_special_abilities(&mut self, thing: &Thing, start_row: u32) {
+        let abilities = thing.get_special_powers()
+        let mut col: u32 = 0
+        let mut row = start_row
+
+        for ability in abilities {
+            if col >= 6 {
+                col = 0
+                row += 1
+            }
+            if row >= 3 {
+                break
+            }
+
+            self.add_special_power_button(row, col, ability.clone())
+            col += 1
+        }
+    }
+
+    fn add_command_button(&mut self, row: u32, col: u32, button_type: CommandButtonType,
+                          name: string, image: string) {
+        let idx = (row * 6 + col) as usize
+        if idx >= MAX_COMMAND_BUTTONS as usize {
+            return
+        }
+
+        self.command_buttons[idx].button_type = button_type
+        self.command_buttons[idx].name = name
+        self.command_buttons[idx].button_image = image
+        self.command_buttons[idx].slot_row = row
+        self.command_buttons[idx].slot_column = col
+        self.command_buttons[idx].is_enabled = true
+        self.command_buttons[idx].is_visible = true
+        self.command_buttons[idx].is_valid = true
+
+        self.active_button_count = std::cmp::max(self.active_button_count, (idx + 1) as u32)
+    }
+
+    fn add_build_button(&mut self, row: u32, col: u32, object_name: string) {
+        let idx = (row * 6 + col) as usize
+        if idx >= MAX_COMMAND_BUTTONS as usize {
+            return
+        }
+
+        self.command_buttons[idx].button_type = CommandButtonType::UnitBuild
+        self.command_buttons[idx].object_name = object_name.clone()
+        self.command_buttons[idx].name = object_name.clone()
+        self.command_buttons[idx].button_image = "SCC" + object_name
+        self.command_buttons[idx].slot_row = row
+        self.command_buttons[idx].slot_column = col
+        self.command_buttons[idx].is_enabled = true
+        self.command_buttons[idx].is_visible = true
+        self.command_buttons[idx].is_valid = true
+
+        self.active_button_count = std::cmp::max(self.active_button_count, (idx + 1) as u32)
+    }
+
+    fn add_special_power_button(&mut self, row: u32, col: u32, power_name: string) {
+        let idx = (row * 6 + col) as usize
+        if idx >= MAX_COMMAND_BUTTONS as usize {
+            return
+        }
+
+        self.command_buttons[idx].button_type = CommandButtonType::SpecialPower
+        self.command_buttons[idx].special_power_name = power_name.clone()
+        self.command_buttons[idx].name = power_name.clone()
+        self.command_buttons[idx].button_image = "SCC" + power_name
+        self.command_buttons[idx].slot_row = row
+        self.command_buttons[idx].slot_column = col
+        self.command_buttons[idx].is_enabled = true
+        self.command_buttons[idx].is_visible = true
+        self.command_buttons[idx].is_valid = true
+
+        self.active_button_count = std::cmp::max(self.active_button_count, (idx + 1) as u32)
+    }
+
+    fn add_default_button(&mut self, row: u32, col: u32, button_type: CommandButtonType, name: string) {
+        self.add_command_button(row, col, button_type, name, "".to_string())
+    }
+
+    fn update_build_queue(&mut self, delta_time: f32) {
+        // Update queue display from selected structure
+        let selected_ids = self.selection_manager.get_selected_ids()
+        if selected_ids.is_empty() {
+            self.queue_count = 0
+            return
+        }
+
+        if let Some(thing) = self.thing_factory.get_thing(selected_ids[0]) {
+            if thing.can_produce() {
+                let queue = thing.get_production_queue()
+                self.queue_count = 0
+
+                for entry in queue {
+                    if self.queue_count >= MAX_QUEUE_SLOTS as u32 {
+                        break
+                    }
+
+                    let idx = self.queue_count as usize
+                    self.queue_slots[idx].object_name = entry.object_name.clone()
+                    self.queue_slots[idx].build_progress = entry.progress
+                    self.queue_slots[idx].queue_position = self.queue_count
+                    self.queue_slots[idx].is_paused = entry.is_paused
+                    self.queue_slots[idx].is_valid = true
+                    self.queue_count += 1
+                }
+            }
+        }
+    }
+
+    fn update_button_states(&mut self) {
+        // Update cooldown and availability for each button
+        for i in 0..self.active_button_count {
+            let button = &mut self.command_buttons[i as usize]
+            if !button.is_valid {
+                continue
+            }
+
+            match button.button_type {
+                CommandButtonType::SpecialPower => {
+                    // Check cooldown
+                    // button.cooldown_percent = get_power_cooldown(button.special_power_name)
+                    // button.is_enabled = button.cooldown_percent >= 1.0
+                }
+                CommandButtonType::UnitBuild => {
+                    // Check prerequisites and resources
+                    // button.is_enabled = can_build(button.object_name)
+                }
+                CommandButtonType::Upgrade => {
+                    // Check if upgrade is available
+                    // button.is_enabled = can_research(button.upgrade_name)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Input handling
+    fn handle_mouse_move(&mut self, x: f32, y: f32) {
+        self.hovered_button = -1
+        self.tooltip_visible = false
+
+        // Check if in command panel region
+        if x >= self.command_panel_region.x &&
+           x < self.command_panel_region.x + self.command_panel_region.width &&
+           y >= self.command_panel_region.y &&
+           y < self.command_panel_region.y + self.command_panel_region.height {
+
+            // Calculate which button
+            let button_width = self.command_panel_region.width / 6.0
+            let button_height = self.command_panel_region.height / 3.0
+
+            let col = ((x - self.command_panel_region.x) / button_width) as u32
+            let row = ((y - self.command_panel_region.y) / button_height) as u32
+
+            let idx = (row * 6 + col) as i32
+            if idx < self.active_button_count as i32 && self.command_buttons[idx as usize].is_valid {
+                self.hovered_button = idx
+                self.tooltip_text = self.command_buttons[idx as usize].name.clone()
+                self.tooltip_visible = true
+            }
+        }
+    }
+
+    fn handle_mouse_click(&mut self, x: f32, y: f32, button: u32) -> bool {
+        if !self.is_visible {
+            return false
+        }
+
+        // Check command buttons
+        if self.hovered_button >= 0 {
+            let btn = &self.command_buttons[self.hovered_button as usize]
+            if btn.is_enabled {
+                self.execute_command(btn)
+                return true
+            }
+        }
+
+        // Check selection cameos (right-click to deselect)
+        if button == 1 {
+            self.handle_selection_click(x, y)
+        }
+
+        // Check queue slots (right-click to cancel)
+        if button == 1 && self.stage == ControlBarStage::SingleSelection {
+            self.handle_queue_click(x, y)
+        }
+
+        false
+    }
+
+    fn execute_command(&self, button: &CommandButton) {
+        match button.button_type {
+            CommandButtonType::UnitBuild => {
+                (self.on_build_requested)(button.object_name.clone())
+            }
+            CommandButtonType::Upgrade | CommandButtonType::ObjectUpgrade | CommandButtonType::PlayerUpgrade => {
+                (self.on_upgrade_requested)(button.upgrade_name.clone())
+            }
+            _ => {
+                (self.on_command_issued)(button.button_type, button.name.clone())
+            }
+        }
+    }
+
+    fn handle_selection_click(&mut self, x: f32, y: f32) {
+        // Check if clicking on a selection cameo
+        // Implementation: calculate cameo grid position and remove from selection
+    }
+
+    fn handle_queue_click(&mut self, x: f32, y: f32) {
+        // Check if clicking on a queue slot to cancel production
+        // Implementation: calculate queue slot and cancel that item
+    }
+
+    // Rendering data getters
+    fn get_command_buttons(&self) -> &[CommandButton] {
+        &self.command_buttons[0..self.active_button_count as usize]
+    }
+
+    fn get_selection_cameos(&self) -> &[SelectionCameo] {
+        &self.selection_cameos[0..self.selection_count as usize]
+    }
+
+    fn get_queue_slots(&self) -> &[QueueSlot] {
+        &self.queue_slots[0..self.queue_count as usize]
+    }
+
+    fn get_unit_info(&self) -> (string, f32, f32, string, u32) {
+        (self.unit_name.clone(), self.unit_health, self.unit_max_health,
+         self.unit_portrait.clone(), self.unit_veterancy)
+    }
+
+    fn get_resources(&self) -> (u32, i32, i32) {
+        (self.money, self.power_produced, self.power_consumed)
+    }
+
+    fn set_resources(&mut self, money: u32, power_produced: i32, power_consumed: i32) {
+        self.money = money
+        self.power_produced = power_produced
+        self.power_consumed = power_consumed
+    }
+
+    fn get_tooltip(&self) -> (string, bool) {
+        (self.tooltip_text.clone(), self.tooltip_visible)
+    }
+
+    fn is_in_control_bar(&self, x: f32, y: f32) -> bool {
+        y >= self.minimap_region.y
+    }
+
+    // Stage controls
+    fn enter_build_placement_mode(&mut self, building_name: string) {
+        self.stage = ControlBarStage::BuildingPlacement
+        // Setup cancel button
+        self.active_button_count = 1
+        self.add_command_button(0, 0, CommandButtonType::CancelConstruction, "Cancel", "SCCCancel")
+    }
+
+    fn enter_superweapon_targeting(&mut self, power_name: string) {
+        self.stage = ControlBarStage::SuperweaponTarget
+    }
+
+    fn exit_special_mode(&mut self) {
+        self.stage = ControlBarStage::Default
+        self.update(0.0) // Refresh buttons
+    }
+
+    fn set_callbacks(&mut self,
+                    on_command: fn(CommandButtonType, string),
+                    on_build: fn(string),
+                    on_upgrade: fn(string)) {
+        self.on_command_issued = on_command
+        self.on_build_requested = on_build
+        self.on_upgrade_requested = on_upgrade
+    }
+}
+
+impl Default for CommandButton {
+    fn default() -> Self {
+        CommandButton {
+            button_type: CommandButtonType::None,
+            name: "".to_string(),
+            display_name: "".to_string(),
+            button_image: "".to_string(),
+            button_border_type: "".to_string(),
+            cursor_name: "".to_string(),
+            invalid_cursor_name: "".to_string(),
+            object_name: "".to_string(),
+            upgrade_name: "".to_string(),
+            special_power_name: "".to_string(),
+            science_name: "".to_string(),
+            required_upgrade: "".to_string(),
+            conflicting_upgrade: "".to_string(),
+            required_science: "".to_string(),
+            prerequisite_objects: [string::default(); 4],
+            prerequisite_count: 0,
+            is_enabled: false,
+            is_visible: false,
+            is_purchasable: false,
+            cooldown_percent: 1.0,
+            build_progress: 0.0,
+            slot_row: 0,
+            slot_column: 0,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for SelectionCameo {
+    fn default() -> Self {
+        SelectionCameo {
+            thing_id: 0,
+            portrait_image: "".to_string(),
+            health_percent: 1.0,
+            veterancy_level: 0,
+            is_selected: false,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for QueueSlot {
+    fn default() -> Self {
+        QueueSlot {
+            object_name: "".to_string(),
+            portrait_image: "".to_string(),
+            build_progress: 0.0,
+            queue_position: 0,
+            is_paused: false,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for ControlBarRegion {
+    fn default() -> Self {
+        ControlBarRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }
+    }
+}

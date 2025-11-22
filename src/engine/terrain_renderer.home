@@ -1,0 +1,745 @@
+// Terrain Renderer - Renders heightmap terrain with texturing
+// Implements the C&C Generals terrain system with tile-based texturing
+
+// Terrain blend types
+enum TerrainBlendType {
+    None,
+    Alpha,
+    Additive,
+    Multiply,
+}
+
+// Terrain tile definition
+struct TerrainTile {
+    texture_name: string,
+    normal_map: string,
+    blend_type: TerrainBlendType,
+    tile_size: f32,
+    uv_scale: f32,
+    is_passable: bool,
+    movement_cost: f32,
+}
+
+// Terrain vertex
+struct TerrainVertex {
+    position: Vec3,
+    normal: Vec3,
+    uv: Vec2,
+    uv2: Vec2,       // For detail texture
+    blend: Vec4,     // Texture blend weights
+    color: Vec4,     // Vertex color for shadows/lighting
+}
+
+// Vec types
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+// Terrain chunk for LOD and culling
+struct TerrainChunk {
+    vertices: Vec<TerrainVertex>,
+    indices: Vec<u32>,
+
+    // Bounding box
+    min_x: f32,
+    min_y: f32,
+    min_z: f32,
+    max_x: f32,
+    max_y: f32,
+    max_z: f32,
+
+    // GPU buffers
+    vertex_buffer: u64,
+    index_buffer: u64,
+
+    // Textures used by this chunk
+    texture_indices: [u32; 4],
+    texture_count: u32,
+
+    // LOD
+    lod_level: u32,
+    distance_to_camera: f32,
+
+    // State
+    is_visible: bool,
+    needs_rebuild: bool,
+    is_uploaded: bool,
+}
+
+// Water plane
+struct WaterPlane {
+    position: Vec3,
+    size_x: f32,
+    size_y: f32,
+    height: f32,
+    flow_direction: Vec2,
+    flow_speed: f32,
+    wave_amplitude: f32,
+    wave_frequency: f32,
+    color: Vec4,
+    transparency: f32,
+    vertex_buffer: u64,
+    index_buffer: u64,
+    is_valid: bool,
+}
+
+// Shore line effect
+struct ShoreEffect {
+    position: Vec3,
+    width: f32,
+    foam_texture: string,
+    is_valid: bool,
+}
+
+const MAX_CHUNKS: u32 = 256
+const CHUNK_SIZE: u32 = 32  // 32x32 vertices per chunk
+const MAX_TEXTURES: u32 = 64
+const MAX_WATER_PLANES: u32 = 16
+const MAX_LOD_LEVELS: u32 = 4
+
+struct TerrainRenderer {
+    // Heightmap data
+    heightmap: Vec<f32>,
+    width: u32,
+    height: u32,
+    cell_size: f32,
+
+    // Texture painting
+    texture_map: Vec<u8>,  // Which texture per cell
+    blend_map: Vec<Vec4>,  // Blend weights per vertex
+
+    // Chunks
+    chunks: [TerrainChunk; MAX_CHUNKS],
+    chunk_count: u32,
+    chunks_x: u32,
+    chunks_y: u32,
+
+    // Textures
+    terrain_tiles: [TerrainTile; MAX_TEXTURES],
+    tile_count: u32,
+    texture_handles: [u64; MAX_TEXTURES],
+
+    // Water
+    water_planes: [WaterPlane; MAX_WATER_PLANES],
+    water_count: u32,
+    water_time: f32,
+
+    // Rendering state
+    device: u64,
+    terrain_pipeline: u64,
+    water_pipeline: u64,
+
+    // Camera for culling
+    camera_position: Vec3,
+    camera_frustum: [Vec4; 6],
+
+    // Settings
+    enable_shadows: bool,
+    enable_detail_texture: bool,
+    lod_distances: [f32; MAX_LOD_LEVELS],
+
+    // Stats
+    visible_chunks: u32,
+    triangles_rendered: u32,
+}
+
+impl TerrainRenderer {
+    fn new(width: u32, height: u32, cell_size: f32) -> Self {
+        let map_size = (width * height) as usize
+
+        let mut renderer = TerrainRenderer {
+            heightmap: vec![0.0; map_size],
+            width: width,
+            height: height,
+            cell_size: cell_size,
+            texture_map: vec![0; map_size],
+            blend_map: vec![Vec4::default(); map_size],
+            chunks: [TerrainChunk::default(); MAX_CHUNKS as usize],
+            chunk_count: 0,
+            chunks_x: (width + CHUNK_SIZE - 1) / CHUNK_SIZE,
+            chunks_y: (height + CHUNK_SIZE - 1) / CHUNK_SIZE,
+            terrain_tiles: [TerrainTile::default(); MAX_TEXTURES as usize],
+            tile_count: 0,
+            texture_handles: [0; MAX_TEXTURES as usize],
+            water_planes: [WaterPlane::default(); MAX_WATER_PLANES as usize],
+            water_count: 0,
+            water_time: 0.0,
+            device: 0,
+            terrain_pipeline: 0,
+            water_pipeline: 0,
+            camera_position: Vec3::default(),
+            camera_frustum: [Vec4::default(); 6],
+            enable_shadows: true,
+            enable_detail_texture: true,
+            lod_distances: [100.0, 200.0, 400.0, 800.0],
+            visible_chunks: 0,
+            triangles_rendered: 0,
+        }
+
+        renderer.build_chunks()
+        renderer
+    }
+
+    // Load heightmap from file
+    fn load_heightmap(&mut self, data: &[f32]) {
+        let expected_size = (self.width * self.height) as usize
+
+        for i in 0..expected_size.min(data.len()) {
+            self.heightmap[i] = data[i]
+        }
+
+        // Rebuild all chunks
+        self.rebuild_all_chunks()
+    }
+
+    // Load texture map (which texture at each cell)
+    fn load_texture_map(&mut self, data: &[u8]) {
+        let expected_size = (self.width * self.height) as usize
+
+        for i in 0..expected_size.min(data.len()) {
+            self.texture_map[i] = data[i]
+        }
+
+        // Rebuild chunks to update texturing
+        self.rebuild_all_chunks()
+    }
+
+    // Load blend map (texture blend weights)
+    fn load_blend_map(&mut self, data: &[Vec4]) {
+        let expected_size = (self.width * self.height) as usize
+
+        for i in 0..expected_size.min(data.len()) {
+            self.blend_map[i] = data[i].clone()
+        }
+
+        self.rebuild_all_chunks()
+    }
+
+    // Add a terrain texture tile
+    fn add_tile(&mut self, name: string, texture: string) -> u32 {
+        if self.tile_count >= MAX_TEXTURES {
+            return 0
+        }
+
+        let idx = self.tile_count as usize
+        self.terrain_tiles[idx] = TerrainTile {
+            texture_name: texture,
+            normal_map: "".to_string(),
+            blend_type: TerrainBlendType::Alpha,
+            tile_size: 1.0,
+            uv_scale: 1.0,
+            is_passable: true,
+            movement_cost: 1.0,
+        }
+
+        self.tile_count += 1
+        self.tile_count - 1
+    }
+
+    // Build chunk grid
+    fn build_chunks(&mut self) {
+        self.chunk_count = 0
+
+        for cy in 0..self.chunks_y {
+            for cx in 0..self.chunks_x {
+                if self.chunk_count >= MAX_CHUNKS {
+                    break
+                }
+
+                let chunk_idx = self.chunk_count as usize
+                self.chunks[chunk_idx] = TerrainChunk::default()
+
+                let start_x = cx * CHUNK_SIZE
+                let start_y = cy * CHUNK_SIZE
+                let end_x = ((cx + 1) * CHUNK_SIZE).min(self.width)
+                let end_y = ((cy + 1) * CHUNK_SIZE).min(self.height)
+
+                self.build_chunk_geometry(chunk_idx, start_x, start_y, end_x, end_y)
+
+                self.chunk_count += 1
+            }
+        }
+    }
+
+    fn build_chunk_geometry(&mut self, chunk_idx: usize,
+                            start_x: u32, start_y: u32,
+                            end_x: u32, end_y: u32) {
+        let chunk = &mut self.chunks[chunk_idx]
+
+        chunk.vertices.clear()
+        chunk.indices.clear()
+
+        // Initialize bounds
+        chunk.min_x = f32::MAX
+        chunk.min_y = f32::MAX
+        chunk.min_z = f32::MAX
+        chunk.max_x = f32::MIN
+        chunk.max_y = f32::MIN
+        chunk.max_z = f32::MIN
+
+        // Build vertices
+        for y in start_y..=end_y {
+            for x in start_x..=end_x {
+                let height = self.get_height(x, y)
+                let normal = self.calculate_normal(x, y)
+
+                let world_x = x as f32 * self.cell_size
+                let world_y = y as f32 * self.cell_size
+
+                let vertex = TerrainVertex {
+                    position: Vec3 { x: world_x, y: world_y, z: height },
+                    normal: normal,
+                    uv: Vec2 { x: x as f32 / 8.0, y: y as f32 / 8.0 },
+                    uv2: Vec2 { x: x as f32 / 32.0, y: y as f32 / 32.0 },
+                    blend: self.get_blend(x, y),
+                    color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+                }
+
+                // Update bounds
+                chunk.min_x = chunk.min_x.min(world_x)
+                chunk.min_y = chunk.min_y.min(world_y)
+                chunk.min_z = chunk.min_z.min(height)
+                chunk.max_x = chunk.max_x.max(world_x)
+                chunk.max_y = chunk.max_y.max(world_y)
+                chunk.max_z = chunk.max_z.max(height)
+
+                chunk.vertices.push(vertex)
+            }
+        }
+
+        // Build indices (triangle strip or list)
+        let chunk_width = end_x - start_x + 1
+
+        for y in 0..(end_y - start_y) {
+            for x in 0..(end_x - start_x) {
+                let base = y * chunk_width + x
+
+                // Two triangles per quad
+                chunk.indices.push(base)
+                chunk.indices.push(base + chunk_width)
+                chunk.indices.push(base + 1)
+
+                chunk.indices.push(base + 1)
+                chunk.indices.push(base + chunk_width)
+                chunk.indices.push(base + chunk_width + 1)
+            }
+        }
+
+        chunk.needs_rebuild = false
+        chunk.is_uploaded = false
+    }
+
+    fn get_height(&self, x: u32, y: u32) -> f32 {
+        let idx = (y * self.width + x) as usize
+        if idx < self.heightmap.len() {
+            self.heightmap[idx]
+        } else {
+            0.0
+        }
+    }
+
+    fn calculate_normal(&self, x: u32, y: u32) -> Vec3 {
+        // Sample heights around this point
+        let h = self.get_height(x, y)
+        let hl = if x > 0 { self.get_height(x - 1, y) } else { h }
+        let hr = if x < self.width - 1 { self.get_height(x + 1, y) } else { h }
+        let hu = if y > 0 { self.get_height(x, y - 1) } else { h }
+        let hd = if y < self.height - 1 { self.get_height(x, y + 1) } else { h }
+
+        // Calculate gradient
+        let dx = (hr - hl) / (2.0 * self.cell_size)
+        let dy = (hd - hu) / (2.0 * self.cell_size)
+
+        // Normal from gradient
+        let normal = Vec3 {
+            x: -dx,
+            y: -dy,
+            z: 1.0,
+        }
+
+        normal.normalized()
+    }
+
+    fn get_blend(&self, x: u32, y: u32) -> Vec4 {
+        let idx = (y * self.width + x) as usize
+        if idx < self.blend_map.len() {
+            self.blend_map[idx].clone()
+        } else {
+            Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 }
+        }
+    }
+
+    fn rebuild_all_chunks(&mut self) {
+        for i in 0..self.chunk_count {
+            let chunk = &mut self.chunks[i as usize]
+            chunk.needs_rebuild = true
+        }
+    }
+
+    // Update terrain (for editor modifications)
+    fn set_height(&mut self, x: u32, y: u32, height: f32) {
+        let idx = (y * self.width + x) as usize
+        if idx < self.heightmap.len() {
+            self.heightmap[idx] = height
+
+            // Mark affected chunks for rebuild
+            let chunk_x = x / CHUNK_SIZE
+            let chunk_y = y / CHUNK_SIZE
+            self.mark_chunk_dirty(chunk_x, chunk_y)
+
+            // Also mark neighbors if on edge
+            if x % CHUNK_SIZE == 0 && chunk_x > 0 {
+                self.mark_chunk_dirty(chunk_x - 1, chunk_y)
+            }
+            if x % CHUNK_SIZE == CHUNK_SIZE - 1 && chunk_x < self.chunks_x - 1 {
+                self.mark_chunk_dirty(chunk_x + 1, chunk_y)
+            }
+            if y % CHUNK_SIZE == 0 && chunk_y > 0 {
+                self.mark_chunk_dirty(chunk_x, chunk_y - 1)
+            }
+            if y % CHUNK_SIZE == CHUNK_SIZE - 1 && chunk_y < self.chunks_y - 1 {
+                self.mark_chunk_dirty(chunk_x, chunk_y + 1)
+            }
+        }
+    }
+
+    fn mark_chunk_dirty(&mut self, chunk_x: u32, chunk_y: u32) {
+        let chunk_idx = (chunk_y * self.chunks_x + chunk_x) as usize
+        if chunk_idx < self.chunk_count as usize {
+            self.chunks[chunk_idx].needs_rebuild = true
+        }
+    }
+
+    // Water
+    fn add_water_plane(&mut self, x: f32, y: f32, size_x: f32, size_y: f32, height: f32) -> u32 {
+        if self.water_count >= MAX_WATER_PLANES {
+            return 0
+        }
+
+        let idx = self.water_count as usize
+        self.water_planes[idx] = WaterPlane {
+            position: Vec3 { x: x, y: y, z: height },
+            size_x: size_x,
+            size_y: size_y,
+            height: height,
+            flow_direction: Vec2 { x: 1.0, y: 0.0 },
+            flow_speed: 0.1,
+            wave_amplitude: 0.5,
+            wave_frequency: 2.0,
+            color: Vec4 { x: 0.2, y: 0.4, z: 0.8, w: 0.7 },
+            transparency: 0.7,
+            vertex_buffer: 0,
+            index_buffer: 0,
+            is_valid: true,
+        }
+
+        self.water_count += 1
+        self.water_count - 1
+    }
+
+    // Rendering
+    fn update(&mut self, delta_time: f32) {
+        self.water_time += delta_time
+
+        // Rebuild dirty chunks
+        for i in 0..self.chunk_count {
+            let chunk = &mut self.chunks[i as usize]
+            if chunk.needs_rebuild {
+                // Would rebuild geometry and re-upload to GPU
+            }
+        }
+    }
+
+    fn cull_chunks(&mut self) {
+        self.visible_chunks = 0
+
+        for i in 0..self.chunk_count {
+            let chunk = &mut self.chunks[i as usize]
+
+            // Simple frustum culling
+            chunk.is_visible = self.is_box_visible(
+                chunk.min_x, chunk.min_y, chunk.min_z,
+                chunk.max_x, chunk.max_y, chunk.max_z
+            )
+
+            if chunk.is_visible {
+                // Calculate distance for LOD
+                let center_x = (chunk.min_x + chunk.max_x) / 2.0
+                let center_y = (chunk.min_y + chunk.max_y) / 2.0
+                let center_z = (chunk.min_z + chunk.max_z) / 2.0
+
+                let dx = center_x - self.camera_position.x
+                let dy = center_y - self.camera_position.y
+                let dz = center_z - self.camera_position.z
+
+                chunk.distance_to_camera = (dx * dx + dy * dy + dz * dz).sqrt()
+
+                // Determine LOD level
+                chunk.lod_level = 0
+                for lod in 0..MAX_LOD_LEVELS {
+                    if chunk.distance_to_camera > self.lod_distances[lod as usize] {
+                        chunk.lod_level = lod + 1
+                    }
+                }
+
+                self.visible_chunks += 1
+            }
+        }
+    }
+
+    fn is_box_visible(&self, min_x: f32, min_y: f32, min_z: f32,
+                      max_x: f32, max_y: f32, max_z: f32) -> bool {
+        // Check against each frustum plane
+        for plane in &self.camera_frustum {
+            // Test all 8 corners of the box
+            let corners = [
+                (min_x, min_y, min_z),
+                (max_x, min_y, min_z),
+                (min_x, max_y, min_z),
+                (max_x, max_y, min_z),
+                (min_x, min_y, max_z),
+                (max_x, min_y, max_z),
+                (min_x, max_y, max_z),
+                (max_x, max_y, max_z),
+            ]
+
+            let mut all_outside = true
+            for (cx, cy, cz) in corners {
+                let dist = plane.x * cx + plane.y * cy + plane.z * cz + plane.w
+                if dist >= 0.0 {
+                    all_outside = false
+                    break
+                }
+            }
+
+            if all_outside {
+                return false
+            }
+        }
+
+        true
+    }
+
+    fn set_camera(&mut self, position: Vec3, frustum: [Vec4; 6]) {
+        self.camera_position = position
+        self.camera_frustum = frustum
+    }
+
+    // Render function would be called by the main renderer
+    fn render(&mut self, command_encoder: u64) {
+        self.cull_chunks()
+        self.triangles_rendered = 0
+
+        // Sort chunks by distance (front to back)
+        // In a real implementation, would sort chunk indices
+
+        // Render terrain chunks
+        for i in 0..self.chunk_count {
+            let chunk = &self.chunks[i as usize]
+            if chunk.is_visible {
+                // Would issue draw call for this chunk
+                self.triangles_rendered += chunk.indices.len() as u32 / 3
+            }
+        }
+
+        // Render water
+        self.render_water(command_encoder)
+    }
+
+    fn render_water(&self, command_encoder: u64) {
+        for i in 0..self.water_count {
+            let water = &self.water_planes[i as usize]
+            if water.is_valid {
+                // Would render water plane with animated UVs
+                // Water shader would apply wave displacement and transparency
+            }
+        }
+    }
+
+    // Query functions
+    fn get_height_at(&self, world_x: f32, world_y: f32) -> f32 {
+        // Convert world to grid coordinates
+        let grid_x = world_x / self.cell_size
+        let grid_y = world_y / self.cell_size
+
+        // Get integer and fractional parts
+        let x0 = grid_x.floor() as u32
+        let y0 = grid_y.floor() as u32
+        let fx = grid_x.fract()
+        let fy = grid_y.fract()
+
+        // Bilinear interpolation
+        let h00 = self.get_height(x0, y0)
+        let h10 = self.get_height(x0 + 1, y0)
+        let h01 = self.get_height(x0, y0 + 1)
+        let h11 = self.get_height(x0 + 1, y0 + 1)
+
+        let h0 = h00 * (1.0 - fx) + h10 * fx
+        let h1 = h01 * (1.0 - fx) + h11 * fx
+
+        h0 * (1.0 - fy) + h1 * fy
+    }
+
+    fn get_normal_at(&self, world_x: f32, world_y: f32) -> Vec3 {
+        let grid_x = (world_x / self.cell_size) as u32
+        let grid_y = (world_y / self.cell_size) as u32
+
+        self.calculate_normal(grid_x, grid_y)
+    }
+
+    fn raycast(&self, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<Vec3> {
+        // March along ray checking terrain height
+        let step_size = self.cell_size * 0.5
+        let steps = (max_dist / step_size) as u32
+
+        let mut pos = origin.clone()
+
+        for _ in 0..steps {
+            let terrain_height = self.get_height_at(pos.x, pos.y)
+
+            if pos.z <= terrain_height {
+                return Some(pos)
+            }
+
+            pos.x += direction.x * step_size
+            pos.y += direction.y * step_size
+            pos.z += direction.z * step_size
+        }
+
+        None
+    }
+
+    fn get_visible_chunk_count(&self) -> u32 {
+        self.visible_chunks
+    }
+
+    fn get_triangle_count(&self) -> u32 {
+        self.triangles_rendered
+    }
+}
+
+impl Default for TerrainVertex {
+    fn default() -> Self {
+        TerrainVertex {
+            position: Vec3::default(),
+            normal: Vec3 { x: 0.0, y: 0.0, z: 1.0 },
+            uv: Vec2::default(),
+            uv2: Vec2::default(),
+            blend: Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },
+            color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+        }
+    }
+}
+
+impl Default for TerrainChunk {
+    fn default() -> Self {
+        TerrainChunk {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            min_z: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
+            max_z: 0.0,
+            vertex_buffer: 0,
+            index_buffer: 0,
+            texture_indices: [0; 4],
+            texture_count: 0,
+            lod_level: 0,
+            distance_to_camera: 0.0,
+            is_visible: false,
+            needs_rebuild: true,
+            is_uploaded: false,
+        }
+    }
+}
+
+impl Default for WaterPlane {
+    fn default() -> Self {
+        WaterPlane {
+            position: Vec3::default(),
+            size_x: 0.0,
+            size_y: 0.0,
+            height: 0.0,
+            flow_direction: Vec2 { x: 1.0, y: 0.0 },
+            flow_speed: 0.1,
+            wave_amplitude: 0.5,
+            wave_frequency: 2.0,
+            color: Vec4 { x: 0.2, y: 0.4, z: 0.8, w: 0.7 },
+            transparency: 0.7,
+            vertex_buffer: 0,
+            index_buffer: 0,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for TerrainTile {
+    fn default() -> Self {
+        TerrainTile {
+            texture_name: "".to_string(),
+            normal_map: "".to_string(),
+            blend_type: TerrainBlendType::Alpha,
+            tile_size: 1.0,
+            uv_scale: 1.0,
+            is_passable: true,
+            movement_cost: 1.0,
+        }
+    }
+}
+
+impl Default for Vec2 {
+    fn default() -> Self {
+        Vec2 { x: 0.0, y: 0.0 }
+    }
+}
+
+impl Default for Vec3 {
+    fn default() -> Self {
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+impl Clone for Vec3 {
+    fn clone(&self) -> Self {
+        Vec3 { x: self.x, y: self.y, z: self.z }
+    }
+}
+
+impl Vec3 {
+    fn normalized(&self) -> Vec3 {
+        let len = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+        if len > 0.001 {
+            Vec3 { x: self.x / len, y: self.y / len, z: self.z / len }
+        } else {
+            Vec3::default()
+        }
+    }
+}
+
+impl Default for Vec4 {
+    fn default() -> Self {
+        Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 }
+    }
+}
+
+impl Clone for Vec4 {
+    fn clone(&self) -> Self {
+        Vec4 { x: self.x, y: self.y, z: self.z, w: self.w }
+    }
+}

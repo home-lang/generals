@@ -1,0 +1,829 @@
+// Window Manager - Manages WND window hierarchy and input
+// Handles creating, destroying, and dispatching input to windows
+
+use std::collections::HashMap
+use wnd_window::{WndWindow, WindowType, WindowStatus, WndRect}
+
+// Window message types
+enum WindowMessage {
+    None,
+    Created,
+    Destroyed,
+    MouseEnter,
+    MouseLeave,
+    MouseMove,
+    LeftDown,
+    LeftUp,
+    LeftClick,
+    LeftDoubleClick,
+    RightDown,
+    RightUp,
+    RightClick,
+    MiddleDown,
+    MiddleUp,
+    WheelUp,
+    WheelDown,
+    KeyDown,
+    KeyUp,
+    CharTyped,
+    GainFocus,
+    LoseFocus,
+    StateChange,
+    ListSelect,
+    SliderChange,
+    TextChange,
+    TabChange,
+    SystemUpdate,
+    Draw,
+}
+
+// Message data
+struct WindowMessageData {
+    message: WindowMessage,
+    window_id: u32,
+    mouse_x: i32,
+    mouse_y: i32,
+    key_code: u32,
+    char_value: char,
+    data: u64,
+}
+
+// Transition types for screen changes
+enum TransitionType {
+    None,
+    Fade,
+    Slide,
+    Wipe,
+    Iris,
+}
+
+// Modal window stack entry
+struct ModalEntry {
+    window_id: u32,
+    previous_focus: u32,
+}
+
+const MAX_WINDOWS: u32 = 1024
+const MAX_MODAL_STACK: u32 = 16
+
+struct WindowManager {
+    // Window storage
+    windows: [WndWindow; MAX_WINDOWS],
+    window_count: u32,
+    window_name_to_id: HashMap<string, u32>,
+    next_window_id: u32,
+
+    // Root windows (top-level screens)
+    root_windows: [u32; 64],
+    root_count: u32,
+    active_root: u32,
+
+    // Focus
+    focused_window: u32,
+    mouse_capture_window: u32,
+    hover_window: u32,
+
+    // Modal stack
+    modal_stack: [ModalEntry; MAX_MODAL_STACK],
+    modal_count: u32,
+
+    // Screen dimensions
+    screen_width: i32,
+    screen_height: i32,
+
+    // Transition state
+    transition_type: TransitionType,
+    transition_progress: f32,
+    transition_from_root: u32,
+    transition_to_root: u32,
+
+    // Tooltip
+    tooltip_window: u32,
+    tooltip_delay_timer: f32,
+    tooltip_target: u32,
+
+    // Input state
+    last_mouse_x: i32,
+    last_mouse_y: i32,
+    left_button_down: bool,
+    right_button_down: bool,
+    middle_button_down: bool,
+
+    // Callbacks
+    on_window_message: fn(&WindowMessageData) -> bool,
+    on_screen_change: fn(u32, u32),
+
+    // Debug
+    debug_draw_bounds: bool,
+}
+
+impl WindowManager {
+    fn new(screen_width: i32, screen_height: i32) -> Self {
+        let mut manager = WindowManager {
+            windows: [WndWindow::default(); MAX_WINDOWS],
+            window_count: 0,
+            window_name_to_id: HashMap::new(),
+            next_window_id: 1,
+            root_windows: [0; 64],
+            root_count: 0,
+            active_root: 0,
+            focused_window: 0,
+            mouse_capture_window: 0,
+            hover_window: 0,
+            modal_stack: [ModalEntry::default(); MAX_MODAL_STACK],
+            modal_count: 0,
+            screen_width: screen_width,
+            screen_height: screen_height,
+            transition_type: TransitionType::None,
+            transition_progress: 0.0,
+            transition_from_root: 0,
+            transition_to_root: 0,
+            tooltip_window: 0,
+            tooltip_delay_timer: 0.0,
+            tooltip_target: 0,
+            last_mouse_x: 0,
+            last_mouse_y: 0,
+            left_button_down: false,
+            right_button_down: false,
+            middle_button_down: false,
+            on_window_message: |_msg: &WindowMessageData| -> bool { false },
+            on_screen_change: |_from: u32, _to: u32| {},
+            debug_draw_bounds: false,
+        }
+
+        // Create tooltip window
+        manager.tooltip_window = manager.create_window("Tooltip", WindowType::StaticText)
+        if let Some(tooltip) = manager.get_window_mut(manager.tooltip_window) {
+            tooltip.set_hidden(true)
+        }
+
+        manager
+    }
+
+    // Window creation/destruction
+    fn create_window(&mut self, name: string, window_type: WindowType) -> u32 {
+        if self.window_count >= MAX_WINDOWS {
+            return 0
+        }
+
+        let id = self.next_window_id
+        self.next_window_id += 1
+
+        let idx = self.find_free_slot()
+        if idx >= MAX_WINDOWS {
+            return 0
+        }
+
+        self.windows[idx as usize] = WndWindow::new(name.clone(), window_type)
+        self.windows[idx as usize].id = id
+        self.window_name_to_id.insert(name, id)
+        self.window_count += 1
+
+        // Send created message
+        self.send_message(id, WindowMessage::Created, 0, 0, 0)
+
+        id
+    }
+
+    fn destroy_window(&mut self, window_id: u32) -> bool {
+        if let Some(window) = self.get_window_mut(window_id) {
+            // Destroy children first
+            let children = window.children.clone()
+            let count = window.child_count
+
+            for i in 0..count {
+                self.destroy_window(children[i as usize])
+            }
+
+            // Remove from parent
+            if window.parent_id != 0 {
+                if let Some(parent) = self.get_window_mut(window.parent_id) {
+                    parent.remove_child(window_id)
+                }
+            }
+
+            // Remove from name map
+            self.window_name_to_id.remove(&window.name)
+
+            // Send destroyed message
+            self.send_message(window_id, WindowMessage::Destroyed, 0, 0, 0)
+
+            // Clear focus if this was focused
+            if self.focused_window == window_id {
+                self.focused_window = 0
+            }
+            if self.hover_window == window_id {
+                self.hover_window = 0
+            }
+
+            // Invalidate
+            window.is_valid = false
+            self.window_count -= 1
+
+            return true
+        }
+
+        false
+    }
+
+    fn find_free_slot(&self) -> u32 {
+        for i in 0..MAX_WINDOWS {
+            if !self.windows[i as usize].is_valid {
+                return i
+            }
+        }
+        MAX_WINDOWS
+    }
+
+    // Window hierarchy
+    fn set_parent(&mut self, window_id: u32, parent_id: u32) -> bool {
+        if let Some(window) = self.get_window_mut(window_id) {
+            // Remove from old parent
+            let old_parent = window.parent_id
+            if old_parent != 0 {
+                if let Some(old) = self.get_window_mut(old_parent) {
+                    old.remove_child(window_id)
+                }
+            }
+
+            window.parent_id = parent_id
+        }
+
+        // Add to new parent
+        if parent_id != 0 {
+            if let Some(parent) = self.get_window_mut(parent_id) {
+                return parent.add_child(window_id)
+            }
+        }
+
+        true
+    }
+
+    fn add_root_window(&mut self, window_id: u32) -> bool {
+        if self.root_count >= 64 {
+            return false
+        }
+
+        self.root_windows[self.root_count as usize] = window_id
+        self.root_count += 1
+
+        if self.active_root == 0 {
+            self.active_root = window_id
+        }
+
+        true
+    }
+
+    // Window access
+    fn get_window(&self, window_id: u32) -> Option<&WndWindow> {
+        for i in 0..MAX_WINDOWS {
+            if self.windows[i as usize].is_valid && self.windows[i as usize].id == window_id {
+                return Some(&self.windows[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_window_mut(&mut self, window_id: u32) -> Option<&mut WndWindow> {
+        for i in 0..MAX_WINDOWS {
+            if self.windows[i as usize].is_valid && self.windows[i as usize].id == window_id {
+                return Some(&mut self.windows[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_window_by_name(&self, name: string) -> Option<&WndWindow> {
+        if let Some(id) = self.window_name_to_id.get(&name) {
+            return self.get_window(*id)
+        }
+        None
+    }
+
+    fn get_window_by_name_mut(&mut self, name: string) -> Option<&mut WndWindow> {
+        if let Some(id) = self.window_name_to_id.get(&name) {
+            return self.get_window_mut(*id)
+        }
+        None
+    }
+
+    // Screen management
+    fn switch_to_screen(&mut self, window_id: u32, transition: TransitionType) {
+        if window_id == self.active_root {
+            return
+        }
+
+        (self.on_screen_change)(self.active_root, window_id)
+
+        self.transition_type = transition
+        self.transition_from_root = self.active_root
+        self.transition_to_root = window_id
+
+        match transition {
+            TransitionType::None => {
+                // Immediate switch
+                self.hide_window(self.active_root)
+                self.show_window(window_id)
+                self.active_root = window_id
+            }
+            _ => {
+                // Start transition
+                self.transition_progress = 0.0
+                self.show_window(window_id)
+            }
+        }
+    }
+
+    fn update_transition(&mut self, delta_time: f32) {
+        if self.transition_type == TransitionType::None {
+            return
+        }
+
+        self.transition_progress += delta_time * 2.0 // 0.5 second transitions
+
+        if self.transition_progress >= 1.0 {
+            // Transition complete
+            self.hide_window(self.transition_from_root)
+            self.active_root = self.transition_to_root
+            self.transition_type = TransitionType::None
+        }
+    }
+
+    fn show_window(&mut self, window_id: u32) {
+        if let Some(window) = self.get_window_mut(window_id) {
+            window.set_hidden(false)
+        }
+    }
+
+    fn hide_window(&mut self, window_id: u32) {
+        if let Some(window) = self.get_window_mut(window_id) {
+            window.set_hidden(true)
+        }
+    }
+
+    // Modal windows
+    fn push_modal(&mut self, window_id: u32) -> bool {
+        if self.modal_count >= MAX_MODAL_STACK {
+            return false
+        }
+
+        self.modal_stack[self.modal_count as usize] = ModalEntry {
+            window_id: window_id,
+            previous_focus: self.focused_window,
+        }
+        self.modal_count += 1
+
+        self.set_focus(window_id)
+        self.show_window(window_id)
+
+        true
+    }
+
+    fn pop_modal(&mut self) -> u32 {
+        if self.modal_count == 0 {
+            return 0
+        }
+
+        self.modal_count -= 1
+        let entry = &self.modal_stack[self.modal_count as usize]
+        let window_id = entry.window_id
+        let prev_focus = entry.previous_focus
+
+        self.hide_window(window_id)
+        self.set_focus(prev_focus)
+
+        window_id
+    }
+
+    fn is_modal_active(&self) -> bool {
+        self.modal_count > 0
+    }
+
+    fn get_active_modal(&self) -> u32 {
+        if self.modal_count > 0 {
+            return self.modal_stack[(self.modal_count - 1) as usize].window_id
+        }
+        0
+    }
+
+    // Focus management
+    fn set_focus(&mut self, window_id: u32) {
+        if self.focused_window == window_id {
+            return
+        }
+
+        // Lose focus on old window
+        if self.focused_window != 0 {
+            self.send_message(self.focused_window, WindowMessage::LoseFocus, 0, 0, 0)
+            if let Some(window) = self.get_window_mut(self.focused_window) {
+                window.is_focused = false
+            }
+        }
+
+        self.focused_window = window_id
+
+        // Gain focus on new window
+        if window_id != 0 {
+            self.send_message(window_id, WindowMessage::GainFocus, 0, 0, 0)
+            if let Some(window) = self.get_window_mut(window_id) {
+                window.is_focused = true
+            }
+        }
+    }
+
+    fn capture_mouse(&mut self, window_id: u32) {
+        self.mouse_capture_window = window_id
+    }
+
+    fn release_mouse(&mut self) {
+        self.mouse_capture_window = 0
+    }
+
+    // Input handling
+    fn handle_mouse_move(&mut self, x: i32, y: i32) -> bool {
+        self.last_mouse_x = x
+        self.last_mouse_y = y
+
+        // Handle captured mouse
+        if self.mouse_capture_window != 0 {
+            self.send_message(self.mouse_capture_window, WindowMessage::MouseMove, x, y, 0)
+            return true
+        }
+
+        // Find window under cursor
+        let window_id = self.window_at_point(x, y)
+
+        // Handle hover changes
+        if window_id != self.hover_window {
+            if self.hover_window != 0 {
+                self.send_message(self.hover_window, WindowMessage::MouseLeave, x, y, 0)
+                if let Some(window) = self.get_window_mut(self.hover_window) {
+                    window.is_mouse_over = false
+                }
+            }
+
+            self.hover_window = window_id
+
+            if window_id != 0 {
+                self.send_message(window_id, WindowMessage::MouseEnter, x, y, 0)
+                if let Some(window) = self.get_window_mut(window_id) {
+                    window.is_mouse_over = true
+                }
+            }
+
+            // Reset tooltip timer
+            self.tooltip_delay_timer = 0.0
+            self.tooltip_target = window_id
+        }
+
+        if window_id != 0 {
+            self.send_message(window_id, WindowMessage::MouseMove, x, y, 0)
+            return true
+        }
+
+        false
+    }
+
+    fn handle_left_down(&mut self, x: i32, y: i32) -> bool {
+        self.left_button_down = true
+
+        let window_id = if self.mouse_capture_window != 0 {
+            self.mouse_capture_window
+        } else {
+            self.window_at_point(x, y)
+        }
+
+        if window_id != 0 {
+            self.set_focus(window_id)
+
+            if let Some(window) = self.get_window_mut(window_id) {
+                window.is_pressed = true
+            }
+
+            self.send_message(window_id, WindowMessage::LeftDown, x, y, 0)
+            return true
+        }
+
+        false
+    }
+
+    fn handle_left_up(&mut self, x: i32, y: i32) -> bool {
+        self.left_button_down = false
+
+        let window_id = if self.mouse_capture_window != 0 {
+            self.mouse_capture_window
+        } else {
+            self.window_at_point(x, y)
+        }
+
+        if window_id != 0 {
+            let was_pressed = if let Some(window) = self.get_window(window_id) {
+                window.is_pressed
+            } else {
+                false
+            }
+
+            if let Some(window) = self.get_window_mut(window_id) {
+                window.is_pressed = false
+            }
+
+            self.send_message(window_id, WindowMessage::LeftUp, x, y, 0)
+
+            // Generate click if button was pressed
+            if was_pressed {
+                self.send_message(window_id, WindowMessage::LeftClick, x, y, 0)
+            }
+
+            return true
+        }
+
+        false
+    }
+
+    fn handle_right_down(&mut self, x: i32, y: i32) -> bool {
+        self.right_button_down = true
+
+        let window_id = if self.mouse_capture_window != 0 {
+            self.mouse_capture_window
+        } else {
+            self.window_at_point(x, y)
+        }
+
+        if window_id != 0 {
+            self.send_message(window_id, WindowMessage::RightDown, x, y, 0)
+            return true
+        }
+
+        false
+    }
+
+    fn handle_right_up(&mut self, x: i32, y: i32) -> bool {
+        self.right_button_down = false
+
+        let window_id = if self.mouse_capture_window != 0 {
+            self.mouse_capture_window
+        } else {
+            self.window_at_point(x, y)
+        }
+
+        if window_id != 0 {
+            self.send_message(window_id, WindowMessage::RightUp, x, y, 0)
+            self.send_message(window_id, WindowMessage::RightClick, x, y, 0)
+            return true
+        }
+
+        false
+    }
+
+    fn handle_mouse_wheel(&mut self, x: i32, y: i32, delta: i32) -> bool {
+        let window_id = self.window_at_point(x, y)
+
+        if window_id != 0 {
+            let message = if delta > 0 {
+                WindowMessage::WheelUp
+            } else {
+                WindowMessage::WheelDown
+            }
+            self.send_message(window_id, message, x, y, delta.abs() as u64)
+            return true
+        }
+
+        false
+    }
+
+    fn handle_key_down(&mut self, key_code: u32) -> bool {
+        if self.focused_window != 0 {
+            self.send_message_key(self.focused_window, WindowMessage::KeyDown, key_code)
+            return true
+        }
+        false
+    }
+
+    fn handle_key_up(&mut self, key_code: u32) -> bool {
+        if self.focused_window != 0 {
+            self.send_message_key(self.focused_window, WindowMessage::KeyUp, key_code)
+            return true
+        }
+        false
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if self.focused_window != 0 {
+            self.send_message_char(self.focused_window, WindowMessage::CharTyped, c)
+            return true
+        }
+        false
+    }
+
+    // Hit testing
+    fn window_at_point(&self, x: i32, y: i32) -> u32 {
+        // Check modal first
+        if self.modal_count > 0 {
+            let modal_id = self.modal_stack[(self.modal_count - 1) as usize].window_id
+            return self.hit_test_recursive(modal_id, x, y)
+        }
+
+        // Check active root
+        if self.active_root != 0 {
+            return self.hit_test_recursive(self.active_root, x, y)
+        }
+
+        0
+    }
+
+    fn hit_test_recursive(&self, window_id: u32, x: i32, y: i32) -> u32 {
+        if let Some(window) = self.get_window(window_id) {
+            if window.is_hidden() || !window.is_enabled() {
+                return 0
+            }
+
+            if !window.contains_point(x, y) {
+                return 0
+            }
+
+            // Check children (reverse order for z-order)
+            for i in (0..window.child_count).rev() {
+                let child_id = window.children[i as usize]
+                let result = self.hit_test_recursive(child_id, x, y)
+                if result != 0 {
+                    return result
+                }
+            }
+
+            // Check if this window accepts input
+            if !window.get_status(WindowStatus::NoInput) {
+                return window_id
+            }
+        }
+
+        0
+    }
+
+    // Message sending
+    fn send_message(&self, window_id: u32, message: WindowMessage, x: i32, y: i32, data: u64) -> bool {
+        let msg_data = WindowMessageData {
+            message: message,
+            window_id: window_id,
+            mouse_x: x,
+            mouse_y: y,
+            key_code: 0,
+            char_value: '\0',
+            data: data,
+        }
+
+        (self.on_window_message)(&msg_data)
+    }
+
+    fn send_message_key(&self, window_id: u32, message: WindowMessage, key_code: u32) -> bool {
+        let msg_data = WindowMessageData {
+            message: message,
+            window_id: window_id,
+            mouse_x: 0,
+            mouse_y: 0,
+            key_code: key_code,
+            char_value: '\0',
+            data: 0,
+        }
+
+        (self.on_window_message)(&msg_data)
+    }
+
+    fn send_message_char(&self, window_id: u32, message: WindowMessage, c: char) -> bool {
+        let msg_data = WindowMessageData {
+            message: message,
+            window_id: window_id,
+            mouse_x: 0,
+            mouse_y: 0,
+            key_code: 0,
+            char_value: c,
+            data: 0,
+        }
+
+        (self.on_window_message)(&msg_data)
+    }
+
+    // Update
+    fn update(&mut self, delta_time: f32) {
+        // Update transitions
+        self.update_transition(delta_time)
+
+        // Update tooltip
+        if self.tooltip_target != 0 {
+            self.tooltip_delay_timer += delta_time * 1000.0 // Convert to ms
+
+            if self.tooltip_delay_timer >= 500.0 {
+                // Show tooltip
+                if let Some(target) = self.get_window(self.tooltip_target) {
+                    if !target.tooltip_text.is_empty() {
+                        self.show_tooltip(target.tooltip_text.clone(),
+                                        self.last_mouse_x + 15,
+                                        self.last_mouse_y + 15)
+                    }
+                }
+            }
+        }
+
+        // Send update message to all visible windows
+        for i in 0..MAX_WINDOWS {
+            if self.windows[i as usize].is_valid && !self.windows[i as usize].is_hidden() {
+                self.send_message(self.windows[i as usize].id, WindowMessage::SystemUpdate, 0, 0, 0)
+            }
+        }
+    }
+
+    fn show_tooltip(&mut self, text: string, x: i32, y: i32) {
+        if let Some(tooltip) = self.get_window_mut(self.tooltip_window) {
+            tooltip.set_text(text)
+            tooltip.set_rect(x, y, 200, 30) // Size will be calculated by renderer
+            tooltip.set_hidden(false)
+        }
+    }
+
+    fn hide_tooltip(&mut self) {
+        if let Some(tooltip) = self.get_window_mut(self.tooltip_window) {
+            tooltip.set_hidden(true)
+        }
+    }
+
+    // Rendering helpers
+    fn get_visible_windows(&self) -> Vec<u32> {
+        let mut result = Vec::new()
+
+        // Add active root and its children
+        if self.active_root != 0 {
+            self.collect_visible_recursive(self.active_root, &mut result)
+        }
+
+        // Add modals
+        for i in 0..self.modal_count {
+            self.collect_visible_recursive(self.modal_stack[i as usize].window_id, &mut result)
+        }
+
+        // Add tooltip
+        if let Some(tooltip) = self.get_window(self.tooltip_window) {
+            if !tooltip.is_hidden() {
+                result.push(self.tooltip_window)
+            }
+        }
+
+        result
+    }
+
+    fn collect_visible_recursive(&self, window_id: u32, result: &mut Vec<u32>) {
+        if let Some(window) = self.get_window(window_id) {
+            if window.is_hidden() {
+                return
+            }
+
+            result.push(window_id)
+
+            for i in 0..window.child_count {
+                self.collect_visible_recursive(window.children[i as usize], result)
+            }
+        }
+    }
+
+    fn set_message_callback(&mut self, callback: fn(&WindowMessageData) -> bool) {
+        self.on_window_message = callback
+    }
+
+    fn set_screen_change_callback(&mut self, callback: fn(u32, u32)) {
+        self.on_screen_change = callback
+    }
+
+    fn set_screen_size(&mut self, width: i32, height: i32) {
+        self.screen_width = width
+        self.screen_height = height
+    }
+
+    fn get_focused_window(&self) -> u32 {
+        self.focused_window
+    }
+
+    fn get_active_root(&self) -> u32 {
+        self.active_root
+    }
+}
+
+impl Default for ModalEntry {
+    fn default() -> Self {
+        ModalEntry {
+            window_id: 0,
+            previous_focus: 0,
+        }
+    }
+}
+
+impl Default for WindowMessageData {
+    fn default() -> Self {
+        WindowMessageData {
+            message: WindowMessage::None,
+            window_id: 0,
+            mouse_x: 0,
+            mouse_y: 0,
+            key_code: 0,
+            char_value: '\0',
+            data: 0,
+        }
+    }
+}

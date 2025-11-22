@@ -1,0 +1,703 @@
+// Game Data Loader - Master coordinator for loading all INI game data
+// Orchestrates loading of all Data/INI files for C&C Generals
+
+use object_definition_parser::ObjectDefinitionParser
+use weapon_definition_parser::WeaponDefinitionParser
+use upgrade_definition_parser::UpgradeDefinitionParser
+use fx_list_parser::FXListParser
+use science_parser::ScienceParser
+use thing_factory::ThingFactory
+
+// Global game settings from GameData.ini
+struct GlobalGameData {
+    // Time and speed
+    default_game_speed: f32,
+    logic_frames_per_second: u32,
+    max_unit_speed: f32,
+
+    // Economy
+    starting_cash: u32,
+    supply_box_initial_value: u32,
+    value_per_supply_box: u32,
+    builder_speed: f32,
+
+    // Combat
+    veterancy_pip_gap: f32,
+    armor_damage_scalar: f32,
+    standard_rally_point_offset: f32,
+
+    // Camera
+    max_camera_height: f32,
+    min_camera_height: f32,
+    camera_pitch: f32,
+    camera_yaw: f32,
+    draw_entire_terrain: bool,
+
+    // Network
+    network_frames_ahead: u32,
+    network_run_ahead_metrics_time: u32,
+    network_run_ahead_slack: u32,
+
+    // Audio
+    audio_footstep_volume: f32,
+    audio_ambient_volume: f32,
+    audio_speech_volume: f32,
+    audio_music_volume: f32,
+
+    // Visual
+    particle_cap: u32,
+    max_shells: u32,
+    max_emitters: u32,
+
+    // Difficulty
+    easy_money_bonus: f32,
+    medium_money_bonus: f32,
+    hard_money_bonus: f32,
+    easy_build_time_bonus: f32,
+    medium_build_time_bonus: f32,
+    hard_build_time_bonus: f32,
+
+    // Radar
+    shroud_color: u32,
+    fog_color: u32,
+    terrain_shroud_ratio: f32,
+
+    is_loaded: bool,
+}
+
+// Player template definition
+struct PlayerTemplateDefinition {
+    name: string,
+    side: string,
+    display_name: string,
+    starting_building: string,
+    starting_unit_0: string,
+    starting_unit_1: string,
+    production_cost_modifier: f32,
+    production_time_modifier: f32,
+    preferred_generals: [string; 4],
+    preferred_general_count: u32,
+    beacon_template: string,
+    play_style: string,
+    is_valid: bool,
+}
+
+// Faction data
+struct FactionData {
+    templates: [PlayerTemplateDefinition; 32],
+    template_count: u32,
+}
+
+// Map cache entry
+struct MapCacheEntry {
+    name: string,
+    display_name: string,
+    file_path: string,
+    num_players: u32,
+    is_multiplayer: bool,
+    is_official: bool,
+    initial_camera_pos_x: f32,
+    initial_camera_pos_y: f32,
+    extent_min_x: f32,
+    extent_min_y: f32,
+    extent_max_x: f32,
+    extent_max_y: f32,
+    is_valid: bool,
+}
+
+const MAX_MAPS: u32 = 512
+const MAX_PLAYER_TEMPLATES: u32 = 32
+
+// Coordinator for all game data
+struct GameDataLoader {
+    // Parsers
+    object_parser: ObjectDefinitionParser,
+    weapon_parser: WeaponDefinitionParser,
+    upgrade_parser: UpgradeDefinitionParser,
+    fx_parser: FXListParser,
+    science_parser: ScienceParser,
+
+    // Global settings
+    game_data: GlobalGameData,
+
+    // Factions
+    factions: FactionData,
+
+    // Map cache
+    maps: [MapCacheEntry; MAX_MAPS],
+    map_count: u32,
+
+    // Paths
+    data_path: string,
+    language: string,
+
+    // Loading state
+    is_initialized: bool,
+    load_errors: [string; 128],
+    error_count: u32,
+
+    // Progress callback
+    on_progress: fn(f32, string),
+}
+
+impl GameDataLoader {
+    fn new(data_path: string) -> Self {
+        let loader = GameDataLoader {
+            object_parser: ObjectDefinitionParser::new(),
+            weapon_parser: WeaponDefinitionParser::new(),
+            upgrade_parser: UpgradeDefinitionParser::new(),
+            fx_parser: FXListParser::new(),
+            science_parser: ScienceParser::new(),
+            game_data: GlobalGameData::default(),
+            factions: FactionData::default(),
+            maps: [MapCacheEntry::default(); MAX_MAPS],
+            map_count: 0,
+            data_path: data_path,
+            language: "english".to_string(),
+            is_initialized: false,
+            load_errors: [string::default(); 128],
+            error_count: 0,
+            on_progress: |_p: f32, _s: string| {},
+        }
+        loader
+    }
+
+    fn set_progress_callback(&mut self, callback: fn(f32, string)) {
+        self.on_progress = callback
+    }
+
+    // Load all game data
+    fn load_all(&mut self, thing_factory: &mut ThingFactory) -> bool {
+        let total_steps: f32 = 8.0
+        let mut step: f32 = 0.0
+
+        // Step 1: Load GameData.ini
+        self.report_progress(step / total_steps, "Loading global game data...")
+        if !self.load_game_data_ini() {
+            self.add_error("Failed to load GameData.ini")
+        }
+        step += 1.0
+
+        // Step 2: Load weapons
+        self.report_progress(step / total_steps, "Loading weapon definitions...")
+        if !self.load_weapons() {
+            self.add_error("Failed to load weapons")
+        }
+        step += 1.0
+
+        // Step 3: Load upgrades
+        self.report_progress(step / total_steps, "Loading upgrade definitions...")
+        if !self.load_upgrades() {
+            self.add_error("Failed to load upgrades")
+        }
+        step += 1.0
+
+        // Step 4: Load sciences
+        self.report_progress(step / total_steps, "Loading science definitions...")
+        if !self.load_sciences() {
+            self.add_error("Failed to load sciences")
+        }
+        step += 1.0
+
+        // Step 5: Load FX lists
+        self.report_progress(step / total_steps, "Loading FX definitions...")
+        if !self.load_fx_lists() {
+            self.add_error("Failed to load FX lists")
+        }
+        step += 1.0
+
+        // Step 6: Load object definitions
+        self.report_progress(step / total_steps, "Loading object definitions...")
+        if !self.load_objects(thing_factory) {
+            self.add_error("Failed to load object definitions")
+        }
+        step += 1.0
+
+        // Step 7: Load player templates
+        self.report_progress(step / total_steps, "Loading player templates...")
+        if !self.load_player_templates() {
+            self.add_error("Failed to load player templates")
+        }
+        step += 1.0
+
+        // Step 8: Load map cache
+        self.report_progress(step / total_steps, "Building map cache...")
+        if !self.load_map_cache() {
+            self.add_error("Failed to load map cache")
+        }
+
+        self.report_progress(1.0, "Game data loaded")
+        self.is_initialized = true
+
+        self.error_count == 0
+    }
+
+    fn report_progress(&self, progress: f32, message: string) {
+        (self.on_progress)(progress, message)
+    }
+
+    // Load GameData.ini
+    fn load_game_data_ini(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/GameData.ini"
+        let content = std::fs::read_to_string(path)
+        if content.is_empty() {
+            return false
+        }
+
+        let lines = content.split('\n')
+        let mut in_game_data = false
+
+        for line in lines {
+            let trimmed = line.trim()
+
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue
+            }
+
+            if trimmed.starts_with("GameData") && !trimmed.contains('=') {
+                in_game_data = true
+                continue
+            }
+
+            if trimmed == "End" && in_game_data {
+                in_game_data = false
+                continue
+            }
+
+            if in_game_data {
+                self.parse_game_data_property(trimmed)
+            }
+        }
+
+        self.game_data.is_loaded = true
+        true
+    }
+
+    fn parse_game_data_property(&mut self, line: string) {
+        let parts = self.split_property(line)
+        let key = parts.0
+        let value = parts.1
+
+        match key.as_str() {
+            "DefaultGameSpeed" => self.game_data.default_game_speed = self.parse_f32(value),
+            "LogicFramesPerSecond" => self.game_data.logic_frames_per_second = self.parse_u32(value),
+            "MaxUnitSpeed" => self.game_data.max_unit_speed = self.parse_f32(value),
+            "StartingCash" => self.game_data.starting_cash = self.parse_u32(value),
+            "SupplyBoxInitialValue" => self.game_data.supply_box_initial_value = self.parse_u32(value),
+            "ValuePerSupplyBox" => self.game_data.value_per_supply_box = self.parse_u32(value),
+            "BuilderSpeed" => self.game_data.builder_speed = self.parse_f32(value),
+            "MaxCameraHeight" => self.game_data.max_camera_height = self.parse_f32(value),
+            "MinCameraHeight" => self.game_data.min_camera_height = self.parse_f32(value),
+            "CameraPitch" => self.game_data.camera_pitch = self.parse_f32(value),
+            "CameraYaw" => self.game_data.camera_yaw = self.parse_f32(value),
+            "NetworkFramesAhead" => self.game_data.network_frames_ahead = self.parse_u32(value),
+            "NetworkRunAheadMetricsTime" => self.game_data.network_run_ahead_metrics_time = self.parse_u32(value),
+            "NetworkRunAheadSlack" => self.game_data.network_run_ahead_slack = self.parse_u32(value),
+            "AudioFootstepVolume" => self.game_data.audio_footstep_volume = self.parse_f32(value),
+            "AudioAmbientVolume" => self.game_data.audio_ambient_volume = self.parse_f32(value),
+            "AudioSpeechVolume" => self.game_data.audio_speech_volume = self.parse_f32(value),
+            "AudioMusicVolume" => self.game_data.audio_music_volume = self.parse_f32(value),
+            "ParticleCap" => self.game_data.particle_cap = self.parse_u32(value),
+            "MaxShells" => self.game_data.max_shells = self.parse_u32(value),
+            "MaxEmitters" => self.game_data.max_emitters = self.parse_u32(value),
+            "EasyMoneyBonus" => self.game_data.easy_money_bonus = self.parse_percent(value),
+            "MediumMoneyBonus" => self.game_data.medium_money_bonus = self.parse_percent(value),
+            "HardMoneyBonus" => self.game_data.hard_money_bonus = self.parse_percent(value),
+            "EasyBuildTimeBonus" => self.game_data.easy_build_time_bonus = self.parse_percent(value),
+            "MediumBuildTimeBonus" => self.game_data.medium_build_time_bonus = self.parse_percent(value),
+            "HardBuildTimeBonus" => self.game_data.hard_build_time_bonus = self.parse_percent(value),
+            _ => {},
+        }
+    }
+
+    // Load weapon definitions
+    fn load_weapons(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/Weapon.ini"
+        self.weapon_parser.parse_file(path)
+    }
+
+    // Load upgrade definitions
+    fn load_upgrades(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/Upgrade.ini"
+        self.upgrade_parser.parse_file(path)
+    }
+
+    // Load science definitions
+    fn load_sciences(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/Science.ini"
+        self.science_parser.parse_file(path)
+    }
+
+    // Load FX list definitions
+    fn load_fx_lists(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/FXList.ini"
+        self.fx_parser.parse_file(path)
+    }
+
+    // Load object definitions
+    fn load_objects(&mut self, thing_factory: &mut ThingFactory) -> bool {
+        // Load main object files
+        let paths = [
+            "/Data/INI/Object/Infantry.ini",
+            "/Data/INI/Object/Vehicle.ini",
+            "/Data/INI/Object/Aircraft.ini",
+            "/Data/INI/Object/Building.ini",
+            "/Data/INI/Object/Civilian.ini",
+            "/Data/INI/Object/System.ini",
+            "/Data/INI/Object/USA.ini",
+            "/Data/INI/Object/China.ini",
+            "/Data/INI/Object/GLA.ini",
+            "/Data/INI/Object/Neutral.ini",
+        ]
+
+        for path in paths {
+            let full_path = self.data_path.clone() + path
+            if std::fs::exists(full_path.clone()) {
+                if !self.object_parser.parse_file(full_path, thing_factory) {
+                    // Non-fatal, continue loading
+                }
+            }
+        }
+
+        true
+    }
+
+    // Load player templates
+    fn load_player_templates(&mut self) -> bool {
+        let path = self.data_path.clone() + "/Data/INI/PlayerTemplate.ini"
+        let content = std::fs::read_to_string(path)
+        if content.is_empty() {
+            return false
+        }
+
+        let lines = content.split('\n')
+        let mut in_template = false
+        let mut current_idx: u32 = 0
+
+        for line in lines {
+            let trimmed = line.trim()
+
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue
+            }
+
+            if trimmed.starts_with("PlayerTemplate ") {
+                if self.factions.template_count >= MAX_PLAYER_TEMPLATES {
+                    continue
+                }
+                let parts = trimmed.split(' ')
+                if parts.len() >= 2 {
+                    current_idx = self.factions.template_count
+                    self.factions.templates[current_idx as usize] = PlayerTemplateDefinition::default()
+                    self.factions.templates[current_idx as usize].name = parts[1].trim().to_string()
+                    self.factions.templates[current_idx as usize].is_valid = true
+                    self.factions.template_count += 1
+                    in_template = true
+                }
+                continue
+            }
+
+            if trimmed == "End" && in_template {
+                in_template = false
+                continue
+            }
+
+            if in_template {
+                self.parse_player_template_property(current_idx, trimmed)
+            }
+        }
+
+        true
+    }
+
+    fn parse_player_template_property(&mut self, idx: u32, line: string) {
+        let parts = self.split_property(line)
+        let key = parts.0
+        let value = parts.1
+        let template = &mut self.factions.templates[idx as usize]
+
+        match key.as_str() {
+            "Side" => template.side = value,
+            "DisplayName" => template.display_name = value,
+            "StartingBuilding" => template.starting_building = value,
+            "StartingUnit0" => template.starting_unit_0 = value,
+            "StartingUnit1" => template.starting_unit_1 = value,
+            "ProductionCostModifier" | "ProductionCostChange" =>
+                template.production_cost_modifier = self.parse_percent(value),
+            "ProductionTimeModifier" | "ProductionTimeChange" =>
+                template.production_time_modifier = self.parse_percent(value),
+            "PreferredGeneral" => {
+                if template.preferred_general_count < 4 {
+                    template.preferred_generals[template.preferred_general_count as usize] = value
+                    template.preferred_general_count += 1
+                }
+            },
+            "BeaconTemplate" => template.beacon_template = value,
+            "PlayStyle" => template.play_style = value,
+            _ => {},
+        }
+    }
+
+    // Load map cache
+    fn load_map_cache(&mut self) -> bool {
+        // Scan maps directory
+        let maps_path = self.data_path.clone() + "/Maps"
+
+        // For now, create entries for known maps
+        // In a full implementation, this would scan the directory
+        let known_maps = [
+            ("Alpine Assault", "Alpine Assault", 4, true),
+            ("Bare Knuckle", "Bare Knuckle", 2, true),
+            ("Battle for Survival", "Battle for Survival", 4, true),
+            ("Death Valley", "Death Valley", 4, true),
+            ("Desert Combat", "Desert Combat", 2, true),
+            ("Destruction Station", "Destruction Station", 4, true),
+            ("El Scorcho", "El Scorcho", 4, true),
+            ("Fallen Empire", "Fallen Empire", 4, true),
+            ("Flash Fire", "Flash Fire", 2, true),
+            ("Fortress", "Fortress", 2, true),
+            ("Homeland Alliance", "Homeland Alliance", 8, true),
+            ("Lone Eagle", "Lone Eagle", 2, true),
+            ("Mountain Guns", "Mountain Guns", 6, true),
+            ("Rogue Agent", "Rogue Agent", 6, true),
+            ("Rocky Rampage", "Rocky Rampage", 4, true),
+            ("Scorched Earth", "Scorched Earth", 4, true),
+            ("Stormy Weather", "Stormy Weather", 4, true),
+            ("Tournament A", "Tournament A", 2, true),
+            ("Tournament City", "Tournament City", 4, true),
+            ("Tournament Desert", "Tournament Desert", 2, true),
+            ("Tournament Island", "Tournament Island", 4, true),
+            ("Twilight Flame", "Twilight Flame", 4, true),
+            ("Winter Wolf", "Winter Wolf", 4, true),
+        ]
+
+        for (name, display_name, players, is_mp) in known_maps {
+            if self.map_count >= MAX_MAPS {
+                break
+            }
+
+            let idx = self.map_count as usize
+            self.maps[idx].name = name.to_string()
+            self.maps[idx].display_name = display_name.to_string()
+            self.maps[idx].file_path = maps_path.clone() + "/" + name + "/" + name + ".map"
+            self.maps[idx].num_players = players
+            self.maps[idx].is_multiplayer = is_mp
+            self.maps[idx].is_official = true
+            self.maps[idx].is_valid = true
+            self.map_count += 1
+        }
+
+        true
+    }
+
+    // Public API
+    fn get_weapon(&self, name: string) -> Option<&weapon_definition_parser::WeaponDefinition> {
+        self.weapon_parser.get_weapon(name)
+    }
+
+    fn get_upgrade(&self, name: string) -> Option<&upgrade_definition_parser::UpgradeDefinition> {
+        self.upgrade_parser.get_upgrade(name)
+    }
+
+    fn get_science(&self, name: string) -> Option<&science_parser::ScienceDefinition> {
+        self.science_parser.get_science(name)
+    }
+
+    fn get_fx_list(&self, name: string) -> Option<&fx_list_parser::FXListDefinition> {
+        self.fx_parser.get_fx_list(name)
+    }
+
+    fn get_player_template(&self, name: string) -> Option<&PlayerTemplateDefinition> {
+        for i in 0..self.factions.template_count {
+            if self.factions.templates[i as usize].name == name {
+                return Some(&self.factions.templates[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_player_template_by_side(&self, side: string) -> Option<&PlayerTemplateDefinition> {
+        for i in 0..self.factions.template_count {
+            if self.factions.templates[i as usize].side == side {
+                return Some(&self.factions.templates[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_map(&self, name: string) -> Option<&MapCacheEntry> {
+        for i in 0..self.map_count {
+            if self.maps[i as usize].name == name {
+                return Some(&self.maps[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_multiplayer_maps(&self) -> Vec<&MapCacheEntry> {
+        let mut result = Vec::new()
+        for i in 0..self.map_count {
+            if self.maps[i as usize].is_multiplayer {
+                result.push(&self.maps[i as usize])
+            }
+        }
+        result
+    }
+
+    fn get_maps_for_player_count(&self, player_count: u32) -> Vec<&MapCacheEntry> {
+        let mut result = Vec::new()
+        for i in 0..self.map_count {
+            if self.maps[i as usize].num_players >= player_count {
+                result.push(&self.maps[i as usize])
+            }
+        }
+        result
+    }
+
+    fn get_game_data(&self) -> &GlobalGameData {
+        &self.game_data
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.is_initialized
+    }
+
+    fn get_error_count(&self) -> u32 {
+        self.error_count
+    }
+
+    fn get_error(&self, index: u32) -> Option<&string> {
+        if index < self.error_count {
+            return Some(&self.load_errors[index as usize])
+        }
+        None
+    }
+
+    // Helper functions
+    fn split_property(&self, line: string) -> (string, string) {
+        let eq_pos = line.find('=')
+        if eq_pos.is_some() {
+            let idx = eq_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        let space_pos = line.find(' ')
+        if space_pos.is_some() {
+            let idx = space_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        (line, "".to_string())
+    }
+
+    fn parse_f32(&self, value: string) -> f32 {
+        value.trim().parse::<f32>().unwrap_or(0.0)
+    }
+
+    fn parse_u32(&self, value: string) -> u32 {
+        value.trim().parse::<u32>().unwrap_or(0)
+    }
+
+    fn parse_percent(&self, value: string) -> f32 {
+        let trimmed = value.trim().replace('%', "")
+        trimmed.parse::<f32>().unwrap_or(100.0) / 100.0
+    }
+
+    fn add_error(&mut self, msg: string) {
+        if self.error_count < 128 {
+            self.load_errors[self.error_count as usize] = msg
+            self.error_count += 1
+        }
+    }
+}
+
+impl Default for GlobalGameData {
+    fn default() -> Self {
+        GlobalGameData {
+            default_game_speed: 1.0,
+            logic_frames_per_second: 30,
+            max_unit_speed: 100.0,
+            starting_cash: 10000,
+            supply_box_initial_value: 1500,
+            value_per_supply_box: 100,
+            builder_speed: 60.0,
+            veterancy_pip_gap: 2.0,
+            armor_damage_scalar: 1.0,
+            standard_rally_point_offset: 100.0,
+            max_camera_height: 600.0,
+            min_camera_height: 200.0,
+            camera_pitch: 37.5,
+            camera_yaw: 0.0,
+            draw_entire_terrain: false,
+            network_frames_ahead: 6,
+            network_run_ahead_metrics_time: 2500,
+            network_run_ahead_slack: 2,
+            audio_footstep_volume: 0.5,
+            audio_ambient_volume: 0.5,
+            audio_speech_volume: 0.7,
+            audio_music_volume: 0.4,
+            particle_cap: 5000,
+            max_shells: 100,
+            max_emitters: 512,
+            easy_money_bonus: 1.25,
+            medium_money_bonus: 1.0,
+            hard_money_bonus: 0.85,
+            easy_build_time_bonus: 0.75,
+            medium_build_time_bonus: 1.0,
+            hard_build_time_bonus: 1.25,
+            shroud_color: 0x000000,
+            fog_color: 0x404040,
+            terrain_shroud_ratio: 0.5,
+            is_loaded: false,
+        }
+    }
+}
+
+impl Default for PlayerTemplateDefinition {
+    fn default() -> Self {
+        PlayerTemplateDefinition {
+            name: "".to_string(),
+            side: "".to_string(),
+            display_name: "".to_string(),
+            starting_building: "".to_string(),
+            starting_unit_0: "".to_string(),
+            starting_unit_1: "".to_string(),
+            production_cost_modifier: 1.0,
+            production_time_modifier: 1.0,
+            preferred_generals: [string::default(); 4],
+            preferred_general_count: 0,
+            beacon_template: "".to_string(),
+            play_style: "".to_string(),
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for FactionData {
+    fn default() -> Self {
+        FactionData {
+            templates: [PlayerTemplateDefinition::default(); 32],
+            template_count: 0,
+        }
+    }
+}
+
+impl Default for MapCacheEntry {
+    fn default() -> Self {
+        MapCacheEntry {
+            name: "".to_string(),
+            display_name: "".to_string(),
+            file_path: "".to_string(),
+            num_players: 0,
+            is_multiplayer: false,
+            is_official: false,
+            initial_camera_pos_x: 0.0,
+            initial_camera_pos_y: 0.0,
+            extent_min_x: 0.0,
+            extent_min_y: 0.0,
+            extent_max_x: 0.0,
+            extent_max_y: 0.0,
+            is_valid: false,
+        }
+    }
+}

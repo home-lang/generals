@@ -1,0 +1,809 @@
+// w3d_animation_player.home - Skeletal animation playback system
+// Plays W3D hierarchical animations with blending and transitions
+
+const MAX_BONES: u32 = 128
+const MAX_ANIMATIONS: u32 = 64
+const MAX_ANIMATION_LAYERS: u32 = 4
+
+// ============================================================================
+// Animation Data Types
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32
+}
+
+struct Quat {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32
+}
+
+struct Mat4 {
+    m: [f32; 16]
+}
+
+struct BoneTransform {
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3
+}
+
+struct AnimationKeyframe {
+    time: f32,
+    transform: BoneTransform
+}
+
+struct AnimationChannel {
+    bone_index: u32,
+    keyframes: [AnimationKeyframe; 256],
+    keyframe_count: u32,
+    interpolation: InterpolationType
+}
+
+enum InterpolationType {
+    Step,
+    Linear,
+    CatmullRom,
+    TCB         // Tension-Continuity-Bias
+}
+
+struct AnimationClip {
+    name: string,
+    duration: f32,
+    frame_rate: f32,
+    channels: [AnimationChannel; MAX_BONES],
+    channel_count: u32,
+    is_looping: bool
+}
+
+// ============================================================================
+// Skeleton Definition
+// ============================================================================
+
+struct Bone {
+    name: string,
+    index: u32,
+    parent_index: i32,          // -1 if root
+    bind_pose: BoneTransform,
+    inverse_bind_matrix: Mat4
+}
+
+struct Skeleton {
+    name: string,
+    bones: [Bone; MAX_BONES],
+    bone_count: u32,
+    root_bone_index: u32
+}
+
+impl Skeleton {
+    fn find_bone(&self, name: string) -> ?u32 {
+        for i in 0..self.bone_count {
+            if self.bones[i].name == name {
+                return i
+            }
+        }
+        return null
+    }
+
+    fn get_bone_chain(&self, bone_index: u32, chain: &mut [u32; MAX_BONES]) -> u32 {
+        var count: u32 = 0
+        var current = bone_index as i32
+
+        while current >= 0 and count < MAX_BONES {
+            chain[count] = current as u32
+            count += 1
+            current = self.bones[current as u32].parent_index
+        }
+
+        return count
+    }
+}
+
+// ============================================================================
+// Animation State
+// ============================================================================
+
+enum AnimationState {
+    Stopped,
+    Playing,
+    Paused,
+    BlendingOut
+}
+
+struct AnimationInstance {
+    clip_index: u32,
+    state: AnimationState,
+    time: f32,
+    speed: f32,
+    weight: f32,
+    blend_in_time: f32,
+    blend_out_time: f32,
+    blend_progress: f32,
+    is_looping: bool,
+    start_time: f32,
+    end_time: f32
+}
+
+impl AnimationInstance {
+    fn new(clip_index: u32) -> AnimationInstance {
+        AnimationInstance {
+            clip_index: clip_index,
+            state: AnimationState::Stopped,
+            time: 0.0,
+            speed: 1.0,
+            weight: 1.0,
+            blend_in_time: 0.2,
+            blend_out_time: 0.2,
+            blend_progress: 0.0,
+            is_looping: false,
+            start_time: 0.0,
+            end_time: -1.0
+        }
+    }
+
+    fn play(&mut self, loop_anim: bool, blend_time: f32) {
+        self.state = AnimationState::Playing
+        self.is_looping = loop_anim
+        self.blend_in_time = blend_time
+        self.blend_progress = 0.0
+        if self.state == AnimationState::Stopped {
+            self.time = self.start_time
+        }
+    }
+
+    fn stop(&mut self, blend_time: f32) {
+        if self.state == AnimationState::Playing {
+            self.state = AnimationState::BlendingOut
+            self.blend_out_time = blend_time
+            self.blend_progress = 0.0
+        }
+    }
+
+    fn pause(&mut self) {
+        if self.state == AnimationState::Playing {
+            self.state = AnimationState::Paused
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.state == AnimationState::Paused {
+            self.state = AnimationState::Playing
+        }
+    }
+
+    fn update(&mut self, delta_time: f32, duration: f32) -> bool {
+        match self.state {
+            AnimationState::Playing => {
+                // Update blend weight
+                if self.blend_progress < 1.0 and self.blend_in_time > 0.0 {
+                    self.blend_progress += delta_time / self.blend_in_time
+                    if self.blend_progress > 1.0 {
+                        self.blend_progress = 1.0
+                    }
+                }
+
+                // Update time
+                self.time += delta_time * self.speed
+                let end = if self.end_time > 0.0 { self.end_time } else { duration }
+
+                if self.time >= end {
+                    if self.is_looping {
+                        self.time = self.start_time + (self.time - end)
+                    } else {
+                        self.time = end
+                        self.state = AnimationState::Stopped
+                        return false
+                    }
+                }
+                return true
+            },
+            AnimationState::BlendingOut => {
+                self.blend_progress += delta_time / self.blend_out_time
+                if self.blend_progress >= 1.0 {
+                    self.state = AnimationState::Stopped
+                    return false
+                }
+                // Still update time during blend out
+                self.time += delta_time * self.speed
+                return true
+            },
+            _ => return self.state != AnimationState::Stopped
+        }
+    }
+
+    fn get_effective_weight(&self) -> f32 {
+        match self.state {
+            AnimationState::Playing => {
+                if self.blend_in_time > 0.0 and self.blend_progress < 1.0 {
+                    return self.weight * self.blend_progress
+                }
+                return self.weight
+            },
+            AnimationState::BlendingOut => {
+                return self.weight * (1.0 - self.blend_progress)
+            },
+            _ => return 0.0
+        }
+    }
+}
+
+// ============================================================================
+// Animation Layer
+// ============================================================================
+
+struct AnimationLayer {
+    name: string,
+    instance: AnimationInstance,
+    bone_mask: [bool; MAX_BONES],   // Which bones this layer affects
+    additive: bool,                   // Additive vs override blending
+    enabled: bool
+}
+
+impl AnimationLayer {
+    fn new(name: string) -> AnimationLayer {
+        var layer = AnimationLayer {
+            name: name,
+            instance: AnimationInstance::new(0),
+            bone_mask: [true; MAX_BONES],
+            additive: false,
+            enabled: true
+        }
+        return layer
+    }
+
+    fn set_bone_mask(&mut self, bone_indices: &[u32], affect: bool) {
+        if affect {
+            // Only affect specified bones
+            for i in 0..MAX_BONES {
+                self.bone_mask[i] = false
+            }
+            for i in 0..bone_indices.len() {
+                if bone_indices[i] < MAX_BONES {
+                    self.bone_mask[bone_indices[i]] = true
+                }
+            }
+        } else {
+            // Affect all except specified
+            for i in 0..MAX_BONES {
+                self.bone_mask[i] = true
+            }
+            for i in 0..bone_indices.len() {
+                if bone_indices[i] < MAX_BONES {
+                    self.bone_mask[bone_indices[i]] = false
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Animation Player
+// ============================================================================
+
+struct AnimationPlayer {
+    skeleton: Skeleton,
+    clips: [AnimationClip; MAX_ANIMATIONS],
+    clip_count: u32,
+
+    layers: [AnimationLayer; MAX_ANIMATION_LAYERS],
+    layer_count: u32,
+
+    // Output transforms
+    local_transforms: [BoneTransform; MAX_BONES],
+    world_matrices: [Mat4; MAX_BONES],
+    skin_matrices: [Mat4; MAX_BONES],   // For GPU skinning
+
+    // State
+    is_playing: bool,
+    root_motion_enabled: bool,
+    root_motion_delta: Vec3
+}
+
+impl AnimationPlayer {
+    fn new(skeleton: Skeleton) -> AnimationPlayer {
+        var player = AnimationPlayer {
+            skeleton: skeleton,
+            clips: undefined,
+            clip_count: 0,
+            layers: undefined,
+            layer_count: 0,
+            local_transforms: undefined,
+            world_matrices: undefined,
+            skin_matrices: undefined,
+            is_playing: false,
+            root_motion_enabled: false,
+            root_motion_delta: Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        }
+
+        // Initialize transforms to bind pose
+        for i in 0..skeleton.bone_count {
+            player.local_transforms[i] = skeleton.bones[i].bind_pose
+        }
+
+        // Create default base layer
+        player.layers[0] = AnimationLayer::new("Base")
+        player.layer_count = 1
+
+        return player
+    }
+
+    // ========================================================================
+    // Clip Management
+    // ========================================================================
+
+    fn add_clip(&mut self, clip: AnimationClip) -> u32 {
+        if self.clip_count >= MAX_ANIMATIONS {
+            return 0xFFFFFFFF
+        }
+
+        let index = self.clip_count
+        self.clips[index] = clip
+        self.clip_count += 1
+        return index
+    }
+
+    fn find_clip(&self, name: string) -> ?u32 {
+        for i in 0..self.clip_count {
+            if self.clips[i].name == name {
+                return i
+            }
+        }
+        return null
+    }
+
+    // ========================================================================
+    // Layer Management
+    // ========================================================================
+
+    fn add_layer(&mut self, name: string) -> u32 {
+        if self.layer_count >= MAX_ANIMATION_LAYERS {
+            return 0xFFFFFFFF
+        }
+
+        let index = self.layer_count
+        self.layers[index] = AnimationLayer::new(name)
+        self.layer_count += 1
+        return index
+    }
+
+    fn get_layer(&mut self, index: u32) -> ?&mut AnimationLayer {
+        if index >= self.layer_count {
+            return null
+        }
+        return &mut self.layers[index]
+    }
+
+    // ========================================================================
+    // Playback Control
+    // ========================================================================
+
+    fn play(&mut self, clip_name: string, loop_anim: bool, blend_time: f32) -> bool {
+        return self.play_on_layer(clip_name, 0, loop_anim, blend_time)
+    }
+
+    fn play_on_layer(&mut self, clip_name: string, layer: u32, loop_anim: bool, blend_time: f32) -> bool {
+        let clip_index = self.find_clip(clip_name)
+        if clip_index == null {
+            return false
+        }
+
+        if layer >= self.layer_count {
+            return false
+        }
+
+        self.layers[layer].instance = AnimationInstance::new(clip_index.unwrap())
+        self.layers[layer].instance.play(loop_anim, blend_time)
+        self.is_playing = true
+        return true
+    }
+
+    fn play_clip(&mut self, clip_index: u32, loop_anim: bool, blend_time: f32) -> bool {
+        if clip_index >= self.clip_count {
+            return false
+        }
+
+        self.layers[0].instance = AnimationInstance::new(clip_index)
+        self.layers[0].instance.play(loop_anim, blend_time)
+        self.is_playing = true
+        return true
+    }
+
+    fn stop(&mut self, blend_time: f32) {
+        for i in 0..self.layer_count {
+            self.layers[i].instance.stop(blend_time)
+        }
+    }
+
+    fn stop_layer(&mut self, layer: u32, blend_time: f32) {
+        if layer < self.layer_count {
+            self.layers[layer].instance.stop(blend_time)
+        }
+    }
+
+    fn set_speed(&mut self, speed: f32) {
+        for i in 0..self.layer_count {
+            self.layers[i].instance.speed = speed
+        }
+    }
+
+    fn set_layer_speed(&mut self, layer: u32, speed: f32) {
+        if layer < self.layer_count {
+            self.layers[layer].instance.speed = speed
+        }
+    }
+
+    fn set_time(&mut self, time: f32) {
+        self.layers[0].instance.time = time
+    }
+
+    fn get_time(&self) -> f32 {
+        return self.layers[0].instance.time
+    }
+
+    fn get_duration(&self) -> f32 {
+        let inst = &self.layers[0].instance
+        if inst.clip_index < self.clip_count {
+            return self.clips[inst.clip_index].duration
+        }
+        return 0.0
+    }
+
+    fn is_finished(&self) -> bool {
+        return self.layers[0].instance.state == AnimationState::Stopped
+    }
+
+    // ========================================================================
+    // Update
+    // ========================================================================
+
+    fn update(&mut self, delta_time: f32) {
+        if !self.is_playing {
+            return
+        }
+
+        self.root_motion_delta = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+
+        // Reset to bind pose
+        for i in 0..self.skeleton.bone_count {
+            self.local_transforms[i] = self.skeleton.bones[i].bind_pose
+        }
+
+        // Update and sample each layer
+        var any_playing = false
+
+        for layer_idx in 0..self.layer_count {
+            let layer = &mut self.layers[layer_idx]
+
+            if !layer.enabled {
+                continue
+            }
+
+            let clip_idx = layer.instance.clip_index
+            if clip_idx >= self.clip_count {
+                continue
+            }
+
+            let clip = &self.clips[clip_idx]
+
+            // Update animation time
+            if layer.instance.update(delta_time, clip.duration) {
+                any_playing = true
+            }
+
+            let weight = layer.instance.get_effective_weight()
+            if weight <= 0.0 {
+                continue
+            }
+
+            // Sample animation at current time
+            self.sample_clip(clip, layer.instance.time, &layer.bone_mask, weight, layer.additive)
+        }
+
+        self.is_playing = any_playing
+
+        // Calculate world matrices
+        self.calculate_world_matrices()
+
+        // Calculate skin matrices
+        self.calculate_skin_matrices()
+    }
+
+    fn sample_clip(&mut self, clip: &AnimationClip, time: f32, bone_mask: &[bool; MAX_BONES], weight: f32, additive: bool) {
+        for ch_idx in 0..clip.channel_count {
+            let channel = &clip.channels[ch_idx]
+            let bone_idx = channel.bone_index
+
+            if bone_idx >= self.skeleton.bone_count {
+                continue
+            }
+
+            if !bone_mask[bone_idx] {
+                continue
+            }
+
+            // Sample keyframes
+            let sampled = self.sample_channel(channel, time)
+
+            // Blend with current transform
+            if additive {
+                self.local_transforms[bone_idx] = blend_transform_additive(
+                    self.local_transforms[bone_idx],
+                    sampled,
+                    weight
+                )
+            } else {
+                self.local_transforms[bone_idx] = blend_transform(
+                    self.local_transforms[bone_idx],
+                    sampled,
+                    weight
+                )
+            }
+        }
+    }
+
+    fn sample_channel(&self, channel: &AnimationChannel, time: f32) -> BoneTransform {
+        if channel.keyframe_count == 0 {
+            return BoneTransform {
+                translation: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                rotation: Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+                scale: Vec3 { x: 1.0, y: 1.0, z: 1.0 }
+            }
+        }
+
+        if channel.keyframe_count == 1 {
+            return channel.keyframes[0].transform
+        }
+
+        // Find surrounding keyframes
+        var prev_idx: u32 = 0
+        var next_idx: u32 = 0
+
+        for i in 0..channel.keyframe_count {
+            if channel.keyframes[i].time <= time {
+                prev_idx = i
+            }
+            if channel.keyframes[i].time >= time and next_idx == 0 {
+                next_idx = i
+                break
+            }
+        }
+
+        if next_idx == 0 {
+            next_idx = channel.keyframe_count - 1
+        }
+
+        if prev_idx == next_idx {
+            return channel.keyframes[prev_idx].transform
+        }
+
+        // Calculate interpolation factor
+        let prev_time = channel.keyframes[prev_idx].time
+        let next_time = channel.keyframes[next_idx].time
+        let t = (time - prev_time) / (next_time - prev_time)
+
+        let prev_xform = &channel.keyframes[prev_idx].transform
+        let next_xform = &channel.keyframes[next_idx].transform
+
+        match channel.interpolation {
+            InterpolationType::Step => {
+                return *prev_xform
+            },
+            InterpolationType::Linear => {
+                return BoneTransform {
+                    translation: lerp_vec3(prev_xform.translation, next_xform.translation, t),
+                    rotation: slerp_quat(prev_xform.rotation, next_xform.rotation, t),
+                    scale: lerp_vec3(prev_xform.scale, next_xform.scale, t)
+                }
+            },
+            _ => {
+                // Default to linear
+                return BoneTransform {
+                    translation: lerp_vec3(prev_xform.translation, next_xform.translation, t),
+                    rotation: slerp_quat(prev_xform.rotation, next_xform.rotation, t),
+                    scale: lerp_vec3(prev_xform.scale, next_xform.scale, t)
+                }
+            }
+        }
+    }
+
+    fn calculate_world_matrices(&mut self) {
+        for i in 0..self.skeleton.bone_count {
+            let bone = &self.skeleton.bones[i]
+            let local = transform_to_matrix(self.local_transforms[i])
+
+            if bone.parent_index < 0 {
+                self.world_matrices[i] = local
+            } else {
+                self.world_matrices[i] = mat4_multiply(
+                    self.world_matrices[bone.parent_index as u32],
+                    local
+                )
+            }
+        }
+    }
+
+    fn calculate_skin_matrices(&mut self) {
+        for i in 0..self.skeleton.bone_count {
+            self.skin_matrices[i] = mat4_multiply(
+                self.world_matrices[i],
+                self.skeleton.bones[i].inverse_bind_matrix
+            )
+        }
+    }
+
+    // ========================================================================
+    // Output
+    // ========================================================================
+
+    fn get_skin_matrices(&self) -> &[Mat4; MAX_BONES] {
+        return &self.skin_matrices
+    }
+
+    fn get_world_matrix(&self, bone_index: u32) -> Mat4 {
+        if bone_index >= self.skeleton.bone_count {
+            return mat4_identity()
+        }
+        return self.world_matrices[bone_index]
+    }
+
+    fn get_bone_position(&self, bone_index: u32) -> Vec3 {
+        if bone_index >= self.skeleton.bone_count {
+            return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        }
+        let m = &self.world_matrices[bone_index]
+        return Vec3 { x: m.m[12], y: m.m[13], z: m.m[14] }
+    }
+}
+
+// ============================================================================
+// Math Helpers
+// ============================================================================
+
+fn lerp_vec3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    Vec3 {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        z: a.z + (b.z - a.z) * t
+    }
+}
+
+fn slerp_quat(a: Quat, b: Quat, t: f32) -> Quat {
+    // Compute dot product
+    var dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+
+    // If dot < 0, negate one quaternion to take shorter path
+    var b_adj = b
+    if dot < 0.0 {
+        b_adj = Quat { x: -b.x, y: -b.y, z: -b.z, w: -b.w }
+        dot = -dot
+    }
+
+    // If very close, use linear interpolation
+    if dot > 0.9995 {
+        return normalize_quat(Quat {
+            x: a.x + (b_adj.x - a.x) * t,
+            y: a.y + (b_adj.y - a.y) * t,
+            z: a.z + (b_adj.z - a.z) * t,
+            w: a.w + (b_adj.w - a.w) * t
+        })
+    }
+
+    let theta_0 = acos(dot)
+    let theta = theta_0 * t
+    let sin_theta = sin(theta)
+    let sin_theta_0 = sin(theta_0)
+
+    let s0 = cos(theta) - dot * sin_theta / sin_theta_0
+    let s1 = sin_theta / sin_theta_0
+
+    return Quat {
+        x: a.x * s0 + b_adj.x * s1,
+        y: a.y * s0 + b_adj.y * s1,
+        z: a.z * s0 + b_adj.z * s1,
+        w: a.w * s0 + b_adj.w * s1
+    }
+}
+
+fn normalize_quat(q: Quat) -> Quat {
+    let len = sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    if len < 0.0001 {
+        return Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+    }
+    let inv = 1.0 / len
+    return Quat { x: q.x * inv, y: q.y * inv, z: q.z * inv, w: q.w * inv }
+}
+
+fn blend_transform(a: BoneTransform, b: BoneTransform, weight: f32) -> BoneTransform {
+    BoneTransform {
+        translation: lerp_vec3(a.translation, b.translation, weight),
+        rotation: slerp_quat(a.rotation, b.rotation, weight),
+        scale: lerp_vec3(a.scale, b.scale, weight)
+    }
+}
+
+fn blend_transform_additive(base: BoneTransform, add: BoneTransform, weight: f32) -> BoneTransform {
+    BoneTransform {
+        translation: Vec3 {
+            x: base.translation.x + add.translation.x * weight,
+            y: base.translation.y + add.translation.y * weight,
+            z: base.translation.z + add.translation.z * weight
+        },
+        rotation: multiply_quat(base.rotation, slerp_quat(quat_identity(), add.rotation, weight)),
+        scale: Vec3 {
+            x: base.scale.x * (1.0 + (add.scale.x - 1.0) * weight),
+            y: base.scale.y * (1.0 + (add.scale.y - 1.0) * weight),
+            z: base.scale.z * (1.0 + (add.scale.z - 1.0) * weight)
+        }
+    }
+}
+
+fn multiply_quat(a: Quat, b: Quat) -> Quat {
+    Quat {
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    }
+}
+
+fn quat_identity() -> Quat {
+    Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+}
+
+fn transform_to_matrix(t: BoneTransform) -> Mat4 {
+    // Convert quaternion to rotation matrix, combine with translation and scale
+    let q = t.rotation
+    let s = t.scale
+
+    let xx = q.x * q.x
+    let yy = q.y * q.y
+    let zz = q.z * q.z
+    let xy = q.x * q.y
+    let xz = q.x * q.z
+    let yz = q.y * q.z
+    let wx = q.w * q.x
+    let wy = q.w * q.y
+    let wz = q.w * q.z
+
+    Mat4 {
+        m: [
+            (1.0 - 2.0 * (yy + zz)) * s.x, (2.0 * (xy + wz)) * s.x, (2.0 * (xz - wy)) * s.x, 0.0,
+            (2.0 * (xy - wz)) * s.y, (1.0 - 2.0 * (xx + zz)) * s.y, (2.0 * (yz + wx)) * s.y, 0.0,
+            (2.0 * (xz + wy)) * s.z, (2.0 * (yz - wx)) * s.z, (1.0 - 2.0 * (xx + yy)) * s.z, 0.0,
+            t.translation.x, t.translation.y, t.translation.z, 1.0
+        ]
+    }
+}
+
+fn mat4_identity() -> Mat4 {
+    Mat4 {
+        m: [1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn mat4_multiply(a: Mat4, b: Mat4) -> Mat4 {
+    var result = Mat4 { m: [0.0; 16] }
+
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                result.m[i * 4 + j] += a.m[i * 4 + k] * b.m[k * 4 + j]
+            }
+        }
+    }
+
+    return result
+}
+
+// External math functions
+extern fn sqrt(x: f32) -> f32
+extern fn sin(x: f32) -> f32
+extern fn cos(x: f32) -> f32
+extern fn acos(x: f32) -> f32

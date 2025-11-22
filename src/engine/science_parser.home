@@ -1,0 +1,416 @@
+// Science Parser - Parses Science INI files for C&C Generals
+// Handles Science blocks (General powers) from Data/INI/Science.ini
+
+use std::collections::HashMap
+
+// Science types - what category of tech tree
+enum ScienceType {
+    GrantedByDefault,
+    PurchasableScience,
+    MultiplayerOnly,
+    CampaignOnly,
+}
+
+// Single science definition (General power)
+struct ScienceDefinition {
+    name: string,
+    display_name: string,
+    description: string,
+
+    // Type and cost
+    science_type: ScienceType,
+    science_purchase_points_cost: u32,
+    is_granted_by_default: bool,
+
+    // Requirements
+    prerequisite_sciences: [string; 8],
+    prerequisite_count: u32,
+    required_rank: u32,
+
+    // UI
+    button_image: string,
+    science_cursor: string,
+
+    // Granted abilities
+    grants_special_powers: [string; 4],
+    grants_special_power_count: u32,
+    grants_upgrades: [string; 4],
+    grants_upgrade_count: u32,
+
+    is_valid: bool,
+}
+
+// Player ranking system
+struct RankDefinition {
+    name: string,
+    rank_number: u32,
+    science_points_required: u32,
+    science_points_granted: u32,
+    is_valid: bool,
+}
+
+const MAX_SCIENCES: u32 = 256
+const MAX_RANKS: u32 = 32
+
+struct ScienceParser {
+    sciences: [ScienceDefinition; MAX_SCIENCES],
+    science_count: u32,
+    science_name_to_index: HashMap<string, u32>,
+
+    ranks: [RankDefinition; MAX_RANKS],
+    rank_count: u32,
+
+    // Parse state
+    current_science: u32,
+    current_rank: u32,
+    in_science_block: bool,
+    in_rank_block: bool,
+
+    // Error tracking
+    parse_errors: [string; 64],
+    error_count: u32,
+}
+
+impl ScienceParser {
+    fn new() -> Self {
+        let parser = ScienceParser {
+            sciences: [ScienceDefinition::default(); MAX_SCIENCES],
+            science_count: 0,
+            science_name_to_index: HashMap::new(),
+            ranks: [RankDefinition::default(); MAX_RANKS],
+            rank_count: 0,
+            current_science: 0,
+            current_rank: 0,
+            in_science_block: false,
+            in_rank_block: false,
+            parse_errors: [string::default(); 64],
+            error_count: 0,
+        }
+        parser
+    }
+
+    fn parse_file(&mut self, file_path: string) -> bool {
+        let content = std::fs::read_to_string(file_path)
+        if content.is_empty() {
+            self.add_error("Failed to read file: " + file_path)
+            return false
+        }
+
+        let lines = content.split('\n')
+        let line_num: u32 = 0
+
+        for line in lines {
+            line_num += 1
+            let trimmed = line.trim()
+
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue
+            }
+
+            if !self.parse_line(trimmed, line_num) {
+                return false
+            }
+        }
+
+        true
+    }
+
+    fn parse_line(&mut self, line: string, line_num: u32) -> bool {
+        // Block starts
+        if line.starts_with("Science ") {
+            return self.begin_science_block(line)
+        }
+
+        if line.starts_with("Rank ") {
+            return self.begin_rank_block(line)
+        }
+
+        // Block end
+        if line == "End" {
+            return self.end_current_block()
+        }
+
+        // Property parsing
+        if self.in_science_block {
+            return self.parse_science_property(line)
+        }
+
+        if self.in_rank_block {
+            return self.parse_rank_property(line)
+        }
+
+        true
+    }
+
+    fn begin_science_block(&mut self, line: string) -> bool {
+        if self.science_count >= MAX_SCIENCES {
+            self.add_error("Maximum science count exceeded")
+            return false
+        }
+
+        // Parse: "Science SCIENCE_NAME"
+        let parts = line.split(' ')
+        if parts.len() < 2 {
+            self.add_error("Invalid science declaration")
+            return false
+        }
+
+        let science_name = parts[1].trim()
+
+        self.current_science = self.science_count
+        self.sciences[self.current_science] = ScienceDefinition::default()
+        self.sciences[self.current_science].name = science_name.to_string()
+        self.sciences[self.current_science].is_valid = true
+
+        self.science_name_to_index.insert(science_name.to_string(), self.current_science)
+        self.science_count += 1
+        self.in_science_block = true
+
+        true
+    }
+
+    fn begin_rank_block(&mut self, line: string) -> bool {
+        if self.rank_count >= MAX_RANKS {
+            self.add_error("Maximum rank count exceeded")
+            return false
+        }
+
+        let parts = line.split(' ')
+        if parts.len() < 2 {
+            self.add_error("Invalid rank declaration")
+            return false
+        }
+
+        let rank_name = parts[1].trim()
+
+        self.current_rank = self.rank_count
+        self.ranks[self.current_rank] = RankDefinition::default()
+        self.ranks[self.current_rank].name = rank_name.to_string()
+        self.ranks[self.current_rank].is_valid = true
+
+        self.rank_count += 1
+        self.in_rank_block = true
+
+        true
+    }
+
+    fn end_current_block(&mut self) -> bool {
+        if self.in_science_block {
+            self.in_science_block = false
+        } else if self.in_rank_block {
+            self.in_rank_block = false
+        }
+        true
+    }
+
+    fn parse_science_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let science = &mut self.sciences[self.current_science]
+
+        match key.as_str() {
+            "DisplayName" => science.display_name = value,
+            "Description" => science.description = value,
+            "ScienceType" => science.science_type = self.parse_science_type(value),
+            "SciencePurchasePointCost" | "PurchasePointCost" =>
+                science.science_purchase_points_cost = self.parse_u32(value),
+            "IsGrantedByDefault" => science.is_granted_by_default = self.parse_bool(value),
+            "PrerequisiteSciences" => self.parse_prerequisites(science, value),
+            "ScienceRequiredRank" | "RequiredRank" => science.required_rank = self.parse_u32(value),
+            "ButtonImage" => science.button_image = value,
+            "ScienceCursor" | "Cursor" => science.science_cursor = value,
+            "GrantsSpecialPower" => self.add_special_power(science, value),
+            "GrantsUpgrade" => self.add_upgrade(science, value),
+            _ => {},
+        }
+
+        true
+    }
+
+    fn parse_rank_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let rank = &mut self.ranks[self.current_rank]
+
+        match key.as_str() {
+            "RankNumber" | "Rank" => rank.rank_number = self.parse_u32(value),
+            "SciencePointsRequired" | "PointsRequired" =>
+                rank.science_points_required = self.parse_u32(value),
+            "SciencePointsGranted" | "PointsGranted" =>
+                rank.science_points_granted = self.parse_u32(value),
+            _ => {},
+        }
+
+        true
+    }
+
+    fn parse_science_type(&self, value: string) -> ScienceType {
+        match value.to_uppercase().as_str() {
+            "GRANTEDBYDEFAULT" | "GRANTED_BY_DEFAULT" => ScienceType::GrantedByDefault,
+            "PURCHASABLESCIENCE" | "PURCHASABLE" => ScienceType::PurchasableScience,
+            "MULTIPLAYERONLY" | "MULTIPLAYER_ONLY" => ScienceType::MultiplayerOnly,
+            "CAMPAIGNONLY" | "CAMPAIGN_ONLY" => ScienceType::CampaignOnly,
+            _ => ScienceType::PurchasableScience,
+        }
+    }
+
+    fn parse_prerequisites(&self, science: &mut ScienceDefinition, value: string) {
+        // Format: "SCIENCE_1 SCIENCE_2" or "SCIENCE_1 OR SCIENCE_2"
+        let parts = value.split(' ')
+        for part in parts {
+            let trimmed = part.trim()
+            if trimmed.is_empty() || trimmed.to_uppercase() == "OR" {
+                continue
+            }
+            if science.prerequisite_count < 8 {
+                science.prerequisite_sciences[science.prerequisite_count as usize] = trimmed.to_string()
+                science.prerequisite_count += 1
+            }
+        }
+    }
+
+    fn add_special_power(&self, science: &mut ScienceDefinition, value: string) {
+        if science.grants_special_power_count < 4 {
+            science.grants_special_powers[science.grants_special_power_count as usize] = value
+            science.grants_special_power_count += 1
+        }
+    }
+
+    fn add_upgrade(&self, science: &mut ScienceDefinition, value: string) {
+        if science.grants_upgrade_count < 4 {
+            science.grants_upgrades[science.grants_upgrade_count as usize] = value
+            science.grants_upgrade_count += 1
+        }
+    }
+
+    fn split_property(&self, line: string) -> (string, string) {
+        let eq_pos = line.find('=')
+        if eq_pos.is_some() {
+            let idx = eq_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        let space_pos = line.find(' ')
+        if space_pos.is_some() {
+            let idx = space_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        (line, "".to_string())
+    }
+
+    fn parse_u32(&self, value: string) -> u32 {
+        value.trim().parse::<u32>().unwrap_or(0)
+    }
+
+    fn parse_bool(&self, value: string) -> bool {
+        let v = value.to_uppercase()
+        v == "YES" || v == "TRUE" || v == "1"
+    }
+
+    fn add_error(&mut self, msg: string) {
+        if self.error_count < 64 {
+            self.parse_errors[self.error_count as usize] = msg
+            self.error_count += 1
+        }
+    }
+
+    // Public API
+    fn get_science(&self, name: string) -> Option<&ScienceDefinition> {
+        if let Some(idx) = self.science_name_to_index.get(&name) {
+            return Some(&self.sciences[*idx as usize])
+        }
+        None
+    }
+
+    fn get_science_by_index(&self, index: u32) -> Option<&ScienceDefinition> {
+        if index < self.science_count {
+            return Some(&self.sciences[index as usize])
+        }
+        None
+    }
+
+    fn get_science_count(&self) -> u32 {
+        self.science_count
+    }
+
+    fn get_rank(&self, rank_number: u32) -> Option<&RankDefinition> {
+        for i in 0..self.rank_count {
+            if self.ranks[i as usize].rank_number == rank_number {
+                return Some(&self.ranks[i as usize])
+            }
+        }
+        None
+    }
+
+    fn get_rank_count(&self) -> u32 {
+        self.rank_count
+    }
+
+    // Check if a science can be purchased given current sciences
+    fn can_purchase_science(&self, science_name: string, owned_sciences: &[string]) -> bool {
+        if let Some(science) = self.get_science(science_name) {
+            if science.prerequisite_count == 0 {
+                return true
+            }
+
+            // Check if any prerequisite is met
+            for i in 0..science.prerequisite_count {
+                let prereq = &science.prerequisite_sciences[i as usize]
+                for owned in owned_sciences {
+                    if prereq == owned {
+                        return true
+                    }
+                }
+            }
+
+            return false
+        }
+        false
+    }
+}
+
+impl Default for ScienceDefinition {
+    fn default() -> Self {
+        ScienceDefinition {
+            name: "".to_string(),
+            display_name: "".to_string(),
+            description: "".to_string(),
+            science_type: ScienceType::PurchasableScience,
+            science_purchase_points_cost: 1,
+            is_granted_by_default: false,
+            prerequisite_sciences: [string::default(); 8],
+            prerequisite_count: 0,
+            required_rank: 0,
+            button_image: "".to_string(),
+            science_cursor: "".to_string(),
+            grants_special_powers: [string::default(); 4],
+            grants_special_power_count: 0,
+            grants_upgrades: [string::default(); 4],
+            grants_upgrade_count: 0,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for RankDefinition {
+    fn default() -> Self {
+        RankDefinition {
+            name: "".to_string(),
+            rank_number: 0,
+            science_points_required: 0,
+            science_points_granted: 0,
+            is_valid: false,
+        }
+    }
+}

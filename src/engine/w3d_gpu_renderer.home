@@ -1,0 +1,978 @@
+// w3d_gpu_renderer.home - Full W3D mesh rendering pipeline for Metal
+// Uploads W3D mesh data to GPU and renders with proper shaders
+
+const MAX_MESHES: u32 = 4096
+const MAX_VERTICES_PER_MESH: u32 = 65536
+const MAX_INDICES_PER_MESH: u32 = 196608
+const MAX_BONES: u32 = 128
+const MAX_TEXTURES: u32 = 1024
+
+// ============================================================================
+// Vertex Formats
+// ============================================================================
+
+struct W3DVertex {
+    position: Vec3,
+    normal: Vec3,
+    tangent: Vec3,
+    texcoord: Vec2,
+    bone_indices: [u8; 4],
+    bone_weights: [f32; 4]
+}
+
+struct W3DVertexStatic {
+    position: Vec3,
+    normal: Vec3,
+    texcoord: Vec2
+}
+
+struct Vec2 {
+    x: f32,
+    y: f32
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32
+}
+
+struct Mat4 {
+    m: [f32; 16]
+}
+
+// ============================================================================
+// GPU Buffer Types
+// ============================================================================
+
+struct GPUBuffer {
+    handle: u64,                // Metal buffer handle
+    size: u32,
+    stride: u32,
+    usage: BufferUsage
+}
+
+enum BufferUsage {
+    Vertex,
+    Index,
+    Uniform,
+    Storage
+}
+
+struct GPUTexture {
+    handle: u64,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+    mip_levels: u32
+}
+
+enum TextureFormat {
+    RGBA8,
+    BGRA8,
+    DXT1,
+    DXT3,
+    DXT5,
+    R8,
+    RG8,
+    Depth32
+}
+
+// ============================================================================
+// Mesh GPU Data
+// ============================================================================
+
+struct MeshGPUData {
+    mesh_id: u32,
+    vertex_buffer: GPUBuffer,
+    index_buffer: GPUBuffer,
+    vertex_count: u32,
+    index_count: u32,
+    primitive_type: PrimitiveType,
+    bounding_box_min: Vec3,
+    bounding_box_max: Vec3,
+    bounding_sphere_center: Vec3,
+    bounding_sphere_radius: f32,
+    is_skinned: bool,
+    material_id: u32
+}
+
+enum PrimitiveType {
+    Triangles,
+    TriangleStrip,
+    Lines,
+    Points
+}
+
+// ============================================================================
+// Material System
+// ============================================================================
+
+struct W3DMaterial {
+    material_id: u32,
+    diffuse_texture: u32,       // Texture ID
+    normal_texture: u32,
+    specular_texture: u32,
+    emissive_texture: u32,
+
+    diffuse_color: Vec4,
+    specular_color: Vec4,
+    emissive_color: Vec4,
+    ambient_color: Vec4,
+
+    shininess: f32,
+    opacity: f32,
+
+    blend_mode: BlendMode,
+    depth_write: bool,
+    two_sided: bool,
+
+    shader_type: W3DShaderType
+}
+
+enum BlendMode {
+    Opaque,
+    AlphaTest,
+    AlphaBlend,
+    Additive,
+    Multiply
+}
+
+enum W3DShaderType {
+    Basic,
+    Skinned,
+    Terrain,
+    Water,
+    Particle,
+    Laser,
+    Shroud
+}
+
+// ============================================================================
+// Uniform Buffers
+// ============================================================================
+
+struct FrameUniforms {
+    view_matrix: Mat4,
+    projection_matrix: Mat4,
+    view_projection: Mat4,
+    camera_position: Vec4,
+    sun_direction: Vec4,
+    sun_color: Vec4,
+    ambient_color: Vec4,
+    time: f32,
+    padding: [f32; 3]
+}
+
+struct ObjectUniforms {
+    model_matrix: Mat4,
+    normal_matrix: Mat4,        // Inverse transpose of model
+    tint_color: Vec4,
+    selection_color: Vec4,
+    object_id: u32,
+    is_selected: u32,
+    padding: [u32; 2]
+}
+
+struct BoneUniforms {
+    bone_matrices: [Mat4; MAX_BONES]
+}
+
+struct MaterialUniforms {
+    diffuse_color: Vec4,
+    specular_color: Vec4,
+    emissive_color: Vec4,
+    shininess: f32,
+    opacity: f32,
+    time: f32,
+    padding: f32
+}
+
+// ============================================================================
+// Render Pipeline State
+// ============================================================================
+
+struct PipelineState {
+    handle: u64,
+    vertex_function: string,
+    fragment_function: string,
+    blend_mode: BlendMode,
+    depth_test: bool,
+    depth_write: bool,
+    cull_mode: CullMode
+}
+
+enum CullMode {
+    None,
+    Front,
+    Back
+}
+
+struct RenderPipelineCache {
+    pipelines: [PipelineState; 32],
+    pipeline_count: u32
+}
+
+// ============================================================================
+// Draw Call
+// ============================================================================
+
+struct DrawCall {
+    mesh_gpu: u32,              // Index into mesh array
+    material_id: u32,
+    object_uniforms: ObjectUniforms,
+    bone_uniforms: ?&BoneUniforms,
+    sort_key: u64,              // For sorting (depth, material, etc.)
+    layer: RenderLayer
+}
+
+enum RenderLayer {
+    Terrain,
+    TerrainDecals,
+    Water,
+    OpaqueObjects,
+    AlphaTestObjects,
+    TransparentObjects,
+    Particles,
+    UI,
+    Debug
+}
+
+// ============================================================================
+// Render Queue
+// ============================================================================
+
+struct RenderQueue {
+    draw_calls: [DrawCall; 8192],
+    draw_call_count: u32,
+    sorted: bool
+}
+
+impl RenderQueue {
+    fn new() -> RenderQueue {
+        RenderQueue {
+            draw_calls: undefined,
+            draw_call_count: 0,
+            sorted: false
+        }
+    }
+
+    fn clear(&mut self) {
+        self.draw_call_count = 0
+        self.sorted = false
+    }
+
+    fn add(&mut self, call: DrawCall) {
+        if self.draw_call_count >= 8192 {
+            return
+        }
+        self.draw_calls[self.draw_call_count] = call
+        self.draw_call_count += 1
+        self.sorted = false
+    }
+
+    fn sort(&mut self) {
+        if self.sorted {
+            return
+        }
+
+        // Sort by: layer -> blend mode -> material -> depth
+        for i in 1..self.draw_call_count {
+            let key = self.draw_calls[i]
+            var j = i as i32 - 1
+
+            while j >= 0 and self.draw_calls[j as u32].sort_key > key.sort_key {
+                self.draw_calls[(j + 1) as u32] = self.draw_calls[j as u32]
+                j -= 1
+            }
+            self.draw_calls[(j + 1) as u32] = key
+        }
+
+        self.sorted = true
+    }
+
+    fn compute_sort_keys(&mut self, camera_pos: Vec3) {
+        for i in 0..self.draw_call_count {
+            let call = &mut self.draw_calls[i]
+
+            // Layer (16 bits) | Material (16 bits) | Depth (32 bits)
+            let layer_bits = (call.layer as u64) << 48
+            let material_bits = (call.material_id as u64) << 32
+
+            // Depth for sorting (front-to-back for opaque, back-to-front for transparent)
+            let obj_pos = Vec3 {
+                x: call.object_uniforms.model_matrix.m[12],
+                y: call.object_uniforms.model_matrix.m[13],
+                z: call.object_uniforms.model_matrix.m[14]
+            }
+            let dist_sq = distance_squared(obj_pos, camera_pos)
+            let depth_bits = if call.layer == RenderLayer::TransparentObjects {
+                // Back to front for transparent
+                (0xFFFFFFFF - (dist_sq * 1000.0) as u32) as u64
+            } else {
+                // Front to back for opaque
+                (dist_sq * 1000.0) as u64
+            }
+
+            call.sort_key = layer_bits | material_bits | depth_bits
+        }
+    }
+}
+
+// ============================================================================
+// W3D GPU Renderer
+// ============================================================================
+
+struct W3DGPURendererConfig {
+    max_draw_calls: u32,
+    enable_shadows: bool,
+    shadow_map_size: u32,
+    enable_fog: bool,
+    fog_start: f32,
+    fog_end: f32,
+    fog_color: Vec4
+}
+
+fn default_renderer_config() -> W3DGPURendererConfig {
+    W3DGPURendererConfig {
+        max_draw_calls: 8192,
+        enable_shadows: true,
+        shadow_map_size: 2048,
+        enable_fog: true,
+        fog_start: 100.0,
+        fog_end: 500.0,
+        fog_color: Vec4 { x: 0.5, y: 0.6, z: 0.7, w: 1.0 }
+    }
+}
+
+struct W3DGPURenderer {
+    config: W3DGPURendererConfig,
+
+    // Metal device/queue
+    device: u64,
+    command_queue: u64,
+
+    // Mesh storage
+    meshes: [MeshGPUData; MAX_MESHES],
+    mesh_count: u32,
+
+    // Material storage
+    materials: [W3DMaterial; 1024],
+    material_count: u32,
+
+    // Texture storage
+    textures: [GPUTexture; MAX_TEXTURES],
+    texture_count: u32,
+
+    // Pipeline cache
+    pipeline_cache: RenderPipelineCache,
+
+    // Uniform buffers
+    frame_uniform_buffer: GPUBuffer,
+    object_uniform_buffer: GPUBuffer,
+    bone_uniform_buffer: GPUBuffer,
+    material_uniform_buffer: GPUBuffer,
+
+    // Render queues (one per layer)
+    render_queue: RenderQueue,
+
+    // Shadow mapping
+    shadow_map: GPUTexture,
+    shadow_view_proj: Mat4,
+
+    // Current frame state
+    current_frame_uniforms: FrameUniforms,
+    current_command_buffer: u64,
+    current_render_encoder: u64
+}
+
+impl W3DGPURenderer {
+    fn new(device: u64, config: W3DGPURendererConfig) -> W3DGPURenderer {
+        var renderer = W3DGPURenderer {
+            config: config,
+            device: device,
+            command_queue: metal_create_command_queue(device),
+            meshes: undefined,
+            mesh_count: 0,
+            materials: undefined,
+            material_count: 0,
+            textures: undefined,
+            texture_count: 0,
+            pipeline_cache: RenderPipelineCache {
+                pipelines: undefined,
+                pipeline_count: 0
+            },
+            frame_uniform_buffer: create_buffer(device, size_of::<FrameUniforms>(), BufferUsage::Uniform),
+            object_uniform_buffer: create_buffer(device, size_of::<ObjectUniforms>() * 1024, BufferUsage::Uniform),
+            bone_uniform_buffer: create_buffer(device, size_of::<BoneUniforms>(), BufferUsage::Uniform),
+            material_uniform_buffer: create_buffer(device, size_of::<MaterialUniforms>() * 256, BufferUsage::Uniform),
+            render_queue: RenderQueue::new(),
+            shadow_map: create_shadow_map(device, config.shadow_map_size),
+            shadow_view_proj: mat4_identity(),
+            current_frame_uniforms: undefined,
+            current_command_buffer: 0,
+            current_render_encoder: 0
+        }
+
+        renderer.create_pipelines()
+        return renderer
+    }
+
+    // ========================================================================
+    // Pipeline Creation
+    // ========================================================================
+
+    fn create_pipelines(&mut self) {
+        // Basic static mesh pipeline
+        self.pipeline_cache.pipelines[0] = PipelineState {
+            handle: metal_create_pipeline(self.device, "w3d_static_vertex", "w3d_static_fragment", false, true, true),
+            vertex_function: "w3d_static_vertex",
+            fragment_function: "w3d_static_fragment",
+            blend_mode: BlendMode::Opaque,
+            depth_test: true,
+            depth_write: true,
+            cull_mode: CullMode::Back
+        }
+
+        // Skinned mesh pipeline
+        self.pipeline_cache.pipelines[1] = PipelineState {
+            handle: metal_create_pipeline(self.device, "w3d_skinned_vertex", "w3d_skinned_fragment", false, true, true),
+            vertex_function: "w3d_skinned_vertex",
+            fragment_function: "w3d_skinned_fragment",
+            blend_mode: BlendMode::Opaque,
+            depth_test: true,
+            depth_write: true,
+            cull_mode: CullMode::Back
+        }
+
+        // Alpha test pipeline
+        self.pipeline_cache.pipelines[2] = PipelineState {
+            handle: metal_create_pipeline(self.device, "w3d_static_vertex", "w3d_alphatest_fragment", false, true, true),
+            vertex_function: "w3d_static_vertex",
+            fragment_function: "w3d_alphatest_fragment",
+            blend_mode: BlendMode::AlphaTest,
+            depth_test: true,
+            depth_write: true,
+            cull_mode: CullMode::None
+        }
+
+        // Alpha blend pipeline
+        self.pipeline_cache.pipelines[3] = PipelineState {
+            handle: metal_create_pipeline(self.device, "w3d_static_vertex", "w3d_alphablend_fragment", true, true, false),
+            vertex_function: "w3d_static_vertex",
+            fragment_function: "w3d_alphablend_fragment",
+            blend_mode: BlendMode::AlphaBlend,
+            depth_test: true,
+            depth_write: false,
+            cull_mode: CullMode::None
+        }
+
+        // Additive blend pipeline
+        self.pipeline_cache.pipelines[4] = PipelineState {
+            handle: metal_create_pipeline(self.device, "w3d_static_vertex", "w3d_additive_fragment", true, true, false),
+            vertex_function: "w3d_static_vertex",
+            fragment_function: "w3d_additive_fragment",
+            blend_mode: BlendMode::Additive,
+            depth_test: true,
+            depth_write: false,
+            cull_mode: CullMode::None
+        }
+
+        self.pipeline_cache.pipeline_count = 5
+    }
+
+    fn get_pipeline_for_material(&self, material: &W3DMaterial) -> &PipelineState {
+        match material.blend_mode {
+            BlendMode::Opaque => {
+                if material.shader_type == W3DShaderType::Skinned {
+                    return &self.pipeline_cache.pipelines[1]
+                }
+                return &self.pipeline_cache.pipelines[0]
+            },
+            BlendMode::AlphaTest => &self.pipeline_cache.pipelines[2],
+            BlendMode::AlphaBlend => &self.pipeline_cache.pipelines[3],
+            BlendMode::Additive => &self.pipeline_cache.pipelines[4],
+            BlendMode::Multiply => &self.pipeline_cache.pipelines[3]
+        }
+    }
+
+    // ========================================================================
+    // Mesh Upload
+    // ========================================================================
+
+    fn upload_mesh(&mut self, vertices: &[W3DVertex], indices: &[u32], is_skinned: bool) -> u32 {
+        if self.mesh_count >= MAX_MESHES {
+            return 0xFFFFFFFF
+        }
+
+        let mesh_id = self.mesh_count
+        self.mesh_count += 1
+
+        let vertex_size = vertices.len() * size_of::<W3DVertex>()
+        let index_size = indices.len() * size_of::<u32>()
+
+        // Create vertex buffer
+        let vb = GPUBuffer {
+            handle: metal_create_buffer(self.device, vertex_size, vertices.as_ptr()),
+            size: vertex_size as u32,
+            stride: size_of::<W3DVertex>() as u32,
+            usage: BufferUsage::Vertex
+        }
+
+        // Create index buffer
+        let ib = GPUBuffer {
+            handle: metal_create_buffer(self.device, index_size, indices.as_ptr()),
+            size: index_size as u32,
+            stride: 4,
+            usage: BufferUsage::Index
+        }
+
+        // Calculate bounds
+        var min = Vec3 { x: 1e30, y: 1e30, z: 1e30 }
+        var max = Vec3 { x: -1e30, y: -1e30, z: -1e30 }
+
+        for i in 0..vertices.len() {
+            let v = &vertices[i]
+            if v.position.x < min.x { min.x = v.position.x }
+            if v.position.y < min.y { min.y = v.position.y }
+            if v.position.z < min.z { min.z = v.position.z }
+            if v.position.x > max.x { max.x = v.position.x }
+            if v.position.y > max.y { max.y = v.position.y }
+            if v.position.z > max.z { max.z = v.position.z }
+        }
+
+        let center = Vec3 {
+            x: (min.x + max.x) * 0.5,
+            y: (min.y + max.y) * 0.5,
+            z: (min.z + max.z) * 0.5
+        }
+        let radius = distance(min, max) * 0.5
+
+        self.meshes[mesh_id] = MeshGPUData {
+            mesh_id: mesh_id,
+            vertex_buffer: vb,
+            index_buffer: ib,
+            vertex_count: vertices.len() as u32,
+            index_count: indices.len() as u32,
+            primitive_type: PrimitiveType::Triangles,
+            bounding_box_min: min,
+            bounding_box_max: max,
+            bounding_sphere_center: center,
+            bounding_sphere_radius: radius,
+            is_skinned: is_skinned,
+            material_id: 0
+        }
+
+        return mesh_id
+    }
+
+    fn upload_static_mesh(&mut self, vertices: &[W3DVertexStatic], indices: &[u32]) -> u32 {
+        // Convert to full vertex format
+        var full_vertices: [W3DVertex; MAX_VERTICES_PER_MESH] = undefined
+        for i in 0..vertices.len() {
+            full_vertices[i] = W3DVertex {
+                position: vertices[i].position,
+                normal: vertices[i].normal,
+                tangent: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+                texcoord: vertices[i].texcoord,
+                bone_indices: [0, 0, 0, 0],
+                bone_weights: [1.0, 0.0, 0.0, 0.0]
+            }
+        }
+
+        return self.upload_mesh(&full_vertices[0..vertices.len()], indices, false)
+    }
+
+    // ========================================================================
+    // Texture Upload
+    // ========================================================================
+
+    fn upload_texture(&mut self, width: u32, height: u32, format: TextureFormat, data: &[u8], generate_mips: bool) -> u32 {
+        if self.texture_count >= MAX_TEXTURES {
+            return 0xFFFFFFFF
+        }
+
+        let tex_id = self.texture_count
+        self.texture_count += 1
+
+        let mip_levels = if generate_mips {
+            calculate_mip_levels(width, height)
+        } else {
+            1
+        }
+
+        let handle = metal_create_texture(self.device, width, height, format as u32, mip_levels, data.as_ptr(), data.len())
+
+        self.textures[tex_id] = GPUTexture {
+            handle: handle,
+            width: width,
+            height: height,
+            format: format,
+            mip_levels: mip_levels
+        }
+
+        return tex_id
+    }
+
+    // ========================================================================
+    // Material Creation
+    // ========================================================================
+
+    fn create_material(&mut self, diffuse_tex: u32, blend: BlendMode, is_skinned: bool) -> u32 {
+        if self.material_count >= 1024 {
+            return 0xFFFFFFFF
+        }
+
+        let mat_id = self.material_count
+        self.material_count += 1
+
+        self.materials[mat_id] = W3DMaterial {
+            material_id: mat_id,
+            diffuse_texture: diffuse_tex,
+            normal_texture: 0xFFFFFFFF,
+            specular_texture: 0xFFFFFFFF,
+            emissive_texture: 0xFFFFFFFF,
+            diffuse_color: Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 },
+            specular_color: Vec4 { x: 0.5, y: 0.5, z: 0.5, w: 1.0 },
+            emissive_color: Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+            ambient_color: Vec4 { x: 0.2, y: 0.2, z: 0.2, w: 1.0 },
+            shininess: 32.0,
+            opacity: 1.0,
+            blend_mode: blend,
+            depth_write: blend == BlendMode::Opaque or blend == BlendMode::AlphaTest,
+            two_sided: false,
+            shader_type: if is_skinned { W3DShaderType::Skinned } else { W3DShaderType::Basic }
+        }
+
+        return mat_id
+    }
+
+    // ========================================================================
+    // Frame Rendering
+    // ========================================================================
+
+    fn begin_frame(&mut self, view: Mat4, projection: Mat4, camera_pos: Vec3, sun_dir: Vec3) {
+        self.render_queue.clear()
+
+        // Update frame uniforms
+        self.current_frame_uniforms = FrameUniforms {
+            view_matrix: view,
+            projection_matrix: projection,
+            view_projection: mat4_multiply(projection, view),
+            camera_position: Vec4 { x: camera_pos.x, y: camera_pos.y, z: camera_pos.z, w: 1.0 },
+            sun_direction: Vec4 { x: sun_dir.x, y: sun_dir.y, z: sun_dir.z, w: 0.0 },
+            sun_color: Vec4 { x: 1.0, y: 0.95, z: 0.9, w: 1.0 },
+            ambient_color: Vec4 { x: 0.3, y: 0.35, z: 0.4, w: 1.0 },
+            time: get_time_seconds(),
+            padding: [0.0, 0.0, 0.0]
+        }
+
+        // Upload to GPU
+        metal_update_buffer(self.frame_uniform_buffer.handle, &self.current_frame_uniforms, size_of::<FrameUniforms>())
+
+        // Create command buffer
+        self.current_command_buffer = metal_create_command_buffer(self.command_queue)
+    }
+
+    fn submit_mesh(&mut self, mesh_id: u32, material_id: u32, model_matrix: Mat4, bone_matrices: ?&[Mat4; MAX_BONES], is_selected: bool, tint: Vec4) {
+        if mesh_id >= self.mesh_count {
+            return
+        }
+
+        let mesh = &self.meshes[mesh_id]
+        let material = &self.materials[material_id]
+
+        let layer = match material.blend_mode {
+            BlendMode::Opaque => RenderLayer::OpaqueObjects,
+            BlendMode::AlphaTest => RenderLayer::AlphaTestObjects,
+            _ => RenderLayer::TransparentObjects
+        }
+
+        var call = DrawCall {
+            mesh_gpu: mesh_id,
+            material_id: material_id,
+            object_uniforms: ObjectUniforms {
+                model_matrix: model_matrix,
+                normal_matrix: mat4_inverse_transpose(model_matrix),
+                tint_color: tint,
+                selection_color: if is_selected { Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.3 } } else { Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 } },
+                object_id: mesh_id,
+                is_selected: if is_selected { 1 } else { 0 },
+                padding: [0, 0]
+            },
+            bone_uniforms: null,
+            sort_key: 0,
+            layer: layer
+        }
+
+        self.render_queue.add(call)
+    }
+
+    fn end_frame(&mut self, render_target: u64) {
+        let camera_pos = Vec3 {
+            x: self.current_frame_uniforms.camera_position.x,
+            y: self.current_frame_uniforms.camera_position.y,
+            z: self.current_frame_uniforms.camera_position.z
+        }
+
+        // Sort draw calls
+        self.render_queue.compute_sort_keys(camera_pos)
+        self.render_queue.sort()
+
+        // Begin render pass
+        self.current_render_encoder = metal_begin_render_pass(self.current_command_buffer, render_target)
+
+        // Bind frame uniforms
+        metal_set_vertex_buffer(self.current_render_encoder, self.frame_uniform_buffer.handle, 0)
+        metal_set_fragment_buffer(self.current_render_encoder, self.frame_uniform_buffer.handle, 0)
+
+        // Render all draw calls
+        var current_pipeline: u64 = 0
+        var current_material: u32 = 0xFFFFFFFF
+
+        for i in 0..self.render_queue.draw_call_count {
+            let call = &self.render_queue.draw_calls[i]
+            let mesh = &self.meshes[call.mesh_gpu]
+            let material = &self.materials[call.material_id]
+
+            // Switch pipeline if needed
+            let pipeline = self.get_pipeline_for_material(material)
+            if pipeline.handle != current_pipeline {
+                metal_set_pipeline(self.current_render_encoder, pipeline.handle)
+                current_pipeline = pipeline.handle
+            }
+
+            // Bind material textures if changed
+            if call.material_id != current_material {
+                if material.diffuse_texture < self.texture_count {
+                    metal_set_fragment_texture(self.current_render_encoder, self.textures[material.diffuse_texture].handle, 0)
+                }
+                if material.normal_texture < self.texture_count {
+                    metal_set_fragment_texture(self.current_render_encoder, self.textures[material.normal_texture].handle, 1)
+                }
+                current_material = call.material_id
+            }
+
+            // Upload object uniforms
+            metal_update_buffer_offset(self.object_uniform_buffer.handle, &call.object_uniforms, size_of::<ObjectUniforms>(), i * size_of::<ObjectUniforms>())
+            metal_set_vertex_buffer_offset(self.current_render_encoder, self.object_uniform_buffer.handle, 1, i * size_of::<ObjectUniforms>())
+
+            // Bind bone matrices if skinned
+            if mesh.is_skinned and call.bone_uniforms != null {
+                metal_update_buffer(self.bone_uniform_buffer.handle, call.bone_uniforms.unwrap(), size_of::<BoneUniforms>())
+                metal_set_vertex_buffer(self.current_render_encoder, self.bone_uniform_buffer.handle, 2)
+            }
+
+            // Bind mesh buffers and draw
+            metal_set_vertex_buffer(self.current_render_encoder, mesh.vertex_buffer.handle, 3)
+            metal_draw_indexed(self.current_render_encoder, mesh.index_buffer.handle, mesh.index_count, mesh.primitive_type as u32)
+        }
+
+        // End render pass
+        metal_end_render_pass(self.current_render_encoder)
+
+        // Commit command buffer
+        metal_commit_command_buffer(self.current_command_buffer)
+    }
+
+    // ========================================================================
+    // Frustum Culling
+    // ========================================================================
+
+    fn is_visible(&self, mesh_id: u32, model_matrix: Mat4) -> bool {
+        if mesh_id >= self.mesh_count {
+            return false
+        }
+
+        let mesh = &self.meshes[mesh_id]
+
+        // Transform bounding sphere to world space
+        let world_center = mat4_transform_point(model_matrix, mesh.bounding_sphere_center)
+
+        // Extract frustum planes from view-projection matrix
+        let vp = self.current_frame_uniforms.view_projection
+
+        // Test against each frustum plane (simplified)
+        // Left plane
+        let left = Vec4 {
+            x: vp.m[3] + vp.m[0],
+            y: vp.m[7] + vp.m[4],
+            z: vp.m[11] + vp.m[8],
+            w: vp.m[15] + vp.m[12]
+        }
+        if dot_plane_point(left, world_center) < -mesh.bounding_sphere_radius {
+            return false
+        }
+
+        // Right plane
+        let right = Vec4 {
+            x: vp.m[3] - vp.m[0],
+            y: vp.m[7] - vp.m[4],
+            z: vp.m[11] - vp.m[8],
+            w: vp.m[15] - vp.m[12]
+        }
+        if dot_plane_point(right, world_center) < -mesh.bounding_sphere_radius {
+            return false
+        }
+
+        // Top/Bottom/Near/Far planes... (similar)
+
+        return true
+    }
+
+    // ========================================================================
+    // Cleanup
+    // ========================================================================
+
+    fn destroy_mesh(&mut self, mesh_id: u32) {
+        if mesh_id >= self.mesh_count {
+            return
+        }
+
+        metal_destroy_buffer(self.meshes[mesh_id].vertex_buffer.handle)
+        metal_destroy_buffer(self.meshes[mesh_id].index_buffer.handle)
+    }
+
+    fn destroy(&mut self) {
+        for i in 0..self.mesh_count {
+            self.destroy_mesh(i)
+        }
+
+        for i in 0..self.texture_count {
+            metal_destroy_texture(self.textures[i].handle)
+        }
+
+        metal_destroy_buffer(self.frame_uniform_buffer.handle)
+        metal_destroy_buffer(self.object_uniform_buffer.handle)
+        metal_destroy_buffer(self.bone_uniform_buffer.handle)
+        metal_destroy_buffer(self.material_uniform_buffer.handle)
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn mat4_identity() -> Mat4 {
+    Mat4 {
+        m: [1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn mat4_multiply(a: Mat4, b: Mat4) -> Mat4 {
+    var result = Mat4 { m: [0.0; 16] }
+
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                result.m[i * 4 + j] += a.m[i * 4 + k] * b.m[k * 4 + j]
+            }
+        }
+    }
+
+    return result
+}
+
+fn mat4_inverse_transpose(m: Mat4) -> Mat4 {
+    // Simplified - just returns normal matrix for uniform scaling
+    // Full implementation would compute proper inverse transpose
+    return m
+}
+
+fn mat4_transform_point(m: Mat4, p: Vec3) -> Vec3 {
+    Vec3 {
+        x: m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12],
+        y: m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+        z: m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14]
+    }
+}
+
+fn distance(a: Vec3, b: Vec3) -> f32 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let dz = b.z - a.z
+    return sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+fn distance_squared(a: Vec3, b: Vec3) -> f32 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let dz = b.z - a.z
+    return dx * dx + dy * dy + dz * dz
+}
+
+fn dot_plane_point(plane: Vec4, point: Vec3) -> f32 {
+    return plane.x * point.x + plane.y * point.y + plane.z * point.z + plane.w
+}
+
+fn calculate_mip_levels(width: u32, height: u32) -> u32 {
+    var levels: u32 = 1
+    var size = max(width, height)
+    while size > 1 {
+        size /= 2
+        levels += 1
+    }
+    return levels
+}
+
+fn max(a: u32, b: u32) -> u32 {
+    if a > b { return a }
+    return b
+}
+
+fn create_buffer(device: u64, size: u32, usage: BufferUsage) -> GPUBuffer {
+    GPUBuffer {
+        handle: metal_create_buffer_empty(device, size),
+        size: size,
+        stride: 0,
+        usage: usage
+    }
+}
+
+fn create_shadow_map(device: u64, size: u32) -> GPUTexture {
+    GPUTexture {
+        handle: metal_create_depth_texture(device, size, size),
+        width: size,
+        height: size,
+        format: TextureFormat::Depth32,
+        mip_levels: 1
+    }
+}
+
+// ============================================================================
+// External Metal Functions
+// ============================================================================
+
+extern fn metal_create_command_queue(device: u64) -> u64
+extern fn metal_create_pipeline(device: u64, vertex: string, fragment: string, blend: bool, depth_test: bool, depth_write: bool) -> u64
+extern fn metal_create_buffer(device: u64, size: u32, data: *const u8) -> u64
+extern fn metal_create_buffer_empty(device: u64, size: u32) -> u64
+extern fn metal_create_texture(device: u64, width: u32, height: u32, format: u32, mips: u32, data: *const u8, data_len: u32) -> u64
+extern fn metal_create_depth_texture(device: u64, width: u32, height: u32) -> u64
+extern fn metal_update_buffer(buffer: u64, data: *const u8, size: u32)
+extern fn metal_update_buffer_offset(buffer: u64, data: *const u8, size: u32, offset: u32)
+extern fn metal_create_command_buffer(queue: u64) -> u64
+extern fn metal_begin_render_pass(cmd_buffer: u64, target: u64) -> u64
+extern fn metal_set_pipeline(encoder: u64, pipeline: u64)
+extern fn metal_set_vertex_buffer(encoder: u64, buffer: u64, index: u32)
+extern fn metal_set_vertex_buffer_offset(encoder: u64, buffer: u64, index: u32, offset: u32)
+extern fn metal_set_fragment_buffer(encoder: u64, buffer: u64, index: u32)
+extern fn metal_set_fragment_texture(encoder: u64, texture: u64, index: u32)
+extern fn metal_draw_indexed(encoder: u64, index_buffer: u64, index_count: u32, primitive: u32)
+extern fn metal_end_render_pass(encoder: u64)
+extern fn metal_commit_command_buffer(cmd_buffer: u64)
+extern fn metal_destroy_buffer(buffer: u64)
+extern fn metal_destroy_texture(texture: u64)
+extern fn get_time_seconds() -> f32
+extern fn sqrt(x: f32) -> f32
+extern fn size_of<T>() -> u32

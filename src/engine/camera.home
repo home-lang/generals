@@ -1,317 +1,418 @@
-// ============================================================================
-// Camera System for 2D RTS View
-// Handles world-to-screen coordinate transformation
-// ============================================================================
+// C&C Generals Zero Hour - Home Port
+// Camera System
+//
+// Original: Camera.cpp (Westwood Studios/EA)
+// Ported to Home with modern camera controls
 
-from basics import Collection
+import graphics/mesh
 
-// ============================================================================
-// 2D Vector Helper
-// ============================================================================
-
-struct Vec2 {
-    x: Float,
-    y: Float,
+// Camera projection types
+enum CameraProjection {
+    Perspective
+    Orthographic
 }
 
-fn vec2_init(x: Float, y: Float) -> Vec2 {
-    let v = Vec2 {}
-    v.x = x
-    v.y = y
-    return v
+// Camera movement modes
+enum CameraMode {
+    FreeCam      // Free movement (dev mode)
+    RTS          // RTS camera (main game mode)
+    Cinematic    // Scripted camera movement
 }
 
-fn vec2_sub(a: Vec2, b: Vec2) -> Vec2 {
-    return vec2_init(a.x - b.x, a.y - b.y)
+// 4x4 Matrix for transformations
+struct Mat4 {
+    m: [16]f32
+
+    fn identity(): Mat4 {
+        return Mat4 {
+            m: [16]f32{
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0
+            }
+        }
+    }
+
+    fn perspective(fov: f32, aspect: f32, near: f32, far: f32): Mat4 {
+        let mut result = Mat4.identity()
+
+        let tan_half_fov = @tan(fov * 0.5)
+
+        result.m[0] = 1.0 / (aspect * tan_half_fov)
+        result.m[5] = 1.0 / tan_half_fov
+        result.m[10] = -(far + near) / (far - near)
+        result.m[11] = -1.0
+        result.m[14] = -(2.0 * far * near) / (far - near)
+        result.m[15] = 0.0
+
+        return result
+    }
+
+    fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32): Mat4 {
+        let mut result = Mat4.identity()
+
+        result.m[0] = 2.0 / (right - left)
+        result.m[5] = 2.0 / (top - bottom)
+        result.m[10] = -2.0 / (far - near)
+        result.m[12] = -(right + left) / (right - left)
+        result.m[13] = -(top + bottom) / (top - bottom)
+        result.m[14] = -(far + near) / (far - near)
+
+        return result
+    }
+
+    fn look_at(eye: Vec3, center: Vec3, up: Vec3): Mat4 {
+        let mut result = Mat4.identity()
+
+        // Calculate forward vector
+        let f = Vec3 {
+            x: center.x - eye.x
+            y: center.y - eye.y
+            z: center.z - eye.z
+        }.normalize()
+
+        // Calculate right vector
+        let r = f.cross(up).normalize()
+
+        // Calculate up vector
+        let u = r.cross(f)
+
+        result.m[0] = r.x
+        result.m[4] = r.y
+        result.m[8] = r.z
+
+        result.m[1] = u.x
+        result.m[5] = u.y
+        result.m[9] = u.z
+
+        result.m[2] = -f.x
+        result.m[6] = -f.y
+        result.m[10] = -f.z
+
+        result.m[12] = -r.dot(eye)
+        result.m[13] = -u.dot(eye)
+        result.m[14] = f.dot(eye)
+
+        return result
+    }
+
+    fn multiply(self, other: Mat4): Mat4 {
+        let mut result = Mat4.identity()
+
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut sum: f32 = 0.0
+                for k in 0..4 {
+                    sum += self.m[i * 4 + k] * other.m[k * 4 + j]
+                }
+                result.m[i * 4 + j] = sum
+            }
+        }
+
+        return result
+    }
 }
 
-fn vec2_scale(v: Vec2, s: Float) -> Vec2 {
-    return vec2_init(v.x * s, v.y * s)
+// Frustum planes for culling
+struct Frustum {
+    planes: [6]Plane  // Left, Right, Bottom, Top, Near, Far
 }
 
-// ============================================================================
-// Camera Structure
-// ============================================================================
+struct Plane {
+    normal: Vec3
+    distance: f32
 
-/// 2D Camera for RTS game
+    fn distance_to_point(self, point: Vec3): f32 {
+        return self.normal.dot(point) + self.distance
+    }
+}
+
+// Camera structure
 struct Camera {
-    /// Camera position in world space
-    position: Vec2,
+    // Position and orientation
+    position: Vec3
+    target: Vec3  // Look-at target
+    up: Vec3
+    forward: Vec3
+    right: Vec3
 
-    /// Zoom level (1.0 = normal, 2.0 = 2x zoom in, 0.5 = 2x zoom out)
-    zoom: Float,
+    // Projection parameters
+    projection_type: CameraProjection
+    fov: f32  // Field of view (radians)
+    aspect_ratio: f32
+    near_plane: f32
+    far_plane: f32
 
-    /// Viewport size (screen dimensions)
-    viewport_width: Float,
-    viewport_height: Float,
+    // Orthographic bounds
+    ortho_left: f32
+    ortho_right: f32
+    ortho_bottom: f32
+    ortho_top: f32
 
-    /// Camera movement speed (units per second)
-    pan_speed: Float,
+    // Camera mode
+    mode: CameraMode
 
-    /// Zoom speed (zoom factor per second)
-    zoom_speed: Float,
+    // RTS camera specific
+    zoom: f32  // Distance from ground
+    pitch: f32  // Angle from ground
+    yaw: f32    // Rotation around up axis
+    min_zoom: f32
+    max_zoom: f32
 
-    /// Min/max zoom levels
-    min_zoom: Float,
-    max_zoom: Float,
-}
+    // Movement speed
+    move_speed: f32
+    rotate_speed: f32
+    zoom_speed: f32
 
-fn create_camera(viewport_width: Float, viewport_height: Float) -> Camera {
-    let camera = Camera {}
-    camera.position = vec2_init(0.0, 0.0)
-    camera.zoom = 1.0
-    camera.viewport_width = viewport_width
-    camera.viewport_height = viewport_height
-    camera.pan_speed = 500.0   // pixels per second
-    camera.zoom_speed = 2.0    // zoom factor per second
-    camera.min_zoom = 0.25     // 4x zoom out
-    camera.max_zoom = 4.0      // 4x zoom in
-    return camera
-}
+    // Matrices
+    view_matrix: Mat4
+    projection_matrix: Mat4
+    view_projection_matrix: Mat4
 
-/// Convert world coordinates to screen coordinates
-fn world_to_screen(camera: Camera, world_pos: Vec2) -> Vec2 {
-    // Apply camera transformation
-    let relative = vec2_sub(world_pos, camera.position)
-    let scaled = vec2_scale(relative, camera.zoom)
+    // Frustum
+    frustum: Frustum
 
-    // Center on screen
-    let screen_x = scaled.x + camera.viewport_width / 2.0
-    let screen_y = scaled.y + camera.viewport_height / 2.0
-
-    return vec2_init(screen_x, screen_y)
-}
-
-/// Convert screen coordinates to world coordinates
-fn screen_to_world(camera: Camera, screen_pos: Vec2) -> Vec2 {
-    // Uncenter from screen
-    let centered_x = screen_pos.x - camera.viewport_width / 2.0
-    let centered_y = screen_pos.y - camera.viewport_height / 2.0
-
-    // Unscale and add camera position
-    let world_x = centered_x / camera.zoom + camera.position.x
-    let world_y = centered_y / camera.zoom + camera.position.y
-
-    return vec2_init(world_x, world_y)
-}
-
-/// Pan camera (move in world space)
-fn pan(camera: Camera, delta_x: Float, delta_y: Float) {
-    camera.position.x = camera.position.x + delta_x
-    camera.position.y = camera.position.y + delta_y
-}
-
-/// Pan with delta time (for smooth movement)
-fn pan_with_delta(camera: Camera, dir_x: Float, dir_y: Float, dt: Float) {
-    let distance = camera.pan_speed * dt / camera.zoom  // Adjust speed based on zoom
-    camera.position.x = camera.position.x + dir_x * distance
-    camera.position.y = camera.position.y + dir_y * distance
-}
-
-/// Zoom in/out
-fn set_zoom(camera: Camera, new_zoom: Float) {
-    // Clamp zoom between min and max
-    let clamped = new_zoom
-    if clamped < camera.min_zoom {
-        clamped = camera.min_zoom
+    fn init(position: Vec3, target: Vec3): Camera {
+        return Camera {
+            position: position
+            target: target
+            up: Vec3.init(0.0, 1.0, 0.0)
+            forward: Vec3.init(0.0, 0.0, 1.0)
+            right: Vec3.init(1.0, 0.0, 0.0)
+            projection_type: CameraProjection.Perspective
+            fov: 1.0472  // 60 degrees in radians
+            aspect_ratio: 16.0 / 9.0
+            near_plane: 0.1
+            far_plane: 10000.0
+            ortho_left: -100.0
+            ortho_right: 100.0
+            ortho_bottom: -100.0
+            ortho_top: 100.0
+            mode: CameraMode.RTS
+            zoom: 50.0
+            pitch: 0.785  // 45 degrees
+            yaw: 0.0
+            min_zoom: 10.0
+            max_zoom: 200.0
+            move_speed: 50.0
+            rotate_speed: 2.0
+            zoom_speed: 10.0
+            view_matrix: Mat4.identity()
+            projection_matrix: Mat4.identity()
+            view_projection_matrix: Mat4.identity()
+            frustum: Frustum { planes: [6]Plane{} }
+        }
     }
-    if clamped > camera.max_zoom {
-        clamped = camera.max_zoom
+
+    fn update_rts(mut self, delta_time: f32) {
+        // RTS camera orbits around a ground target point
+        // Calculate position based on zoom, pitch, and yaw
+
+        let x = self.zoom * @cos(self.pitch) * @sin(self.yaw)
+        let y = self.zoom * @sin(self.pitch)
+        let z = self.zoom * @cos(self.pitch) * @cos(self.yaw)
+
+        self.position = Vec3 {
+            x: self.target.x + x
+            y: self.target.y + y
+            z: self.target.z + z
+        }
+
+        self.update_matrices()
     }
-    camera.zoom = clamped
+
+    fn update_free_cam(mut self, delta_time: f32) {
+        // Free camera uses forward/right vectors for movement
+        self.update_matrices()
+    }
+
+    fn update_matrices(mut self) {
+        // Update view matrix
+        self.view_matrix = Mat4.look_at(self.position, self.target, self.up)
+
+        // Update projection matrix
+        match self.projection_type {
+            CameraProjection.Perspective => {
+                self.projection_matrix = Mat4.perspective(
+                    self.fov,
+                    self.aspect_ratio,
+                    self.near_plane,
+                    self.far_plane
+                )
+            }
+            CameraProjection.Orthographic => {
+                self.projection_matrix = Mat4.orthographic(
+                    self.ortho_left,
+                    self.ortho_right,
+                    self.ortho_bottom,
+                    self.ortho_top,
+                    self.near_plane,
+                    self.far_plane
+                )
+            }
+        }
+
+        // Combine matrices
+        self.view_projection_matrix = self.projection_matrix.multiply(self.view_matrix)
+
+        // Update frustum
+        self.update_frustum()
+    }
+
+    fn update_frustum(mut self) {
+        // Extract frustum planes from view-projection matrix
+        // TODO: Implement frustum extraction from matrix
+    }
+
+    fn move_forward(mut self, amount: f32) {
+        match self.mode {
+            CameraMode.RTS => {
+                // Move target forward in xz plane
+                let forward_xz = Vec3 {
+                    x: @sin(self.yaw)
+                    y: 0.0
+                    z: @cos(self.yaw)
+                }.normalize()
+
+                self.target.x += forward_xz.x * amount
+                self.target.z += forward_xz.z * amount
+            }
+            CameraMode.FreeCam => {
+                self.position.x += self.forward.x * amount
+                self.position.y += self.forward.y * amount
+                self.position.z += self.forward.z * amount
+            }
+            _ => {}
+        }
+    }
+
+    fn move_right(mut self, amount: f32) {
+        match self.mode {
+            CameraMode.RTS => {
+                let right_xz = Vec3 {
+                    x: @cos(self.yaw)
+                    y: 0.0
+                    z: -@sin(self.yaw)
+                }.normalize()
+
+                self.target.x += right_xz.x * amount
+                self.target.z += right_xz.z * amount
+            }
+            CameraMode.FreeCam => {
+                self.position.x += self.right.x * amount
+                self.position.y += self.right.y * amount
+                self.position.z += self.right.z * amount
+            }
+            _ => {}
+        }
+    }
+
+    fn rotate(mut self, yaw_delta: f32, pitch_delta: f32) {
+        match self.mode {
+            CameraMode.RTS => {
+                self.yaw += yaw_delta
+                self.pitch += pitch_delta
+
+                // Clamp pitch for RTS camera
+                const MIN_PITCH: f32 = 0.1  // ~6 degrees
+                const MAX_PITCH: f32 = 1.48  // ~85 degrees
+
+                if self.pitch < MIN_PITCH {
+                    self.pitch = MIN_PITCH
+                }
+                if self.pitch > MAX_PITCH {
+                    self.pitch = MAX_PITCH
+                }
+            }
+            CameraMode.FreeCam => {
+                // TODO: Update forward/right vectors for free cam
+            }
+            _ => {}
+        }
+    }
+
+    fn zoom(mut self, amount: f32) {
+        self.zoom += amount
+
+        if self.zoom < self.min_zoom {
+            self.zoom = self.min_zoom
+        }
+        if self.zoom > self.max_zoom {
+            self.zoom = self.max_zoom
+        }
+    }
+
+    fn set_aspect_ratio(mut self, width: u32, height: u32) {
+        self.aspect_ratio = @intToFloat(f32, width) / @intToFloat(f32, height)
+    }
+
+    fn is_box_in_frustum(self, bbox: BoundingBox): bool {
+        // Check if bounding box is inside frustum
+        // TODO: Implement frustum culling test
+        return true
+    }
+
+    fn screen_to_world_ray(self, screen_x: f32, screen_y: f32): Ray {
+        // Convert screen coordinates to world-space ray
+        // TODO: Implement ray casting from screen
+        return Ray {
+            origin: self.position
+            direction: self.forward
+        }
+    }
 }
 
-/// Zoom with delta (smooth zoom)
-fn zoom_with_delta(camera: Camera, zoom_delta: Float, dt: Float) {
-    let new_zoom = camera.zoom * (1.0 + zoom_delta * camera.zoom_speed * dt)
-    set_zoom(camera, new_zoom)
+struct Ray {
+    origin: Vec3
+    direction: Vec3
 }
 
-/// Reset camera to default position and zoom
-fn reset_camera(camera: Camera) {
-    camera.position = vec2_init(0.0, 0.0)
-    camera.zoom = 1.0
+// Global camera instance
+var g_camera: ?Camera = null
+
+export fn init_camera(position: Vec3, target: Vec3) {
+    g_camera = Camera.init(position, target)
 }
 
-/// Update viewport size (called when window is resized)
-fn set_viewport_size(camera: Camera, width: Float, height: Float) {
-    camera.viewport_width = width
-    camera.viewport_height = height
+export fn update_camera(delta_time: f32) {
+    if g_camera {
+        match g_camera.?.mode {
+            CameraMode.RTS => {
+                g_camera.?.update_rts(delta_time)
+            }
+            CameraMode.FreeCam => {
+                g_camera.?.update_free_cam(delta_time)
+            }
+            _ => {}
+        }
+    }
 }
 
-/// Check if a world position is visible on screen
-fn is_visible(camera: Camera, world_pos: Vec2, margin: Float) -> Bool {
-    let screen_pos = world_to_screen(camera, world_pos)
-
-    return screen_pos.x >= -margin &&
-           screen_pos.x <= camera.viewport_width + margin &&
-           screen_pos.y >= -margin &&
-           screen_pos.y <= camera.viewport_height + margin
+export fn get_camera(): ?*Camera {
+    if g_camera {
+        return &g_camera.?
+    }
+    return null
 }
 
-/// Get visible world bounds
-struct VisibleBounds {
-    min_x: Float,
-    min_y: Float,
-    max_x: Float,
-    max_y: Float,
+export fn get_view_matrix(): Mat4 {
+    if g_camera {
+        return g_camera.?.view_matrix
+    }
+    return Mat4.identity()
 }
 
-fn get_visible_bounds(camera: Camera) -> VisibleBounds {
-    let top_left = screen_to_world(camera, vec2_init(0.0, 0.0))
-    let bottom_right = screen_to_world(camera, vec2_init(camera.viewport_width, camera.viewport_height))
-
-    let bounds = VisibleBounds {}
-    bounds.min_x = top_left.x
-    bounds.min_y = top_left.y
-    bounds.max_x = bottom_right.x
-    bounds.max_y = bottom_right.y
-
-    return bounds
+export fn get_projection_matrix(): Mat4 {
+    if g_camera {
+        return g_camera.?.projection_matrix
+    }
+    return Mat4.identity()
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-fn test_world_to_screen() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    // Center of world should map to center of screen
-    let world_center = vec2_init(0.0, 0.0)
-    let screen_center = world_to_screen(camera, world_center)
-
-    assert(abs(screen_center.x - 400.0) < 0.01, "Screen X should be 400")
-    assert(abs(screen_center.y - 300.0) < 0.01, "Screen Y should be 300")
-
-    return true
-}
-
-fn test_screen_to_world() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    // Center of screen should map to center of world
-    let screen_center = vec2_init(400.0, 300.0)
-    let world_center = screen_to_world(camera, screen_center)
-
-    assert(abs(world_center.x) < 0.01, "World X should be 0")
-    assert(abs(world_center.y) < 0.01, "World Y should be 0")
-
-    return true
-}
-
-fn test_pan() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    pan(camera, 100.0, 50.0)
-
-    assert(camera.position.x == 100.0, "Position X should be 100")
-    assert(camera.position.y == 50.0, "Position Y should be 50")
-
-    return true
-}
-
-fn test_zoom() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    set_zoom(camera, 2.0)
-    assert(camera.zoom == 2.0, "Zoom should be 2.0")
-
-    // Test clamping to max
-    set_zoom(camera, 10.0)
-    assert(camera.zoom == 4.0, "Zoom should clamp to max 4.0")
-
-    // Test clamping to min
-    set_zoom(camera, 0.1)
-    assert(camera.zoom == 0.25, "Zoom should clamp to min 0.25")
-
-    return true
-}
-
-fn test_zoom_with_delta() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    // Zoom in slightly
-    zoom_with_delta(camera, 0.1, 1.0)
-    assert(camera.zoom > 1.0, "Zoom should increase")
-
-    return true
-}
-
-fn test_pan_with_delta() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    pan_with_delta(camera, 1.0, 0.0, 1.0)
-    assert(camera.position.x > 0.0, "Position X should increase")
-
-    return true
-}
-
-fn test_reset() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    pan(camera, 100.0, 50.0)
-    set_zoom(camera, 2.0)
-
-    reset_camera(camera)
-
-    assert(camera.position.x == 0.0, "Position X should reset")
-    assert(camera.position.y == 0.0, "Position Y should reset")
-    assert(camera.zoom == 1.0, "Zoom should reset")
-
-    return true
-}
-
-fn test_viewport_resize() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    set_viewport_size(camera, 1024.0, 768.0)
-
-    assert(camera.viewport_width == 1024.0, "Width should update")
-    assert(camera.viewport_height == 768.0, "Height should update")
-
-    return true
-}
-
-fn test_visibility() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    // Position at center should be visible
-    let center = vec2_init(0.0, 0.0)
-    assert(is_visible(camera, center, 0.0), "Center should be visible")
-
-    // Position far away should not be visible
-    let far_away = vec2_init(10000.0, 10000.0)
-    assert(!is_visible(camera, far_away, 0.0), "Far position should not be visible")
-
-    return true
-}
-
-fn test_visible_bounds() -> Bool {
-    let camera = create_camera(800.0, 600.0)
-
-    let bounds = get_visible_bounds(camera)
-
-    // At zoom 1.0, visible area should be viewport size
-    let width = bounds.max_x - bounds.min_x
-    let height = bounds.max_y - bounds.min_y
-
-    assert(abs(width - 800.0) < 1.0, "Visible width should match viewport")
-    assert(abs(height - 600.0) < 1.0, "Visible height should match viewport")
-
-    return true
-}
-
-fn run_all_tests() -> Bool {
-    assert(test_world_to_screen(), "World to screen test failed")
-    assert(test_screen_to_world(), "Screen to world test failed")
-    assert(test_pan(), "Pan test failed")
-    assert(test_zoom(), "Zoom test failed")
-    assert(test_zoom_with_delta(), "Zoom with delta test failed")
-    assert(test_pan_with_delta(), "Pan with delta test failed")
-    assert(test_reset(), "Reset test failed")
-    assert(test_viewport_resize(), "Viewport resize test failed")
-    assert(test_visibility(), "Visibility test failed")
-    assert(test_visible_bounds(), "Visible bounds test failed")
-    return true
+export fn get_view_projection_matrix(): Mat4 {
+    if g_camera {
+        return g_camera.?.view_projection_matrix
+    }
+    return Mat4.identity()
 }

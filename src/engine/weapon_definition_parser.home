@@ -1,0 +1,700 @@
+// Weapon Definition Parser - Parses weapon INI files for C&C Generals
+// Handles Weapon blocks from Data/INI/Weapon.ini and related files
+
+use std::collections::HashMap
+
+// Weapon damage types matching Thyme's DamageType enum
+enum DamageType {
+    Explosion,
+    Crush,
+    Armor_Piercing,
+    Small_Arms,
+    Gattling,
+    Radiation,
+    Flame,
+    Laser,
+    Sniper,
+    Poison,
+    Healing,
+    Unresistable,
+    Water,
+    DeployDeath,
+    Surrender,
+    Hack,
+    Kill_Pilot,
+    Penalty,
+    Falling,
+    Melee,
+    Disarm,
+    Hazard_Cleanup,
+    Particle_Beam,
+    Toppling,
+    Infantry_Missile,
+    Aurora_Bomb,
+    Land_Mine,
+    JetFuel,
+    Stealthjet_Missile,
+    Molotov,
+    Comanche_Vulcan,
+    FlakBullet,
+    Status,
+    Subdual_Damage,
+    Microwave,
+}
+
+// Weapon fire types
+enum WeaponFireType {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+// Projectile detonation types
+enum DetonationType {
+    Contact,
+    Proximity,
+    Timed,
+    AtTarget,
+}
+
+// Weapon scatter types
+enum ScatterType {
+    None,
+    Circle,
+    Line,
+    Ring,
+}
+
+// A single damage nugget within a weapon
+struct DamageNugget {
+    damage: f32,
+    radius: f32,
+    damage_type: DamageType,
+    death_type: string,
+    damage_scalar_infantry: f32,
+    damage_scalar_vehicle: f32,
+    damage_scalar_structure: f32,
+    damage_scalar_air: f32,
+    damage_arc: f32,
+    damage_max_height: f32,
+    damage_speed: f32,
+    delay_time: u32,
+    is_valid: bool,
+}
+
+// Weapon projectile definition
+struct ProjectileData {
+    projectile_name: string,
+    projectile_speed: f32,
+    projectile_arc: f32,
+    projectile_turn_rate: f32,
+    projectile_self_homing: bool,
+    detonation_type: DetonationType,
+    detonation_delay: u32,
+    projectile_fx: string,
+    exhaust_fx: string,
+    is_valid: bool,
+}
+
+// Complete weapon definition
+struct WeaponDefinition {
+    name: string,
+
+    // Attack parameters
+    attack_range: f32,
+    minimum_attack_range: f32,
+    range_bonus_per_rank: f32,
+    request_assist_range: f32,
+
+    // Damage
+    primary_damage: f32,
+    primary_damage_radius: f32,
+    secondary_damage: f32,
+    secondary_damage_radius: f32,
+    damage_type: DamageType,
+    death_type: string,
+
+    // Damage nuggets (modern INI format)
+    damage_nuggets: [DamageNugget; 8],
+    damage_nugget_count: u32,
+
+    // Firing mechanics
+    delay_between_shots: u32,
+    pre_attack_delay: u32,
+    fire_sound_loop_time: u32,
+    clip_size: u32,
+    clip_reload_time: u32,
+    auto_reload_when_idle: bool,
+    continue_attack_range: f32,
+
+    // Targeting
+    anti_mask: u32,
+    affected_by_mask: u32,
+    scatter_radius: f32,
+    scatter_radius_vs_infantry: f32,
+    scatter_target_scalar: f32,
+    scatter_type: ScatterType,
+
+    // Projectile
+    projectile: ProjectileData,
+
+    // Bonuses
+    damage_bonus_percent: f32,
+    rate_of_fire_bonus_percent: f32,
+
+    // Visual/Audio
+    fire_fx: string,
+    fire_fx_bone: string,
+    fire_sound: string,
+    weapon_template_id: u32,
+
+    is_valid: bool,
+}
+
+const MAX_WEAPONS: u32 = 1024
+const MAX_DAMAGE_NUGGETS: u32 = 8
+
+struct WeaponDefinitionParser {
+    weapons: [WeaponDefinition; MAX_WEAPONS],
+    weapon_count: u32,
+    weapon_name_to_index: HashMap<string, u32>,
+
+    // Current parse state
+    current_weapon: u32,
+    current_nugget: u32,
+    in_weapon_block: bool,
+    in_damage_nugget: bool,
+    in_projectile_block: bool,
+
+    // Error tracking
+    parse_errors: [string; 256],
+    error_count: u32,
+}
+
+impl WeaponDefinitionParser {
+    fn new() -> Self {
+        let mut parser = WeaponDefinitionParser {
+            weapons: [WeaponDefinition::default(); MAX_WEAPONS],
+            weapon_count: 0,
+            weapon_name_to_index: HashMap::new(),
+            current_weapon: 0,
+            current_nugget: 0,
+            in_weapon_block: false,
+            in_damage_nugget: false,
+            in_projectile_block: false,
+            parse_errors: [string::default(); 256],
+            error_count: 0,
+        }
+        parser
+    }
+
+    fn parse_file(&mut self, file_path: string) -> bool {
+        let content = std::fs::read_to_string(file_path)
+        if content.is_empty() {
+            self.add_error("Failed to read file: " + file_path)
+            return false
+        }
+
+        let lines = content.split('\n')
+        let line_num: u32 = 0
+
+        for line in lines {
+            line_num += 1
+            let trimmed = line.trim()
+
+            // Skip empty lines and comments
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue
+            }
+
+            if !self.parse_line(trimmed, line_num) {
+                return false
+            }
+        }
+
+        true
+    }
+
+    fn parse_line(&mut self, line: string, line_num: u32) -> bool {
+        // Handle block starts
+        if line.starts_with("Weapon ") {
+            return self.begin_weapon_block(line)
+        }
+
+        if line.starts_with("DamageNugget") {
+            return self.begin_damage_nugget()
+        }
+
+        if line.starts_with("ProjectileNugget") {
+            return self.begin_projectile_block()
+        }
+
+        // Handle block ends
+        if line == "End" {
+            return self.end_current_block()
+        }
+
+        // Parse properties within blocks
+        if self.in_damage_nugget {
+            return self.parse_damage_nugget_property(line)
+        }
+
+        if self.in_projectile_block {
+            return self.parse_projectile_property(line)
+        }
+
+        if self.in_weapon_block {
+            return self.parse_weapon_property(line)
+        }
+
+        true
+    }
+
+    fn begin_weapon_block(&mut self, line: string) -> bool {
+        if self.weapon_count >= MAX_WEAPONS {
+            self.add_error("Maximum weapon count exceeded")
+            return false
+        }
+
+        // Parse weapon name: "Weapon WeaponName" or "Weapon WeaponName : ParentWeapon"
+        let parts = line.split(' ')
+        if parts.len() < 2 {
+            self.add_error("Invalid weapon declaration: " + line)
+            return false
+        }
+
+        let weapon_name = parts[1].trim()
+        let parent_name: string = ""
+
+        // Check for inheritance
+        if line.contains(":") {
+            let inherit_parts = line.split(':')
+            if inherit_parts.len() >= 2 {
+                weapon_name = inherit_parts[0].split(' ')[1].trim()
+                parent_name = inherit_parts[1].trim()
+            }
+        }
+
+        self.current_weapon = self.weapon_count
+        self.weapons[self.current_weapon] = WeaponDefinition::default()
+        self.weapons[self.current_weapon].name = weapon_name
+        self.weapons[self.current_weapon].is_valid = true
+
+        // Handle inheritance
+        if !parent_name.is_empty() {
+            self.inherit_from(parent_name)
+        }
+
+        self.weapon_name_to_index.insert(weapon_name, self.current_weapon)
+        self.weapon_count += 1
+        self.in_weapon_block = true
+
+        true
+    }
+
+    fn inherit_from(&mut self, parent_name: string) {
+        if let Some(parent_idx) = self.weapon_name_to_index.get(&parent_name) {
+            let parent = &self.weapons[*parent_idx]
+            let current = &mut self.weapons[self.current_weapon]
+
+            // Copy all values from parent
+            current.attack_range = parent.attack_range
+            current.minimum_attack_range = parent.minimum_attack_range
+            current.primary_damage = parent.primary_damage
+            current.primary_damage_radius = parent.primary_damage_radius
+            current.secondary_damage = parent.secondary_damage
+            current.secondary_damage_radius = parent.secondary_damage_radius
+            current.damage_type = parent.damage_type
+            current.death_type = parent.death_type.clone()
+            current.delay_between_shots = parent.delay_between_shots
+            current.pre_attack_delay = parent.pre_attack_delay
+            current.clip_size = parent.clip_size
+            current.clip_reload_time = parent.clip_reload_time
+            current.fire_fx = parent.fire_fx.clone()
+            current.fire_sound = parent.fire_sound.clone()
+            current.projectile = parent.projectile.clone()
+
+            // Copy damage nuggets
+            for i in 0..parent.damage_nugget_count {
+                current.damage_nuggets[i] = parent.damage_nuggets[i].clone()
+            }
+            current.damage_nugget_count = parent.damage_nugget_count
+        }
+    }
+
+    fn begin_damage_nugget(&mut self) -> bool {
+        if !self.in_weapon_block {
+            self.add_error("DamageNugget outside of Weapon block")
+            return false
+        }
+
+        let weapon = &mut self.weapons[self.current_weapon]
+        if weapon.damage_nugget_count >= MAX_DAMAGE_NUGGETS as u32 {
+            self.add_error("Maximum damage nuggets exceeded")
+            return false
+        }
+
+        self.current_nugget = weapon.damage_nugget_count
+        weapon.damage_nuggets[self.current_nugget as usize] = DamageNugget::default()
+        weapon.damage_nuggets[self.current_nugget as usize].is_valid = true
+        weapon.damage_nugget_count += 1
+
+        self.in_damage_nugget = true
+        true
+    }
+
+    fn begin_projectile_block(&mut self) -> bool {
+        if !self.in_weapon_block {
+            self.add_error("ProjectileNugget outside of Weapon block")
+            return false
+        }
+
+        self.weapons[self.current_weapon].projectile = ProjectileData::default()
+        self.weapons[self.current_weapon].projectile.is_valid = true
+        self.in_projectile_block = true
+        true
+    }
+
+    fn end_current_block(&mut self) -> bool {
+        if self.in_damage_nugget {
+            self.in_damage_nugget = false
+        } else if self.in_projectile_block {
+            self.in_projectile_block = false
+        } else if self.in_weapon_block {
+            self.in_weapon_block = false
+        }
+        true
+    }
+
+    fn parse_weapon_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let weapon = &mut self.weapons[self.current_weapon]
+
+        match key.as_str() {
+            "AttackRange" => weapon.attack_range = self.parse_f32(value),
+            "MinimumAttackRange" => weapon.minimum_attack_range = self.parse_f32(value),
+            "RangeBonusPerRank" => weapon.range_bonus_per_rank = self.parse_f32(value),
+            "RequestAssistRange" => weapon.request_assist_range = self.parse_f32(value),
+            "PrimaryDamage" => weapon.primary_damage = self.parse_f32(value),
+            "PrimaryDamageRadius" => weapon.primary_damage_radius = self.parse_f32(value),
+            "SecondaryDamage" => weapon.secondary_damage = self.parse_f32(value),
+            "SecondaryDamageRadius" => weapon.secondary_damage_radius = self.parse_f32(value),
+            "DamageType" => weapon.damage_type = self.parse_damage_type(value),
+            "DeathType" => weapon.death_type = value,
+            "DelayBetweenShots" => weapon.delay_between_shots = self.parse_u32(value),
+            "PreAttackDelay" => weapon.pre_attack_delay = self.parse_u32(value),
+            "FireSoundLoopTime" => weapon.fire_sound_loop_time = self.parse_u32(value),
+            "ClipSize" => weapon.clip_size = self.parse_u32(value),
+            "ClipReloadTime" => weapon.clip_reload_time = self.parse_u32(value),
+            "AutoReloadWhenIdle" => weapon.auto_reload_when_idle = self.parse_bool(value),
+            "ContinueAttackRange" => weapon.continue_attack_range = self.parse_f32(value),
+            "AntiMask" => weapon.anti_mask = self.parse_anti_mask(value),
+            "ScatterRadius" => weapon.scatter_radius = self.parse_f32(value),
+            "ScatterRadiusVsInfantry" => weapon.scatter_radius_vs_infantry = self.parse_f32(value),
+            "ScatterTargetScalar" => weapon.scatter_target_scalar = self.parse_f32(value),
+            "FireFX" => weapon.fire_fx = value,
+            "FireFXBone" => weapon.fire_fx_bone = value,
+            "FireSound" => weapon.fire_sound = value,
+            "ProjectileObject" => weapon.projectile.projectile_name = value,
+            "ProjectileStreamName" => weapon.projectile.projectile_name = value,
+            "DamageBonusPercent" => weapon.damage_bonus_percent = self.parse_f32(value),
+            "RateOfFireBonusPercent" => weapon.rate_of_fire_bonus_percent = self.parse_f32(value),
+            _ => {}, // Unknown property, ignore
+        }
+
+        true
+    }
+
+    fn parse_damage_nugget_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let nugget = &mut self.weapons[self.current_weapon].damage_nuggets[self.current_nugget as usize]
+
+        match key.as_str() {
+            "Damage" => nugget.damage = self.parse_f32(value),
+            "Radius" => nugget.radius = self.parse_f32(value),
+            "DamageType" => nugget.damage_type = self.parse_damage_type(value),
+            "DeathType" => nugget.death_type = value,
+            "DamageScalar" => self.parse_damage_scalar(value, nugget),
+            "DamageArc" => nugget.damage_arc = self.parse_f32(value),
+            "DamageMaxHeight" => nugget.damage_max_height = self.parse_f32(value),
+            "DamageSpeed" => nugget.damage_speed = self.parse_f32(value),
+            "DelayTime" => nugget.delay_time = self.parse_u32(value),
+            _ => {},
+        }
+
+        true
+    }
+
+    fn parse_projectile_property(&mut self, line: string) -> bool {
+        let parts = self.split_property(line)
+        if parts.0.is_empty() {
+            return true
+        }
+
+        let key = parts.0
+        let value = parts.1
+        let projectile = &mut self.weapons[self.current_weapon].projectile
+
+        match key.as_str() {
+            "ProjectileName" => projectile.projectile_name = value,
+            "ProjectileSpeed" => projectile.projectile_speed = self.parse_f32(value),
+            "ProjectileArc" => projectile.projectile_arc = self.parse_f32(value),
+            "ProjectileTurnRate" => projectile.projectile_turn_rate = self.parse_f32(value),
+            "ProjectileSelfHoming" => projectile.projectile_self_homing = self.parse_bool(value),
+            "DetonationType" => projectile.detonation_type = self.parse_detonation_type(value),
+            "DetonationDelay" => projectile.detonation_delay = self.parse_u32(value),
+            "ProjectileFX" => projectile.projectile_fx = value,
+            "ExhaustFX" => projectile.exhaust_fx = value,
+            _ => {},
+        }
+
+        true
+    }
+
+    fn parse_damage_type(&self, value: string) -> DamageType {
+        match value.to_uppercase().as_str() {
+            "EXPLOSION" => DamageType::Explosion,
+            "CRUSH" => DamageType::Crush,
+            "ARMOR_PIERCING" => DamageType::Armor_Piercing,
+            "SMALL_ARMS" => DamageType::Small_Arms,
+            "GATTLING" => DamageType::Gattling,
+            "RADIATION" => DamageType::Radiation,
+            "FLAME" => DamageType::Flame,
+            "LASER" => DamageType::Laser,
+            "SNIPER" => DamageType::Sniper,
+            "POISON" => DamageType::Poison,
+            "HEALING" => DamageType::Healing,
+            "UNRESISTABLE" => DamageType::Unresistable,
+            "WATER" => DamageType::Water,
+            "DEPLOYDEATH" => DamageType::DeployDeath,
+            "SURRENDER" => DamageType::Surrender,
+            "HACK" => DamageType::Hack,
+            "KILL_PILOT" => DamageType::Kill_Pilot,
+            "PENALTY" => DamageType::Penalty,
+            "FALLING" => DamageType::Falling,
+            "MELEE" => DamageType::Melee,
+            "DISARM" => DamageType::Disarm,
+            "HAZARD_CLEANUP" => DamageType::Hazard_Cleanup,
+            "PARTICLE_BEAM" => DamageType::Particle_Beam,
+            "TOPPLING" => DamageType::Toppling,
+            "INFANTRY_MISSILE" => DamageType::Infantry_Missile,
+            "AURORA_BOMB" => DamageType::Aurora_Bomb,
+            "LAND_MINE" => DamageType::Land_Mine,
+            "JETFUEL" => DamageType::JetFuel,
+            "STEALTHJET_MISSILE" => DamageType::Stealthjet_Missile,
+            "MOLOTOV" => DamageType::Molotov,
+            "COMANCHE_VULCAN" => DamageType::Comanche_Vulcan,
+            "FLAKBULLET" => DamageType::FlakBullet,
+            "STATUS" => DamageType::Status,
+            "SUBDUAL_DAMAGE" => DamageType::Subdual_Damage,
+            "MICROWAVE" => DamageType::Microwave,
+            _ => DamageType::Explosion,
+        }
+    }
+
+    fn parse_detonation_type(&self, value: string) -> DetonationType {
+        match value.to_uppercase().as_str() {
+            "CONTACT" => DetonationType::Contact,
+            "PROXIMITY" => DetonationType::Proximity,
+            "TIMED" => DetonationType::Timed,
+            "ATTARGET" => DetonationType::AtTarget,
+            _ => DetonationType::Contact,
+        }
+    }
+
+    fn parse_damage_scalar(&self, value: string, nugget: &mut DamageNugget) {
+        // Format: "INFANTRY:200% VEHICLE:50%"
+        let parts = value.split(' ')
+        for part in parts {
+            if part.contains(':') {
+                let kv = part.split(':')
+                if kv.len() == 2 {
+                    let target = kv[0].to_uppercase()
+                    let scalar = self.parse_percent(kv[1])
+                    match target.as_str() {
+                        "INFANTRY" => nugget.damage_scalar_infantry = scalar,
+                        "VEHICLE" => nugget.damage_scalar_vehicle = scalar,
+                        "STRUCTURE" => nugget.damage_scalar_structure = scalar,
+                        "AIR" => nugget.damage_scalar_air = scalar,
+                        _ => {},
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_anti_mask(&self, value: string) -> u32 {
+        let mut mask: u32 = 0
+        let parts = value.split(' ')
+        for part in parts {
+            match part.to_uppercase().as_str() {
+                "ANTI_GROUND" => mask |= 1,
+                "ANTI_INFANTRY" => mask |= 2,
+                "ANTI_VEHICLE" => mask |= 4,
+                "ANTI_STRUCTURE" => mask |= 8,
+                "ANTI_AIRBORNE_VEHICLE" => mask |= 16,
+                "ANTI_AIRBORNE_INFANTRY" => mask |= 32,
+                "ANTI_MINE" => mask |= 64,
+                "ANTI_PROJECTILE" => mask |= 128,
+                "ANTI_SMALL_MISSILE" => mask |= 256,
+                "ANTI_PARACHUTE" => mask |= 512,
+                "ANTI_BALLISTIC_MISSILE" => mask |= 1024,
+                _ => {},
+            }
+        }
+        mask
+    }
+
+    fn split_property(&self, line: string) -> (string, string) {
+        // Split "Key = Value" or "Key Value"
+        let eq_pos = line.find('=')
+        if eq_pos.is_some() {
+            let idx = eq_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        let space_pos = line.find(' ')
+        if space_pos.is_some() {
+            let idx = space_pos.unwrap()
+            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        }
+
+        (line, "".to_string())
+    }
+
+    fn parse_f32(&self, value: string) -> f32 {
+        value.trim().parse::<f32>().unwrap_or(0.0)
+    }
+
+    fn parse_u32(&self, value: string) -> u32 {
+        value.trim().parse::<u32>().unwrap_or(0)
+    }
+
+    fn parse_bool(&self, value: string) -> bool {
+        let v = value.to_uppercase()
+        v == "YES" || v == "TRUE" || v == "1"
+    }
+
+    fn parse_percent(&self, value: string) -> f32 {
+        // Parse "200%" -> 2.0
+        let trimmed = value.trim().replace('%', "")
+        trimmed.parse::<f32>().unwrap_or(100.0) / 100.0
+    }
+
+    fn add_error(&mut self, msg: string) {
+        if self.error_count < 256 {
+            self.parse_errors[self.error_count as usize] = msg
+            self.error_count += 1
+        }
+    }
+
+    // Public API for accessing weapons
+    fn get_weapon(&self, name: string) -> Option<&WeaponDefinition> {
+        if let Some(idx) = self.weapon_name_to_index.get(&name) {
+            return Some(&self.weapons[*idx as usize])
+        }
+        None
+    }
+
+    fn get_weapon_by_index(&self, index: u32) -> Option<&WeaponDefinition> {
+        if index < self.weapon_count {
+            return Some(&self.weapons[index as usize])
+        }
+        None
+    }
+
+    fn get_weapon_count(&self) -> u32 {
+        self.weapon_count
+    }
+}
+
+// Default implementations
+impl Default for DamageNugget {
+    fn default() -> Self {
+        DamageNugget {
+            damage: 0.0,
+            radius: 0.0,
+            damage_type: DamageType::Explosion,
+            death_type: "".to_string(),
+            damage_scalar_infantry: 1.0,
+            damage_scalar_vehicle: 1.0,
+            damage_scalar_structure: 1.0,
+            damage_scalar_air: 1.0,
+            damage_arc: 360.0,
+            damage_max_height: 0.0,
+            damage_speed: 0.0,
+            delay_time: 0,
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for ProjectileData {
+    fn default() -> Self {
+        ProjectileData {
+            projectile_name: "".to_string(),
+            projectile_speed: 0.0,
+            projectile_arc: 0.0,
+            projectile_turn_rate: 0.0,
+            projectile_self_homing: false,
+            detonation_type: DetonationType::Contact,
+            detonation_delay: 0,
+            projectile_fx: "".to_string(),
+            exhaust_fx: "".to_string(),
+            is_valid: false,
+        }
+    }
+}
+
+impl Default for WeaponDefinition {
+    fn default() -> Self {
+        WeaponDefinition {
+            name: "".to_string(),
+            attack_range: 0.0,
+            minimum_attack_range: 0.0,
+            range_bonus_per_rank: 0.0,
+            request_assist_range: 0.0,
+            primary_damage: 0.0,
+            primary_damage_radius: 0.0,
+            secondary_damage: 0.0,
+            secondary_damage_radius: 0.0,
+            damage_type: DamageType::Explosion,
+            death_type: "".to_string(),
+            damage_nuggets: [DamageNugget::default(); 8],
+            damage_nugget_count: 0,
+            delay_between_shots: 0,
+            pre_attack_delay: 0,
+            fire_sound_loop_time: 0,
+            clip_size: 0,
+            clip_reload_time: 0,
+            auto_reload_when_idle: true,
+            continue_attack_range: 0.0,
+            anti_mask: 0,
+            affected_by_mask: 0,
+            scatter_radius: 0.0,
+            scatter_radius_vs_infantry: 0.0,
+            scatter_target_scalar: 1.0,
+            scatter_type: ScatterType::None,
+            projectile: ProjectileData::default(),
+            damage_bonus_percent: 0.0,
+            rate_of_fire_bonus_percent: 0.0,
+            fire_fx: "".to_string(),
+            fire_fx_bone: "".to_string(),
+            fire_sound: "".to_string(),
+            weapon_template_id: 0,
+            is_valid: false,
+        }
+    }
+}

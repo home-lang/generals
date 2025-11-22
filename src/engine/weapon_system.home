@@ -1,0 +1,802 @@
+// Weapon System - Handles weapon firing, projectiles, and damage
+// Implements the C&C Generals combat system
+
+use weapon_definition_parser::{WeaponDefinition, DamageType, DamageNugget}
+use thing_factory::{Thing, ThingFactory}
+
+// Weapon slot indices
+enum WeaponSlot {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+// Weapon state
+enum WeaponState {
+    Idle,
+    PreAttack,
+    Firing,
+    Reloading,
+    BetweenShots,
+    OutOfRange,
+    NoAmmo,
+}
+
+// Projectile state
+enum ProjectileState {
+    Active,
+    Detonated,
+    Expired,
+}
+
+// 3D vector
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+// Active weapon instance on a unit
+struct WeaponInstance {
+    definition: &WeaponDefinition,
+    slot: WeaponSlot,
+    state: WeaponState,
+
+    // Target
+    target_id: u32,
+    target_position: Vec3,
+    has_target: bool,
+
+    // Firing state
+    current_clip: u32,
+    pre_attack_timer: f32,
+    fire_timer: f32,
+    reload_timer: f32,
+
+    // Bonuses
+    damage_bonus: f32,
+    range_bonus: f32,
+    rate_of_fire_bonus: f32,
+
+    // Status
+    is_active: bool,
+    can_fire: bool,
+    in_range: bool,
+}
+
+// Active projectile in flight
+struct Projectile {
+    id: u32,
+
+    // Source
+    owner_id: u32,
+    weapon_definition: &WeaponDefinition,
+
+    // Position and movement
+    position: Vec3,
+    velocity: Vec3,
+    target_position: Vec3,
+    target_id: u32,
+
+    // Tracking
+    is_homing: bool,
+    turn_rate: f32,
+
+    // State
+    state: ProjectileState,
+    lifetime: f32,
+    max_lifetime: f32,
+
+    // Visual
+    model_name: string,
+    trail_fx: string,
+
+    // Damage
+    damage_dealt: bool,
+}
+
+// Damage event for things to process
+struct DamageEvent {
+    source_id: u32,
+    target_id: u32,
+    damage_type: DamageType,
+    damage_amount: f32,
+    death_type: string,
+    position: Vec3,
+    radius: f32,
+    is_area_damage: bool,
+}
+
+const MAX_PROJECTILES: u32 = 1024
+const MAX_DAMAGE_EVENTS: u32 = 256
+const MAX_WEAPONS_PER_UNIT: u32 = 3
+
+struct WeaponSystem {
+    // Active projectiles
+    projectiles: [Projectile; MAX_PROJECTILES],
+    projectile_count: u32,
+    next_projectile_id: u32,
+
+    // Pending damage events
+    damage_events: [DamageEvent; MAX_DAMAGE_EVENTS],
+    damage_event_count: u32,
+
+    // References
+    thing_factory: &ThingFactory,
+
+    // Callbacks
+    on_projectile_created: fn(&Projectile),
+    on_projectile_impact: fn(&Projectile, Vec3),
+    on_damage_dealt: fn(&DamageEvent),
+
+    // Settings
+    gravity: f32,
+}
+
+impl WeaponSystem {
+    fn new(thing_factory: &ThingFactory) -> Self {
+        WeaponSystem {
+            projectiles: [Projectile::default(); MAX_PROJECTILES as usize],
+            projectile_count: 0,
+            next_projectile_id: 1,
+            damage_events: [DamageEvent::default(); MAX_DAMAGE_EVENTS as usize],
+            damage_event_count: 0,
+            thing_factory: thing_factory,
+            on_projectile_created: |_p: &Projectile| {},
+            on_projectile_impact: |_p: &Projectile, _pos: Vec3| {},
+            on_damage_dealt: |_e: &DamageEvent| {},
+            gravity: 9.81,
+        }
+    }
+
+    // Main update loop
+    fn update(&mut self, delta_time: f32) {
+        // Update all active projectiles
+        self.update_projectiles(delta_time)
+
+        // Process damage events
+        self.process_damage_events()
+    }
+
+    // Fire a weapon at a target
+    fn fire_weapon(&mut self, weapon: &WeaponInstance, shooter_id: u32,
+                   muzzle_position: Vec3, target_position: Vec3, target_id: u32) {
+        if !weapon.is_active || !weapon.can_fire {
+            return
+        }
+
+        let def = weapon.definition
+
+        // Check if weapon has projectile
+        if def.projectile.is_valid {
+            // Create projectile
+            self.create_projectile(def, shooter_id, muzzle_position, target_position, target_id)
+        } else {
+            // Instant hit weapon (hitscan)
+            self.apply_instant_damage(def, shooter_id, muzzle_position, target_position, target_id)
+        }
+
+        // Trigger fire FX callback
+        // (self.on_weapon_fired)(weapon, muzzle_position)
+    }
+
+    fn create_projectile(&mut self, weapon: &WeaponDefinition, owner_id: u32,
+                         start_pos: Vec3, target_pos: Vec3, target_id: u32) {
+        if self.projectile_count >= MAX_PROJECTILES {
+            // Find and remove oldest projectile
+            self.remove_oldest_projectile()
+        }
+
+        let idx = self.find_free_projectile_slot()
+        if idx >= MAX_PROJECTILES as usize {
+            return
+        }
+
+        let projectile = &mut self.projectiles[idx]
+        projectile.id = self.next_projectile_id
+        self.next_projectile_id += 1
+
+        projectile.owner_id = owner_id
+        projectile.weapon_definition = weapon
+        projectile.position = start_pos.clone()
+        projectile.target_position = target_pos.clone()
+        projectile.target_id = target_id
+        projectile.state = ProjectileState::Active
+
+        // Calculate initial velocity
+        let direction = Vec3::direction(&start_pos, &target_pos)
+        let speed = weapon.projectile.projectile_speed
+
+        if weapon.projectile.projectile_arc > 0.0 {
+            // Ballistic projectile - calculate arc trajectory
+            projectile.velocity = self.calculate_ballistic_velocity(
+                &start_pos, &target_pos, speed, weapon.projectile.projectile_arc
+            )
+        } else {
+            // Direct fire
+            projectile.velocity = Vec3 {
+                x: direction.x * speed,
+                y: direction.y * speed,
+                z: direction.z * speed,
+            }
+        }
+
+        projectile.is_homing = weapon.projectile.projectile_self_homing
+        projectile.turn_rate = weapon.projectile.projectile_turn_rate
+
+        // Calculate lifetime based on distance and speed
+        let dist = Vec3::distance(&start_pos, &target_pos)
+        projectile.max_lifetime = (dist / speed) * 2.0 // Double for safety
+        projectile.lifetime = 0.0
+
+        projectile.model_name = weapon.projectile.projectile_name.clone()
+        projectile.trail_fx = weapon.projectile.exhaust_fx.clone()
+        projectile.damage_dealt = false
+
+        self.projectile_count += 1
+
+        (self.on_projectile_created)(projectile)
+    }
+
+    fn calculate_ballistic_velocity(&self, start: &Vec3, target: &Vec3,
+                                    speed: f32, arc: f32) -> Vec3 {
+        let dx = target.x - start.x
+        let dy = target.y - start.y
+        let dz = target.z - start.z
+
+        let horizontal_dist = (dx * dx + dy * dy).sqrt()
+
+        // Calculate launch angle for desired arc
+        let angle = arc.to_radians()
+        let vz = speed * angle.sin()
+        let vh = speed * angle.cos()
+
+        // Horizontal direction
+        let h_len = (dx * dx + dy * dy).sqrt()
+        let nx = if h_len > 0.001 { dx / h_len } else { 0.0 }
+        let ny = if h_len > 0.001 { dy / h_len } else { 0.0 }
+
+        Vec3 {
+            x: nx * vh,
+            y: ny * vh,
+            z: vz,
+        }
+    }
+
+    fn update_projectiles(&mut self, delta_time: f32) {
+        for i in 0..MAX_PROJECTILES as usize {
+            let projectile = &mut self.projectiles[i]
+
+            match projectile.state {
+                ProjectileState::Active => {
+                    self.update_single_projectile(i, delta_time)
+                }
+                ProjectileState::Detonated => {
+                    // Already processed
+                }
+                ProjectileState::Expired => {
+                    // Can be reused
+                }
+            }
+        }
+    }
+
+    fn update_single_projectile(&mut self, idx: usize, delta_time: f32) {
+        let projectile = &mut self.projectiles[idx]
+
+        // Update lifetime
+        projectile.lifetime += delta_time
+        if projectile.lifetime >= projectile.max_lifetime {
+            projectile.state = ProjectileState::Expired
+            self.projectile_count -= 1
+            return
+        }
+
+        // Homing behavior
+        if projectile.is_homing && projectile.target_id != 0 {
+            // Update target position from thing
+            if let Some(target) = self.thing_factory.get_thing(projectile.target_id) {
+                projectile.target_position = target.get_position()
+            }
+
+            // Adjust velocity towards target
+            let to_target = Vec3::direction(&projectile.position, &projectile.target_position)
+            let turn_amount = projectile.turn_rate * delta_time
+
+            projectile.velocity = self.turn_velocity(
+                &projectile.velocity,
+                &to_target,
+                turn_amount
+            )
+        }
+
+        // Apply gravity to ballistic projectiles
+        let weapon = projectile.weapon_definition
+        if weapon.projectile.projectile_arc > 0.0 {
+            projectile.velocity.z -= self.gravity * delta_time
+        }
+
+        // Update position
+        projectile.position.x += projectile.velocity.x * delta_time
+        projectile.position.y += projectile.velocity.y * delta_time
+        projectile.position.z += projectile.velocity.z * delta_time
+
+        // Check for collision/impact
+        if self.check_projectile_impact(idx) {
+            self.detonate_projectile(idx)
+        }
+    }
+
+    fn turn_velocity(&self, current: &Vec3, target_dir: &Vec3, max_turn: f32) -> Vec3 {
+        let speed = current.length()
+        let current_dir = current.normalized()
+
+        // Interpolate direction
+        let new_dir = Vec3 {
+            x: current_dir.x + (target_dir.x - current_dir.x) * max_turn,
+            y: current_dir.y + (target_dir.y - current_dir.y) * max_turn,
+            z: current_dir.z + (target_dir.z - current_dir.z) * max_turn,
+        }.normalized()
+
+        Vec3 {
+            x: new_dir.x * speed,
+            y: new_dir.y * speed,
+            z: new_dir.z * speed,
+        }
+    }
+
+    fn check_projectile_impact(&self, idx: usize) -> bool {
+        let projectile = &self.projectiles[idx]
+        let weapon = projectile.weapon_definition
+
+        // Check if close enough to target
+        let dist_to_target = Vec3::distance(&projectile.position, &projectile.target_position)
+
+        // Impact radius based on projectile speed
+        let impact_radius = weapon.projectile.projectile_speed * 0.033 // ~1 frame at 30fps
+
+        if dist_to_target <= impact_radius.max(5.0) {
+            return true
+        }
+
+        // Check if hit ground (z <= terrain height)
+        if projectile.position.z <= 0.0 && weapon.projectile.projectile_arc > 0.0 {
+            return true
+        }
+
+        // Check direct hit on target
+        if projectile.target_id != 0 {
+            if let Some(target) = self.thing_factory.get_thing(projectile.target_id) {
+                let target_pos = target.get_position()
+                let target_radius = target.get_collision_radius()
+
+                if Vec3::distance(&projectile.position, &target_pos) <= target_radius {
+                    return true
+                }
+            }
+        }
+
+        false
+    }
+
+    fn detonate_projectile(&mut self, idx: usize) {
+        let projectile = &mut self.projectiles[idx]
+
+        if projectile.damage_dealt {
+            return
+        }
+
+        projectile.state = ProjectileState::Detonated
+        projectile.damage_dealt = true
+
+        let weapon = projectile.weapon_definition
+        let impact_pos = projectile.position.clone()
+
+        // Create damage events from weapon nuggets
+        if weapon.damage_nugget_count > 0 {
+            for i in 0..weapon.damage_nugget_count {
+                let nugget = &weapon.damage_nuggets[i as usize]
+                if nugget.is_valid {
+                    self.create_damage_event_from_nugget(
+                        projectile.owner_id,
+                        projectile.target_id,
+                        nugget,
+                        &impact_pos
+                    )
+                }
+            }
+        } else {
+            // Legacy damage format
+            self.create_damage_event(
+                projectile.owner_id,
+                projectile.target_id,
+                weapon.damage_type,
+                weapon.primary_damage,
+                weapon.death_type.clone(),
+                &impact_pos,
+                weapon.primary_damage_radius,
+                weapon.primary_damage_radius > 0.0
+            )
+
+            // Secondary damage
+            if weapon.secondary_damage > 0.0 {
+                self.create_damage_event(
+                    projectile.owner_id,
+                    projectile.target_id,
+                    weapon.damage_type,
+                    weapon.secondary_damage,
+                    weapon.death_type.clone(),
+                    &impact_pos,
+                    weapon.secondary_damage_radius,
+                    true
+                )
+            }
+        }
+
+        // Trigger impact callback
+        (self.on_projectile_impact)(projectile, impact_pos)
+
+        self.projectile_count -= 1
+    }
+
+    fn apply_instant_damage(&mut self, weapon: &WeaponDefinition, shooter_id: u32,
+                           muzzle_pos: Vec3, target_pos: Vec3, target_id: u32) {
+        // Direct hit weapon (laser, bullet, etc.)
+        if weapon.damage_nugget_count > 0 {
+            for i in 0..weapon.damage_nugget_count {
+                let nugget = &weapon.damage_nuggets[i as usize]
+                if nugget.is_valid {
+                    self.create_damage_event_from_nugget(
+                        shooter_id,
+                        target_id,
+                        nugget,
+                        &target_pos
+                    )
+                }
+            }
+        } else {
+            self.create_damage_event(
+                shooter_id,
+                target_id,
+                weapon.damage_type,
+                weapon.primary_damage,
+                weapon.death_type.clone(),
+                &target_pos,
+                weapon.primary_damage_radius,
+                weapon.primary_damage_radius > 0.0
+            )
+        }
+    }
+
+    fn create_damage_event_from_nugget(&mut self, source_id: u32, target_id: u32,
+                                       nugget: &DamageNugget, position: &Vec3) {
+        self.create_damage_event(
+            source_id,
+            target_id,
+            nugget.damage_type,
+            nugget.damage,
+            nugget.death_type.clone(),
+            position,
+            nugget.radius,
+            nugget.radius > 0.0
+        )
+    }
+
+    fn create_damage_event(&mut self, source_id: u32, target_id: u32,
+                          damage_type: DamageType, damage: f32,
+                          death_type: string, position: &Vec3,
+                          radius: f32, is_area: bool) {
+        if self.damage_event_count >= MAX_DAMAGE_EVENTS {
+            return
+        }
+
+        let idx = self.damage_event_count as usize
+        self.damage_events[idx] = DamageEvent {
+            source_id: source_id,
+            target_id: target_id,
+            damage_type: damage_type,
+            damage_amount: damage,
+            death_type: death_type,
+            position: position.clone(),
+            radius: radius,
+            is_area_damage: is_area,
+        }
+        self.damage_event_count += 1
+    }
+
+    fn process_damage_events(&mut self) {
+        for i in 0..self.damage_event_count {
+            let event = &self.damage_events[i as usize]
+
+            if event.is_area_damage {
+                self.apply_area_damage(event)
+            } else {
+                self.apply_direct_damage(event)
+            }
+
+            (self.on_damage_dealt)(event)
+        }
+
+        // Clear events
+        self.damage_event_count = 0
+    }
+
+    fn apply_direct_damage(&self, event: &DamageEvent) {
+        if event.target_id == 0 {
+            return
+        }
+
+        // Get target and apply damage
+        // In a real implementation:
+        // let target = self.thing_factory.get_thing_mut(event.target_id)
+        // target.take_damage(event.damage_amount, event.damage_type, event.source_id)
+    }
+
+    fn apply_area_damage(&self, event: &DamageEvent) {
+        // Query spatial hash for all things within radius
+        // For each thing, calculate damage falloff based on distance
+        // Apply damage
+
+        // Damage falloff: full damage at center, linear falloff to edge
+        // let damage = event.damage_amount * (1.0 - dist / event.radius)
+    }
+
+    fn find_free_projectile_slot(&self) -> usize {
+        for i in 0..MAX_PROJECTILES as usize {
+            if self.projectiles[i].state == ProjectileState::Expired ||
+               self.projectiles[i].id == 0 {
+                return i
+            }
+        }
+        MAX_PROJECTILES as usize
+    }
+
+    fn remove_oldest_projectile(&mut self) {
+        let mut oldest_idx = 0
+        let mut oldest_time: f32 = 0.0
+
+        for i in 0..MAX_PROJECTILES as usize {
+            if self.projectiles[i].state == ProjectileState::Active {
+                if self.projectiles[i].lifetime > oldest_time {
+                    oldest_time = self.projectiles[i].lifetime
+                    oldest_idx = i
+                }
+            }
+        }
+
+        self.projectiles[oldest_idx].state = ProjectileState::Expired
+        self.projectile_count -= 1
+    }
+
+    // Public API
+    fn get_active_projectiles(&self) -> Vec<&Projectile> {
+        let mut result = Vec::new()
+        for i in 0..MAX_PROJECTILES as usize {
+            if self.projectiles[i].state == ProjectileState::Active {
+                result.push(&self.projectiles[i])
+            }
+        }
+        result
+    }
+
+    fn set_callbacks(&mut self,
+                    on_created: fn(&Projectile),
+                    on_impact: fn(&Projectile, Vec3),
+                    on_damage: fn(&DamageEvent)) {
+        self.on_projectile_created = on_created
+        self.on_projectile_impact = on_impact
+        self.on_damage_dealt = on_damage
+    }
+}
+
+// Weapon instance on a unit
+impl WeaponInstance {
+    fn new(definition: &WeaponDefinition, slot: WeaponSlot) -> Self {
+        WeaponInstance {
+            definition: definition,
+            slot: slot,
+            state: WeaponState::Idle,
+            target_id: 0,
+            target_position: Vec3::default(),
+            has_target: false,
+            current_clip: definition.clip_size,
+            pre_attack_timer: 0.0,
+            fire_timer: 0.0,
+            reload_timer: 0.0,
+            damage_bonus: 0.0,
+            range_bonus: 0.0,
+            rate_of_fire_bonus: 0.0,
+            is_active: true,
+            can_fire: true,
+            in_range: false,
+        }
+    }
+
+    fn update(&mut self, delta_time: f32, dist_to_target: f32) {
+        let def = self.definition
+
+        // Check range
+        let effective_range = def.attack_range + self.range_bonus
+        self.in_range = dist_to_target <= effective_range && dist_to_target >= def.minimum_attack_range
+
+        match self.state {
+            WeaponState::Idle => {
+                if self.has_target && self.in_range {
+                    self.state = WeaponState::PreAttack
+                    self.pre_attack_timer = def.pre_attack_delay as f32 / 1000.0
+                }
+            }
+            WeaponState::PreAttack => {
+                self.pre_attack_timer -= delta_time
+                if self.pre_attack_timer <= 0.0 {
+                    self.state = WeaponState::Firing
+                    self.can_fire = true
+                }
+            }
+            WeaponState::Firing => {
+                // Ready to fire - external code calls fire_weapon()
+                // After firing, transition to BetweenShots or Reloading
+            }
+            WeaponState::BetweenShots => {
+                self.fire_timer -= delta_time
+                if self.fire_timer <= 0.0 {
+                    if self.current_clip > 0 {
+                        self.state = WeaponState::Firing
+                        self.can_fire = true
+                    } else {
+                        self.state = WeaponState::Reloading
+                        self.reload_timer = def.clip_reload_time as f32 / 1000.0
+                    }
+                }
+            }
+            WeaponState::Reloading => {
+                self.reload_timer -= delta_time
+                if self.reload_timer <= 0.0 {
+                    self.current_clip = def.clip_size
+                    self.state = WeaponState::Idle
+                }
+            }
+            WeaponState::OutOfRange => {
+                if self.in_range {
+                    self.state = WeaponState::Idle
+                }
+            }
+            WeaponState::NoAmmo => {
+                // Weapon has no ammo, cannot fire
+            }
+        }
+    }
+
+    fn on_fired(&mut self) {
+        let def = self.definition
+
+        self.can_fire = false
+        self.current_clip -= 1
+
+        // Calculate delay with rate of fire bonus
+        let base_delay = def.delay_between_shots as f32 / 1000.0
+        let bonus_mult = 1.0 - (self.rate_of_fire_bonus / 100.0)
+        self.fire_timer = base_delay * bonus_mult.max(0.1)
+
+        self.state = WeaponState::BetweenShots
+    }
+
+    fn set_target(&mut self, target_id: u32, position: Vec3) {
+        self.target_id = target_id
+        self.target_position = position
+        self.has_target = true
+    }
+
+    fn clear_target(&mut self) {
+        self.target_id = 0
+        self.has_target = false
+        self.state = WeaponState::Idle
+    }
+
+    fn get_effective_damage(&self) -> f32 {
+        let base_damage = self.definition.primary_damage
+        base_damage * (1.0 + self.damage_bonus / 100.0)
+    }
+
+    fn get_effective_range(&self) -> f32 {
+        self.definition.attack_range + self.range_bonus
+    }
+}
+
+impl Default for Vec3 {
+    fn default() -> Self {
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+impl Clone for Vec3 {
+    fn clone(&self) -> Self {
+        Vec3 { x: self.x, y: self.y, z: self.z }
+    }
+}
+
+impl Vec3 {
+    fn length(&self) -> f32 {
+        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+    }
+
+    fn normalized(&self) -> Vec3 {
+        let len = self.length()
+        if len > 0.001 {
+            Vec3 {
+                x: self.x / len,
+                y: self.y / len,
+                z: self.z / len,
+            }
+        } else {
+            Vec3::default()
+        }
+    }
+
+    fn distance(a: &Vec3, b: &Vec3) -> f32 {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dz = b.z - a.z
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    fn direction(from: &Vec3, to: &Vec3) -> Vec3 {
+        let dx = to.x - from.x
+        let dy = to.y - from.y
+        let dz = to.z - from.z
+        let len = (dx * dx + dy * dy + dz * dz).sqrt()
+
+        if len > 0.001 {
+            Vec3 {
+                x: dx / len,
+                y: dy / len,
+                z: dz / len,
+            }
+        } else {
+            Vec3::default()
+        }
+    }
+}
+
+impl Default for Projectile {
+    fn default() -> Self {
+        Projectile {
+            id: 0,
+            owner_id: 0,
+            weapon_definition: unsafe { std::mem::zeroed() }, // Placeholder
+            position: Vec3::default(),
+            velocity: Vec3::default(),
+            target_position: Vec3::default(),
+            target_id: 0,
+            is_homing: false,
+            turn_rate: 0.0,
+            state: ProjectileState::Expired,
+            lifetime: 0.0,
+            max_lifetime: 0.0,
+            model_name: "".to_string(),
+            trail_fx: "".to_string(),
+            damage_dealt: false,
+        }
+    }
+}
+
+impl Default for DamageEvent {
+    fn default() -> Self {
+        DamageEvent {
+            source_id: 0,
+            target_id: 0,
+            damage_type: DamageType::Explosion,
+            damage_amount: 0.0,
+            death_type: "".to_string(),
+            position: Vec3::default(),
+            radius: 0.0,
+            is_area_damage: false,
+        }
+    }
+}
+
+impl Default for WeaponInstance {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}

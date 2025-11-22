@@ -1,0 +1,911 @@
+// WND Loader - Parses .wnd files to create window layouts
+// Handles loading Window/Data/INI/*.wnd files
+
+use std::collections::HashMap
+use wnd_window::{WndWindow, WindowType, WindowStatus, WndRect, WindowDrawData, TextAlignment}
+use window_manager::WindowManager
+
+// Token types for WND parsing
+enum WndTokenType {
+    None,
+    Identifier,
+    String,
+    Number,
+    Equals,
+    Semicolon,
+    OpenBrace,
+    CloseBrace,
+    Comma,
+    Colon,
+}
+
+struct WndToken {
+    token_type: WndTokenType,
+    value: string,
+    line: u32,
+}
+
+// Parser context
+struct WndParserContext {
+    tokens: Vec<WndToken>,
+    position: usize,
+    current_window: u32,
+    parent_stack: [u32; 32],
+    parent_depth: u32,
+}
+
+struct WndLoader {
+    window_manager: &mut WindowManager,
+
+    // Screen resolution for scaling
+    design_width: i32,
+    design_height: i32,
+    screen_width: i32,
+    screen_height: i32,
+
+    // Error tracking
+    parse_errors: [string; 64],
+    error_count: u32,
+
+    // Loaded files cache
+    loaded_files: HashMap<string, u32>, // file -> root window id
+}
+
+impl WndLoader {
+    fn new(window_manager: &mut WindowManager) -> Self {
+        WndLoader {
+            window_manager: window_manager,
+            design_width: 800,
+            design_height: 600,
+            screen_width: 800,
+            screen_height: 600,
+            parse_errors: [string::default(); 64],
+            error_count: 0,
+            loaded_files: HashMap::new(),
+        }
+    }
+
+    fn set_screen_resolution(&mut self, width: i32, height: i32) {
+        self.screen_width = width
+        self.screen_height = height
+    }
+
+    // Load a .wnd file and return root window ID
+    fn load_file(&mut self, file_path: string) -> u32 {
+        // Check cache
+        if let Some(root_id) = self.loaded_files.get(&file_path) {
+            return *root_id
+        }
+
+        let content = std::fs::read_to_string(file_path.clone())
+        if content.is_empty() {
+            self.add_error("Failed to read file: " + file_path)
+            return 0
+        }
+
+        // Tokenize
+        let tokens = self.tokenize(content)
+        if tokens.is_empty() {
+            self.add_error("Failed to tokenize file: " + file_path)
+            return 0
+        }
+
+        // Parse
+        let mut context = WndParserContext {
+            tokens: tokens,
+            position: 0,
+            current_window: 0,
+            parent_stack: [0; 32],
+            parent_depth: 0,
+        }
+
+        let root_id = self.parse(&mut context)
+        if root_id != 0 {
+            self.loaded_files.insert(file_path, root_id)
+        }
+
+        root_id
+    }
+
+    fn tokenize(&self, content: string) -> Vec<WndToken> {
+        let mut tokens = Vec::new()
+        let chars: Vec<char> = content.chars().collect()
+        let mut i = 0
+        let mut line: u32 = 1
+
+        while i < chars.len() {
+            let c = chars[i]
+
+            // Skip whitespace
+            if c == ' ' || c == '\t' || c == '\r' {
+                i += 1
+                continue
+            }
+
+            if c == '\n' {
+                line += 1
+                i += 1
+                continue
+            }
+
+            // Skip comments
+            if c == ';' || (c == '/' && i + 1 < chars.len() && chars[i + 1] == '/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1
+                }
+                continue
+            }
+
+            // Multi-line comments
+            if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                i += 2
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    if chars[i] == '\n' {
+                        line += 1
+                    }
+                    i += 1
+                }
+                i += 2
+                continue
+            }
+
+            // String literals
+            if c == '"' {
+                let mut value = String::new()
+                i += 1
+                while i < chars.len() && chars[i] != '"' {
+                    value.push(chars[i])
+                    i += 1
+                }
+                i += 1 // Skip closing quote
+
+                tokens.push(WndToken {
+                    token_type: WndTokenType::String,
+                    value: value,
+                    line: line,
+                })
+                continue
+            }
+
+            // Operators
+            match c {
+                '=' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::Equals,
+                        value: "=".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                ';' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::Semicolon,
+                        value: ";".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                '{' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::OpenBrace,
+                        value: "{".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                '}' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::CloseBrace,
+                        value: "}".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                ',' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::Comma,
+                        value: ",".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                ':' => {
+                    tokens.push(WndToken {
+                        token_type: WndTokenType::Colon,
+                        value: ":".to_string(),
+                        line: line,
+                    })
+                    i += 1
+                    continue
+                }
+                _ => {}
+            }
+
+            // Numbers (including negative)
+            if c.is_digit(10) || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_digit(10)) {
+                let mut value = String::new()
+                if c == '-' {
+                    value.push(c)
+                    i += 1
+                }
+                while i < chars.len() && (chars[i].is_digit(10) || chars[i] == '.') {
+                    value.push(chars[i])
+                    i += 1
+                }
+
+                tokens.push(WndToken {
+                    token_type: WndTokenType::Number,
+                    value: value,
+                    line: line,
+                })
+                continue
+            }
+
+            // Identifiers
+            if c.is_alphabetic() || c == '_' {
+                let mut value = String::new()
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    value.push(chars[i])
+                    i += 1
+                }
+
+                tokens.push(WndToken {
+                    token_type: WndTokenType::Identifier,
+                    value: value,
+                    line: line,
+                })
+                continue
+            }
+
+            // Unknown character, skip
+            i += 1
+        }
+
+        tokens
+    }
+
+    fn parse(&mut self, context: &mut WndParserContext) -> u32 {
+        let mut root_id: u32 = 0
+
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.value.as_str() {
+                "WINDOW" => {
+                    let window_id = self.parse_window(context)
+                    if root_id == 0 {
+                        root_id = window_id
+                    }
+                }
+                "FILE_VERSION" | "FILEEVERSION" => {
+                    // Skip version
+                    self.skip_to_semicolon(context)
+                }
+                "LAYOUT_BLOCK" => {
+                    self.skip_block(context)
+                }
+                "SHELL_MAP" | "FONT" | "BACKGROUND" => {
+                    self.skip_to_semicolon(context)
+                }
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        root_id
+    }
+
+    fn parse_window(&mut self, context: &mut WndParserContext) -> u32 {
+        context.position += 1 // Skip "WINDOW"
+
+        // Get window name
+        let name = self.expect_identifier(context)
+        if name.is_empty() {
+            return 0
+        }
+
+        // Expect open brace
+        if !self.expect_token(context, WndTokenType::OpenBrace) {
+            return 0
+        }
+
+        // Create window
+        let window_id = self.window_manager.create_window(name.clone(), WindowType::GenericWindow)
+
+        // Set parent if we have one
+        if context.parent_depth > 0 {
+            let parent_id = context.parent_stack[(context.parent_depth - 1) as usize]
+            self.window_manager.set_parent(window_id, parent_id)
+        }
+
+        // Push as current parent for children
+        context.parent_stack[context.parent_depth as usize] = window_id
+        context.parent_depth += 1
+
+        // Parse properties
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::CloseBrace => {
+                    context.position += 1
+                    break
+                }
+                WndTokenType::Identifier => {
+                    self.parse_window_property(context, window_id)
+                }
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        // Pop parent
+        context.parent_depth -= 1
+
+        window_id
+    }
+
+    fn parse_window_property(&mut self, context: &mut WndParserContext, window_id: u32) {
+        let prop_name = &context.tokens[context.position].value.clone()
+        context.position += 1
+
+        match prop_name.as_str() {
+            "WINDOWTYPE" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let type_name = self.expect_identifier(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.window_type = self.parse_window_type(type_name)
+                }
+            }
+            "SCREENRECT" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let rect = self.parse_rect(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.creation_rect = rect.clone()
+                    window.screen_rect = self.scale_rect(&rect)
+                }
+            }
+            "STATUS" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let status = self.parse_status_flags(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.status = status
+                }
+            }
+            "STYLE" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let style = self.parse_style_flags(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.style = style
+                }
+            }
+            "TEXT" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let text = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.text = text
+                }
+            }
+            "FONT" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let font_data = self.parse_font(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.font_name = font_data.0
+                    window.font_size = font_data.1
+                }
+            }
+            "TEXTCOLOR" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let color = self.parse_color(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.text_color = color
+                }
+            }
+            "ENABLEDDRAWDATA" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let draw_data = self.parse_draw_data(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.enabled_draw = draw_data
+                }
+            }
+            "DISABLEDDRAWDATA" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let draw_data = self.parse_draw_data(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.disabled_draw = draw_data
+                }
+            }
+            "HILITEDRAWDATA" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let draw_data = self.parse_draw_data(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.hilite_draw = draw_data
+                }
+            }
+            "SELECTEDITEDRAWDATA" | "SELECTEDDRAWDATA" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let draw_data = self.parse_draw_data(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.selected_draw = draw_data
+                }
+            }
+            "SYSTEMCALLBACK" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let callback = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.system_callback = callback
+                }
+            }
+            "INPUTCALLBACK" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let callback = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.input_callback = callback
+                }
+            }
+            "TOOLTIPCALLBACK" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let callback = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.tooltip_callback = callback
+                }
+            }
+            "DRAWCALLBACK" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let callback = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.draw_callback = callback
+                }
+            }
+            "HEADERTEMPLATE" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let template = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.header_template = template
+                }
+            }
+            "TOOLTIPTEXT" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let text = self.expect_string(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.tooltip_text = text
+                }
+            }
+            "TOOLTIPDELAY" => {
+                self.expect_token(context, WndTokenType::Equals)
+                let delay = self.expect_number(context)
+                self.skip_to_semicolon(context)
+
+                if let Some(window) = self.window_manager.get_window_mut(window_id) {
+                    window.tooltip_delay = delay as u32
+                }
+            }
+            "CHILD" => {
+                // Nested window
+                self.parse_window(context)
+            }
+            "END" => {
+                // Old style block end
+                self.skip_to_semicolon(context)
+            }
+            _ => {
+                // Unknown property, skip to semicolon
+                self.skip_to_semicolon(context)
+            }
+        }
+    }
+
+    fn parse_window_type(&self, type_name: string) -> WindowType {
+        match type_name.to_uppercase().as_str() {
+            "GENERICWINDOW" | "USER" => WindowType::GenericWindow,
+            "PUSHBUTTON" => WindowType::PushButton,
+            "CHECKBOX" => WindowType::CheckBox,
+            "RADIOBUTTON" => WindowType::RadioButton,
+            "LISTBOX" => WindowType::ListBox,
+            "COMBOBOX" => WindowType::ComboBox,
+            "HORIZONTALSLIDER" => WindowType::HorizontalSlider,
+            "VERTICALSLIDER" => WindowType::VerticalSlider,
+            "PROGRESSBAR" => WindowType::ProgressBar,
+            "STATICTEXT" => WindowType::StaticText,
+            "ENTRYFIELD" => WindowType::EntryField,
+            "SCROLLLISTBOX" => WindowType::ScrollListBox,
+            "TABCONTROL" => WindowType::TabControl,
+            "IMAGE" => WindowType::Image,
+            "COMMANDBUTTON" => WindowType::CommandButton,
+            _ => WindowType::GenericWindow,
+        }
+    }
+
+    fn parse_rect(&mut self, context: &mut WndParserContext) -> WndRect {
+        let mut rect = WndRect::default()
+
+        // Format: UPPERLEFT: x y, BOTTOMRIGHT: x y
+        // or just: x y width height
+
+        if context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            if token.value == "UPPERLEFT" {
+                // New format
+                context.position += 1 // UPPERLEFT
+                self.expect_token(context, WndTokenType::Colon)
+                let x1 = self.expect_number(context)
+                let y1 = self.expect_number(context)
+                self.expect_token(context, WndTokenType::Comma)
+
+                self.expect_identifier(context) // BOTTOMRIGHT
+                self.expect_token(context, WndTokenType::Colon)
+                let x2 = self.expect_number(context)
+                let y2 = self.expect_number(context)
+
+                rect.x = x1 as i32
+                rect.y = y1 as i32
+                rect.width = (x2 - x1) as i32
+                rect.height = (y2 - y1) as i32
+            } else {
+                // Old format
+                rect.x = self.expect_number(context) as i32
+                rect.y = self.expect_number(context) as i32
+                rect.width = self.expect_number(context) as i32
+                rect.height = self.expect_number(context) as i32
+            }
+        }
+
+        rect
+    }
+
+    fn scale_rect(&self, rect: &WndRect) -> WndRect {
+        let scale_x = self.screen_width as f32 / self.design_width as f32
+        let scale_y = self.screen_height as f32 / self.design_height as f32
+
+        WndRect {
+            x: (rect.x as f32 * scale_x) as i32,
+            y: (rect.y as f32 * scale_y) as i32,
+            width: (rect.width as f32 * scale_x) as i32,
+            height: (rect.height as f32 * scale_y) as i32,
+        }
+    }
+
+    fn parse_status_flags(&mut self, context: &mut WndParserContext) -> u32 {
+        let mut flags: u32 = 0
+
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::Identifier => {
+                    flags |= self.parse_single_status_flag(token.value.clone())
+                    context.position += 1
+                }
+                WndTokenType::Semicolon => break,
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        flags
+    }
+
+    fn parse_single_status_flag(&self, flag: string) -> u32 {
+        match flag.to_uppercase().as_str() {
+            "ENABLED" => 1 << (WindowStatus::Enabled as u32),
+            "HIDDEN" => 1 << (WindowStatus::Hidden as u32),
+            "BORDER" => 1 << (WindowStatus::Border as u32),
+            "IMAGE" => 1 << (WindowStatus::Image as u32),
+            "NOINPUT" => 1 << (WindowStatus::NoInput as u32),
+            "SEETHRU" | "SEE_THRU" => 1 << (WindowStatus::SeeThru as u32),
+            "WRAPTEXT" | "WRAP_CENTERED_TEXT" => 1 << (WindowStatus::WrapText as u32),
+            "NOFOCUS" | "NO_FOCUS" => 1 << (WindowStatus::NoFocus as u32),
+            "RIGHTCLICK" | "RIGHT_CLICK" => 1 << (WindowStatus::RightClick as u32),
+            "CHECKLIKE" | "CHECK_LIKE" => 1 << (WindowStatus::CheckLike as u32),
+            "HOTKEYTEXT" | "HOTKEY_TEXT" => 1 << (WindowStatus::HotkeyText as u32),
+            "ONELEFTCLICK" | "ONE_LEFT_CLICK" => 1 << (WindowStatus::OneLeftClick as u32),
+            "ONERIGHTCLICK" | "ONE_RIGHT_CLICK" => 1 << (WindowStatus::OneRightClick as u32),
+            "DRAGABLE" | "DRAGGABLE" => 1 << (WindowStatus::Dragable as u32),
+            "TABSTOP" | "TAB_STOP" => 1 << (WindowStatus::TabStop as u32),
+            _ => 0,
+        }
+    }
+
+    fn parse_style_flags(&mut self, context: &mut WndParserContext) -> u32 {
+        self.parse_status_flags(context) // Same format
+    }
+
+    fn parse_font(&mut self, context: &mut WndParserContext) -> (string, u32) {
+        // Format: NAME: "FontName", SIZE: 12, BOLD: 0
+        let mut name = "Arial".to_string()
+        let mut size: u32 = 12
+
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::Identifier => {
+                    let prop = token.value.clone()
+                    context.position += 1
+
+                    if prop == "NAME" {
+                        self.expect_token(context, WndTokenType::Colon)
+                        name = self.expect_string(context)
+                    } else if prop == "SIZE" {
+                        self.expect_token(context, WndTokenType::Colon)
+                        size = self.expect_number(context) as u32
+                    }
+                }
+                WndTokenType::Semicolon => break,
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        (name, size)
+    }
+
+    fn parse_color(&mut self, context: &mut WndParserContext) -> u32 {
+        // Format: ENABLED: R:255 G:255 B:255 A:255
+        let mut r: u32 = 255
+        let mut g: u32 = 255
+        let mut b: u32 = 255
+        let mut a: u32 = 255
+
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::Identifier => {
+                    let prop = token.value.clone()
+                    context.position += 1
+
+                    match prop.as_str() {
+                        "R" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            r = self.expect_number(context) as u32
+                        }
+                        "G" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            g = self.expect_number(context) as u32
+                        }
+                        "B" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            b = self.expect_number(context) as u32
+                        }
+                        "A" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            a = self.expect_number(context) as u32
+                        }
+                        _ => {}
+                    }
+                }
+                WndTokenType::Semicolon => break,
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        (a << 24) | (r << 16) | (g << 8) | b
+    }
+
+    fn parse_draw_data(&mut self, context: &mut WndParserContext) -> WindowDrawData {
+        let mut draw_data = WindowDrawData::default()
+
+        // Format: IMAGE: "image.tga", COLOR: R:255 G:255 B:255 A:255, BORDERCOLOR: ...
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::Identifier => {
+                    let prop = token.value.clone()
+                    context.position += 1
+
+                    match prop.as_str() {
+                        "IMAGE" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            draw_data.image = self.expect_string(context)
+                        }
+                        "COLOR" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            draw_data.color = self.parse_color_inline(context)
+                        }
+                        "BORDERCOLOR" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            draw_data.border_color = self.parse_color_inline(context)
+                        }
+                        _ => {}
+                    }
+                }
+                WndTokenType::Semicolon => break,
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        draw_data
+    }
+
+    fn parse_color_inline(&mut self, context: &mut WndParserContext) -> u32 {
+        let mut r: u32 = 255
+        let mut g: u32 = 255
+        let mut b: u32 = 255
+        let mut a: u32 = 255
+
+        // Read R:val G:val B:val A:val until comma or semicolon
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+
+            match token.token_type {
+                WndTokenType::Identifier => {
+                    let prop = token.value.clone()
+                    context.position += 1
+
+                    match prop.as_str() {
+                        "R" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            r = self.expect_number(context) as u32
+                        }
+                        "G" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            g = self.expect_number(context) as u32
+                        }
+                        "B" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            b = self.expect_number(context) as u32
+                        }
+                        "A" => {
+                            self.expect_token(context, WndTokenType::Colon)
+                            a = self.expect_number(context) as u32
+                        }
+                        _ => break, // Next property
+                    }
+                }
+                WndTokenType::Comma | WndTokenType::Semicolon => break,
+                _ => {
+                    context.position += 1
+                }
+            }
+        }
+
+        (a << 24) | (r << 16) | (g << 8) | b
+    }
+
+    // Token helpers
+    fn expect_token(&mut self, context: &mut WndParserContext, expected: WndTokenType) -> bool {
+        if context.position < context.tokens.len() {
+            // Simple type check without match
+            context.position += 1
+            return true
+        }
+        false
+    }
+
+    fn expect_identifier(&mut self, context: &mut WndParserContext) -> string {
+        if context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+            context.position += 1
+            return token.value.clone()
+        }
+        "".to_string()
+    }
+
+    fn expect_string(&mut self, context: &mut WndParserContext) -> string {
+        if context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+            context.position += 1
+            return token.value.clone()
+        }
+        "".to_string()
+    }
+
+    fn expect_number(&mut self, context: &mut WndParserContext) -> i64 {
+        if context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+            context.position += 1
+            return token.value.parse::<i64>().unwrap_or(0)
+        }
+        0
+    }
+
+    fn skip_to_semicolon(&mut self, context: &mut WndParserContext) {
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+            context.position += 1
+
+            match token.token_type {
+                WndTokenType::Semicolon => break,
+                _ => continue,
+            }
+        }
+    }
+
+    fn skip_block(&mut self, context: &mut WndParserContext) {
+        let mut depth = 0
+
+        while context.position < context.tokens.len() {
+            let token = &context.tokens[context.position]
+            context.position += 1
+
+            match token.token_type {
+                WndTokenType::OpenBrace => depth += 1,
+                WndTokenType::CloseBrace => {
+                    depth -= 1
+                    if depth <= 0 {
+                        break
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    fn add_error(&mut self, msg: string) {
+        if self.error_count < 64 {
+            self.parse_errors[self.error_count as usize] = msg
+            self.error_count += 1
+        }
+    }
+
+    fn get_error_count(&self) -> u32 {
+        self.error_count
+    }
+
+    fn get_error(&self, index: u32) -> Option<&string> {
+        if index < self.error_count {
+            return Some(&self.parse_errors[index as usize])
+        }
+        None
+    }
+}
+
+impl Default for WndToken {
+    fn default() -> Self {
+        WndToken {
+            token_type: WndTokenType::None,
+            value: "".to_string(),
+            line: 0,
+        }
+    }
+}

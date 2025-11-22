@@ -1,0 +1,821 @@
+// AI Brain - Core AI decision-making system for computer players
+// Implements the C&C Generals AI system with personality-based behavior
+
+use std::collections::HashMap
+use thing_factory::{Thing, ThingFactory}
+use game_data_loader::GameDataLoader
+
+// AI difficulty levels
+enum AIDifficulty {
+    Easy,
+    Medium,
+    Hard,
+    Brutal,
+}
+
+// AI personality types (matching Thyme)
+enum AIPersonality {
+    Balanced,       // Standard mixed strategy
+    Aggressive,     // Early rushes, constant attacks
+    Defensive,      // Turtles, builds defenses first
+    Tank,          // Prefers heavy armor
+    Infantry,       // Prefers infantry swarms
+    Air,           // Air superiority focused
+    Tech,          // Rush to high-tech units
+    Superweapon,   // Focus on superweapons
+    BuildOrder,    // Follows strict build orders
+    Adaptive,      // Responds to player strategy
+}
+
+// AI state machine states
+enum AIState {
+    Initial,
+    Building,
+    Defending,
+    Scouting,
+    Attacking,
+    Retreating,
+    Regrouping,
+    Expanding,
+    EndGame,
+}
+
+// Target priorities
+struct TargetPriority {
+    target_type: string,
+    priority: f32,
+    can_attack: bool,
+}
+
+// Build list entry
+struct BuildEntry {
+    object_name: string,
+    quantity: u32,
+    priority: f32,
+    is_upgrade: bool,
+    prerequisite_met: bool,
+}
+
+// Attack group
+struct AttackGroup {
+    unit_ids: [u32; 64],
+    unit_count: u32,
+    target_position: Vec3,
+    attack_state: AttackGroupState,
+    group_type: AttackGroupType,
+    creation_time: f32,
+}
+
+enum AttackGroupState {
+    Forming,
+    Moving,
+    Attacking,
+    Retreating,
+    Disbanded,
+}
+
+enum AttackGroupType {
+    Main,
+    Flanking,
+    Harassment,
+    Defense,
+    Scout,
+}
+
+// Position
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+// AI team representing a computer player
+struct AITeam {
+    player_id: u32,
+    team_id: u32,
+    faction: string,
+    difficulty: AIDifficulty,
+    personality: AIPersonality,
+
+    // Current state
+    state: AIState,
+    state_timer: f32,
+
+    // Resources
+    money: u32,
+    power_surplus: i32,
+
+    // Base location
+    base_center: Vec3,
+    base_radius: f32,
+
+    // Unit tracking
+    owned_units: [u32; 512],
+    owned_unit_count: u32,
+    owned_buildings: [u32; 128],
+    owned_building_count: u32,
+
+    // Attack groups
+    attack_groups: [AttackGroup; 8],
+    attack_group_count: u32,
+
+    // Build queue
+    build_list: [BuildEntry; 64],
+    build_list_count: u32,
+
+    // Enemy tracking
+    known_enemy_positions: [Vec3; 64],
+    known_enemy_count: u32,
+    last_scout_time: f32,
+
+    // Target priorities
+    target_priorities: [TargetPriority; 32],
+    target_priority_count: u32,
+
+    // Timing
+    next_think_time: f32,
+    think_interval: f32,
+
+    // Personality modifiers
+    aggression: f32,       // 0.0-1.0
+    economy_focus: f32,    // 0.0-1.0
+    defense_focus: f32,    // 0.0-1.0
+    tech_focus: f32,       // 0.0-1.0
+    attack_threshold: f32, // Army size needed to attack
+
+    is_active: bool,
+}
+
+const MAX_AI_TEAMS: u32 = 8
+const MAX_OWNED_UNITS: u32 = 512
+const MAX_OWNED_BUILDINGS: u32 = 128
+const MAX_BUILD_LIST: u32 = 64
+const MAX_ATTACK_GROUPS: u32 = 8
+
+struct AIBrain {
+    teams: [AITeam; MAX_AI_TEAMS],
+    team_count: u32,
+
+    // References
+    thing_factory: &ThingFactory,
+    game_data: &GameDataLoader,
+
+    // Global AI settings
+    base_think_interval: f32,
+    difficulty_multipliers: [f32; 4], // Easy, Medium, Hard, Brutal
+
+    // Build order templates
+    build_templates: HashMap<string, Vec<string>>,
+
+    // Current game time
+    game_time: f32,
+}
+
+impl AIBrain {
+    fn new(thing_factory: &ThingFactory, game_data: &GameDataLoader) -> Self {
+        let mut brain = AIBrain {
+            teams: [AITeam::default(); MAX_AI_TEAMS],
+            team_count: 0,
+            thing_factory: thing_factory,
+            game_data: game_data,
+            base_think_interval: 1.0, // Think once per second
+            difficulty_multipliers: [0.5, 1.0, 1.5, 2.0],
+            build_templates: HashMap::new(),
+            game_time: 0.0,
+        }
+
+        brain.setup_build_templates()
+        brain
+    }
+
+    fn setup_build_templates(&mut self) {
+        // USA standard build order
+        self.build_templates.insert("USA_Standard".to_string(), vec![
+            "AmericaCommandCenter".to_string(),
+            "AmericaPowerPlant".to_string(),
+            "AmericaBarracks".to_string(),
+            "AmericaPowerPlant".to_string(),
+            "AmericaSupplyCenter".to_string(),
+            "AmericaWarFactory".to_string(),
+            "AmericaSupplyCenter".to_string(),
+            "AmericaAirfield".to_string(),
+            "AmericaStrategyCenter".to_string(),
+        ])
+
+        // China standard build order
+        self.build_templates.insert("China_Standard".to_string(), vec![
+            "ChinaCommandCenter".to_string(),
+            "ChinaPowerPlant".to_string(),
+            "ChinaBarracks".to_string(),
+            "ChinaSupplyCenter".to_string(),
+            "ChinaPowerPlant".to_string(),
+            "ChinaWarFactory".to_string(),
+            "ChinaSupplyCenter".to_string(),
+            "ChinaAirfield".to_string(),
+            "ChinaPropagandaCenter".to_string(),
+        ])
+
+        // GLA standard build order
+        self.build_templates.insert("GLA_Standard".to_string(), vec![
+            "GLACommandCenter".to_string(),
+            "GLABarracks".to_string(),
+            "GLASupplyStash".to_string(),
+            "GLAArmsDealer".to_string(),
+            "GLASupplyStash".to_string(),
+            "GLABlackMarket".to_string(),
+            "GLAPalace".to_string(),
+        ])
+    }
+
+    // Add a new AI team
+    fn add_team(&mut self, player_id: u32, faction: string, difficulty: AIDifficulty,
+                personality: AIPersonality) -> u32 {
+        if self.team_count >= MAX_AI_TEAMS {
+            return 0
+        }
+
+        let team_id = self.team_count
+        self.teams[team_id as usize] = AITeam::new(player_id, team_id, faction,
+                                                    difficulty, personality)
+        self.team_count += 1
+
+        team_id
+    }
+
+    fn remove_team(&mut self, team_id: u32) {
+        if team_id < self.team_count {
+            self.teams[team_id as usize].is_active = false
+        }
+    }
+
+    // Main update loop
+    fn update(&mut self, delta_time: f32) {
+        self.game_time += delta_time
+
+        for i in 0..self.team_count {
+            if self.teams[i as usize].is_active {
+                self.update_team(i, delta_time)
+            }
+        }
+    }
+
+    fn update_team(&mut self, team_id: u32, delta_time: f32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Check if it's time to think
+        if self.game_time < team.next_think_time {
+            return
+        }
+
+        team.next_think_time = self.game_time + team.think_interval
+
+        // Update unit tracking
+        self.update_unit_tracking(team_id)
+
+        // Run state machine
+        let current_state = team.state
+        match current_state {
+            AIState::Initial => self.state_initial(team_id),
+            AIState::Building => self.state_building(team_id),
+            AIState::Defending => self.state_defending(team_id),
+            AIState::Scouting => self.state_scouting(team_id),
+            AIState::Attacking => self.state_attacking(team_id),
+            AIState::Retreating => self.state_retreating(team_id),
+            AIState::Regrouping => self.state_regrouping(team_id),
+            AIState::Expanding => self.state_expanding(team_id),
+            AIState::EndGame => self.state_endgame(team_id),
+        }
+
+        // Always update build queue
+        self.process_build_queue(team_id)
+
+        // Update attack groups
+        self.update_attack_groups(team_id)
+    }
+
+    fn update_unit_tracking(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        team.owned_unit_count = 0
+        team.owned_building_count = 0
+
+        // Query all things owned by this player
+        // In a real implementation, this would iterate over the ThingFactory
+        // for thing in self.thing_factory.get_things_for_player(team.player_id)
+    }
+
+    // State handlers
+    fn state_initial(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Find our starting position
+        if team.owned_building_count > 0 {
+            // Use first building as base center
+            // team.base_center = get_building_position(team.owned_buildings[0])
+        }
+
+        // Setup initial build list
+        self.setup_initial_build_list(team_id)
+
+        // Transition to building
+        team.state = AIState::Building
+    }
+
+    fn state_building(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Check if we have enough army to attack
+        let army_strength = self.calculate_army_strength(team_id)
+
+        if army_strength >= team.attack_threshold {
+            // Form attack group and transition to attacking
+            self.form_attack_group(team_id, AttackGroupType::Main)
+            team.state = AIState::Attacking
+        }
+
+        // Check if we need to defend
+        if self.detect_threat_at_base(team_id) {
+            team.state = AIState::Defending
+        }
+
+        // Check if we should scout
+        if self.game_time - team.last_scout_time > 60.0 { // Scout every minute
+            self.send_scout(team_id)
+            team.last_scout_time = self.game_time
+        }
+
+        // Update state timer
+        team.state_timer += 1.0
+    }
+
+    fn state_defending(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Rally all available units to base
+        self.rally_units_to_base(team_id)
+
+        // Check if threat is eliminated
+        if !self.detect_threat_at_base(team_id) {
+            team.state = AIState::Building
+        }
+    }
+
+    fn state_scouting(&mut self, team_id: u32) {
+        // Scout state logic - usually transitions quickly
+        let team = &mut self.teams[team_id as usize]
+        team.state = AIState::Building
+    }
+
+    fn state_attacking(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Check attack group status
+        let main_group_alive = self.is_attack_group_alive(team_id, 0)
+
+        if !main_group_alive {
+            // Attack failed, retreat and rebuild
+            team.state = AIState::Retreating
+        }
+
+        // Check if we need to defend base
+        if self.detect_threat_at_base(team_id) {
+            // Split force or retreat
+            if team.defense_focus > 0.5 {
+                team.state = AIState::Retreating
+            }
+        }
+    }
+
+    fn state_retreating(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Move all attack groups back to base
+        for i in 0..team.attack_group_count {
+            let group = &mut team.attack_groups[i as usize]
+            group.target_position = team.base_center.clone()
+            group.attack_state = AttackGroupState::Retreating
+        }
+
+        team.state = AIState::Regrouping
+    }
+
+    fn state_regrouping(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Wait for units to return, then go back to building
+        let all_near_base = true // Check if units are near base
+
+        if all_near_base {
+            // Disband attack groups
+            team.attack_group_count = 0
+            team.state = AIState::Building
+        }
+    }
+
+    fn state_expanding(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Try to build expansion base
+        // This is GLA-specific or for maps with supply docks
+
+        team.state = AIState::Building
+    }
+
+    fn state_endgame(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Late game - focus on superweapons and final push
+        // Adjust priorities
+        team.tech_focus = 1.0
+        team.attack_threshold = 20.0 // Need bigger army
+    }
+
+    // Build queue management
+    fn setup_initial_build_list(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Get build template for faction
+        let template_key = team.faction.clone() + "_Standard"
+
+        if let Some(template) = self.build_templates.get(&template_key) {
+            team.build_list_count = 0
+
+            for building in template {
+                if team.build_list_count >= MAX_BUILD_LIST as u32 {
+                    break
+                }
+
+                let idx = team.build_list_count as usize
+                team.build_list[idx].object_name = building.clone()
+                team.build_list[idx].quantity = 1
+                team.build_list[idx].priority = 1.0
+                team.build_list[idx].is_upgrade = false
+                team.build_list[idx].prerequisite_met = true
+                team.build_list_count += 1
+            }
+        }
+
+        // Add unit builds based on personality
+        self.add_unit_builds_for_personality(team_id)
+    }
+
+    fn add_unit_builds_for_personality(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        let units_to_add: Vec<(string, u32)> = match team.personality {
+            AIPersonality::Aggressive => vec![
+                ("AmericaRanger".to_string(), 10),
+                ("AmericaHumvee".to_string(), 5),
+            ],
+            AIPersonality::Defensive => vec![
+                ("AmericaPatriotMissile".to_string(), 4),
+                ("AmericaMissileDefender".to_string(), 6),
+            ],
+            AIPersonality::Tank => vec![
+                ("AmericaCrusaderTank".to_string(), 8),
+                ("AmericaPaladinTank".to_string(), 4),
+            ],
+            AIPersonality::Infantry => vec![
+                ("AmericaRanger".to_string(), 15),
+                ("AmericaMissileDefender".to_string(), 8),
+                ("AmericaPathfinder".to_string(), 4),
+            ],
+            AIPersonality::Air => vec![
+                ("AmericaComanche".to_string(), 6),
+                ("AmericaRaptor".to_string(), 4),
+            ],
+            _ => vec![
+                ("AmericaRanger".to_string(), 8),
+                ("AmericaCrusaderTank".to_string(), 4),
+                ("AmericaComanche".to_string(), 2),
+            ],
+        }
+
+        for (unit_name, quantity) in units_to_add {
+            if team.build_list_count >= MAX_BUILD_LIST as u32 {
+                break
+            }
+
+            let idx = team.build_list_count as usize
+            team.build_list[idx].object_name = unit_name
+            team.build_list[idx].quantity = quantity
+            team.build_list[idx].priority = 0.8
+            team.build_list[idx].is_upgrade = false
+            team.build_list_count += 1
+        }
+    }
+
+    fn process_build_queue(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        // Find highest priority item we can build
+        let mut best_idx: i32 = -1
+        let mut best_priority: f32 = 0.0
+
+        for i in 0..team.build_list_count {
+            let entry = &team.build_list[i as usize]
+
+            if entry.quantity == 0 {
+                continue
+            }
+
+            if !entry.prerequisite_met {
+                continue
+            }
+
+            // Check if we can afford it
+            // let cost = self.game_data.get_build_cost(entry.object_name)
+            // if team.money < cost { continue }
+
+            if entry.priority > best_priority {
+                best_priority = entry.priority
+                best_idx = i as i32
+            }
+        }
+
+        if best_idx >= 0 {
+            let entry = &mut team.build_list[best_idx as usize]
+            // Issue build command
+            // self.issue_build_command(team_id, entry.object_name.clone())
+            entry.quantity -= 1
+        }
+    }
+
+    // Attack group management
+    fn form_attack_group(&mut self, team_id: u32, group_type: AttackGroupType) {
+        let team = &mut self.teams[team_id as usize]
+
+        if team.attack_group_count >= MAX_ATTACK_GROUPS as u32 {
+            return
+        }
+
+        let group_idx = team.attack_group_count as usize
+        let group = &mut team.attack_groups[group_idx]
+
+        group.group_type = group_type
+        group.attack_state = AttackGroupState::Forming
+        group.creation_time = self.game_time
+        group.unit_count = 0
+
+        // Add available combat units to group
+        for i in 0..team.owned_unit_count {
+            let unit_id = team.owned_units[i as usize]
+            // Check if unit is combat capable and not in another group
+            // if self.thing_factory.get_thing(unit_id).is_combat_unit()
+
+            if group.unit_count < 64 {
+                group.unit_ids[group.unit_count as usize] = unit_id
+                group.unit_count += 1
+            }
+        }
+
+        // Find target
+        if team.known_enemy_count > 0 {
+            group.target_position = team.known_enemy_positions[0].clone()
+        }
+
+        team.attack_group_count += 1
+    }
+
+    fn update_attack_groups(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        for i in 0..team.attack_group_count {
+            let group = &mut team.attack_groups[i as usize]
+
+            match group.attack_state {
+                AttackGroupState::Forming => {
+                    // Wait for minimum units
+                    if group.unit_count >= 5 {
+                        group.attack_state = AttackGroupState::Moving
+                        // Issue move command to all units
+                    }
+                }
+                AttackGroupState::Moving => {
+                    // Check if we've reached target
+                    // If enemies nearby, switch to attacking
+                    // group.attack_state = AttackGroupState::Attacking
+                }
+                AttackGroupState::Attacking => {
+                    // Check if we've won or need to retreat
+                    // if group.unit_count < 3
+                    //     group.attack_state = AttackGroupState::Retreating
+                }
+                AttackGroupState::Retreating => {
+                    // Move back to base
+                    group.target_position = team.base_center.clone()
+                }
+                AttackGroupState::Disbanded => {
+                    // Remove this group
+                }
+            }
+        }
+    }
+
+    fn is_attack_group_alive(&self, team_id: u32, group_idx: u32) -> bool {
+        let team = &self.teams[team_id as usize]
+
+        if group_idx >= team.attack_group_count {
+            return false
+        }
+
+        team.attack_groups[group_idx as usize].unit_count >= 3
+    }
+
+    // Helper functions
+    fn calculate_army_strength(&self, team_id: u32) -> f32 {
+        let team = &self.teams[team_id as usize]
+
+        // Simple strength calculation based on unit count
+        // In a real implementation, this would factor in unit types and health
+        team.owned_unit_count as f32
+    }
+
+    fn detect_threat_at_base(&self, team_id: u32) -> bool {
+        // Check for enemy units near base
+        // Would query spatial hash for enemies near base_center
+        false
+    }
+
+    fn send_scout(&mut self, team_id: u32) {
+        // Find a fast unit and send it to explore
+        // team.last_scout_time = self.game_time
+    }
+
+    fn rally_units_to_base(&mut self, team_id: u32) {
+        let team = &self.teams[team_id as usize]
+
+        // Issue move command to all owned units to return to base
+        for i in 0..team.owned_unit_count {
+            // Issue move command to team.base_center
+        }
+    }
+
+    // Public interface
+    fn get_team(&self, team_id: u32) -> Option<&AITeam> {
+        if team_id < self.team_count && self.teams[team_id as usize].is_active {
+            return Some(&self.teams[team_id as usize])
+        }
+        None
+    }
+
+    fn set_team_difficulty(&mut self, team_id: u32, difficulty: AIDifficulty) {
+        if team_id < self.team_count {
+            self.teams[team_id as usize].difficulty = difficulty
+            self.apply_difficulty_modifiers(team_id)
+        }
+    }
+
+    fn apply_difficulty_modifiers(&mut self, team_id: u32) {
+        let team = &mut self.teams[team_id as usize]
+
+        match team.difficulty {
+            AIDifficulty::Easy => {
+                team.think_interval = 2.0 // Slower thinking
+                team.attack_threshold = 15.0 // Needs bigger army to attack
+                team.aggression = 0.3
+            }
+            AIDifficulty::Medium => {
+                team.think_interval = 1.0
+                team.attack_threshold = 10.0
+                team.aggression = 0.5
+            }
+            AIDifficulty::Hard => {
+                team.think_interval = 0.5 // Faster thinking
+                team.attack_threshold = 8.0
+                team.aggression = 0.7
+            }
+            AIDifficulty::Brutal => {
+                team.think_interval = 0.25 // Very fast
+                team.attack_threshold = 5.0
+                team.aggression = 0.9
+            }
+        }
+    }
+
+    fn report_enemy_spotted(&mut self, team_id: u32, position: Vec3) {
+        let team = &mut self.teams[team_id as usize]
+
+        if team.known_enemy_count < 64 {
+            team.known_enemy_positions[team.known_enemy_count as usize] = position
+            team.known_enemy_count += 1
+        }
+    }
+}
+
+impl AITeam {
+    fn new(player_id: u32, team_id: u32, faction: string, difficulty: AIDifficulty,
+           personality: AIPersonality) -> Self {
+        let mut team = AITeam {
+            player_id: player_id,
+            team_id: team_id,
+            faction: faction,
+            difficulty: difficulty,
+            personality: personality,
+            state: AIState::Initial,
+            state_timer: 0.0,
+            money: 0,
+            power_surplus: 0,
+            base_center: Vec3::default(),
+            base_radius: 200.0,
+            owned_units: [0; MAX_OWNED_UNITS as usize],
+            owned_unit_count: 0,
+            owned_buildings: [0; MAX_OWNED_BUILDINGS as usize],
+            owned_building_count: 0,
+            attack_groups: [AttackGroup::default(); MAX_ATTACK_GROUPS as usize],
+            attack_group_count: 0,
+            build_list: [BuildEntry::default(); MAX_BUILD_LIST as usize],
+            build_list_count: 0,
+            known_enemy_positions: [Vec3::default(); 64],
+            known_enemy_count: 0,
+            last_scout_time: 0.0,
+            target_priorities: [TargetPriority::default(); 32],
+            target_priority_count: 0,
+            next_think_time: 0.0,
+            think_interval: 1.0,
+            aggression: 0.5,
+            economy_focus: 0.5,
+            defense_focus: 0.5,
+            tech_focus: 0.5,
+            attack_threshold: 10.0,
+            is_active: true,
+        }
+
+        // Apply personality modifiers
+        match personality {
+            AIPersonality::Aggressive => {
+                team.aggression = 0.8
+                team.economy_focus = 0.3
+                team.attack_threshold = 6.0
+            }
+            AIPersonality::Defensive => {
+                team.aggression = 0.2
+                team.defense_focus = 0.9
+                team.attack_threshold = 15.0
+            }
+            AIPersonality::Tank => {
+                team.economy_focus = 0.6
+            }
+            AIPersonality::Tech => {
+                team.tech_focus = 0.9
+                team.attack_threshold = 12.0
+            }
+            _ => {}
+        }
+
+        team
+    }
+}
+
+impl Default for AITeam {
+    fn default() -> Self {
+        AITeam::new(0, 0, "USA".to_string(), AIDifficulty::Medium, AIPersonality::Balanced)
+    }
+}
+
+impl Default for Vec3 {
+    fn default() -> Self {
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+impl Clone for Vec3 {
+    fn clone(&self) -> Self {
+        Vec3 { x: self.x, y: self.y, z: self.z }
+    }
+}
+
+impl Default for AttackGroup {
+    fn default() -> Self {
+        AttackGroup {
+            unit_ids: [0; 64],
+            unit_count: 0,
+            target_position: Vec3::default(),
+            attack_state: AttackGroupState::Disbanded,
+            group_type: AttackGroupType::Main,
+            creation_time: 0.0,
+        }
+    }
+}
+
+impl Default for BuildEntry {
+    fn default() -> Self {
+        BuildEntry {
+            object_name: "".to_string(),
+            quantity: 0,
+            priority: 0.0,
+            is_upgrade: false,
+            prerequisite_met: false,
+        }
+    }
+}
+
+impl Default for TargetPriority {
+    fn default() -> Self {
+        TargetPriority {
+            target_type: "".to_string(),
+            priority: 0.0,
+            can_attack: true,
+        }
+    }
+}
