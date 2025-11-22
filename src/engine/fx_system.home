@@ -1,0 +1,887 @@
+// FX System - Visual effects manager connecting FXList definitions to particles/sounds
+// Implements the C&C Generals effect system for explosions, impacts, etc.
+
+import graphics/particles::{ParticleEmitter, ParticleSystem, ParticlePriority, BlendMode, create_particle_emitter}
+import fx_list_parser::{FXListDefinition, FXNugget, FXNuggetType}
+import audio/game_audio_events::{audio_explosion, audio_weapon_fire}
+import math/vector3::{Vec3}
+
+// FX instance - a spawned effect
+struct FXInstance {
+    fx_name: string,
+    position: Vec3,
+    rotation: f32,
+    scale: f32,
+
+    // Component handles
+    particle_emitters: [&ParticleEmitter; 8],
+    emitter_count: u32,
+    audio_handle: u32,
+
+    // State
+    lifetime: f32,
+    elapsed: f32,
+    is_active: bool,
+    is_attached: bool,
+    attached_object_id: u32,
+    attached_bone: string,
+}
+
+impl FXInstance {
+    fn new() -> FXInstance {
+        return FXInstance {
+            fx_name: "",
+            position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            rotation: 0.0,
+            scale: 1.0,
+            particle_emitters: [],
+            emitter_count: 0,
+            audio_handle: 0,
+            lifetime: 5.0,
+            elapsed: 0.0,
+            is_active: false,
+            is_attached: false,
+            attached_object_id: 0,
+            attached_bone: "",
+        }
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        if not self.is_active {
+            return
+        }
+
+        self.elapsed = self.elapsed + delta_time
+
+        // Update attached position if attached to an object
+        if self.is_attached {
+            // Get object position + bone offset
+            // self.position = get_object_bone_position(self.attached_object_id, self.attached_bone)
+        }
+
+        // Update emitter positions
+        for i in 0..self.emitter_count {
+            self.particle_emitters[i].position = self.position
+        }
+
+        // Check if effect should die
+        if self.elapsed >= self.lifetime {
+            self.stop()
+        }
+    }
+
+    fn stop(self: &mut Self) {
+        self.is_active = false
+
+        // Stop all emitters
+        for i in 0..self.emitter_count {
+            self.particle_emitters[i].stop()
+        }
+    }
+}
+
+const MAX_FX_INSTANCES: u32 = 512
+const MAX_FX_DEFINITIONS: u32 = 256
+
+// Predefined FX types
+enum FXType {
+    // Explosions
+    SmallExplosion,
+    MediumExplosion,
+    LargeExplosion,
+    NuclearExplosion,
+
+    // Weapon effects
+    MuzzleFlash,
+    BulletImpact,
+    MissileTrail,
+    LaserBeam,
+    ToxinSpray,
+    FlameStream,
+
+    // Vehicle effects
+    DustTrail,
+    TankTreads,
+    JetExhaust,
+    HelicopterRotor,
+    CrashFire,
+    WreckSmoke,
+
+    // Building effects
+    ConstructionDust,
+    BuildingFire,
+    BuildingSmoke,
+    PowerPlantGlow,
+    FactorySparks,
+
+    // Environmental
+    BloodSplatter,
+    WaterSplash,
+    DirtKickup,
+    GlassShattering,
+
+    // Special powers
+    ParticleBeam,
+    CarpetBombing,
+    EMPWave,
+    AnthraxCloud,
+    NeutronShell,
+
+    // Misc
+    LevelUp,
+    Promotion,
+    Heal,
+    Repair,
+}
+
+// FX definition (from INI)
+struct FXDefinition {
+    name: string,
+    fx_type: FXType,
+
+    // Particle configurations
+    particle_configs: [ParticleConfig; 4],
+    particle_count: u32,
+
+    // Audio
+    sound_name: string,
+    sound_delay: f32,
+
+    // Timing
+    duration: f32,
+    delay_start: f32,
+
+    // Scale modifiers
+    scale_min: f32,
+    scale_max: f32,
+
+    // Light
+    has_light: bool,
+    light_color: Vec3,
+    light_radius: f32,
+    light_duration: f32,
+
+    // Screen shake
+    shake_intensity: f32,
+    shake_duration: f32,
+}
+
+struct ParticleConfig {
+    emitter_name: string,
+    offset: Vec3,
+    inherit_velocity: bool,
+    max_particles: u32,
+
+    // Particle properties
+    lifetime_min: f32,
+    lifetime_max: f32,
+    size_min: f32,
+    size_max: f32,
+    emit_rate: f32,
+    burst_count: u32,
+
+    // Color
+    start_color_r: f32,
+    start_color_g: f32,
+    start_color_b: f32,
+    start_color_a: f32,
+    end_color_r: f32,
+    end_color_g: f32,
+    end_color_b: f32,
+    end_color_a: f32,
+
+    // Velocity
+    velocity_min: Vec3,
+    velocity_max: Vec3,
+    gravity: Vec3,
+
+    // Texture
+    texture_name: string,
+    blend_mode: u32,  // 0=Alpha, 1=Additive, 2=Multiply
+}
+
+// FX System manager
+struct FXSystem {
+    // FX definitions
+    definitions: [FXDefinition; MAX_FX_DEFINITIONS],
+    definition_count: u32,
+
+    // Active instances
+    instances: [FXInstance; MAX_FX_INSTANCES],
+    instance_count: u32,
+
+    // Performance
+    max_active_fx: u32,
+    current_active: u32,
+
+    // Quality settings
+    fx_quality: u32,  // 0=Low, 1=Medium, 2=High
+}
+
+impl FXSystem {
+    fn new() -> FXSystem {
+        let system = FXSystem {
+            definitions: [],
+            definition_count: 0,
+            instances: [],
+            instance_count: 0,
+            max_active_fx: 256,
+            current_active: 0,
+            fx_quality: 2,
+        }
+
+        system.register_default_fx()
+
+        return system
+    }
+
+    fn register_default_fx(self: &mut Self) {
+        // Small explosion
+        self.register_fx(FXDefinition {
+            name: "FX_SmallExplosion",
+            fx_type: FXType::SmallExplosion,
+            particle_configs: [
+                self.create_explosion_fire_config(0.5),
+                self.create_explosion_smoke_config(0.5),
+                self.create_debris_config(0.3),
+                ParticleConfig::default(),
+            ],
+            particle_count: 3,
+            sound_name: "ExplosionSmall",
+            sound_delay: 0.0,
+            duration: 2.0,
+            delay_start: 0.0,
+            scale_min: 0.8,
+            scale_max: 1.2,
+            has_light: true,
+            light_color: Vec3 { x: 1.0, y: 0.6, z: 0.2 },
+            light_radius: 20.0,
+            light_duration: 0.3,
+            shake_intensity: 0.1,
+            shake_duration: 0.2,
+        })
+
+        // Medium explosion
+        self.register_fx(FXDefinition {
+            name: "FX_MediumExplosion",
+            fx_type: FXType::MediumExplosion,
+            particle_configs: [
+                self.create_explosion_fire_config(1.0),
+                self.create_explosion_smoke_config(1.0),
+                self.create_debris_config(0.5),
+                self.create_shockwave_config(0.8),
+            ],
+            particle_count: 4,
+            sound_name: "ExplosionMedium",
+            sound_delay: 0.0,
+            duration: 3.0,
+            delay_start: 0.0,
+            scale_min: 0.8,
+            scale_max: 1.2,
+            has_light: true,
+            light_color: Vec3 { x: 1.0, y: 0.5, z: 0.1 },
+            light_radius: 40.0,
+            light_duration: 0.5,
+            shake_intensity: 0.3,
+            shake_duration: 0.4,
+        })
+
+        // Large explosion
+        self.register_fx(FXDefinition {
+            name: "FX_LargeExplosion",
+            fx_type: FXType::LargeExplosion,
+            particle_configs: [
+                self.create_explosion_fire_config(2.0),
+                self.create_explosion_smoke_config(2.5),
+                self.create_debris_config(1.0),
+                self.create_shockwave_config(1.5),
+            ],
+            particle_count: 4,
+            sound_name: "ExplosionLarge",
+            sound_delay: 0.0,
+            duration: 5.0,
+            delay_start: 0.0,
+            scale_min: 0.9,
+            scale_max: 1.1,
+            has_light: true,
+            light_color: Vec3 { x: 1.0, y: 0.4, z: 0.0 },
+            light_radius: 80.0,
+            light_duration: 0.8,
+            shake_intensity: 0.6,
+            shake_duration: 0.6,
+        })
+
+        // Muzzle flash
+        self.register_fx(FXDefinition {
+            name: "FX_MuzzleFlash",
+            fx_type: FXType::MuzzleFlash,
+            particle_configs: [
+                self.create_muzzle_flash_config(),
+                self.create_muzzle_smoke_config(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+            ],
+            particle_count: 2,
+            sound_name: "",
+            sound_delay: 0.0,
+            duration: 0.5,
+            delay_start: 0.0,
+            scale_min: 1.0,
+            scale_max: 1.0,
+            has_light: true,
+            light_color: Vec3 { x: 1.0, y: 0.8, z: 0.3 },
+            light_radius: 5.0,
+            light_duration: 0.1,
+            shake_intensity: 0.0,
+            shake_duration: 0.0,
+        })
+
+        // Missile trail
+        self.register_fx(FXDefinition {
+            name: "FX_MissileTrail",
+            fx_type: FXType::MissileTrail,
+            particle_configs: [
+                self.create_missile_smoke_config(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+            ],
+            particle_count: 1,
+            sound_name: "",
+            sound_delay: 0.0,
+            duration: 10.0,
+            delay_start: 0.0,
+            scale_min: 1.0,
+            scale_max: 1.0,
+            has_light: false,
+            light_color: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            light_radius: 0.0,
+            light_duration: 0.0,
+            shake_intensity: 0.0,
+            shake_duration: 0.0,
+        })
+
+        // Dust trail (for ground vehicles)
+        self.register_fx(FXDefinition {
+            name: "FX_DustTrail",
+            fx_type: FXType::DustTrail,
+            particle_configs: [
+                self.create_dust_trail_config(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+            ],
+            particle_count: 1,
+            sound_name: "",
+            sound_delay: 0.0,
+            duration: 999.0,  // Continuous while moving
+            delay_start: 0.0,
+            scale_min: 1.0,
+            scale_max: 1.0,
+            has_light: false,
+            light_color: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            light_radius: 0.0,
+            light_duration: 0.0,
+            shake_intensity: 0.0,
+            shake_duration: 0.0,
+        })
+
+        // Building fire
+        self.register_fx(FXDefinition {
+            name: "FX_BuildingFire",
+            fx_type: FXType::BuildingFire,
+            particle_configs: [
+                self.create_building_fire_config(),
+                self.create_building_smoke_config(),
+                ParticleConfig::default(),
+                ParticleConfig::default(),
+            ],
+            particle_count: 2,
+            sound_name: "FireLoop",
+            sound_delay: 0.0,
+            duration: 999.0,
+            delay_start: 0.0,
+            scale_min: 1.0,
+            scale_max: 1.0,
+            has_light: true,
+            light_color: Vec3 { x: 1.0, y: 0.5, z: 0.1 },
+            light_radius: 15.0,
+            light_duration: 999.0,
+            shake_intensity: 0.0,
+            shake_duration: 0.0,
+        })
+    }
+
+    // Particle config helpers
+    fn create_explosion_fire_config(self: &Self, scale: f32) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "ExplosionFire",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 50,
+            lifetime_min: 0.3 * scale,
+            lifetime_max: 0.6 * scale,
+            size_min: 5.0 * scale,
+            size_max: 10.0 * scale,
+            emit_rate: 0.0,
+            burst_count: (30.0 * scale) as u32,
+            start_color_r: 1.0,
+            start_color_g: 0.8,
+            start_color_b: 0.2,
+            start_color_a: 1.0,
+            end_color_r: 1.0,
+            end_color_g: 0.3,
+            end_color_b: 0.0,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -20.0 * scale, y: 10.0 * scale, z: -20.0 * scale },
+            velocity_max: Vec3 { x: 20.0 * scale, y: 40.0 * scale, z: 20.0 * scale },
+            gravity: Vec3 { x: 0.0, y: -5.0, z: 0.0 },
+            texture_name: "EXFire01",
+            blend_mode: 1,  // Additive
+        }
+    }
+
+    fn create_explosion_smoke_config(self: &Self, scale: f32) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "ExplosionSmoke",
+            offset: Vec3 { x: 0.0, y: 2.0 * scale, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 100,
+            lifetime_min: 1.0 * scale,
+            lifetime_max: 2.0 * scale,
+            size_min: 8.0 * scale,
+            size_max: 15.0 * scale,
+            emit_rate: 0.0,
+            burst_count: (20.0 * scale) as u32,
+            start_color_r: 0.3,
+            start_color_g: 0.3,
+            start_color_b: 0.3,
+            start_color_a: 0.8,
+            end_color_r: 0.1,
+            end_color_g: 0.1,
+            end_color_b: 0.1,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -10.0 * scale, y: 15.0 * scale, z: -10.0 * scale },
+            velocity_max: Vec3 { x: 10.0 * scale, y: 30.0 * scale, z: 10.0 * scale },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "Smoke01",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn create_debris_config(self: &Self, scale: f32) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "Debris",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 30,
+            lifetime_min: 1.0,
+            lifetime_max: 2.0,
+            size_min: 0.5 * scale,
+            size_max: 1.5 * scale,
+            emit_rate: 0.0,
+            burst_count: (15.0 * scale) as u32,
+            start_color_r: 0.4,
+            start_color_g: 0.35,
+            start_color_b: 0.3,
+            start_color_a: 1.0,
+            end_color_r: 0.4,
+            end_color_g: 0.35,
+            end_color_b: 0.3,
+            end_color_a: 1.0,
+            velocity_min: Vec3 { x: -30.0 * scale, y: 20.0 * scale, z: -30.0 * scale },
+            velocity_max: Vec3 { x: 30.0 * scale, y: 50.0 * scale, z: 30.0 * scale },
+            gravity: Vec3 { x: 0.0, y: -40.0, z: 0.0 },
+            texture_name: "Debris01",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn create_shockwave_config(self: &Self, scale: f32) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "Shockwave",
+            offset: Vec3 { x: 0.0, y: 0.5, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 1,
+            lifetime_min: 0.3,
+            lifetime_max: 0.3,
+            size_min: 1.0,
+            size_max: 30.0 * scale,
+            emit_rate: 0.0,
+            burst_count: 1,
+            start_color_r: 1.0,
+            start_color_g: 1.0,
+            start_color_b: 1.0,
+            start_color_a: 0.5,
+            end_color_r: 1.0,
+            end_color_g: 1.0,
+            end_color_b: 1.0,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            velocity_max: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "Shockwave",
+            blend_mode: 1,  // Additive
+        }
+    }
+
+    fn create_muzzle_flash_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "MuzzleFlash",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 1,
+            lifetime_min: 0.05,
+            lifetime_max: 0.1,
+            size_min: 1.0,
+            size_max: 2.0,
+            emit_rate: 0.0,
+            burst_count: 1,
+            start_color_r: 1.0,
+            start_color_g: 0.9,
+            start_color_b: 0.5,
+            start_color_a: 1.0,
+            end_color_r: 1.0,
+            end_color_g: 0.5,
+            end_color_b: 0.0,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            velocity_max: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "MuzzleFlash",
+            blend_mode: 1,  // Additive
+        }
+    }
+
+    fn create_muzzle_smoke_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "MuzzleSmoke",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: true,
+            max_particles: 10,
+            lifetime_min: 0.5,
+            lifetime_max: 1.0,
+            size_min: 0.5,
+            size_max: 1.5,
+            emit_rate: 0.0,
+            burst_count: 3,
+            start_color_r: 0.6,
+            start_color_g: 0.6,
+            start_color_b: 0.6,
+            start_color_a: 0.5,
+            end_color_r: 0.3,
+            end_color_g: 0.3,
+            end_color_b: 0.3,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -2.0, y: 1.0, z: -2.0 },
+            velocity_max: Vec3 { x: 2.0, y: 3.0, z: 2.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "SmokePuff",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn create_missile_smoke_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "MissileSmoke",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: true,
+            max_particles: 200,
+            lifetime_min: 0.5,
+            lifetime_max: 1.5,
+            size_min: 1.0,
+            size_max: 3.0,
+            emit_rate: 50.0,
+            burst_count: 0,
+            start_color_r: 0.8,
+            start_color_g: 0.8,
+            start_color_b: 0.8,
+            start_color_a: 0.8,
+            end_color_r: 0.3,
+            end_color_g: 0.3,
+            end_color_b: 0.3,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -1.0, y: -1.0, z: -1.0 },
+            velocity_max: Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "MissileSmoke",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn create_dust_trail_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "DustTrail",
+            offset: Vec3 { x: 0.0, y: 0.5, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 100,
+            lifetime_min: 1.0,
+            lifetime_max: 2.0,
+            size_min: 2.0,
+            size_max: 5.0,
+            emit_rate: 20.0,
+            burst_count: 0,
+            start_color_r: 0.7,
+            start_color_g: 0.6,
+            start_color_b: 0.5,
+            start_color_a: 0.4,
+            end_color_r: 0.5,
+            end_color_g: 0.45,
+            end_color_b: 0.4,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -3.0, y: 1.0, z: -3.0 },
+            velocity_max: Vec3 { x: 3.0, y: 5.0, z: 3.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "Dust",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn create_building_fire_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "BuildingFire",
+            offset: Vec3 { x: 0.0, y: 5.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 50,
+            lifetime_min: 0.3,
+            lifetime_max: 0.8,
+            size_min: 3.0,
+            size_max: 6.0,
+            emit_rate: 30.0,
+            burst_count: 0,
+            start_color_r: 1.0,
+            start_color_g: 0.7,
+            start_color_b: 0.2,
+            start_color_a: 1.0,
+            end_color_r: 1.0,
+            end_color_g: 0.3,
+            end_color_b: 0.0,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -2.0, y: 5.0, z: -2.0 },
+            velocity_max: Vec3 { x: 2.0, y: 15.0, z: 2.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "Fire01",
+            blend_mode: 1,  // Additive
+        }
+    }
+
+    fn create_building_smoke_config(self: &Self) -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "BuildingSmoke",
+            offset: Vec3 { x: 0.0, y: 8.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 100,
+            lifetime_min: 2.0,
+            lifetime_max: 4.0,
+            size_min: 5.0,
+            size_max: 12.0,
+            emit_rate: 10.0,
+            burst_count: 0,
+            start_color_r: 0.2,
+            start_color_g: 0.2,
+            start_color_b: 0.2,
+            start_color_a: 0.7,
+            end_color_r: 0.1,
+            end_color_g: 0.1,
+            end_color_b: 0.1,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: -3.0, y: 5.0, z: -3.0 },
+            velocity_max: Vec3 { x: 3.0, y: 15.0, z: 3.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "DarkSmoke",
+            blend_mode: 0,  // Alpha
+        }
+    }
+
+    fn register_fx(self: &mut Self, definition: FXDefinition) {
+        if self.definition_count < MAX_FX_DEFINITIONS {
+            self.definitions[self.definition_count] = definition
+            self.definition_count = self.definition_count + 1
+        }
+    }
+
+    fn find_definition(self: &Self, name: string) -> i32 {
+        for i in 0..self.definition_count {
+            if self.definitions[i].name == name {
+                return i as i32
+            }
+        }
+        return -1
+    }
+
+    fn spawn_fx(self: &mut Self, name: string, position: Vec3) -> i32 {
+        let def_index = self.find_definition(name)
+        if def_index < 0 {
+            return -1
+        }
+
+        // Find free instance slot
+        let instance_index = self.find_free_instance()
+        if instance_index < 0 {
+            return -1
+        }
+
+        let definition = &self.definitions[def_index as u32]
+        let instance = &mut self.instances[instance_index as u32]
+
+        instance.fx_name = name
+        instance.position = position
+        instance.lifetime = definition.duration
+        instance.elapsed = 0.0
+        instance.is_active = true
+        instance.emitter_count = 0
+
+        // Create particle emitters
+        for i in 0..definition.particle_count {
+            let config = &definition.particle_configs[i]
+            let emitter = create_particle_emitter(config.emitter_name, config.max_particles)
+
+            if emitter != null {
+                // Configure emitter
+                emitter.position = position + config.offset
+                emitter.particle_lifetime_min = config.lifetime_min
+                emitter.particle_lifetime_max = config.lifetime_max
+                emitter.particle_size_min = config.size_min
+                emitter.particle_size_max = config.size_max
+                emitter.emit_rate = config.emit_rate
+                emitter.burst_count = config.burst_count
+
+                emitter.start()
+
+                instance.particle_emitters[instance.emitter_count] = emitter
+                instance.emitter_count = instance.emitter_count + 1
+            }
+        }
+
+        // Play sound
+        if definition.sound_name.len() > 0 {
+            audio_explosion(definition.sound_name, position.x, position.y, position.z)
+        }
+
+        self.current_active = self.current_active + 1
+
+        return instance_index
+    }
+
+    fn find_free_instance(self: &Self) -> i32 {
+        for i in 0..MAX_FX_INSTANCES {
+            if not self.instances[i].is_active {
+                return i as i32
+            }
+        }
+        return -1
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        for i in 0..MAX_FX_INSTANCES {
+            if self.instances[i].is_active {
+                self.instances[i].update(delta_time)
+
+                if not self.instances[i].is_active {
+                    self.current_active = self.current_active - 1
+                }
+            }
+        }
+    }
+
+    fn stop_fx(self: &mut Self, instance_index: i32) {
+        if instance_index >= 0 and instance_index < MAX_FX_INSTANCES as i32 {
+            self.instances[instance_index as u32].stop()
+        }
+    }
+
+    fn set_quality(self: &mut Self, quality: u32) {
+        self.fx_quality = quality.min(2)
+
+        // Adjust max active based on quality
+        self.max_active_fx = match self.fx_quality {
+            0 => 64,
+            1 => 128,
+            2 => 256,
+            _ => 256,
+        }
+    }
+}
+
+impl ParticleConfig {
+    fn default() -> ParticleConfig {
+        return ParticleConfig {
+            emitter_name: "",
+            offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            inherit_velocity: false,
+            max_particles: 0,
+            lifetime_min: 1.0,
+            lifetime_max: 1.0,
+            size_min: 1.0,
+            size_max: 1.0,
+            emit_rate: 0.0,
+            burst_count: 0,
+            start_color_r: 1.0,
+            start_color_g: 1.0,
+            start_color_b: 1.0,
+            start_color_a: 1.0,
+            end_color_r: 1.0,
+            end_color_g: 1.0,
+            end_color_b: 1.0,
+            end_color_a: 0.0,
+            velocity_min: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            velocity_max: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            gravity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            texture_name: "",
+            blend_mode: 0,
+        }
+    }
+}
+
+// Global FX System
+var g_fx_system: FXSystem = FXSystem::new()
+
+// Export functions
+export fn fx_init() {
+    g_fx_system = FXSystem::new()
+}
+
+export fn fx_update(delta_time: f32) {
+    g_fx_system.update(delta_time)
+}
+
+export fn fx_spawn(name: string, x: f32, y: f32, z: f32) -> i32 {
+    return g_fx_system.spawn_fx(name, Vec3 { x: x, y: y, z: z })
+}
+
+export fn fx_stop(instance_index: i32) {
+    g_fx_system.stop_fx(instance_index)
+}
+
+export fn fx_set_quality(quality: u32) {
+    g_fx_system.set_quality(quality)
+}
+
+// Convenience functions
+export fn fx_small_explosion(x: f32, y: f32, z: f32) {
+    fx_spawn("FX_SmallExplosion", x, y, z)
+}
+
+export fn fx_medium_explosion(x: f32, y: f32, z: f32) {
+    fx_spawn("FX_MediumExplosion", x, y, z)
+}
+
+export fn fx_large_explosion(x: f32, y: f32, z: f32) {
+    fx_spawn("FX_LargeExplosion", x, y, z)
+}
+
+export fn fx_muzzle_flash(x: f32, y: f32, z: f32) {
+    fx_spawn("FX_MuzzleFlash", x, y, z)
+}
+
+export fn fx_missile_trail(x: f32, y: f32, z: f32) -> i32 {
+    return fx_spawn("FX_MissileTrail", x, y, z)
+}
+
+export fn fx_dust_trail(x: f32, y: f32, z: f32) -> i32 {
+    return fx_spawn("FX_DustTrail", x, y, z)
+}
+
+export fn fx_building_fire(x: f32, y: f32, z: f32) -> i32 {
+    return fx_spawn("FX_BuildingFire", x, y, z)
+}

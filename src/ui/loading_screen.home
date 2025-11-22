@@ -1,0 +1,501 @@
+// Loading Screen - Mission loading with progress bar and tips
+// Implements the C&C Generals loading screen between matches
+
+import window_manager::{WindowManager, WindowMessage}
+import wnd_window::{WndWindow, WindowType}
+
+// Loading stage
+enum LoadingStage {
+    None,
+    InitializingRenderer,
+    LoadingTerrain,
+    LoadingObjects,
+    LoadingTextures,
+    LoadingModels,
+    LoadingAudio,
+    LoadingSidescripts,
+    InitializingAI,
+    SpawningUnits,
+    FinalSetup,
+    Complete,
+}
+
+// Loading tip category
+enum TipCategory {
+    General,
+    Combat,
+    Building,
+    Economy,
+    Faction,
+    Multiplayer,
+}
+
+// Loading tip
+struct LoadingTip {
+    text: string,
+    category: TipCategory,
+    faction_specific: bool,
+    faction: string,
+}
+
+const MAX_TIPS: u32 = 128
+const TIP_DISPLAY_TIME: f32 = 5.0  // Seconds per tip
+
+// Tips database
+const GENERAL_TIPS: [string; 20] = [
+    "Use control groups to quickly select and command your units.",
+    "Hold Ctrl and click to force-fire on your own units or friendly forces.",
+    "Double-click a unit to select all visible units of that type.",
+    "Use the minimap to quickly navigate around the battlefield.",
+    "Build Supply Centers near Supply Docks for efficient resource gathering.",
+    "Scatter your units with X to avoid splash damage from explosions.",
+    "Garrisoned infantry gain protection and improved firepower.",
+    "Watch the minimap for enemy movements and incoming attacks.",
+    "Hotkey buildings to quickly produce units from anywhere on the map.",
+    "Mixed forces are usually more effective than single unit types.",
+    "Upgrade your units to increase their combat effectiveness.",
+    "General powers can turn the tide of battle - use them wisely!",
+    "Repair damaged vehicles and aircraft to keep your forces at full strength.",
+    "Scouting early reveals enemy strategies and expansion plans.",
+    "Defend your base while attacking to avoid counterattacks.",
+    "Click and drag to select multiple units at once.",
+    "Use waypoints by holding Shift while giving movement orders.",
+    "Press F1 through F9 to use your General powers.",
+    "Capture tech buildings on the map for bonus abilities.",
+    "Economy is key - secure multiple supply sources when possible.",
+]
+
+const USA_TIPS: [string; 10] = [
+    "USA Pathfinders can eliminate infantry from extreme range.",
+    "Comanches can quickly destroy enemy vehicles when upgraded.",
+    "The Particle Cannon is devastating against stationary targets.",
+    "USA Chinooks can carry infantry units to distant locations.",
+    "Paladin Tanks have point-defense lasers that shoot down missiles.",
+    "Aurora Bombers are nearly invincible while attacking.",
+    "Rangers with flashbangs are effective against garrisoned buildings.",
+    "Combat Chinooks can deploy Rangers directly into combat.",
+    "Stealth Fighters are invisible on radar until they attack.",
+    "USA drones provide support abilities to your vehicles.",
+]
+
+const CHINA_TIPS: [string; 10] = [
+    "Chinese Hackers can generate cash from the internet.",
+    "Overlord Tanks can be upgraded with multiple weapons.",
+    "The Nuclear Missile creates a large area of radiation damage.",
+    "Dragon Tanks can clear garrisoned buildings with their firestream.",
+    "Red Guard are cheap and effective in large groups.",
+    "Chinese units gain Horde Bonuses when grouped together.",
+    "MiG aircraft are fast and deal heavy damage.",
+    "Speaker Towers boost nearby units' firepower significantly.",
+    "Inferno Cannons have extreme range but cannot fire while moving.",
+    "Nuke Cannons are slow but deal devastating damage.",
+]
+
+const GLA_TIPS: [string; 10] = [
+    "GLA Workers can salvage destroyed vehicles for resources.",
+    "GLA Tunnels can ambush enemies and provide quick transportation.",
+    "The SCUD Storm fires multiple missiles at a wide area.",
+    "Technical vehicles are fast and can be upgraded with weapons.",
+    "GLA buildings rebuild automatically when destroyed.",
+    "Jarmen Kell can snipe vehicle pilots, allowing you to capture vehicles.",
+    "Toxin attacks bypass most conventional armor.",
+    "Quad Cannons are effective against both air and ground targets.",
+    "Demo Traps can devastate enemy forces when triggered.",
+    "Hijackers can steal enemy vehicles for your own use.",
+]
+
+// Loading screen state
+struct LoadingScreen {
+    // Window references
+    window_manager: &WindowManager,
+    root_window: &WndWindow,
+
+    // Loading state
+    current_stage: LoadingStage,
+    stage_progress: f32,      // 0.0 to 1.0 within current stage
+    total_progress: f32,      // 0.0 to 1.0 overall
+
+    // Stage info
+    stage_name: string,
+    loading_item: string,
+
+    // Map info
+    map_name: string,
+    map_preview_texture: u64,
+    map_description: string,
+    num_players: u32,
+
+    // Tips
+    tips: [LoadingTip; MAX_TIPS],
+    tip_count: u32,
+    current_tip_index: u32,
+    tip_timer: f32,
+    current_faction: string,
+
+    // Animation
+    is_visible: bool,
+    fade_alpha: f32,
+    is_fading_in: bool,
+    is_fading_out: bool,
+
+    // Timing
+    min_display_time: f32,    // Minimum time to show loading screen
+    elapsed_time: f32,
+    loading_complete: bool,
+}
+
+impl LoadingScreen {
+    fn new(window_manager: &WindowManager) -> LoadingScreen {
+        let screen = LoadingScreen {
+            window_manager: window_manager,
+            root_window: null,
+            current_stage: LoadingStage::None,
+            stage_progress: 0.0,
+            total_progress: 0.0,
+            stage_name: "",
+            loading_item: "",
+            map_name: "",
+            map_preview_texture: 0,
+            map_description: "",
+            num_players: 0,
+            tips: [],
+            tip_count: 0,
+            current_tip_index: 0,
+            tip_timer: 0.0,
+            current_faction: "",
+            is_visible: false,
+            fade_alpha: 0.0,
+            is_fading_in: false,
+            is_fading_out: false,
+            min_display_time: 2.0,
+            elapsed_time: 0.0,
+            loading_complete: false,
+        }
+
+        screen.init_tips()
+
+        return screen
+    }
+
+    fn init_tips(self: &mut Self) {
+        // Add general tips
+        for i in 0..20 {
+            self.add_tip(GENERAL_TIPS[i], TipCategory::General, false, "")
+        }
+
+        // Add faction-specific tips
+        for i in 0..10 {
+            self.add_tip(USA_TIPS[i], TipCategory::Faction, true, "USA")
+        }
+        for i in 0..10 {
+            self.add_tip(CHINA_TIPS[i], TipCategory::Faction, true, "China")
+        }
+        for i in 0..10 {
+            self.add_tip(GLA_TIPS[i], TipCategory::Faction, true, "GLA")
+        }
+    }
+
+    fn add_tip(self: &mut Self, text: string, category: TipCategory, faction_specific: bool, faction: string) {
+        if self.tip_count < MAX_TIPS {
+            self.tips[self.tip_count] = LoadingTip {
+                text: text,
+                category: category,
+                faction_specific: faction_specific,
+                faction: faction,
+            }
+            self.tip_count = self.tip_count + 1
+        }
+    }
+
+    fn show(self: &mut Self, map_name: string, faction: string) {
+        self.map_name = map_name
+        self.current_faction = faction
+
+        self.current_stage = LoadingStage::None
+        self.stage_progress = 0.0
+        self.total_progress = 0.0
+        self.elapsed_time = 0.0
+        self.loading_complete = false
+
+        // Pick initial tip
+        self.pick_random_tip()
+        self.tip_timer = 0.0
+
+        // Start fade in
+        self.is_visible = true
+        self.is_fading_in = true
+        self.is_fading_out = false
+        self.fade_alpha = 0.0
+
+        self.show_window("LoadingScreen")
+        self.load_map_preview()
+    }
+
+    fn hide(self: &mut Self) {
+        // Start fade out instead of immediate hide
+        self.is_fading_out = true
+        self.is_fading_in = false
+    }
+
+    fn on_fade_complete(self: &mut Self) {
+        self.is_visible = false
+        self.hide_window("LoadingScreen")
+    }
+
+    fn show_window(self: &Self, name: string) {
+        // Show named window
+    }
+
+    fn hide_window(self: &Self, name: string) {
+        // Hide named window
+    }
+
+    fn load_map_preview(self: &mut Self) {
+        // Load map preview texture from map data
+        // map_preview_texture = TextureManager::load(map_name + "_preview.tga")
+    }
+
+    fn pick_random_tip(self: &mut Self) {
+        // Build list of valid tips (general + faction-specific)
+        let valid_indices: [u32; MAX_TIPS] = []
+        let valid_count: u32 = 0
+
+        for i in 0..self.tip_count {
+            let tip = &self.tips[i]
+            if not tip.faction_specific or tip.faction == self.current_faction {
+                valid_indices[valid_count] = i
+                valid_count = valid_count + 1
+            }
+        }
+
+        if valid_count > 0 {
+            // Pick random from valid tips
+            let random_index = (self.elapsed_time * 1000.0) as u32 % valid_count
+            self.current_tip_index = valid_indices[random_index]
+        }
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        self.elapsed_time = self.elapsed_time + delta_time
+
+        // Handle fading
+        if self.is_fading_in {
+            self.fade_alpha = self.fade_alpha + delta_time * 4.0
+            if self.fade_alpha >= 1.0 {
+                self.fade_alpha = 1.0
+                self.is_fading_in = false
+            }
+        } else if self.is_fading_out {
+            self.fade_alpha = self.fade_alpha - delta_time * 4.0
+            if self.fade_alpha <= 0.0 {
+                self.fade_alpha = 0.0
+                self.is_fading_out = false
+                self.on_fade_complete()
+            }
+        }
+
+        // Update tip rotation
+        self.tip_timer = self.tip_timer + delta_time
+        if self.tip_timer >= TIP_DISPLAY_TIME {
+            self.tip_timer = 0.0
+            self.pick_random_tip()
+            self.update_tip_display()
+        }
+
+        // Check if loading is done and minimum time has passed
+        if self.loading_complete and self.elapsed_time >= self.min_display_time {
+            if not self.is_fading_out {
+                self.hide()
+            }
+        }
+
+        self.update_progress_display()
+    }
+
+    fn set_stage(self: &mut Self, stage: LoadingStage) {
+        self.current_stage = stage
+        self.stage_progress = 0.0
+
+        self.stage_name = self.get_stage_name(stage)
+        self.update_stage_display()
+
+        // Calculate total progress based on stage
+        let stage_weight = self.get_stage_weight(stage)
+        self.recalculate_total_progress()
+    }
+
+    fn get_stage_name(self: &Self, stage: LoadingStage) -> string {
+        match stage {
+            LoadingStage::None => return ""
+            LoadingStage::InitializingRenderer => return "Initializing Graphics..."
+            LoadingStage::LoadingTerrain => return "Loading Terrain..."
+            LoadingStage::LoadingObjects => return "Loading Objects..."
+            LoadingStage::LoadingTextures => return "Loading Textures..."
+            LoadingStage::LoadingModels => return "Loading Models..."
+            LoadingStage::LoadingAudio => return "Loading Audio..."
+            LoadingSidescripts => return "Loading Scripts..."
+            LoadingStage::InitializingAI => return "Initializing AI..."
+            LoadingStage::SpawningUnits => return "Deploying Forces..."
+            LoadingStage::FinalSetup => return "Final Setup..."
+            LoadingStage::Complete => return "Ready!"
+        }
+    }
+
+    fn get_stage_weight(self: &Self, stage: LoadingStage) -> f32 {
+        // How much each stage contributes to total progress
+        match stage {
+            LoadingStage::None => return 0.0
+            LoadingStage::InitializingRenderer => return 0.05
+            LoadingStage::LoadingTerrain => return 0.15
+            LoadingStage::LoadingObjects => return 0.10
+            LoadingStage::LoadingTextures => return 0.25
+            LoadingStage::LoadingModels => return 0.20
+            LoadingStage::LoadingAudio => return 0.10
+            LoadingSidescripts => return 0.05
+            LoadingStage::InitializingAI => return 0.05
+            LoadingStage::SpawningUnits => return 0.03
+            LoadingStage::FinalSetup => return 0.02
+            LoadingStage::Complete => return 0.0
+        }
+    }
+
+    fn recalculate_total_progress(self: &mut Self) {
+        let total: f32 = 0.0
+        let stage_index = self.current_stage as u32
+
+        // Add completed stages
+        for i in 0..stage_index {
+            let s = i as LoadingStage
+            total = total + self.get_stage_weight(s)
+        }
+
+        // Add current stage progress
+        let current_weight = self.get_stage_weight(self.current_stage)
+        total = total + (current_weight * self.stage_progress)
+
+        self.total_progress = total.min(1.0)
+    }
+
+    fn set_stage_progress(self: &mut Self, progress: f32, item_name: string) {
+        self.stage_progress = progress.clamp(0.0, 1.0)
+        self.loading_item = item_name
+        self.recalculate_total_progress()
+        self.update_progress_display()
+    }
+
+    fn set_loading_complete(self: &mut Self) {
+        self.current_stage = LoadingStage::Complete
+        self.total_progress = 1.0
+        self.loading_complete = true
+        self.update_progress_display()
+    }
+
+    fn update_stage_display(self: &Self) {
+        // Update stage label text
+        self.set_label_text("StageLabel", self.stage_name)
+    }
+
+    fn update_progress_display(self: &Self) {
+        // Update progress bar
+        self.set_progress_bar("LoadingProgressBar", self.total_progress)
+
+        // Update percentage text
+        let percent = (self.total_progress * 100.0) as u32
+        self.set_label_text("PercentLabel", percent.to_string() + "%")
+
+        // Update loading item
+        if self.loading_item.len() > 0 {
+            self.set_label_text("ItemLabel", self.loading_item)
+        }
+    }
+
+    fn update_tip_display(self: &Self) {
+        if self.current_tip_index < self.tip_count {
+            let tip = &self.tips[self.current_tip_index]
+            self.set_label_text("TipLabel", tip.text)
+        }
+    }
+
+    fn set_label_text(self: &Self, name: string, text: string) {
+        // Set label text in UI
+    }
+
+    fn set_progress_bar(self: &Self, name: string, value: f32) {
+        // Set progress bar value (0.0 to 1.0)
+    }
+
+    fn render(self: &Self) {
+        if not self.is_visible {
+            return
+        }
+
+        // Draw loading screen background (fullscreen)
+        self.draw_background()
+
+        // Draw map preview
+        self.draw_map_preview()
+
+        // Draw map info
+        self.draw_map_info()
+
+        // Draw progress bar
+        self.draw_progress_bar()
+
+        // Draw current tip
+        self.draw_tip()
+
+        // Draw loading stage info
+        self.draw_stage_info()
+
+        // Apply fade
+        if self.fade_alpha < 1.0 {
+            self.draw_fade_overlay()
+        }
+    }
+
+    fn draw_background(self: &Self) {
+        // Draw loading screen background texture
+    }
+
+    fn draw_map_preview(self: &Self) {
+        // Draw map preview image in designated area
+        if self.map_preview_texture != 0 {
+            // Draw texture
+        }
+    }
+
+    fn draw_map_info(self: &Self) {
+        // Draw map name and description
+    }
+
+    fn draw_progress_bar(self: &Self) {
+        // Draw progress bar background
+        // Draw filled portion based on total_progress
+    }
+
+    fn draw_tip(self: &Self) {
+        // Draw "TIP:" label and tip text
+        if self.current_tip_index < self.tip_count {
+            let tip = &self.tips[self.current_tip_index]
+            // Draw tip.text
+        }
+    }
+
+    fn draw_stage_info(self: &Self) {
+        // Draw current loading stage name and item
+    }
+
+    fn draw_fade_overlay(self: &Self) {
+        // Draw black overlay with alpha for fade effect
+    }
+}
+
+// Loading progress callbacks for game systems
+fn on_loading_progress(screen: &mut LoadingScreen, stage: LoadingStage, progress: f32, item: string) {
+    screen.set_stage(stage)
+    screen.set_stage_progress(progress, item)
+}
+
+fn on_loading_complete(screen: &mut LoadingScreen) {
+    screen.set_loading_complete()
+}

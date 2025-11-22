@@ -1,0 +1,457 @@
+// Credits Screen - Scrolling credits display
+// Implements the C&C Generals credits with smooth scrolling and music
+
+import window_manager::{WindowManager, WindowMessage}
+import wnd_window::{WndWindow, WindowType}
+import audio_system::{AudioSystem}
+
+// Credit entry type
+enum CreditType {
+    Title,          // Large title text
+    Header,         // Section header
+    Name,           // Person name
+    Role,           // Job role
+    Spacer,         // Empty space
+    Image,          // Logo or image
+}
+
+// Single credit entry
+struct CreditEntry {
+    credit_type: CreditType,
+    text: string,
+    secondary_text: string,  // For role + name combinations
+    image_path: string,
+    image_width: u32,
+    image_height: u32,
+}
+
+const MAX_CREDITS: u32 = 512
+const SCROLL_SPEED: f32 = 50.0  // Pixels per second
+const FAST_SCROLL_MULTIPLIER: f32 = 4.0
+
+// Credits screen state
+struct CreditsScreen {
+    // Window references
+    window_manager: &WindowManager,
+    root_window: &WndWindow,
+
+    // Credits data
+    credits: [CreditEntry; MAX_CREDITS],
+    credit_count: u32,
+
+    // Scroll state
+    scroll_position: f32,
+    max_scroll: f32,
+    scroll_speed: f32,
+    is_fast_scrolling: bool,
+
+    // Display
+    is_visible: bool,
+    is_complete: bool,
+
+    // Music
+    credits_music_playing: bool,
+
+    // Input
+    skip_requested: bool,
+}
+
+impl CreditsScreen {
+    fn new(window_manager: &WindowManager) -> CreditsScreen {
+        let screen = CreditsScreen {
+            window_manager: window_manager,
+            root_window: null,
+            credits: [],
+            credit_count: 0,
+            scroll_position: 0.0,
+            max_scroll: 0.0,
+            scroll_speed: SCROLL_SPEED,
+            is_fast_scrolling: false,
+            is_visible: false,
+            is_complete: false,
+            credits_music_playing: false,
+            skip_requested: false,
+        }
+
+        screen.build_credits()
+        screen.calculate_max_scroll()
+
+        return screen
+    }
+
+    fn build_credits(self: &mut Self) {
+        // Title
+        self.add_credit(CreditType::Title, "COMMAND & CONQUER", "")
+        self.add_credit(CreditType::Title, "GENERALS: ZERO HOUR", "")
+        self.add_spacer(100)
+
+        // EA Pacific
+        self.add_credit(CreditType::Image, "", "")  // EA Logo
+        self.add_spacer(50)
+        self.add_credit(CreditType::Header, "EA PACIFIC", "")
+        self.add_spacer(30)
+
+        // Development Team
+        self.add_credit(CreditType::Header, "DEVELOPMENT TEAM", "")
+        self.add_spacer(20)
+
+        self.add_credit(CreditType::Role, "Executive Producer", "")
+        self.add_credit(CreditType::Name, "Mark Skaggs", "")
+        self.add_spacer(15)
+
+        self.add_credit(CreditType::Role, "Producer", "")
+        self.add_credit(CreditType::Name, "Harvard Bonin", "")
+        self.add_spacer(15)
+
+        self.add_credit(CreditType::Role, "Lead Designer", "")
+        self.add_credit(CreditType::Name, "Dustin Browder", "")
+        self.add_spacer(15)
+
+        self.add_credit(CreditType::Role, "Lead Programmer", "")
+        self.add_credit(CreditType::Name, "Steve Tall", "")
+        self.add_spacer(15)
+
+        // Programming Team
+        self.add_credit(CreditType::Header, "PROGRAMMING", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Name, "John Ahlquist", "")
+        self.add_credit(CreditType::Name, "Jason Booth", "")
+        self.add_credit(CreditType::Name, "Graham Fuchs", "")
+        self.add_credit(CreditType::Name, "Dan Liebgold", "")
+        self.add_credit(CreditType::Name, "James McNeill", "")
+        self.add_credit(CreditType::Name, "Joby Otero", "")
+        self.add_credit(CreditType::Name, "Jonathan Skinner", "")
+        self.add_credit(CreditType::Name, "Greg Tavares", "")
+        self.add_spacer(30)
+
+        // Art Team
+        self.add_credit(CreditType::Header, "ART", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Role, "Art Director", "")
+        self.add_credit(CreditType::Name, "Jim McLeod", "")
+        self.add_spacer(15)
+        self.add_credit(CreditType::Name, "Nathan Anderson", "")
+        self.add_credit(CreditType::Name, "Steve Harding", "")
+        self.add_credit(CreditType::Name, "Bill Jackson", "")
+        self.add_credit(CreditType::Name, "Peter Ju", "")
+        self.add_credit(CreditType::Name, "Mike Lightner", "")
+        self.add_credit(CreditType::Name, "Chalo Maldonado", "")
+        self.add_credit(CreditType::Name, "Thaddeus Sasser", "")
+        self.add_credit(CreditType::Name, "Peter Tran", "")
+        self.add_spacer(30)
+
+        // Design Team
+        self.add_credit(CreditType::Header, "DESIGN", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Name, "Christopher Rubyor", "")
+        self.add_credit(CreditType::Name, "Jason Wong", "")
+        self.add_spacer(30)
+
+        // Audio Team
+        self.add_credit(CreditType::Header, "AUDIO", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Role, "Audio Director", "")
+        self.add_credit(CreditType::Name, "Bill Brown", "")
+        self.add_spacer(15)
+        self.add_credit(CreditType::Role, "Music", "")
+        self.add_credit(CreditType::Name, "Bill Brown", "")
+        self.add_credit(CreditType::Name, "Mikael Sandgren", "")
+        self.add_spacer(15)
+        self.add_credit(CreditType::Role, "Sound Design", "")
+        self.add_credit(CreditType::Name, "Frank Klepacki", "")
+        self.add_credit(CreditType::Name, "Charles Deenen", "")
+        self.add_spacer(30)
+
+        // QA
+        self.add_credit(CreditType::Header, "QUALITY ASSURANCE", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Role, "QA Manager", "")
+        self.add_credit(CreditType::Name, "Dan Jevons", "")
+        self.add_spacer(15)
+        self.add_credit(CreditType::Role, "Lead Tester", "")
+        self.add_credit(CreditType::Name, "Aaron Deleon", "")
+        self.add_spacer(30)
+
+        // EA Los Angeles
+        self.add_credit(CreditType::Header, "EA LOS ANGELES", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Role, "VP & Studio Head", "")
+        self.add_credit(CreditType::Name, "Neil Young", "")
+        self.add_spacer(30)
+
+        // Additional credits
+        self.add_credit(CreditType::Header, "SPECIAL THANKS", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Name, "The Westwood Community", "")
+        self.add_credit(CreditType::Name, "All C&C Fans Worldwide", "")
+        self.add_spacer(50)
+
+        // Home Implementation Credits
+        self.add_credit(CreditType::Header, "HOME IMPLEMENTATION", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Role, "Implementation", "")
+        self.add_credit(CreditType::Name, "Chris Breuer", "")
+        self.add_spacer(15)
+        self.add_credit(CreditType::Role, "Home Language", "")
+        self.add_credit(CreditType::Name, "The Home Team", "")
+        self.add_spacer(30)
+
+        // Reference
+        self.add_credit(CreditType::Header, "BASED ON", "")
+        self.add_spacer(20)
+        self.add_credit(CreditType::Name, "Thyme Project", "")
+        self.add_credit(CreditType::Name, "OpenSAGE Project", "")
+        self.add_spacer(50)
+
+        // Trademarks
+        self.add_credit(CreditType::Spacer, "", "")
+        self.add_credit(CreditType::Role, "Command & Conquer is a trademark of", "")
+        self.add_credit(CreditType::Role, "Electronic Arts Inc.", "")
+        self.add_spacer(100)
+
+        // Final title
+        self.add_credit(CreditType::Title, "THANK YOU FOR PLAYING", "")
+        self.add_spacer(200)
+    }
+
+    fn add_credit(self: &mut Self, credit_type: CreditType, text: string, secondary: string) {
+        if self.credit_count < MAX_CREDITS {
+            self.credits[self.credit_count] = CreditEntry {
+                credit_type: credit_type,
+                text: text,
+                secondary_text: secondary,
+                image_path: "",
+                image_width: 0,
+                image_height: 0,
+            }
+            self.credit_count = self.credit_count + 1
+        }
+    }
+
+    fn add_spacer(self: &mut Self, height: u32) {
+        if self.credit_count < MAX_CREDITS {
+            self.credits[self.credit_count] = CreditEntry {
+                credit_type: CreditType::Spacer,
+                text: "",
+                secondary_text: "",
+                image_path: "",
+                image_width: 0,
+                image_height: height,
+            }
+            self.credit_count = self.credit_count + 1
+        }
+    }
+
+    fn add_image(self: &mut Self, path: string, width: u32, height: u32) {
+        if self.credit_count < MAX_CREDITS {
+            self.credits[self.credit_count] = CreditEntry {
+                credit_type: CreditType::Image,
+                text: "",
+                secondary_text: "",
+                image_path: path,
+                image_width: width,
+                image_height: height,
+            }
+            self.credit_count = self.credit_count + 1
+        }
+    }
+
+    fn calculate_max_scroll(self: &mut Self) {
+        let total_height: f32 = 0.0
+
+        for i in 0..self.credit_count {
+            let entry = &self.credits[i]
+            total_height = total_height + self.get_entry_height(entry)
+        }
+
+        // Add screen height so credits scroll fully off
+        self.max_scroll = total_height + 768.0  // Assuming 768 screen height
+    }
+
+    fn get_entry_height(self: &Self, entry: &CreditEntry) -> f32 {
+        match entry.credit_type {
+            CreditType::Title => return 80.0,
+            CreditType::Header => return 50.0,
+            CreditType::Name => return 30.0,
+            CreditType::Role => return 25.0,
+            CreditType::Spacer => return entry.image_height as f32,
+            CreditType::Image => return entry.image_height as f32,
+        }
+    }
+
+    fn show(self: &mut Self) {
+        self.scroll_position = 0.0
+        self.is_visible = true
+        self.is_complete = false
+        self.skip_requested = false
+        self.scroll_speed = SCROLL_SPEED
+        self.is_fast_scrolling = false
+
+        self.show_window("CreditsScreen")
+        self.start_credits_music()
+    }
+
+    fn hide(self: &mut Self) {
+        self.is_visible = false
+        self.stop_credits_music()
+        self.hide_window("CreditsScreen")
+    }
+
+    fn show_window(self: &Self, name: string) {
+        // Show named window
+    }
+
+    fn hide_window(self: &Self, name: string) {
+        // Hide named window
+    }
+
+    fn start_credits_music(self: &mut Self) {
+        if not self.credits_music_playing {
+            // AudioSystem::play_music("Credits")
+            self.credits_music_playing = true
+        }
+    }
+
+    fn stop_credits_music(self: &Self) {
+        // AudioSystem::stop_music()
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        if not self.is_visible {
+            return
+        }
+
+        // Check for skip
+        if self.skip_requested {
+            self.is_complete = true
+            self.hide()
+            return
+        }
+
+        // Update scroll
+        let effective_speed = self.scroll_speed
+        if self.is_fast_scrolling {
+            effective_speed = effective_speed * FAST_SCROLL_MULTIPLIER
+        }
+
+        self.scroll_position = self.scroll_position + effective_speed * delta_time
+
+        // Check if credits are done
+        if self.scroll_position >= self.max_scroll {
+            self.is_complete = true
+            self.hide()
+        }
+    }
+
+    fn on_mouse_down(self: &mut Self) {
+        // Start fast scrolling while mouse is held
+        self.is_fast_scrolling = true
+    }
+
+    fn on_mouse_up(self: &mut Self) {
+        // Stop fast scrolling
+        self.is_fast_scrolling = false
+    }
+
+    fn on_key_press(self: &mut Self, key_code: u32) {
+        // Escape or space skips credits
+        if key_code == 0x1B or key_code == 0x20 {
+            self.skip_requested = true
+        }
+
+        // Down arrow or enter for fast scroll
+        if key_code == 0x28 or key_code == 0x0D {
+            self.is_fast_scrolling = true
+        }
+    }
+
+    fn on_key_release(self: &mut Self, key_code: u32) {
+        if key_code == 0x28 or key_code == 0x0D {
+            self.is_fast_scrolling = false
+        }
+    }
+
+    fn render(self: &Self) {
+        if not self.is_visible {
+            return
+        }
+
+        // Draw background (black)
+        self.draw_background()
+
+        // Draw credits
+        let screen_height: f32 = 768.0
+        let y_position: f32 = screen_height - self.scroll_position
+
+        for i in 0..self.credit_count {
+            let entry = &self.credits[i]
+            let entry_height = self.get_entry_height(entry)
+
+            // Only render if visible on screen
+            if y_position + entry_height > 0.0 and y_position < screen_height {
+                self.render_entry(entry, y_position)
+            }
+
+            y_position = y_position + entry_height
+        }
+
+        // Draw skip hint at bottom
+        self.draw_skip_hint()
+    }
+
+    fn draw_background(self: &Self) {
+        // Draw black background with optional subtle pattern
+    }
+
+    fn render_entry(self: &Self, entry: &CreditEntry, y: f32) {
+        let screen_width: f32 = 1024.0
+        let center_x: f32 = screen_width / 2.0
+
+        match entry.credit_type {
+            CreditType::Title => {
+                // Large centered gold text
+                self.draw_text_centered(entry.text, center_x, y, 48.0, 0xFFFFD700)
+            }
+            CreditType::Header => {
+                // Medium centered white text with underline
+                self.draw_text_centered(entry.text, center_x, y, 32.0, 0xFFFFFFFF)
+            }
+            CreditType::Name => {
+                // Normal centered light text
+                self.draw_text_centered(entry.text, center_x, y, 24.0, 0xFFCCCCCC)
+            }
+            CreditType::Role => {
+                // Smaller centered gray text
+                self.draw_text_centered(entry.text, center_x, y, 18.0, 0xFF888888)
+            }
+            CreditType::Spacer => {
+                // Nothing to draw
+            }
+            CreditType::Image => {
+                // Draw centered image
+                let x = center_x - (entry.image_width as f32 / 2.0)
+                self.draw_image(entry.image_path, x, y, entry.image_width, entry.image_height)
+            }
+        }
+    }
+
+    fn draw_text_centered(self: &Self, text: string, x: f32, y: f32, size: f32, color: u32) {
+        // Draw text centered at x position
+    }
+
+    fn draw_image(self: &Self, path: string, x: f32, y: f32, width: u32, height: u32) {
+        // Draw image at position
+    }
+
+    fn draw_skip_hint(self: &Self) {
+        // Draw "Press ESC to skip" at bottom
+        self.draw_text_centered("Press ESC to skip", 512.0, 730.0, 14.0, 0xFF666666)
+    }
+
+    fn handle_message(self: &mut Self, message: WindowMessage, sender: string) {
+        match sender {
+            "BackButton" => self.skip_requested = true,
+            _ => {}
+        }
+    }
+}

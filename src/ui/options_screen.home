@@ -1,0 +1,699 @@
+// Options Screen - Game options and settings menus
+// Implements the C&C Generals options system with tabs
+
+import window_manager::{WindowManager, WindowMessage}
+import wnd_window::{WndWindow, WindowType}
+import audio_system::{AudioSystem}
+
+// Options tab types
+enum OptionsTab {
+    Game,
+    Controls,
+    Audio,
+    Video,
+    Network,
+}
+
+// Resolution options
+struct Resolution {
+    width: u32,
+    height: u32,
+    display_name: string,
+}
+
+// Control binding
+struct KeyBinding {
+    action: string,
+    display_name: string,
+    primary_key: u32,
+    secondary_key: u32,
+    is_modifiable: bool,
+}
+
+// Audio settings
+struct AudioSettings {
+    master_volume: f32,
+    music_volume: f32,
+    sfx_volume: f32,
+    voice_volume: f32,
+    ambient_volume: f32,
+
+    music_enabled: bool,
+    sfx_enabled: bool,
+    voice_enabled: bool,
+    3d_audio: bool,
+
+    speaker_type: string,  // "Stereo", "5.1", "Headphones"
+}
+
+// Video settings
+struct VideoSettings {
+    resolution: Resolution,
+    fullscreen: bool,
+    vsync: bool,
+
+    texture_quality: u32,      // 0=Low, 1=Medium, 2=High
+    shadow_quality: u32,
+    effects_quality: u32,
+    terrain_detail: u32,
+
+    gamma: f32,
+    brightness: f32,
+    contrast: f32,
+
+    show_fps: bool,
+    limit_fps: bool,
+    target_fps: u32,
+}
+
+// Game settings
+struct GameSettings {
+    scroll_speed: f32,
+    camera_height: f32,
+
+    auto_save: bool,
+    auto_save_interval: u32,
+
+    tooltips_enabled: bool,
+    health_bars: u32,  // 0=Never, 1=Damaged, 2=Selected, 3=Always
+
+    alternate_mouse_setup: bool,
+    double_click_attack: bool,
+
+    language: string,
+}
+
+// Network settings
+struct NetworkSettings {
+    player_name: string,
+    firewall_helper: bool,
+    port_number: u32,
+
+    send_delay: u32,
+    bandwidth: u32,
+}
+
+const MAX_RESOLUTIONS: u32 = 32
+const MAX_BINDINGS: u32 = 64
+
+// Available resolutions
+const RESOLUTIONS: [Resolution; 10] = [
+    Resolution { width: 800, height: 600, display_name: "800x600" },
+    Resolution { width: 1024, height: 768, display_name: "1024x768" },
+    Resolution { width: 1280, height: 720, display_name: "1280x720" },
+    Resolution { width: 1280, height: 800, display_name: "1280x800" },
+    Resolution { width: 1280, height: 1024, display_name: "1280x1024" },
+    Resolution { width: 1440, height: 900, display_name: "1440x900" },
+    Resolution { width: 1600, height: 900, display_name: "1600x900" },
+    Resolution { width: 1920, height: 1080, display_name: "1920x1080" },
+    Resolution { width: 2560, height: 1440, display_name: "2560x1440" },
+    Resolution { width: 3840, height: 2160, display_name: "3840x2160" },
+]
+
+// Options screen
+struct OptionsScreen {
+    // Window references
+    window_manager: &WindowManager,
+    root_window: &WndWindow,
+
+    // Current state
+    current_tab: OptionsTab,
+    is_visible: bool,
+    has_changes: bool,
+
+    // Settings (working copy)
+    audio_settings: AudioSettings,
+    video_settings: VideoSettings,
+    game_settings: GameSettings,
+    network_settings: NetworkSettings,
+
+    // Saved settings (for revert)
+    saved_audio: AudioSettings,
+    saved_video: VideoSettings,
+    saved_game: GameSettings,
+    saved_network: NetworkSettings,
+
+    // Key bindings
+    bindings: [KeyBinding; MAX_BINDINGS],
+    binding_count: u32,
+
+    // Key rebinding state
+    awaiting_key: bool,
+    rebind_index: i32,
+    rebind_is_primary: bool,
+
+    // Available resolutions for current display
+    available_resolutions: [Resolution; MAX_RESOLUTIONS],
+    resolution_count: u32,
+}
+
+impl OptionsScreen {
+    fn new(window_manager: &WindowManager) -> OptionsScreen {
+        let screen = OptionsScreen {
+            window_manager: window_manager,
+            root_window: null,
+            current_tab: OptionsTab::Game,
+            is_visible: false,
+            has_changes: false,
+            audio_settings: AudioSettings::default(),
+            video_settings: VideoSettings::default(),
+            game_settings: GameSettings::default(),
+            network_settings: NetworkSettings::default(),
+            saved_audio: AudioSettings::default(),
+            saved_video: VideoSettings::default(),
+            saved_game: GameSettings::default(),
+            saved_network: NetworkSettings::default(),
+            bindings: [],
+            binding_count: 0,
+            awaiting_key: false,
+            rebind_index: -1,
+            rebind_is_primary: true,
+            available_resolutions: [],
+            resolution_count: 0,
+        }
+
+        screen.init_key_bindings()
+        screen.detect_available_resolutions()
+
+        return screen
+    }
+
+    fn init_key_bindings(self: &mut Self) {
+        // Camera controls
+        self.add_binding("SCROLL_UP", "Scroll Up", 'W', 0)
+        self.add_binding("SCROLL_DOWN", "Scroll Down", 'S', 0)
+        self.add_binding("SCROLL_LEFT", "Scroll Left", 'A', 0)
+        self.add_binding("SCROLL_RIGHT", "Scroll Right", 'D', 0)
+        self.add_binding("ROTATE_LEFT", "Rotate Left", '[', 0)
+        self.add_binding("ROTATE_RIGHT", "Rotate Right", ']', 0)
+        self.add_binding("ZOOM_IN", "Zoom In", '=', 0)
+        self.add_binding("ZOOM_OUT", "Zoom Out", '-', 0)
+
+        // Unit controls
+        self.add_binding("ATTACK_MOVE", "Attack Move", 'A', 0)
+        self.add_binding("FORCE_ATTACK", "Force Attack", 0x11, 0)  // Ctrl
+        self.add_binding("FORCE_MOVE", "Force Move", 'G', 0)
+        self.add_binding("STOP", "Stop", 'S', 0)
+        self.add_binding("SCATTER", "Scatter", 'X', 0)
+        self.add_binding("GUARD", "Guard", 'G', 0)
+
+        // Selection controls
+        self.add_binding("SELECT_ALL", "Select All Units", 'Q', 0)
+        self.add_binding("SELECT_ALL_TYPE", "Select All of Type", 'W', 0)
+
+        // Control groups
+        for i in 0..10 {
+            let key_char = if i == 0 then '0' else ('1' + i - 1)
+            let name = "Control Group " + i.to_string()
+            self.add_binding("GROUP_" + i.to_string(), name, key_char, 0)
+        }
+
+        // Special powers
+        for i in 1..10 {
+            let name = "Special Power " + i.to_string()
+            self.add_binding("POWER_" + i.to_string(), name, 0x70 + i - 1, 0)  // F1-F9
+        }
+
+        // Misc
+        self.add_binding("DIPLOMACY", "Diplomacy", 0x74, 0)  // F5
+        self.add_binding("OPTIONS", "Options Menu", 0x1B, 0)  // Escape
+        self.add_binding("CHAT", "Chat", 0x0D, 0)  // Enter
+        self.add_binding("TEAM_CHAT", "Team Chat", 0, 0)
+    }
+
+    fn add_binding(self: &mut Self, action: string, display_name: string, primary: u32, secondary: u32) {
+        if self.binding_count < MAX_BINDINGS {
+            self.bindings[self.binding_count] = KeyBinding {
+                action: action,
+                display_name: display_name,
+                primary_key: primary,
+                secondary_key: secondary,
+                is_modifiable: true,
+            }
+            self.binding_count = self.binding_count + 1
+        }
+    }
+
+    fn detect_available_resolutions(self: &mut Self) {
+        // Copy standard resolutions (in real impl, query display modes)
+        self.resolution_count = 0
+        for i in 0..10 {
+            self.available_resolutions[self.resolution_count] = RESOLUTIONS[i]
+            self.resolution_count = self.resolution_count + 1
+        }
+    }
+
+    fn show(self: &mut Self) {
+        // Save current settings for potential revert
+        self.saved_audio = self.audio_settings
+        self.saved_video = self.video_settings
+        self.saved_game = self.game_settings
+        self.saved_network = self.network_settings
+
+        self.is_visible = true
+        self.has_changes = false
+        self.current_tab = OptionsTab::Game
+
+        self.show_window("OptionsMenu")
+        self.update_tab_display()
+    }
+
+    fn hide(self: &mut Self) {
+        self.is_visible = false
+        self.hide_window("OptionsMenu")
+    }
+
+    fn show_window(self: &Self, name: string) {
+        // Show named window
+    }
+
+    fn hide_window(self: &Self, name: string) {
+        // Hide named window
+    }
+
+    fn switch_tab(self: &mut Self, tab: OptionsTab) {
+        self.current_tab = tab
+        self.update_tab_display()
+    }
+
+    fn update_tab_display(self: &Self) {
+        // Hide all tab panels
+        self.hide_window("GameOptionsPanel")
+        self.hide_window("ControlsOptionsPanel")
+        self.hide_window("AudioOptionsPanel")
+        self.hide_window("VideoOptionsPanel")
+        self.hide_window("NetworkOptionsPanel")
+
+        // Show current tab panel
+        match self.current_tab {
+            OptionsTab::Game => {
+                self.show_window("GameOptionsPanel")
+                self.populate_game_options()
+            }
+            OptionsTab::Controls => {
+                self.show_window("ControlsOptionsPanel")
+                self.populate_controls_options()
+            }
+            OptionsTab::Audio => {
+                self.show_window("AudioOptionsPanel")
+                self.populate_audio_options()
+            }
+            OptionsTab::Video => {
+                self.show_window("VideoOptionsPanel")
+                self.populate_video_options()
+            }
+            OptionsTab::Network => {
+                self.show_window("NetworkOptionsPanel")
+                self.populate_network_options()
+            }
+        }
+    }
+
+    // Game options
+    fn populate_game_options(self: &Self) {
+        // Set slider values
+        self.set_slider_value("ScrollSpeedSlider", self.game_settings.scroll_speed)
+        self.set_slider_value("CameraHeightSlider", self.game_settings.camera_height)
+
+        // Set checkboxes
+        self.set_checkbox("AutoSaveCheckbox", self.game_settings.auto_save)
+        self.set_checkbox("TooltipsCheckbox", self.game_settings.tooltips_enabled)
+        self.set_checkbox("AlternateMouseCheckbox", self.game_settings.alternate_mouse_setup)
+        self.set_checkbox("DoubleClickAttackCheckbox", self.game_settings.double_click_attack)
+
+        // Set health bar dropdown
+        self.set_combobox_selection("HealthBarsCombo", self.game_settings.health_bars)
+    }
+
+    fn on_scroll_speed_changed(self: &mut Self, value: f32) {
+        self.game_settings.scroll_speed = value
+        self.has_changes = true
+    }
+
+    fn on_camera_height_changed(self: &mut Self, value: f32) {
+        self.game_settings.camera_height = value
+        self.has_changes = true
+    }
+
+    // Audio options
+    fn populate_audio_options(self: &Self) {
+        self.set_slider_value("MasterVolumeSlider", self.audio_settings.master_volume)
+        self.set_slider_value("MusicVolumeSlider", self.audio_settings.music_volume)
+        self.set_slider_value("SFXVolumeSlider", self.audio_settings.sfx_volume)
+        self.set_slider_value("VoiceVolumeSlider", self.audio_settings.voice_volume)
+        self.set_slider_value("AmbientVolumeSlider", self.audio_settings.ambient_volume)
+
+        self.set_checkbox("MusicEnabledCheckbox", self.audio_settings.music_enabled)
+        self.set_checkbox("SFXEnabledCheckbox", self.audio_settings.sfx_enabled)
+        self.set_checkbox("VoiceEnabledCheckbox", self.audio_settings.voice_enabled)
+        self.set_checkbox("3DAudioCheckbox", self.audio_settings.3d_audio)
+    }
+
+    fn on_master_volume_changed(self: &mut Self, value: f32) {
+        self.audio_settings.master_volume = value
+        self.has_changes = true
+        // Apply immediately for preview
+        self.apply_audio_preview()
+    }
+
+    fn on_music_volume_changed(self: &mut Self, value: f32) {
+        self.audio_settings.music_volume = value
+        self.has_changes = true
+        self.apply_audio_preview()
+    }
+
+    fn apply_audio_preview(self: &Self) {
+        // Update audio system with preview settings
+        // AudioSystem::set_master_volume(self.audio_settings.master_volume)
+    }
+
+    // Video options
+    fn populate_video_options(self: &Self) {
+        // Resolution dropdown
+        self.populate_resolution_combo()
+
+        self.set_checkbox("FullscreenCheckbox", self.video_settings.fullscreen)
+        self.set_checkbox("VSyncCheckbox", self.video_settings.vsync)
+
+        self.set_combobox_selection("TextureQualityCombo", self.video_settings.texture_quality)
+        self.set_combobox_selection("ShadowQualityCombo", self.video_settings.shadow_quality)
+        self.set_combobox_selection("EffectsQualityCombo", self.video_settings.effects_quality)
+
+        self.set_slider_value("GammaSlider", self.video_settings.gamma)
+        self.set_slider_value("BrightnessSlider", self.video_settings.brightness)
+
+        self.set_checkbox("ShowFPSCheckbox", self.video_settings.show_fps)
+        self.set_checkbox("LimitFPSCheckbox", self.video_settings.limit_fps)
+    }
+
+    fn populate_resolution_combo(self: &Self) {
+        // Clear and populate resolution dropdown
+        for i in 0..self.resolution_count {
+            let res = &self.available_resolutions[i]
+            // Add to combo box
+        }
+    }
+
+    fn on_resolution_changed(self: &mut Self, index: u32) {
+        if index < self.resolution_count {
+            self.video_settings.resolution = self.available_resolutions[index]
+            self.has_changes = true
+        }
+    }
+
+    fn on_fullscreen_changed(self: &mut Self, value: bool) {
+        self.video_settings.fullscreen = value
+        self.has_changes = true
+    }
+
+    // Controls options
+    fn populate_controls_options(self: &Self) {
+        // Populate key binding list
+        for i in 0..self.binding_count {
+            let binding = &self.bindings[i]
+            // Add row to list: [Display Name] [Primary Key] [Secondary Key]
+        }
+    }
+
+    fn start_rebind(self: &mut Self, binding_index: u32, is_primary: bool) {
+        if binding_index < self.binding_count {
+            if self.bindings[binding_index].is_modifiable {
+                self.awaiting_key = true
+                self.rebind_index = binding_index as i32
+                self.rebind_is_primary = is_primary
+                // Show "Press any key..." prompt
+            }
+        }
+    }
+
+    fn on_key_press(self: &mut Self, key_code: u32) {
+        if self.awaiting_key and self.rebind_index >= 0 {
+            let index = self.rebind_index as u32
+
+            // Check for Escape to cancel
+            if key_code == 0x1B {
+                self.awaiting_key = false
+                self.rebind_index = -1
+                return
+            }
+
+            // Check for conflicts
+            let has_conflict = self.check_key_conflict(key_code, index)
+
+            if not has_conflict {
+                if self.rebind_is_primary {
+                    self.bindings[index].primary_key = key_code
+                } else {
+                    self.bindings[index].secondary_key = key_code
+                }
+                self.has_changes = true
+            }
+
+            self.awaiting_key = false
+            self.rebind_index = -1
+            self.populate_controls_options()
+        }
+    }
+
+    fn check_key_conflict(self: &Self, key_code: u32, exclude_index: u32) -> bool {
+        for i in 0..self.binding_count {
+            if i != exclude_index {
+                if self.bindings[i].primary_key == key_code or
+                   self.bindings[i].secondary_key == key_code {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fn reset_controls_to_defaults(self: &mut Self) {
+        self.binding_count = 0
+        self.init_key_bindings()
+        self.has_changes = true
+        self.populate_controls_options()
+    }
+
+    // Network options
+    fn populate_network_options(self: &Self) {
+        self.set_text_field("PlayerNameField", self.network_settings.player_name)
+        self.set_checkbox("FirewallHelperCheckbox", self.network_settings.firewall_helper)
+        self.set_text_field("PortField", self.network_settings.port_number.to_string())
+    }
+
+    fn on_player_name_changed(self: &mut Self, name: string) {
+        self.network_settings.player_name = name
+        self.has_changes = true
+    }
+
+    // Apply/Revert
+    fn apply_settings(self: &mut Self) {
+        // Apply to actual game systems
+        self.apply_audio_settings()
+        self.apply_video_settings()
+        self.apply_game_settings()
+        self.apply_network_settings()
+
+        // Save to file
+        self.save_settings_to_file()
+
+        // Update saved copies
+        self.saved_audio = self.audio_settings
+        self.saved_video = self.video_settings
+        self.saved_game = self.game_settings
+        self.saved_network = self.network_settings
+
+        self.has_changes = false
+    }
+
+    fn revert_settings(self: &mut Self) {
+        self.audio_settings = self.saved_audio
+        self.video_settings = self.saved_video
+        self.game_settings = self.saved_game
+        self.network_settings = self.saved_network
+
+        self.has_changes = false
+        self.update_tab_display()
+    }
+
+    fn apply_audio_settings(self: &Self) {
+        // Apply to AudioSystem
+    }
+
+    fn apply_video_settings(self: &Self) {
+        // Apply to renderer
+        // May require restart for some settings
+    }
+
+    fn apply_game_settings(self: &Self) {
+        // Apply to game systems
+    }
+
+    fn apply_network_settings(self: &Self) {
+        // Apply to network system
+    }
+
+    fn save_settings_to_file(self: &Self) {
+        // Write Options.ini
+    }
+
+    fn load_settings_from_file(self: &mut Self) {
+        // Read Options.ini
+    }
+
+    // Window message handling
+    fn handle_message(self: &mut Self, message: WindowMessage, sender: string) {
+        match sender {
+            // Tab buttons
+            "GameTabButton" => self.switch_tab(OptionsTab::Game),
+            "ControlsTabButton" => self.switch_tab(OptionsTab::Controls),
+            "AudioTabButton" => self.switch_tab(OptionsTab::Audio),
+            "VideoTabButton" => self.switch_tab(OptionsTab::Video),
+            "NetworkTabButton" => self.switch_tab(OptionsTab::Network),
+
+            // Action buttons
+            "ApplyButton" => self.apply_settings(),
+            "RevertButton" => self.revert_settings(),
+            "OKButton" => {
+                self.apply_settings()
+                self.hide()
+            }
+            "CancelButton" => {
+                if self.has_changes {
+                    self.revert_settings()
+                }
+                self.hide()
+            }
+
+            // Controls
+            "ResetControlsButton" => self.reset_controls_to_defaults(),
+
+            _ => {}
+        }
+    }
+
+    // Helper functions for UI interaction
+    fn set_slider_value(self: &Self, name: string, value: f32) {
+        // Set slider position
+    }
+
+    fn set_checkbox(self: &Self, name: string, checked: bool) {
+        // Set checkbox state
+    }
+
+    fn set_combobox_selection(self: &Self, name: string, index: u32) {
+        // Set combobox selection
+    }
+
+    fn set_text_field(self: &Self, name: string, text: string) {
+        // Set text field content
+    }
+}
+
+impl AudioSettings {
+    fn default() -> AudioSettings {
+        return AudioSettings {
+            master_volume: 1.0,
+            music_volume: 0.8,
+            sfx_volume: 1.0,
+            voice_volume: 1.0,
+            ambient_volume: 0.7,
+            music_enabled: true,
+            sfx_enabled: true,
+            voice_enabled: true,
+            3d_audio: true,
+            speaker_type: "Stereo",
+        }
+    }
+}
+
+impl VideoSettings {
+    fn default() -> VideoSettings {
+        return VideoSettings {
+            resolution: Resolution { width: 1920, height: 1080, display_name: "1920x1080" },
+            fullscreen: true,
+            vsync: true,
+            texture_quality: 2,
+            shadow_quality: 2,
+            effects_quality: 2,
+            terrain_detail: 2,
+            gamma: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            show_fps: false,
+            limit_fps: false,
+            target_fps: 60,
+        }
+    }
+}
+
+impl GameSettings {
+    fn default() -> GameSettings {
+        return GameSettings {
+            scroll_speed: 1.0,
+            camera_height: 1.0,
+            auto_save: true,
+            auto_save_interval: 300,  // 5 minutes
+            tooltips_enabled: true,
+            health_bars: 2,  // Selected
+            alternate_mouse_setup: false,
+            double_click_attack: true,
+            language: "English",
+        }
+    }
+}
+
+impl NetworkSettings {
+    fn default() -> NetworkSettings {
+        return NetworkSettings {
+            player_name: "Player",
+            firewall_helper: false,
+            port_number: 8086,
+            send_delay: 0,
+            bandwidth: 0,
+        }
+    }
+}
+
+// Key code to string conversion
+fn key_code_to_string(code: u32) -> string {
+    match code {
+        0 => return "None"
+        0x1B => return "Escape"
+        0x0D => return "Enter"
+        0x20 => return "Space"
+        0x08 => return "Backspace"
+        0x09 => return "Tab"
+        0x10 => return "Shift"
+        0x11 => return "Ctrl"
+        0x12 => return "Alt"
+
+        // F keys
+        0x70 => return "F1"
+        0x71 => return "F2"
+        0x72 => return "F3"
+        0x73 => return "F4"
+        0x74 => return "F5"
+        0x75 => return "F6"
+        0x76 => return "F7"
+        0x77 => return "F8"
+        0x78 => return "F9"
+        0x79 => return "F10"
+        0x7A => return "F11"
+        0x7B => return "F12"
+
+        // Arrow keys
+        0x25 => return "Left"
+        0x26 => return "Up"
+        0x27 => return "Right"
+        0x28 => return "Down"
+
+        _ => {
+            // Printable ASCII
+            if code >= 32 and code <= 126 {
+                return (code as char).to_string()
+            }
+            return "Key " + code.to_string()
+        }
+    }
+}

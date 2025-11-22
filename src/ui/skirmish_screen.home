@@ -1,0 +1,565 @@
+// Skirmish Screen - Setup screen for skirmish games
+// Implements the C&C Generals skirmish game setup UI
+
+import window_manager::{WindowManager, WindowMessage}
+import wnd_window::{WndWindow, WindowType}
+import game_data_loader::{GameDataLoader, MapCacheEntry, PlayerTemplateDefinition}
+
+// Player slot state
+enum PlayerSlotState {
+    Closed,
+    Open,
+    Human,
+    EasyAI,
+    MediumAI,
+    HardAI,
+    BrutalAI,
+}
+
+// Player slot in skirmish
+struct PlayerSlot {
+    index: u32,
+    state: PlayerSlotState,
+    faction: string,
+    color: u32,
+    team: u32,
+    handicap: u32,
+    start_position: i32,  // -1 = random
+    player_name: string,
+    is_ready: bool,
+}
+
+// Map preview data
+struct MapPreview {
+    name: string,
+    display_name: string,
+    num_players: u32,
+    thumbnail_texture: u64,
+    is_selected: bool,
+}
+
+const MAX_PLAYERS: u32 = 8
+const MAX_MAPS: u32 = 128
+
+// Faction colors
+const FACTION_COLORS: [u32; 8] = [
+    0xFFFF0000,  // Red
+    0xFF0000FF,  // Blue
+    0xFF00FF00,  // Green
+    0xFFFFFF00,  // Yellow
+    0xFFFF8000,  // Orange
+    0xFF8000FF,  // Purple
+    0xFF00FFFF,  // Cyan
+    0xFFFF80FF,  // Pink
+]
+
+struct SkirmishScreen {
+    // Window references
+    window_manager: &mut WindowManager,
+    root_window: u32,
+
+    // Player slots
+    slots: [PlayerSlot; MAX_PLAYERS],
+    local_player_slot: u32,
+
+    // Available factions
+    factions: Vec<string>,
+    faction_display_names: Vec<string>,
+
+    // Map selection
+    maps: [MapPreview; MAX_MAPS],
+    map_count: u32,
+    selected_map_index: i32,
+    map_filter_players: u32,  // 0 = all
+
+    // Game settings
+    starting_cash: u32,
+    superweapons_enabled: bool,
+    fog_of_war_enabled: bool,
+    crates_enabled: bool,
+    build_speed: f32,
+
+    // UI state
+    is_host: bool,
+    can_start: bool,
+
+    // Callbacks
+    on_start_game: fn(&SkirmishSettings),
+    on_back: fn(),
+
+    // Game data reference
+    game_data: &GameDataLoader,
+}
+
+// Settings passed to game start
+struct SkirmishSettings {
+    map_name: string,
+    players: [PlayerSlot; MAX_PLAYERS],
+    player_count: u32,
+    starting_cash: u32,
+    superweapons: bool,
+    fog_of_war: bool,
+    crates: bool,
+}
+
+impl SkirmishScreen {
+    fn new(window_manager: &mut WindowManager, game_data: &GameDataLoader) -> Self {
+        let mut screen = SkirmishScreen {
+            window_manager: window_manager,
+            root_window: 0,
+            slots: [PlayerSlot::default(); MAX_PLAYERS as usize],
+            local_player_slot: 0,
+            factions: Vec::new(),
+            faction_display_names: Vec::new(),
+            maps: [MapPreview::default(); MAX_MAPS as usize],
+            map_count: 0,
+            selected_map_index: -1,
+            map_filter_players: 0,
+            starting_cash: 10000,
+            superweapons_enabled: true,
+            fog_of_war_enabled: true,
+            crates_enabled: false,
+            build_speed: 1.0,
+            is_host: true,
+            can_start: false,
+            on_start_game: |_s: &SkirmishSettings| {},
+            on_back: || {},
+            game_data: game_data,
+        }
+
+        screen.load_factions()
+        screen.load_maps()
+        screen.create_ui()
+        screen.setup_default_slots()
+        screen
+    }
+
+    fn load_factions(&mut self) {
+        // Add standard factions
+        self.factions.push("USA".to_string())
+        self.faction_display_names.push("USA".to_string())
+
+        self.factions.push("China".to_string())
+        self.faction_display_names.push("China".to_string())
+
+        self.factions.push("GLA".to_string())
+        self.faction_display_names.push("GLA".to_string())
+
+        // Add generals (Zero Hour)
+        self.factions.push("USA_AirForce".to_string())
+        self.faction_display_names.push("USA Air Force".to_string())
+
+        self.factions.push("USA_Laser".to_string())
+        self.faction_display_names.push("USA Laser".to_string())
+
+        self.factions.push("USA_Superweapon".to_string())
+        self.faction_display_names.push("USA Superweapon".to_string())
+
+        self.factions.push("China_Tank".to_string())
+        self.faction_display_names.push("China Tank".to_string())
+
+        self.factions.push("China_Infantry".to_string())
+        self.faction_display_names.push("China Infantry".to_string())
+
+        self.factions.push("China_Nuke".to_string())
+        self.faction_display_names.push("China Nuke".to_string())
+
+        self.factions.push("GLA_Toxin".to_string())
+        self.faction_display_names.push("GLA Toxin".to_string())
+
+        self.factions.push("GLA_Stealth".to_string())
+        self.faction_display_names.push("GLA Stealth".to_string())
+
+        self.factions.push("GLA_Demolition".to_string())
+        self.faction_display_names.push("GLA Demolition".to_string())
+
+        // Random
+        self.factions.push("Random".to_string())
+        self.faction_display_names.push("Random".to_string())
+    }
+
+    fn load_maps(&mut self) {
+        let mp_maps = self.game_data.get_multiplayer_maps()
+
+        for map in mp_maps {
+            if self.map_count >= MAX_MAPS {
+                break
+            }
+
+            let idx = self.map_count as usize
+            self.maps[idx].name = map.name.clone()
+            self.maps[idx].display_name = map.display_name.clone()
+            self.maps[idx].num_players = map.num_players
+            self.maps[idx].is_selected = false
+            self.map_count += 1
+        }
+
+        // Select first map by default
+        if self.map_count > 0 {
+            self.selected_map_index = 0
+            self.maps[0].is_selected = true
+        }
+    }
+
+    fn create_ui(&mut self) {
+        // Create root window
+        self.root_window = self.window_manager.create_window(
+            "SkirmishScreen".to_string(),
+            WindowType::GenericWindow
+        )
+
+        // Create player slots panel (left side)
+        let slots_panel = self.window_manager.create_window(
+            "PlayerSlotsPanel".to_string(),
+            WindowType::GenericWindow
+        )
+        self.window_manager.set_parent(slots_panel, self.root_window)
+
+        // Create 8 player slot rows
+        for i in 0..MAX_PLAYERS {
+            self.create_player_slot_ui(i, slots_panel)
+        }
+
+        // Create map selection panel (right side)
+        let map_panel = self.window_manager.create_window(
+            "MapPanel".to_string(),
+            WindowType::GenericWindow
+        )
+        self.window_manager.set_parent(map_panel, self.root_window)
+
+        // Map list
+        let map_list = self.window_manager.create_window(
+            "MapList".to_string(),
+            WindowType::ScrollListBox
+        )
+        self.window_manager.set_parent(map_list, map_panel)
+
+        // Map preview
+        let map_preview = self.window_manager.create_window(
+            "MapPreview".to_string(),
+            WindowType::Image
+        )
+        self.window_manager.set_parent(map_preview, map_panel)
+
+        // Game options panel (bottom)
+        let options_panel = self.window_manager.create_window(
+            "OptionsPanel".to_string(),
+            WindowType::GenericWindow
+        )
+        self.window_manager.set_parent(options_panel, self.root_window)
+
+        self.create_options_ui(options_panel)
+
+        // Buttons
+        let start_button = self.window_manager.create_window(
+            "StartButton".to_string(),
+            WindowType::PushButton
+        )
+        self.window_manager.set_parent(start_button, self.root_window)
+        if let Some(btn) = self.window_manager.get_window_mut(start_button) {
+            btn.text = "Start Game".to_string()
+        }
+
+        let back_button = self.window_manager.create_window(
+            "BackButton".to_string(),
+            WindowType::PushButton
+        )
+        self.window_manager.set_parent(back_button, self.root_window)
+        if let Some(btn) = self.window_manager.get_window_mut(back_button) {
+            btn.text = "Back".to_string()
+        }
+    }
+
+    fn create_player_slot_ui(&mut self, slot_index: u32, parent: u32) {
+        let slot_name = "PlayerSlot_".to_string() + slot_index.to_string()
+
+        let slot_row = self.window_manager.create_window(
+            slot_name.clone(),
+            WindowType::GenericWindow
+        )
+        self.window_manager.set_parent(slot_row, parent)
+
+        // Player type dropdown (Open/Closed/Human/AI)
+        let type_combo = self.window_manager.create_window(
+            slot_name.clone() + "_Type",
+            WindowType::ComboBox
+        )
+        self.window_manager.set_parent(type_combo, slot_row)
+
+        // Faction dropdown
+        let faction_combo = self.window_manager.create_window(
+            slot_name.clone() + "_Faction",
+            WindowType::ComboBox
+        )
+        self.window_manager.set_parent(faction_combo, slot_row)
+
+        // Color dropdown
+        let color_combo = self.window_manager.create_window(
+            slot_name.clone() + "_Color",
+            WindowType::ComboBox
+        )
+        self.window_manager.set_parent(color_combo, slot_row)
+
+        // Team dropdown
+        let team_combo = self.window_manager.create_window(
+            slot_name.clone() + "_Team",
+            WindowType::ComboBox
+        )
+        self.window_manager.set_parent(team_combo, slot_row)
+    }
+
+    fn create_options_ui(&mut self, parent: u32) {
+        // Starting cash dropdown
+        let cash_label = self.window_manager.create_window(
+            "CashLabel".to_string(),
+            WindowType::StaticText
+        )
+        self.window_manager.set_parent(cash_label, parent)
+        if let Some(lbl) = self.window_manager.get_window_mut(cash_label) {
+            lbl.text = "Starting Cash:".to_string()
+        }
+
+        let cash_combo = self.window_manager.create_window(
+            "CashCombo".to_string(),
+            WindowType::ComboBox
+        )
+        self.window_manager.set_parent(cash_combo, parent)
+
+        // Superweapons checkbox
+        let sw_check = self.window_manager.create_window(
+            "SuperweaponsCheck".to_string(),
+            WindowType::CheckBox
+        )
+        self.window_manager.set_parent(sw_check, parent)
+        if let Some(chk) = self.window_manager.get_window_mut(sw_check) {
+            chk.text = "Superweapons".to_string()
+        }
+
+        // Fog of war checkbox
+        let fog_check = self.window_manager.create_window(
+            "FogCheck".to_string(),
+            WindowType::CheckBox
+        )
+        self.window_manager.set_parent(fog_check, parent)
+        if let Some(chk) = self.window_manager.get_window_mut(fog_check) {
+            chk.text = "Fog of War".to_string()
+        }
+
+        // Crates checkbox
+        let crates_check = self.window_manager.create_window(
+            "CratesCheck".to_string(),
+            WindowType::CheckBox
+        )
+        self.window_manager.set_parent(crates_check, parent)
+        if let Some(chk) = self.window_manager.get_window_mut(crates_check) {
+            chk.text = "Crates".to_string()
+        }
+    }
+
+    fn setup_default_slots(&mut self) {
+        // Slot 0 = Human player
+        self.slots[0].state = PlayerSlotState::Human
+        self.slots[0].faction = "Random".to_string()
+        self.slots[0].color = FACTION_COLORS[0]
+        self.slots[0].team = 0
+        self.slots[0].player_name = "Player".to_string()
+        self.local_player_slot = 0
+
+        // Slot 1 = Medium AI by default
+        self.slots[1].state = PlayerSlotState::MediumAI
+        self.slots[1].faction = "Random".to_string()
+        self.slots[1].color = FACTION_COLORS[1]
+        self.slots[1].team = 0
+
+        // Rest closed
+        for i in 2..MAX_PLAYERS as usize {
+            self.slots[i].state = PlayerSlotState::Closed
+        }
+
+        self.update_can_start()
+    }
+
+    fn set_slot_state(&mut self, slot: u32, state: PlayerSlotState) {
+        if slot >= MAX_PLAYERS {
+            return
+        }
+
+        self.slots[slot as usize].state = state
+
+        match state {
+            PlayerSlotState::Closed | PlayerSlotState::Open => {
+                self.slots[slot as usize].faction = "".to_string()
+            }
+            _ => {
+                if self.slots[slot as usize].faction.is_empty() {
+                    self.slots[slot as usize].faction = "Random".to_string()
+                }
+            }
+        }
+
+        self.update_can_start()
+    }
+
+    fn set_slot_faction(&mut self, slot: u32, faction: string) {
+        if slot >= MAX_PLAYERS {
+            return
+        }
+        self.slots[slot as usize].faction = faction
+    }
+
+    fn set_slot_color(&mut self, slot: u32, color_index: u32) {
+        if slot >= MAX_PLAYERS || color_index >= 8 {
+            return
+        }
+        self.slots[slot as usize].color = FACTION_COLORS[color_index as usize]
+    }
+
+    fn set_slot_team(&mut self, slot: u32, team: u32) {
+        if slot >= MAX_PLAYERS {
+            return
+        }
+        self.slots[slot as usize].team = team
+    }
+
+    fn select_map(&mut self, map_index: u32) {
+        if map_index >= self.map_count {
+            return
+        }
+
+        // Deselect previous
+        if self.selected_map_index >= 0 {
+            self.maps[self.selected_map_index as usize].is_selected = false
+        }
+
+        self.selected_map_index = map_index as i32
+        self.maps[map_index as usize].is_selected = true
+
+        self.update_can_start()
+    }
+
+    fn update_can_start(&mut self) {
+        // Need at least 2 players and a selected map
+        let mut player_count: u32 = 0
+
+        for slot in &self.slots {
+            match slot.state {
+                PlayerSlotState::Human |
+                PlayerSlotState::EasyAI |
+                PlayerSlotState::MediumAI |
+                PlayerSlotState::HardAI |
+                PlayerSlotState::BrutalAI => {
+                    player_count += 1
+                }
+                _ => {}
+            }
+        }
+
+        self.can_start = player_count >= 2 && self.selected_map_index >= 0
+    }
+
+    fn start_game(&self) {
+        if !self.can_start {
+            return
+        }
+
+        let mut settings = SkirmishSettings {
+            map_name: self.maps[self.selected_map_index as usize].name.clone(),
+            players: self.slots.clone(),
+            player_count: 0,
+            starting_cash: self.starting_cash,
+            superweapons: self.superweapons_enabled,
+            fog_of_war: self.fog_of_war_enabled,
+            crates: self.crates_enabled,
+        }
+
+        // Count active players
+        for slot in &self.slots {
+            match slot.state {
+                PlayerSlotState::Human |
+                PlayerSlotState::EasyAI |
+                PlayerSlotState::MediumAI |
+                PlayerSlotState::HardAI |
+                PlayerSlotState::BrutalAI => {
+                    settings.player_count += 1
+                }
+                _ => {}
+            }
+        }
+
+        (self.on_start_game)(&settings)
+    }
+
+    fn handle_message(&mut self, msg: &WindowMessage, window_id: u32) -> bool {
+        // Handle button clicks
+        if let Some(window) = self.window_manager.get_window(window_id) {
+            if window.name == "StartButton" {
+                self.start_game()
+                return true
+            }
+
+            if window.name == "BackButton" {
+                (self.on_back)()
+                return true
+            }
+        }
+
+        false
+    }
+
+    fn show(&mut self) {
+        self.window_manager.show_window(self.root_window)
+    }
+
+    fn hide(&mut self) {
+        self.window_manager.hide_window(self.root_window)
+    }
+
+    fn set_callbacks(&mut self, on_start: fn(&SkirmishSettings), on_back: fn()) {
+        self.on_start_game = on_start
+        self.on_back = on_back
+    }
+}
+
+impl Default for PlayerSlot {
+    fn default() -> Self {
+        PlayerSlot {
+            index: 0,
+            state: PlayerSlotState::Closed,
+            faction: "".to_string(),
+            color: 0xFFFFFFFF,
+            team: 0,
+            handicap: 100,
+            start_position: -1,
+            player_name: "".to_string(),
+            is_ready: false,
+        }
+    }
+}
+
+impl Clone for PlayerSlot {
+    fn clone(&self) -> Self {
+        PlayerSlot {
+            index: self.index,
+            state: self.state,
+            faction: self.faction.clone(),
+            color: self.color,
+            team: self.team,
+            handicap: self.handicap,
+            start_position: self.start_position,
+            player_name: self.player_name.clone(),
+            is_ready: self.is_ready,
+        }
+    }
+}
+
+impl Default for MapPreview {
+    fn default() -> Self {
+        MapPreview {
+            name: "".to_string(),
+            display_name: "".to_string(),
+            num_players: 0,
+            thumbnail_texture: 0,
+            is_selected: false,
+        }
+    }
+}

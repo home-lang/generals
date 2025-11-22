@@ -1,0 +1,598 @@
+// Quality of Life Features - Hotkeys, control groups, tooltips, and UI helpers
+// Implements C&C Generals quality-of-life features for better user experience
+
+import engine/input::{KeyCode, MouseButton}
+
+// Control group (numbered selection groups 0-9)
+const MAX_CONTROL_GROUPS: u32 = 10
+const MAX_UNITS_PER_GROUP: u32 = 200
+
+struct ControlGroup {
+    index: u32,
+    unit_ids: [u64; MAX_UNITS_PER_GROUP],
+    unit_count: u32,
+    center_position_x: f32,
+    center_position_z: f32,
+    is_set: bool,
+}
+
+impl ControlGroup {
+    fn new(index: u32) -> ControlGroup {
+        return ControlGroup {
+            index: index,
+            unit_ids: [],
+            unit_count: 0,
+            center_position_x: 0.0,
+            center_position_z: 0.0,
+            is_set: false,
+        }
+    }
+
+    fn set_units(self: &mut Self, units: &[u64], count: u32) {
+        self.unit_count = count.min(MAX_UNITS_PER_GROUP)
+        for i in 0..self.unit_count {
+            self.unit_ids[i] = units[i]
+        }
+        self.is_set = true
+        self.update_center()
+    }
+
+    fn add_units(self: &mut Self, units: &[u64], count: u32) {
+        for i in 0..count {
+            if self.unit_count >= MAX_UNITS_PER_GROUP {
+                break
+            }
+
+            // Check if unit already in group
+            let mut found = false
+            for j in 0..self.unit_count {
+                if self.unit_ids[j] == units[i] {
+                    found = true
+                    break
+                }
+            }
+
+            if not found {
+                self.unit_ids[self.unit_count] = units[i]
+                self.unit_count = self.unit_count + 1
+            }
+        }
+        self.is_set = true
+        self.update_center()
+    }
+
+    fn remove_unit(self: &mut Self, unit_id: u64) {
+        for i in 0..self.unit_count {
+            if self.unit_ids[i] == unit_id {
+                // Shift remaining units
+                for j in i..(self.unit_count - 1) {
+                    self.unit_ids[j] = self.unit_ids[j + 1]
+                }
+                self.unit_count = self.unit_count - 1
+                break
+            }
+        }
+
+        if self.unit_count == 0 {
+            self.is_set = false
+        }
+
+        self.update_center()
+    }
+
+    fn update_center(self: &mut Self) {
+        if self.unit_count == 0 {
+            return
+        }
+
+        // Calculate center of group (would need unit positions)
+        // For now, this is a placeholder
+    }
+
+    fn clear(self: &mut Self) {
+        self.unit_count = 0
+        self.is_set = false
+    }
+}
+
+// Control groups manager
+struct ControlGroupsManager {
+    groups: [ControlGroup; MAX_CONTROL_GROUPS],
+    last_selected_group: i32,
+    double_tap_timer: f32,
+    double_tap_group: i32,
+}
+
+impl ControlGroupsManager {
+    fn new() -> ControlGroupsManager {
+        let mut manager = ControlGroupsManager {
+            groups: [],
+            last_selected_group: -1,
+            double_tap_timer: 0.0,
+            double_tap_group: -1,
+        }
+
+        for i in 0..MAX_CONTROL_GROUPS {
+            manager.groups[i] = ControlGroup::new(i)
+        }
+
+        return manager
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        if self.double_tap_timer > 0.0 {
+            self.double_tap_timer = self.double_tap_timer - delta_time
+        }
+    }
+
+    fn assign_group(self: &mut Self, group_index: u32, unit_ids: &[u64], count: u32, add_to_existing: bool) {
+        if group_index >= MAX_CONTROL_GROUPS {
+            return
+        }
+
+        if add_to_existing and self.groups[group_index].is_set {
+            self.groups[group_index].add_units(unit_ids, count)
+        } else {
+            self.groups[group_index].set_units(unit_ids, count)
+        }
+    }
+
+    fn select_group(self: &mut Self, group_index: u32) -> &ControlGroup {
+        if group_index >= MAX_CONTROL_GROUPS {
+            return &self.groups[0]
+        }
+
+        // Check for double tap (jump to group)
+        let is_double_tap = self.last_selected_group == group_index as i32 and self.double_tap_timer > 0.0
+
+        self.last_selected_group = group_index as i32
+        self.double_tap_timer = 0.3  // 300ms for double tap
+
+        return &self.groups[group_index]
+    }
+
+    fn is_double_tap(self: &Self) -> bool {
+        return self.double_tap_timer > 0.0 and self.last_selected_group == self.double_tap_group
+    }
+
+    fn remove_dead_unit(self: &mut Self, unit_id: u64) {
+        for i in 0..MAX_CONTROL_GROUPS {
+            self.groups[i].remove_unit(unit_id)
+        }
+    }
+}
+
+// Hotkey binding
+struct HotkeyBinding {
+    action: string,
+    key: KeyCode,
+    modifiers: u32,  // Bitmask: 1=Ctrl, 2=Shift, 4=Alt
+    is_global: bool, // Works even when UI focused
+}
+
+const MAX_HOTKEYS: u32 = 128
+
+// Hotkey manager
+struct HotkeyManager {
+    bindings: [HotkeyBinding; MAX_HOTKEYS],
+    binding_count: u32,
+}
+
+impl HotkeyManager {
+    fn new() -> HotkeyManager {
+        let mut manager = HotkeyManager {
+            bindings: [],
+            binding_count: 0,
+        }
+
+        manager.setup_default_hotkeys()
+
+        return manager
+    }
+
+    fn setup_default_hotkeys(self: &mut Self) {
+        // Camera controls
+        self.bind("camera_pan_up", KeyCode::W, 0, true)
+        self.bind("camera_pan_down", KeyCode::S, 0, true)
+        self.bind("camera_pan_left", KeyCode::A, 0, true)
+        self.bind("camera_pan_right", KeyCode::D, 0, true)
+        self.bind("camera_rotate_left", KeyCode::LeftBracket, 0, true)
+        self.bind("camera_rotate_right", KeyCode::RightBracket, 0, true)
+        self.bind("camera_zoom_in", KeyCode::Equals, 0, true)
+        self.bind("camera_zoom_out", KeyCode::Minus, 0, true)
+
+        // Unit commands
+        self.bind("attack_move", KeyCode::A, 0, false)
+        self.bind("force_attack", KeyCode::A, 1, false)  // Ctrl+A
+        self.bind("stop", KeyCode::S, 0, false)
+        self.bind("scatter", KeyCode::X, 0, false)
+        self.bind("guard", KeyCode::G, 0, false)
+        self.bind("force_move", KeyCode::G, 0, false)
+        self.bind("patrol", KeyCode::P, 0, false)
+
+        // Selection
+        self.bind("select_all", KeyCode::Q, 1, false)      // Ctrl+Q
+        self.bind("select_all_type", KeyCode::W, 1, false) // Ctrl+W
+        self.bind("select_idle", KeyCode::Period, 0, false)
+        self.bind("select_wounded", KeyCode::Comma, 0, false)
+
+        // Control groups
+        for i in 0..10 {
+            let key = if i == 0 then KeyCode::Key0 else (KeyCode::Key1 + i - 1)
+            self.bind("select_group_" + i.to_string(), key, 0, false)
+            self.bind("assign_group_" + i.to_string(), key, 1, false)  // Ctrl+number
+            self.bind("add_to_group_" + i.to_string(), key, 2, false)  // Shift+number
+        }
+
+        // Special powers (F1-F9)
+        for i in 1..10 {
+            self.bind("special_power_" + i.to_string(), KeyCode::F1 + i - 1, 0, false)
+        }
+
+        // UI
+        self.bind("options_menu", KeyCode::Escape, 0, true)
+        self.bind("diplomacy", KeyCode::F5, 0, false)
+        self.bind("chat", KeyCode::Enter, 0, true)
+        self.bind("team_chat", KeyCode::Enter, 2, true)  // Shift+Enter
+
+        // Building/Production
+        self.bind("sell_mode", KeyCode::Z, 0, false)
+        self.bind("repair_mode", KeyCode::C, 0, false)
+        self.bind("power_mode", KeyCode::V, 0, false)
+    }
+
+    fn bind(self: &mut Self, action: string, key: KeyCode, modifiers: u32, is_global: bool) {
+        if self.binding_count >= MAX_HOTKEYS {
+            return
+        }
+
+        self.bindings[self.binding_count] = HotkeyBinding {
+            action: action,
+            key: key,
+            modifiers: modifiers,
+            is_global: is_global,
+        }
+        self.binding_count = self.binding_count + 1
+    }
+
+    fn rebind(self: &mut Self, action: string, key: KeyCode, modifiers: u32) {
+        for i in 0..self.binding_count {
+            if self.bindings[i].action == action {
+                self.bindings[i].key = key
+                self.bindings[i].modifiers = modifiers
+                return
+            }
+        }
+    }
+
+    fn get_action_for_key(self: &Self, key: KeyCode, ctrl: bool, shift: bool, alt: bool) -> string {
+        let modifiers: u32 = 0
+        if ctrl then modifiers = modifiers | 1
+        if shift then modifiers = modifiers | 2
+        if alt then modifiers = modifiers | 4
+
+        for i in 0..self.binding_count {
+            if self.bindings[i].key == key and self.bindings[i].modifiers == modifiers {
+                return self.bindings[i].action
+            }
+        }
+
+        return ""
+    }
+
+    fn get_key_for_action(self: &Self, action: string) -> (KeyCode, u32) {
+        for i in 0..self.binding_count {
+            if self.bindings[i].action == action {
+                return (self.bindings[i].key, self.bindings[i].modifiers)
+            }
+        }
+
+        return (KeyCode::None, 0)
+    }
+}
+
+// Tooltip data
+struct TooltipInfo {
+    title: string,
+    description: string,
+    hotkey_hint: string,
+    cost: string,
+    build_time: string,
+    requirements: string,
+    is_visible: bool,
+    show_delay: f32,
+    position_x: f32,
+    position_y: f32,
+}
+
+// Tooltip manager
+struct TooltipManager {
+    current_tooltip: TooltipInfo,
+    hover_time: f32,
+    hover_target: string,
+    show_delay: f32,
+    is_enabled: bool,
+}
+
+impl TooltipManager {
+    fn new() -> TooltipManager {
+        return TooltipManager {
+            current_tooltip: TooltipInfo {
+                title: "",
+                description: "",
+                hotkey_hint: "",
+                cost: "",
+                build_time: "",
+                requirements: "",
+                is_visible: false,
+                show_delay: 0.5,
+                position_x: 0.0,
+                position_y: 0.0,
+            },
+            hover_time: 0.0,
+            hover_target: "",
+            show_delay: 0.5,
+            is_enabled: true,
+        }
+    }
+
+    fn update(self: &mut Self, delta_time: f32, mouse_x: f32, mouse_y: f32) {
+        if not self.is_enabled {
+            self.current_tooltip.is_visible = false
+            return
+        }
+
+        if self.hover_target.len() > 0 {
+            self.hover_time = self.hover_time + delta_time
+
+            if self.hover_time >= self.show_delay {
+                self.current_tooltip.is_visible = true
+                self.current_tooltip.position_x = mouse_x + 15.0
+                self.current_tooltip.position_y = mouse_y + 15.0
+
+                // Clamp to screen bounds
+                // self.clamp_to_screen()
+            }
+        }
+    }
+
+    fn set_hover_target(self: &mut Self, target: string, title: string, description: string) {
+        if target != self.hover_target {
+            self.hover_target = target
+            self.hover_time = 0.0
+            self.current_tooltip.is_visible = false
+            self.current_tooltip.title = title
+            self.current_tooltip.description = description
+        }
+    }
+
+    fn set_unit_tooltip(self: &mut Self, target: string, unit_name: string, health: u32, max_health: u32, veterancy: u32) {
+        let health_text = "Health: " + health.to_string() + "/" + max_health.to_string()
+        let vet_text = if veterancy > 0 then " (Veteran " + veterancy.to_string() + ")" else ""
+
+        self.set_hover_target(target, unit_name + vet_text, health_text)
+    }
+
+    fn set_building_tooltip(self: &mut Self, target: string, name: string, cost: u32, build_time: f32, hotkey: string) {
+        self.set_hover_target(target, name, "")
+        self.current_tooltip.cost = "$" + cost.to_string()
+        self.current_tooltip.build_time = build_time.to_string() + "s"
+        self.current_tooltip.hotkey_hint = hotkey
+    }
+
+    fn clear_hover(self: &mut Self) {
+        self.hover_target = ""
+        self.hover_time = 0.0
+        self.current_tooltip.is_visible = false
+    }
+
+    fn set_enabled(self: &mut Self, enabled: bool) {
+        self.is_enabled = enabled
+        if not enabled {
+            self.current_tooltip.is_visible = false
+        }
+    }
+}
+
+// Selection box
+struct SelectionBox {
+    start_x: f32,
+    start_y: f32,
+    end_x: f32,
+    end_y: f32,
+    is_active: bool,
+    min_drag_distance: f32,
+}
+
+impl SelectionBox {
+    fn new() -> SelectionBox {
+        return SelectionBox {
+            start_x: 0.0,
+            start_y: 0.0,
+            end_x: 0.0,
+            end_y: 0.0,
+            is_active: false,
+            min_drag_distance: 5.0,
+        }
+    }
+
+    fn start_selection(self: &mut Self, x: f32, y: f32) {
+        self.start_x = x
+        self.start_y = y
+        self.end_x = x
+        self.end_y = y
+        self.is_active = true
+    }
+
+    fn update_selection(self: &mut Self, x: f32, y: f32) {
+        self.end_x = x
+        self.end_y = y
+    }
+
+    fn end_selection(self: &mut Self) {
+        self.is_active = false
+    }
+
+    fn is_valid_drag(self: &Self) -> bool {
+        let dx = (self.end_x - self.start_x).abs()
+        let dy = (self.end_y - self.start_y).abs()
+        return dx > self.min_drag_distance or dy > self.min_drag_distance
+    }
+
+    fn get_bounds(self: &Self) -> (f32, f32, f32, f32) {
+        let min_x = self.start_x.min(self.end_x)
+        let min_y = self.start_y.min(self.end_y)
+        let max_x = self.start_x.max(self.end_x)
+        let max_y = self.start_y.max(self.end_y)
+        return (min_x, min_y, max_x, max_y)
+    }
+}
+
+// Rally point marker
+struct RallyPointMarker {
+    position_x: f32,
+    position_y: f32,
+    position_z: f32,
+    building_id: u64,
+    is_visible: bool,
+    animation_time: f32,
+}
+
+// Rally point manager
+struct RallyPointManager {
+    markers: [RallyPointMarker; 64],
+    marker_count: u32,
+}
+
+impl RallyPointManager {
+    fn new() -> RallyPointManager {
+        return RallyPointManager {
+            markers: [],
+            marker_count: 0,
+        }
+    }
+
+    fn set_rally_point(self: &mut Self, building_id: u64, x: f32, y: f32, z: f32) {
+        // Check if building already has rally point
+        for i in 0..self.marker_count {
+            if self.markers[i].building_id == building_id {
+                self.markers[i].position_x = x
+                self.markers[i].position_y = y
+                self.markers[i].position_z = z
+                self.markers[i].animation_time = 0.0
+                return
+            }
+        }
+
+        // Add new rally point
+        if self.marker_count < 64 {
+            self.markers[self.marker_count] = RallyPointMarker {
+                position_x: x,
+                position_y: y,
+                position_z: z,
+                building_id: building_id,
+                is_visible: true,
+                animation_time: 0.0,
+            }
+            self.marker_count = self.marker_count + 1
+        }
+    }
+
+    fn remove_rally_point(self: &mut Self, building_id: u64) {
+        for i in 0..self.marker_count {
+            if self.markers[i].building_id == building_id {
+                // Shift remaining markers
+                for j in i..(self.marker_count - 1) {
+                    self.markers[j] = self.markers[j + 1]
+                }
+                self.marker_count = self.marker_count - 1
+                return
+            }
+        }
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        for i in 0..self.marker_count {
+            self.markers[i].animation_time = self.markers[i].animation_time + delta_time
+        }
+    }
+}
+
+// Global QoL managers
+var g_control_groups: ControlGroupsManager = ControlGroupsManager::new()
+var g_hotkey_manager: HotkeyManager = HotkeyManager::new()
+var g_tooltip_manager: TooltipManager = TooltipManager::new()
+var g_selection_box: SelectionBox = SelectionBox::new()
+var g_rally_points: RallyPointManager = RallyPointManager::new()
+
+// Export functions
+export fn qol_init() {
+    g_control_groups = ControlGroupsManager::new()
+    g_hotkey_manager = HotkeyManager::new()
+    g_tooltip_manager = TooltipManager::new()
+    g_selection_box = SelectionBox::new()
+    g_rally_points = RallyPointManager::new()
+}
+
+export fn qol_update(delta_time: f32, mouse_x: f32, mouse_y: f32) {
+    g_control_groups.update(delta_time)
+    g_tooltip_manager.update(delta_time, mouse_x, mouse_y)
+    g_rally_points.update(delta_time)
+}
+
+// Control group exports
+export fn assign_control_group(group_index: u32, unit_ids: &[u64], count: u32, add: bool) {
+    g_control_groups.assign_group(group_index, unit_ids, count, add)
+}
+
+export fn select_control_group(group_index: u32) -> &ControlGroup {
+    return g_control_groups.select_group(group_index)
+}
+
+// Hotkey exports
+export fn get_action_for_key(key: u32, ctrl: bool, shift: bool, alt: bool) -> string {
+    return g_hotkey_manager.get_action_for_key(key as KeyCode, ctrl, shift, alt)
+}
+
+export fn rebind_hotkey(action: string, key: u32, modifiers: u32) {
+    g_hotkey_manager.rebind(action, key as KeyCode, modifiers)
+}
+
+// Tooltip exports
+export fn show_tooltip(target: string, title: string, description: string) {
+    g_tooltip_manager.set_hover_target(target, title, description)
+}
+
+export fn hide_tooltip() {
+    g_tooltip_manager.clear_hover()
+}
+
+export fn set_tooltips_enabled(enabled: bool) {
+    g_tooltip_manager.set_enabled(enabled)
+}
+
+// Selection box exports
+export fn start_selection_box(x: f32, y: f32) {
+    g_selection_box.start_selection(x, y)
+}
+
+export fn update_selection_box(x: f32, y: f32) {
+    g_selection_box.update_selection(x, y)
+}
+
+export fn end_selection_box() {
+    g_selection_box.end_selection()
+}
+
+export fn is_selection_box_active() -> bool {
+    return g_selection_box.is_active
+}
+
+// Rally point exports
+export fn set_rally_point(building_id: u64, x: f32, y: f32, z: f32) {
+    g_rally_points.set_rally_point(building_id, x, y, z)
+}
+
+export fn remove_rally_point(building_id: u64) {
+    g_rally_points.remove_rally_point(building_id)
+}

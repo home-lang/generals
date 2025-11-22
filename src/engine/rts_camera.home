@@ -1,0 +1,584 @@
+// RTS Camera - Extended camera system for C&C Generals style RTS controls
+// Implements edge scrolling, cinematic sequences, and map constraints
+
+import engine/camera::{Camera, CameraMode, Mat4, Vec3, Ray, get_camera}
+import math/vector3::{vec3_lerp, vec3_distance}
+
+// Camera bookmark (saved position)
+struct CameraBookmark {
+    target: Vec3,
+    zoom: f32,
+    pitch: f32,
+    yaw: f32,
+    is_valid: bool,
+}
+
+// Cinematic keyframe
+struct CameraKeyframe {
+    target: Vec3,
+    zoom: f32,
+    pitch: f32,
+    yaw: f32,
+    time: f32,         // Time in sequence
+    ease_type: EaseType,
+}
+
+enum EaseType {
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+// Cinematic camera sequence
+struct CinematicSequence {
+    keyframes: [CameraKeyframe; 32],
+    keyframe_count: u32,
+    duration: f32,
+    current_time: f32,
+    is_playing: bool,
+    is_looping: bool,
+}
+
+const MAX_BOOKMARKS: u32 = 10
+const EDGE_SCROLL_MARGIN: f32 = 20.0  // Pixels from screen edge
+const EDGE_SCROLL_SPEED: f32 = 50.0
+
+// RTS Camera controller
+struct RTSCameraController {
+    camera: &Camera,
+
+    // Map bounds
+    map_min_x: f32,
+    map_max_x: f32,
+    map_min_z: f32,
+    map_max_z: f32,
+
+    // Bookmarks
+    bookmarks: [CameraBookmark; MAX_BOOKMARKS],
+
+    // Cinematic
+    cinematic: CinematicSequence,
+
+    // Edge scrolling
+    edge_scroll_enabled: bool,
+    screen_width: f32,
+    screen_height: f32,
+    mouse_x: f32,
+    mouse_y: f32,
+
+    // Smoothing
+    target_position: Vec3,
+    target_zoom: f32,
+    target_pitch: f32,
+    target_yaw: f32,
+    smooth_speed: f32,
+
+    // Jump to location
+    jump_target: Vec3,
+    is_jumping: bool,
+    jump_duration: f32,
+    jump_elapsed: f32,
+    jump_start_position: Vec3,
+
+    // Shake effect
+    shake_intensity: f32,
+    shake_duration: f32,
+    shake_elapsed: f32,
+    shake_offset: Vec3,
+
+    // Zoom presets
+    zoom_presets: [f32; 3],
+    current_zoom_preset: u32,
+}
+
+impl RTSCameraController {
+    fn new(camera: &Camera) -> RTSCameraController {
+        return RTSCameraController {
+            camera: camera,
+            map_min_x: -1000.0,
+            map_max_x: 1000.0,
+            map_min_z: -1000.0,
+            map_max_z: 1000.0,
+            bookmarks: [],
+            cinematic: CinematicSequence::new(),
+            edge_scroll_enabled: true,
+            screen_width: 1920.0,
+            screen_height: 1080.0,
+            mouse_x: 0.0,
+            mouse_y: 0.0,
+            target_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            target_zoom: 50.0,
+            target_pitch: 0.785,
+            target_yaw: 0.0,
+            smooth_speed: 10.0,
+            jump_target: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            is_jumping: false,
+            jump_duration: 0.5,
+            jump_elapsed: 0.0,
+            jump_start_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            shake_intensity: 0.0,
+            shake_duration: 0.0,
+            shake_elapsed: 0.0,
+            shake_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            zoom_presets: [30.0, 60.0, 120.0],  // Close, Medium, Far
+            current_zoom_preset: 1,
+        }
+    }
+
+    fn set_map_bounds(self: &mut Self, min_x: f32, max_x: f32, min_z: f32, max_z: f32) {
+        self.map_min_x = min_x
+        self.map_max_x = max_x
+        self.map_min_z = min_z
+        self.map_max_z = max_z
+    }
+
+    fn set_screen_size(self: &mut Self, width: f32, height: f32) {
+        self.screen_width = width
+        self.screen_height = height
+    }
+
+    fn set_mouse_position(self: &mut Self, x: f32, y: f32) {
+        self.mouse_x = x
+        self.mouse_y = y
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        // Handle cinematic playback
+        if self.cinematic.is_playing {
+            self.update_cinematic(delta_time)
+            return
+        }
+
+        // Handle jump to location
+        if self.is_jumping {
+            self.update_jump(delta_time)
+        } else {
+            // Normal camera control
+            self.update_edge_scroll(delta_time)
+            self.update_smooth_movement(delta_time)
+        }
+
+        // Apply shake
+        self.update_shake(delta_time)
+
+        // Clamp to map bounds
+        self.clamp_to_bounds()
+
+        // Update actual camera
+        self.apply_to_camera()
+    }
+
+    fn update_edge_scroll(self: &mut Self, delta_time: f32) {
+        if not self.edge_scroll_enabled {
+            return
+        }
+
+        let speed = EDGE_SCROLL_SPEED * delta_time
+
+        // Left edge
+        if self.mouse_x < EDGE_SCROLL_MARGIN {
+            let strength = 1.0 - (self.mouse_x / EDGE_SCROLL_MARGIN)
+            self.target_position.x = self.target_position.x - speed * strength
+        }
+
+        // Right edge
+        if self.mouse_x > self.screen_width - EDGE_SCROLL_MARGIN {
+            let strength = (self.mouse_x - (self.screen_width - EDGE_SCROLL_MARGIN)) / EDGE_SCROLL_MARGIN
+            self.target_position.x = self.target_position.x + speed * strength
+        }
+
+        // Top edge
+        if self.mouse_y < EDGE_SCROLL_MARGIN {
+            let strength = 1.0 - (self.mouse_y / EDGE_SCROLL_MARGIN)
+            self.target_position.z = self.target_position.z - speed * strength
+        }
+
+        // Bottom edge
+        if self.mouse_y > self.screen_height - EDGE_SCROLL_MARGIN {
+            let strength = (self.mouse_y - (self.screen_height - EDGE_SCROLL_MARGIN)) / EDGE_SCROLL_MARGIN
+            self.target_position.z = self.target_position.z + speed * strength
+        }
+    }
+
+    fn update_smooth_movement(self: &mut Self, delta_time: f32) {
+        let t = (self.smooth_speed * delta_time).min(1.0)
+
+        self.camera.target.x = lerp(self.camera.target.x, self.target_position.x, t)
+        self.camera.target.z = lerp(self.camera.target.z, self.target_position.z, t)
+        self.camera.zoom = lerp(self.camera.zoom, self.target_zoom, t)
+        self.camera.pitch = lerp(self.camera.pitch, self.target_pitch, t)
+        self.camera.yaw = lerp_angle(self.camera.yaw, self.target_yaw, t)
+    }
+
+    fn update_jump(self: &mut Self, delta_time: f32) {
+        self.jump_elapsed = self.jump_elapsed + delta_time
+
+        if self.jump_elapsed >= self.jump_duration {
+            self.is_jumping = false
+            self.target_position = self.jump_target
+            self.camera.target = self.jump_target
+            return
+        }
+
+        let t = ease_out_quad(self.jump_elapsed / self.jump_duration)
+        self.camera.target = vec3_lerp(self.jump_start_position, self.jump_target, t)
+        self.target_position = self.camera.target
+    }
+
+    fn update_shake(self: &mut Self, delta_time: f32) {
+        if self.shake_duration <= 0.0 {
+            self.shake_offset = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+            return
+        }
+
+        self.shake_elapsed = self.shake_elapsed + delta_time
+
+        if self.shake_elapsed >= self.shake_duration {
+            self.shake_duration = 0.0
+            self.shake_offset = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+            return
+        }
+
+        // Decay intensity over time
+        let progress = self.shake_elapsed / self.shake_duration
+        let current_intensity = self.shake_intensity * (1.0 - progress)
+
+        // Random offset
+        self.shake_offset = Vec3 {
+            x: random_range(-1.0, 1.0) * current_intensity,
+            y: random_range(-1.0, 1.0) * current_intensity * 0.5,
+            z: random_range(-1.0, 1.0) * current_intensity,
+        }
+    }
+
+    fn clamp_to_bounds(self: &mut Self) {
+        self.target_position.x = self.target_position.x.clamp(self.map_min_x, self.map_max_x)
+        self.target_position.z = self.target_position.z.clamp(self.map_min_z, self.map_max_z)
+
+        self.camera.target.x = self.camera.target.x.clamp(self.map_min_x, self.map_max_x)
+        self.camera.target.z = self.camera.target.z.clamp(self.map_min_z, self.map_max_z)
+    }
+
+    fn apply_to_camera(self: &Self) {
+        // Apply shake offset
+        self.camera.position.x = self.camera.position.x + self.shake_offset.x
+        self.camera.position.y = self.camera.position.y + self.shake_offset.y
+        self.camera.position.z = self.camera.position.z + self.shake_offset.z
+    }
+
+    // User input functions
+    fn pan(self: &mut Self, dx: f32, dy: f32) {
+        // Pan camera based on yaw direction
+        let cos_yaw = self.camera.yaw.cos()
+        let sin_yaw = self.camera.yaw.sin()
+
+        self.target_position.x = self.target_position.x + dx * cos_yaw - dy * sin_yaw
+        self.target_position.z = self.target_position.z + dx * sin_yaw + dy * cos_yaw
+    }
+
+    fn rotate(self: &mut Self, yaw_delta: f32) {
+        self.target_yaw = self.target_yaw + yaw_delta
+    }
+
+    fn zoom_in(self: &mut Self) {
+        self.target_zoom = (self.target_zoom - self.camera.zoom_speed).max(self.camera.min_zoom)
+    }
+
+    fn zoom_out(self: &mut Self) {
+        self.target_zoom = (self.target_zoom + self.camera.zoom_speed).min(self.camera.max_zoom)
+    }
+
+    fn zoom_to(self: &mut Self, zoom_level: f32) {
+        self.target_zoom = zoom_level.clamp(self.camera.min_zoom, self.camera.max_zoom)
+    }
+
+    fn cycle_zoom_preset(self: &mut Self) {
+        self.current_zoom_preset = (self.current_zoom_preset + 1) % 3
+        self.target_zoom = self.zoom_presets[self.current_zoom_preset]
+    }
+
+    fn jump_to(self: &mut Self, position: Vec3) {
+        self.is_jumping = true
+        self.jump_elapsed = 0.0
+        self.jump_start_position = self.camera.target
+        self.jump_target = position
+    }
+
+    fn jump_to_unit(self: &mut Self, unit_x: f32, unit_z: f32) {
+        self.jump_to(Vec3 { x: unit_x, y: 0.0, z: unit_z })
+    }
+
+    fn center_on(self: &mut Self, x: f32, z: f32) {
+        self.target_position.x = x
+        self.target_position.z = z
+    }
+
+    fn shake(self: &mut Self, intensity: f32, duration: f32) {
+        self.shake_intensity = intensity
+        self.shake_duration = duration
+        self.shake_elapsed = 0.0
+    }
+
+    // Bookmarks
+    fn save_bookmark(self: &mut Self, index: u32) {
+        if index < MAX_BOOKMARKS {
+            self.bookmarks[index] = CameraBookmark {
+                target: self.camera.target,
+                zoom: self.camera.zoom,
+                pitch: self.camera.pitch,
+                yaw: self.camera.yaw,
+                is_valid: true,
+            }
+        }
+    }
+
+    fn load_bookmark(self: &mut Self, index: u32) {
+        if index < MAX_BOOKMARKS and self.bookmarks[index].is_valid {
+            let bookmark = &self.bookmarks[index]
+            self.jump_to(bookmark.target)
+            self.target_zoom = bookmark.zoom
+            self.target_pitch = bookmark.pitch
+            self.target_yaw = bookmark.yaw
+        }
+    }
+
+    // Cinematic control
+    fn update_cinematic(self: &mut Self, delta_time: f32) {
+        self.cinematic.current_time = self.cinematic.current_time + delta_time
+
+        if self.cinematic.current_time >= self.cinematic.duration {
+            if self.cinematic.is_looping {
+                self.cinematic.current_time = 0.0
+            } else {
+                self.cinematic.is_playing = false
+                return
+            }
+        }
+
+        // Find current keyframes
+        let mut prev_index: u32 = 0
+        let mut next_index: u32 = 0
+
+        for i in 0..self.cinematic.keyframe_count {
+            if self.cinematic.keyframes[i].time <= self.cinematic.current_time {
+                prev_index = i
+            }
+            if self.cinematic.keyframes[i].time > self.cinematic.current_time {
+                next_index = i
+                break
+            }
+        }
+
+        // Interpolate between keyframes
+        let prev = &self.cinematic.keyframes[prev_index]
+        let next = &self.cinematic.keyframes[next_index]
+
+        let segment_duration = next.time - prev.time
+        let segment_progress = (self.cinematic.current_time - prev.time) / segment_duration
+        let t = apply_easing(segment_progress, next.ease_type)
+
+        self.camera.target = vec3_lerp(prev.target, next.target, t)
+        self.camera.zoom = lerp(prev.zoom, next.zoom, t)
+        self.camera.pitch = lerp(prev.pitch, next.pitch, t)
+        self.camera.yaw = lerp_angle(prev.yaw, next.yaw, t)
+
+        self.target_position = self.camera.target
+        self.target_zoom = self.camera.zoom
+        self.target_pitch = self.camera.pitch
+        self.target_yaw = self.camera.yaw
+    }
+
+    fn play_cinematic(self: &mut Self, sequence: &CinematicSequence) {
+        self.cinematic = sequence.clone()
+        self.cinematic.is_playing = true
+        self.cinematic.current_time = 0.0
+    }
+
+    fn stop_cinematic(self: &mut Self) {
+        self.cinematic.is_playing = false
+    }
+
+    fn is_cinematic_playing(self: &Self) -> bool {
+        return self.cinematic.is_playing
+    }
+
+    // Edge scrolling toggle
+    fn set_edge_scroll_enabled(self: &mut Self, enabled: bool) {
+        self.edge_scroll_enabled = enabled
+    }
+
+    // Reset camera to default
+    fn reset(self: &mut Self) {
+        self.target_position = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        self.target_zoom = 60.0
+        self.target_pitch = 0.785
+        self.target_yaw = 0.0
+        self.is_jumping = false
+        self.shake_duration = 0.0
+    }
+}
+
+impl CinematicSequence {
+    fn new() -> CinematicSequence {
+        return CinematicSequence {
+            keyframes: [],
+            keyframe_count: 0,
+            duration: 0.0,
+            current_time: 0.0,
+            is_playing: false,
+            is_looping: false,
+        }
+    }
+
+    fn add_keyframe(self: &mut Self, target: Vec3, zoom: f32, pitch: f32, yaw: f32, time: f32, ease: EaseType) {
+        if self.keyframe_count < 32 {
+            self.keyframes[self.keyframe_count] = CameraKeyframe {
+                target: target,
+                zoom: zoom,
+                pitch: pitch,
+                yaw: yaw,
+                time: time,
+                ease_type: ease,
+            }
+            self.keyframe_count = self.keyframe_count + 1
+
+            // Update duration
+            if time > self.duration {
+                self.duration = time
+            }
+        }
+    }
+
+    fn clone(self: &Self) -> CinematicSequence {
+        let mut seq = CinematicSequence::new()
+        seq.keyframes = self.keyframes
+        seq.keyframe_count = self.keyframe_count
+        seq.duration = self.duration
+        seq.is_looping = self.is_looping
+        return seq
+    }
+}
+
+// Easing functions
+fn ease_out_quad(t: f32) -> f32 {
+    return 1.0 - (1.0 - t) * (1.0 - t)
+}
+
+fn ease_in_quad(t: f32) -> f32 {
+    return t * t
+}
+
+fn ease_in_out_quad(t: f32) -> f32 {
+    if t < 0.5 {
+        return 2.0 * t * t
+    } else {
+        return 1.0 - ((-2.0 * t + 2.0) * (-2.0 * t + 2.0)) / 2.0
+    }
+}
+
+fn apply_easing(t: f32, ease_type: EaseType) -> f32 {
+    match ease_type {
+        EaseType::Linear => return t,
+        EaseType::EaseIn => return ease_in_quad(t),
+        EaseType::EaseOut => return ease_out_quad(t),
+        EaseType::EaseInOut => return ease_in_out_quad(t),
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t
+}
+
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    // Handle angle wrapping
+    let mut diff = b - a
+    while diff > 3.14159 {
+        diff = diff - 6.28318
+    }
+    while diff < -3.14159 {
+        diff = diff + 6.28318
+    }
+    return a + diff * t
+}
+
+fn random_range(min: f32, max: f32) -> f32 {
+    // Pseudo-random for shake effect
+    // In real implementation, use proper RNG
+    return min
+}
+
+// Global RTS camera controller
+var g_rts_camera: RTSCameraController = RTSCameraController::new(get_camera())
+
+// Export functions
+export fn rts_camera_init() {
+    let camera = get_camera()
+    if camera != null {
+        g_rts_camera = RTSCameraController::new(camera)
+    }
+}
+
+export fn rts_camera_update(delta_time: f32) {
+    g_rts_camera.update(delta_time)
+}
+
+export fn rts_camera_set_map_bounds(min_x: f32, max_x: f32, min_z: f32, max_z: f32) {
+    g_rts_camera.set_map_bounds(min_x, max_x, min_z, max_z)
+}
+
+export fn rts_camera_set_mouse(x: f32, y: f32) {
+    g_rts_camera.set_mouse_position(x, y)
+}
+
+export fn rts_camera_set_screen_size(width: f32, height: f32) {
+    g_rts_camera.set_screen_size(width, height)
+}
+
+export fn rts_camera_pan(dx: f32, dy: f32) {
+    g_rts_camera.pan(dx, dy)
+}
+
+export fn rts_camera_rotate(yaw_delta: f32) {
+    g_rts_camera.rotate(yaw_delta)
+}
+
+export fn rts_camera_zoom_in() {
+    g_rts_camera.zoom_in()
+}
+
+export fn rts_camera_zoom_out() {
+    g_rts_camera.zoom_out()
+}
+
+export fn rts_camera_cycle_zoom() {
+    g_rts_camera.cycle_zoom_preset()
+}
+
+export fn rts_camera_jump_to(x: f32, z: f32) {
+    g_rts_camera.jump_to(Vec3 { x: x, y: 0.0, z: z })
+}
+
+export fn rts_camera_center_on(x: f32, z: f32) {
+    g_rts_camera.center_on(x, z)
+}
+
+export fn rts_camera_shake(intensity: f32, duration: f32) {
+    g_rts_camera.shake(intensity, duration)
+}
+
+export fn rts_camera_save_bookmark(index: u32) {
+    g_rts_camera.save_bookmark(index)
+}
+
+export fn rts_camera_load_bookmark(index: u32) {
+    g_rts_camera.load_bookmark(index)
+}
+
+export fn rts_camera_set_edge_scroll(enabled: bool) {
+    g_rts_camera.set_edge_scroll_enabled(enabled)
+}
+
+export fn rts_camera_reset() {
+    g_rts_camera.reset()
+}

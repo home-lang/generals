@@ -1,0 +1,510 @@
+// Game Audio Events - Connects game events to audio playback
+// Implements the C&C Generals audio event system for in-game sounds
+
+import audio_engine::{AudioEngine, AudioEventInfo, AudioPriority, AudioType, SoundType, AudioControl, AudioHandle, INVALID_AUDIO_HANDLE, play_sound, play_sound_3d, audio_register_event}
+import music_system::{music_play_combat, music_play_ambient}
+import math/vector3::{Vec3}
+
+// Unit voice responses
+enum UnitVoiceType {
+    Select,           // Unit selected
+    SelectMultiple,   // Multiple selections
+    Move,             // Move order
+    Attack,           // Attack order
+    Guard,            // Guard order
+    Stop,             // Stop order
+    Scatter,          // Scatter order
+    GarrisonBuilding, // Enter building
+    Capture,          // Capture building
+    Fear,             // Under attack, low health
+    Created,          // Unit built
+    Upgrade,          // Upgrade complete
+    Veterancy,        // Veterancy level up
+    Death,            // Unit killed
+}
+
+// Combat audio events
+enum CombatAudioType {
+    WeaponFire,       // Weapon discharge
+    WeaponImpact,     // Projectile impact
+    Explosion,        // Explosion
+    MissilelaLaunch,  // Missile launch
+    VehicleExplosion, // Vehicle destruction
+    BuildingExplosion,// Building destruction
+    DamageSmall,      // Light damage
+    DamageMedium,     // Medium damage
+    DamageHeavy,      // Heavy damage
+}
+
+// UI audio events
+enum UIAudioType {
+    ButtonClick,
+    ButtonHover,
+    MenuOpen,
+    MenuClose,
+    BuildStart,
+    BuildComplete,
+    UpgradeComplete,
+    NotEnoughMoney,
+    CannotBuild,
+    UnitReady,
+    SuperweaponReady,
+    SuperweaponLaunched,
+    RadarOnline,
+    RadarOffline,
+    LowPower,
+    BaseUnderAttack,
+    GeneralPromotion,
+    Victory,
+    Defeat,
+}
+
+// Environment audio
+enum EnvironmentAudioType {
+    AmbientWind,
+    AmbientBirds,
+    AmbientCity,
+    AmbientDesert,
+    Thunder,
+    Rain,
+    Sandstorm,
+}
+
+const MAX_RECENT_COMBAT: u32 = 64
+
+// Combat state tracker for dynamic music
+struct CombatTracker {
+    recent_events: [CombatEvent; MAX_RECENT_COMBAT],
+    event_count: u32,
+    combat_intensity: f32,       // 0.0 = peace, 1.0 = heavy combat
+    time_since_combat: f32,
+    is_in_combat: bool,
+}
+
+struct CombatEvent {
+    event_type: CombatAudioType,
+    position: Vec3,
+    timestamp: f32,
+}
+
+impl CombatTracker {
+    fn new() -> CombatTracker {
+        return CombatTracker {
+            recent_events: [],
+            event_count: 0,
+            combat_intensity: 0.0,
+            time_since_combat: 10.0,
+            is_in_combat: false,
+        }
+    }
+
+    fn record_event(self: &mut Self, event_type: CombatAudioType, position: Vec3, current_time: f32) {
+        // Add event
+        if self.event_count < MAX_RECENT_COMBAT {
+            self.recent_events[self.event_count] = CombatEvent {
+                event_type: event_type,
+                position: position,
+                timestamp: current_time,
+            }
+            self.event_count = self.event_count + 1
+        }
+
+        self.time_since_combat = 0.0
+    }
+
+    fn update(self: &mut Self, delta_time: f32, current_time: f32) {
+        // Remove old events (older than 5 seconds)
+        let mut new_count: u32 = 0
+        for i in 0..self.event_count {
+            if current_time - self.recent_events[i].timestamp < 5.0 {
+                self.recent_events[new_count] = self.recent_events[i]
+                new_count = new_count + 1
+            }
+        }
+        self.event_count = new_count
+
+        // Update combat intensity
+        let target_intensity = (self.event_count as f32) / 20.0
+        self.combat_intensity = lerp(self.combat_intensity, target_intensity.min(1.0), delta_time * 2.0)
+
+        // Track time since combat
+        self.time_since_combat = self.time_since_combat + delta_time
+
+        // Determine combat state
+        let was_in_combat = self.is_in_combat
+        self.is_in_combat = self.combat_intensity > 0.2
+
+        // Trigger music transitions
+        if self.is_in_combat and not was_in_combat {
+            music_play_combat()
+        } else if not self.is_in_combat and was_in_combat and self.time_since_combat > 10.0 {
+            music_play_ambient()
+        }
+    }
+}
+
+// Global combat tracker
+var g_combat_tracker: CombatTracker = CombatTracker::new()
+
+// Game audio events manager
+struct GameAudioEvents {
+    combat_tracker: CombatTracker,
+    game_time: f32,
+
+    // Audio event cooldowns (prevent spam)
+    base_attack_cooldown: f32,
+    low_power_cooldown: f32,
+
+    // Volume multipliers for different categories
+    voice_volume: f32,
+    combat_volume: f32,
+    ui_volume: f32,
+    ambient_volume: f32,
+}
+
+impl GameAudioEvents {
+    fn new() -> GameAudioEvents {
+        let events = GameAudioEvents {
+            combat_tracker: CombatTracker::new(),
+            game_time: 0.0,
+            base_attack_cooldown: 0.0,
+            low_power_cooldown: 0.0,
+            voice_volume: 1.0,
+            combat_volume: 1.0,
+            ui_volume: 1.0,
+            ambient_volume: 0.7,
+        }
+
+        events.register_audio_events()
+
+        return events
+    }
+
+    fn register_audio_events(self: &Self) {
+        // Register UI audio events
+        self.register_ui_event("ButtonClick", "Data/Audio/Sounds/UI/ButtonClick.wav", 0.8)
+        self.register_ui_event("ButtonHover", "Data/Audio/Sounds/UI/ButtonHover.wav", 0.5)
+        self.register_ui_event("MenuOpen", "Data/Audio/Sounds/UI/MenuOpen.wav", 0.7)
+        self.register_ui_event("MenuClose", "Data/Audio/Sounds/UI/MenuClose.wav", 0.7)
+        self.register_ui_event("BuildStart", "Data/Audio/Sounds/UI/BuildStart.wav", 0.8)
+        self.register_ui_event("BuildComplete", "Data/Audio/Sounds/UI/BuildComplete.wav", 0.9)
+        self.register_ui_event("UpgradeComplete", "Data/Audio/Sounds/UI/UpgradeComplete.wav", 0.9)
+        self.register_ui_event("NotEnoughMoney", "Data/Audio/Sounds/UI/InsufficientFunds.wav", 1.0)
+        self.register_ui_event("CannotBuild", "Data/Audio/Sounds/UI/CannotBuild.wav", 1.0)
+        self.register_ui_event("UnitReady", "Data/Audio/Sounds/UI/UnitReady.wav", 1.0)
+        self.register_ui_event("SuperweaponReady", "Data/Audio/Sounds/UI/SuperweaponReady.wav", 1.0)
+        self.register_ui_event("RadarOnline", "Data/Audio/Sounds/UI/RadarOnline.wav", 0.9)
+        self.register_ui_event("RadarOffline", "Data/Audio/Sounds/UI/RadarOffline.wav", 0.9)
+        self.register_ui_event("LowPower", "Data/Audio/Sounds/UI/LowPower.wav", 1.0)
+        self.register_ui_event("BaseUnderAttack", "Data/Audio/Sounds/UI/BaseUnderAttack.wav", 1.0)
+        self.register_ui_event("GeneralPromotion", "Data/Audio/Sounds/UI/GeneralPromotion.wav", 1.0)
+
+        // Register common combat sounds
+        self.register_combat_event("ExplosionSmall", "Data/Audio/Sounds/Combat/ExplosionSmall.wav", 0.8)
+        self.register_combat_event("ExplosionMedium", "Data/Audio/Sounds/Combat/ExplosionMedium.wav", 0.9)
+        self.register_combat_event("ExplosionLarge", "Data/Audio/Sounds/Combat/ExplosionLarge.wav", 1.0)
+        self.register_combat_event("MissileImpact", "Data/Audio/Sounds/Combat/MissileImpact.wav", 0.9)
+        self.register_combat_event("BulletImpact", "Data/Audio/Sounds/Combat/BulletImpact.wav", 0.6)
+        self.register_combat_event("VehicleExplosion", "Data/Audio/Sounds/Combat/VehicleExplosion.wav", 1.0)
+        self.register_combat_event("BuildingExplosion", "Data/Audio/Sounds/Combat/BuildingExplosion.wav", 1.0)
+
+        // Register USA weapons
+        self.register_combat_event("USA_MachineGun", "Data/Audio/Sounds/Weapons/USA/MachineGun.wav", 0.7)
+        self.register_combat_event("USA_TankCannon", "Data/Audio/Sounds/Weapons/USA/TankCannon.wav", 0.9)
+        self.register_combat_event("USA_Missile", "Data/Audio/Sounds/Weapons/USA/MissileLaunch.wav", 0.8)
+        self.register_combat_event("USA_Tomahawk", "Data/Audio/Sounds/Weapons/USA/TomahawkLaunch.wav", 1.0)
+        self.register_combat_event("USA_PatriotMissile", "Data/Audio/Sounds/Weapons/USA/PatriotLaunch.wav", 0.9)
+        self.register_combat_event("USA_Comanche", "Data/Audio/Sounds/Weapons/USA/ComancheGun.wav", 0.8)
+
+        // Register China weapons
+        self.register_combat_event("China_TankCannon", "Data/Audio/Sounds/Weapons/China/TankCannon.wav", 0.9)
+        self.register_combat_event("China_GattlingGun", "Data/Audio/Sounds/Weapons/China/GattlingGun.wav", 0.8)
+        self.register_combat_event("China_Artillery", "Data/Audio/Sounds/Weapons/China/Artillery.wav", 1.0)
+        self.register_combat_event("China_NukeCannonFire", "Data/Audio/Sounds/Weapons/China/NukeCannonFire.wav", 1.0)
+        self.register_combat_event("China_DragonTank", "Data/Audio/Sounds/Weapons/China/DragonTank.wav", 0.9)
+
+        // Register GLA weapons
+        self.register_combat_event("GLA_AK47", "Data/Audio/Sounds/Weapons/GLA/AK47.wav", 0.6)
+        self.register_combat_event("GLA_RPG", "Data/Audio/Sounds/Weapons/GLA/RPG.wav", 0.8)
+        self.register_combat_event("GLA_ScudLaunch", "Data/Audio/Sounds/Weapons/GLA/ScudLaunch.wav", 1.0)
+        self.register_combat_event("GLA_ToxinSpray", "Data/Audio/Sounds/Weapons/GLA/ToxinSpray.wav", 0.7)
+        self.register_combat_event("GLA_CarBomb", "Data/Audio/Sounds/Weapons/GLA/CarBomb.wav", 1.0)
+    }
+
+    fn register_ui_event(self: &Self, name: string, filename: string, volume: f32) {
+        let mut event = AudioEventInfo::init(name)
+        event.filename = filename
+        event.volume = volume
+        event.audio_type = AudioType::SoundEffect
+        event.priority = AudioPriority::High
+        event.sound_type = SoundType::UI as u32
+        event.limit = 2
+        audio_register_event(event)
+    }
+
+    fn register_combat_event(self: &Self, name: string, filename: string, volume: f32) {
+        let mut event = AudioEventInfo::init(name)
+        event.filename = filename
+        event.volume = volume
+        event.audio_type = AudioType::SoundEffect
+        event.priority = AudioPriority::Normal
+        event.sound_type = SoundType::World as u32
+        event.min_distance = 20.0
+        event.max_distance = 300.0
+        event.pitch_shift_min = 0.95
+        event.pitch_shift_max = 1.05
+        event.limit = 8
+        audio_register_event(event)
+    }
+
+    fn update(self: &mut Self, delta_time: f32) {
+        self.game_time = self.game_time + delta_time
+
+        // Update combat tracker
+        self.combat_tracker.update(delta_time, self.game_time)
+
+        // Update cooldowns
+        if self.base_attack_cooldown > 0.0 {
+            self.base_attack_cooldown = self.base_attack_cooldown - delta_time
+        }
+        if self.low_power_cooldown > 0.0 {
+            self.low_power_cooldown = self.low_power_cooldown - delta_time
+        }
+    }
+
+    // UI events
+    fn play_button_click(self: &Self) {
+        play_sound("ButtonClick")
+    }
+
+    fn play_button_hover(self: &Self) {
+        play_sound("ButtonHover")
+    }
+
+    fn play_build_start(self: &Self) {
+        play_sound("BuildStart")
+    }
+
+    fn play_build_complete(self: &Self) {
+        play_sound("BuildComplete")
+    }
+
+    fn play_upgrade_complete(self: &Self) {
+        play_sound("UpgradeComplete")
+    }
+
+    fn play_unit_ready(self: &Self) {
+        play_sound("UnitReady")
+    }
+
+    fn play_not_enough_money(self: &Self) {
+        play_sound("NotEnoughMoney")
+    }
+
+    fn play_cannot_build(self: &Self) {
+        play_sound("CannotBuild")
+    }
+
+    fn play_superweapon_ready(self: &Self) {
+        play_sound("SuperweaponReady")
+    }
+
+    fn play_general_promotion(self: &Self) {
+        play_sound("GeneralPromotion")
+    }
+
+    fn play_base_under_attack(self: &mut Self) {
+        // Cooldown to prevent spam
+        if self.base_attack_cooldown <= 0.0 {
+            play_sound("BaseUnderAttack")
+            self.base_attack_cooldown = 10.0  // 10 second cooldown
+        }
+    }
+
+    fn play_low_power(self: &mut Self) {
+        if self.low_power_cooldown <= 0.0 {
+            play_sound("LowPower")
+            self.low_power_cooldown = 30.0  // 30 second cooldown
+        }
+    }
+
+    // Combat events with position
+    fn play_weapon_fire(self: &mut Self, weapon_sound: string, position: Vec3) {
+        play_sound_3d(weapon_sound, position)
+        self.combat_tracker.record_event(CombatAudioType::WeaponFire, position, self.game_time)
+    }
+
+    fn play_explosion(self: &mut Self, size: string, position: Vec3) {
+        let sound_name = match size {
+            "small" => "ExplosionSmall",
+            "medium" => "ExplosionMedium",
+            "large" => "ExplosionLarge",
+            _ => "ExplosionMedium",
+        }
+        play_sound_3d(sound_name, position)
+        self.combat_tracker.record_event(CombatAudioType::Explosion, position, self.game_time)
+    }
+
+    fn play_missile_impact(self: &mut Self, position: Vec3) {
+        play_sound_3d("MissileImpact", position)
+        self.combat_tracker.record_event(CombatAudioType::WeaponImpact, position, self.game_time)
+    }
+
+    fn play_vehicle_explosion(self: &mut Self, position: Vec3) {
+        play_sound_3d("VehicleExplosion", position)
+        self.combat_tracker.record_event(CombatAudioType::VehicleExplosion, position, self.game_time)
+    }
+
+    fn play_building_explosion(self: &mut Self, position: Vec3) {
+        play_sound_3d("BuildingExplosion", position)
+        self.combat_tracker.record_event(CombatAudioType::BuildingExplosion, position, self.game_time)
+    }
+
+    // Unit voice responses
+    fn play_unit_voice(self: &Self, unit_type: string, faction: string, voice_type: UnitVoiceType, position: Vec3) {
+        let voice_name = self.get_voice_event_name(unit_type, faction, voice_type)
+        play_sound_3d(voice_name, position)
+    }
+
+    fn get_voice_event_name(self: &Self, unit_type: string, faction: string, voice_type: UnitVoiceType) -> string {
+        let voice_suffix = match voice_type {
+            UnitVoiceType::Select => "Select",
+            UnitVoiceType::SelectMultiple => "SelectMultiple",
+            UnitVoiceType::Move => "Move",
+            UnitVoiceType::Attack => "Attack",
+            UnitVoiceType::Guard => "Guard",
+            UnitVoiceType::Stop => "Stop",
+            UnitVoiceType::Scatter => "Scatter",
+            UnitVoiceType::GarrisonBuilding => "Garrison",
+            UnitVoiceType::Capture => "Capture",
+            UnitVoiceType::Fear => "Fear",
+            UnitVoiceType::Created => "Created",
+            UnitVoiceType::Upgrade => "Upgrade",
+            UnitVoiceType::Veterancy => "Veterancy",
+            UnitVoiceType::Death => "Death",
+        }
+
+        return faction + "_" + unit_type + "_" + voice_suffix
+    }
+
+    // Volume controls
+    fn set_voice_volume(self: &mut Self, volume: f32) {
+        self.voice_volume = volume.clamp(0.0, 1.0)
+    }
+
+    fn set_combat_volume(self: &mut Self, volume: f32) {
+        self.combat_volume = volume.clamp(0.0, 1.0)
+    }
+
+    fn set_ui_volume(self: &mut Self, volume: f32) {
+        self.ui_volume = volume.clamp(0.0, 1.0)
+    }
+
+    fn set_ambient_volume(self: &mut Self, volume: f32) {
+        self.ambient_volume = volume.clamp(0.0, 1.0)
+    }
+}
+
+// Helper functions
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t
+}
+
+// Global game audio events
+var g_game_audio: GameAudioEvents = GameAudioEvents::new()
+
+// Export functions for use by game systems
+export fn audio_init() {
+    g_game_audio = GameAudioEvents::new()
+}
+
+export fn audio_update(delta_time: f32) {
+    g_game_audio.update(delta_time)
+}
+
+// UI audio exports
+export fn audio_button_click() {
+    g_game_audio.play_button_click()
+}
+
+export fn audio_button_hover() {
+    g_game_audio.play_button_hover()
+}
+
+export fn audio_build_start() {
+    g_game_audio.play_build_start()
+}
+
+export fn audio_build_complete() {
+    g_game_audio.play_build_complete()
+}
+
+export fn audio_upgrade_complete() {
+    g_game_audio.play_upgrade_complete()
+}
+
+export fn audio_unit_ready() {
+    g_game_audio.play_unit_ready()
+}
+
+export fn audio_not_enough_money() {
+    g_game_audio.play_not_enough_money()
+}
+
+export fn audio_cannot_build() {
+    g_game_audio.play_cannot_build()
+}
+
+export fn audio_superweapon_ready() {
+    g_game_audio.play_superweapon_ready()
+}
+
+export fn audio_general_promotion() {
+    g_game_audio.play_general_promotion()
+}
+
+export fn audio_base_under_attack() {
+    g_game_audio.play_base_under_attack()
+}
+
+export fn audio_low_power() {
+    g_game_audio.play_low_power()
+}
+
+// Combat audio exports
+export fn audio_weapon_fire(weapon_sound: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_weapon_fire(weapon_sound, Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_explosion(size: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_explosion(size, Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_missile_impact(x: f32, y: f32, z: f32) {
+    g_game_audio.play_missile_impact(Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_vehicle_explosion(x: f32, y: f32, z: f32) {
+    g_game_audio.play_vehicle_explosion(Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_building_explosion(x: f32, y: f32, z: f32) {
+    g_game_audio.play_building_explosion(Vec3 { x: x, y: y, z: z })
+}
+
+// Unit voice exports
+export fn audio_unit_select(unit_type: string, faction: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_unit_voice(unit_type, faction, UnitVoiceType::Select, Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_unit_move(unit_type: string, faction: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_unit_voice(unit_type, faction, UnitVoiceType::Move, Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_unit_attack(unit_type: string, faction: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_unit_voice(unit_type, faction, UnitVoiceType::Attack, Vec3 { x: x, y: y, z: z })
+}
+
+export fn audio_unit_created(unit_type: string, faction: string, x: f32, y: f32, z: f32) {
+    g_game_audio.play_unit_voice(unit_type, faction, UnitVoiceType::Created, Vec3 { x: x, y: y, z: z })
+}
