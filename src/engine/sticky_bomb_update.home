@@ -1,0 +1,634 @@
+// Sticky Bomb Update - Attached Explosive Logic
+// Based on Thyme engine StickyBombUpdate
+// Handles attachment tracking, detonation timer, damage application
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Sticky Bomb Configuration
+// ============================================================================
+
+enum StickyBombState {
+    Inactive,       // Not attached
+    Attaching,      // In process of attaching
+    Attached,       // Stuck to target
+    Countdown,      // Timer counting down
+    Detonating,     // Exploding
+    Detonated,      // Already exploded
+}
+
+enum StickyBombType {
+    Standard,       // Normal timed bomb
+    Proximity,      // Detonates when target moves
+    Remote,         // Manually detonated
+    Daisy,          // Chain reaction with nearby bombs
+}
+
+struct StickyBombConfig {
+    bomb_type: StickyBombType,
+    fuse_time: Float,               // Time before detonation
+    damage: Float,                  // Damage dealt
+    damage_radius: Float,           // Explosion radius
+    attachment_range: Float,        // Max range to attach
+    attachment_time: Float,         // Time to attach
+
+    // Damage types
+    damage_type: String,            // Armor, AP, HE, etc.
+    kills_target_instantly: Bool,   // Some bombs just kill
+
+    // Visual
+    attached_model: String,
+    explosion_fx: String,
+    countdown_fx: String,
+    attachment_fx: String,
+
+    // Audio
+    countdown_sound: String,
+    explosion_sound: String,
+    attachment_sound: String,
+
+    // Behavior
+    can_be_removed: Bool,           // Can target remove it?
+    removal_time: Float,            // Time to remove
+    sticks_to_vehicles: Bool,
+    sticks_to_infantry: Bool,
+    sticks_to_buildings: Bool,
+    max_bombs_per_target: Int,
+}
+
+fn default_sticky_bomb_config() -> StickyBombConfig {
+    return StickyBombConfig {
+        bomb_type: StickyBombType::Standard,
+        fuse_time: 5.0,
+        damage: 500.0,
+        damage_radius: 20.0,
+        attachment_range: 50.0,
+        attachment_time: 0.5,
+        damage_type: "EXPLOSION",
+        kills_target_instantly: false,
+        attached_model: "StickyBomb",
+        explosion_fx: "FX_StickyBombExplosion",
+        countdown_fx: "FX_StickyBombCountdown",
+        attachment_fx: "FX_StickyBombAttach",
+        countdown_sound: "StickyBomb_Countdown",
+        explosion_sound: "StickyBomb_Explode",
+        attachment_sound: "StickyBomb_Attach",
+        can_be_removed: false,
+        removal_time: 3.0,
+        sticks_to_vehicles: true,
+        sticks_to_infantry: true,
+        sticks_to_buildings: true,
+        max_bombs_per_target: 5,
+    }
+}
+
+// ============================================================================
+// Sticky Bomb Instance
+// ============================================================================
+
+struct StickyBomb {
+    bomb_id: Int,
+    config: StickyBombConfig,
+    state: StickyBombState,
+
+    // Target
+    target_id: Int,
+    attach_point_x: Float,          // Relative position on target
+    attach_point_y: Float,
+    attach_point_z: Float,
+
+    // World position (updated from target)
+    world_x: Float,
+    world_y: Float,
+    world_z: Float,
+
+    // Timer
+    fuse_remaining: Float,
+    attachment_progress: Float,
+
+    // Owner
+    owner_id: Int,                  // Unit that placed the bomb
+    owner_player_id: Int,
+
+    // Removal
+    is_being_removed: Bool,
+    removal_progress: Float,
+
+    // Chain reaction
+    triggered_by_chain: Bool,
+}
+
+fn create_sticky_bomb(id: Int) -> StickyBomb {
+    return StickyBomb {
+        bomb_id: id,
+        config: default_sticky_bomb_config(),
+        state: StickyBombState::Inactive,
+        target_id: 0,
+        attach_point_x: 0.0,
+        attach_point_y: 0.0,
+        attach_point_z: 0.0,
+        world_x: 0.0,
+        world_y: 0.0,
+        world_z: 0.0,
+        fuse_remaining: 0.0,
+        attachment_progress: 0.0,
+        owner_id: 0,
+        owner_player_id: 0,
+        is_being_removed: false,
+        removal_progress: 0.0,
+        triggered_by_chain: false,
+    }
+}
+
+// ============================================================================
+// Sticky Bomb Update Module
+// ============================================================================
+
+struct StickyBombUpdateModule {
+    base: UpdateModule,
+    config: StickyBombConfig,
+
+    // Active bombs
+    active_bombs: Collection<StickyBomb>,
+    bombs_by_target: Map<Int, Collection<Int>>,
+
+    // ID tracking
+    next_bomb_id: Int,
+
+    // Statistics
+    total_attached: Int,
+    total_detonated: Int,
+    total_removed: Int,
+}
+
+fn create_sticky_bomb_update(tag: String) -> StickyBombUpdateModule {
+    return StickyBombUpdateModule {
+        base: create_update_module(tag, UpdateType::Weapon),
+        config: default_sticky_bomb_config(),
+        active_bombs: Collection<StickyBomb>{},
+        bombs_by_target: Map<Int, Collection<Int>>{},
+        next_bomb_id: 1,
+        total_attached: 0,
+        total_detonated: 0,
+        total_removed: 0,
+    }
+}
+
+// ============================================================================
+// Bomb Attachment
+// ============================================================================
+
+/// Attempt to attach bomb to target
+fn attach_bomb(module: StickyBombUpdateModule, target_id: Int, target_type: String,
+                owner_id: Int, owner_player_id: Int,
+                attach_x: Float, attach_y: Float, attach_z: Float) -> Int {
+    // Check if target type is valid
+    if target_type == "Infantry" && !module.config.sticks_to_infantry {
+        return -1
+    }
+    if target_type == "Vehicle" && !module.config.sticks_to_vehicles {
+        return -1
+    }
+    if target_type == "Building" && !module.config.sticks_to_buildings {
+        return -1
+    }
+
+    // Check max bombs per target
+    let current_count = get_bomb_count_on_target(module, target_id)
+    if current_count >= module.config.max_bombs_per_target {
+        return -2
+    }
+
+    // Create bomb
+    let bomb = create_sticky_bomb(module.next_bomb_id)
+    module.next_bomb_id = module.next_bomb_id + 1
+
+    bomb.config = module.config
+    bomb.target_id = target_id
+    bomb.attach_point_x = attach_x
+    bomb.attach_point_y = attach_y
+    bomb.attach_point_z = attach_z
+    bomb.owner_id = owner_id
+    bomb.owner_player_id = owner_player_id
+    bomb.state = StickyBombState::Attaching
+    bomb.attachment_progress = 0.0
+
+    module.active_bombs.add(bomb)
+
+    // Track by target
+    if !module.bombs_by_target.has(target_id) {
+        module.bombs_by_target.set(target_id, Collection<Int>{})
+    }
+    module.bombs_by_target.get(target_id).add(bomb.bomb_id)
+
+    return bomb.bomb_id
+}
+
+/// Complete attachment
+fn complete_attachment(module: StickyBombUpdateModule, bomb_id: Int) -> Bool {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id && bomb.state == StickyBombState::Attaching {
+            bomb.state = StickyBombState::Attached
+            bomb.fuse_remaining = bomb.config.fuse_time
+
+            // Start countdown immediately for standard bombs
+            if bomb.config.bomb_type == StickyBombType::Standard {
+                bomb.state = StickyBombState::Countdown
+            }
+
+            module.total_attached = module.total_attached + 1
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================================
+// Bomb Detonation
+// ============================================================================
+
+/// Detonate a specific bomb
+fn detonate_bomb(module: StickyBombUpdateModule, bomb_id: Int) -> (Int, Float, Float, Float, Float) {
+    // Returns (target_id, damage, x, y, z)
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            bomb.state = StickyBombState::Detonating
+
+            let target = bomb.target_id
+            let damage = bomb.config.damage
+            let x = bomb.world_x
+            let y = bomb.world_y
+            let z = bomb.world_z
+
+            // Mark as detonated
+            bomb.state = StickyBombState::Detonated
+            module.total_detonated = module.total_detonated + 1
+
+            return (target, damage, x, y, z)
+        }
+    }
+    return (0, 0.0, 0.0, 0.0, 0.0)
+}
+
+/// Trigger chain reaction (for daisy bombs)
+fn trigger_chain_reaction(module: StickyBombUpdateModule, center_x: Float, center_y: Float, radius: Float) -> Collection<Int> {
+    let triggered = Collection<Int>{}
+
+    for bomb in module.active_bombs {
+        if bomb.state == StickyBombState::Attached || bomb.state == StickyBombState::Countdown {
+            let dx = bomb.world_x - center_x
+            let dy = bomb.world_y - center_y
+            let dist = sqrt(dx * dx + dy * dy)
+
+            if dist <= radius {
+                bomb.triggered_by_chain = true
+                bomb.state = StickyBombState::Countdown
+                bomb.fuse_remaining = 0.1  // Very short fuse for chain
+                triggered.add(bomb.bomb_id)
+            }
+        }
+    }
+
+    return triggered
+}
+
+// ============================================================================
+// Bomb Removal
+// ============================================================================
+
+/// Start removing a bomb
+fn start_remove_bomb(module: StickyBombUpdateModule, bomb_id: Int) -> Bool {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            if !bomb.config.can_be_removed {
+                return false
+            }
+            if bomb.state == StickyBombState::Detonating || bomb.state == StickyBombState::Detonated {
+                return false
+            }
+
+            bomb.is_being_removed = true
+            bomb.removal_progress = 0.0
+            return true
+        }
+    }
+    return false
+}
+
+/// Cancel bomb removal
+fn cancel_remove_bomb(module: StickyBombUpdateModule, bomb_id: Int) {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            bomb.is_being_removed = false
+            bomb.removal_progress = 0.0
+        }
+    }
+}
+
+/// Complete bomb removal
+fn complete_remove_bomb(module: StickyBombUpdateModule, bomb_id: Int) {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            bomb.state = StickyBombState::Inactive
+            module.total_removed = module.total_removed + 1
+
+            // Remove from target tracking
+            let target_id = bomb.target_id
+            if module.bombs_by_target.has(target_id) {
+                let bombs = module.bombs_by_target.get(target_id)
+                let new_bombs = Collection<Int>{}
+                for b_id in bombs {
+                    if b_id != bomb_id {
+                        new_bombs.add(b_id)
+                    }
+                }
+                module.bombs_by_target.set(target_id, new_bombs)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update bomb position from target position
+fn update_bomb_position(bomb: StickyBomb, target_x: Float, target_y: Float, target_z: Float, target_rotation: Float) {
+    // Calculate world position from attachment point
+    let cos_r = cos_approx(target_rotation)
+    let sin_r = sin_approx(target_rotation)
+
+    bomb.world_x = target_x + bomb.attach_point_x * cos_r - bomb.attach_point_y * sin_r
+    bomb.world_y = target_y + bomb.attach_point_x * sin_r + bomb.attach_point_y * cos_r
+    bomb.world_z = target_z + bomb.attach_point_z
+}
+
+/// Update all bombs
+fn update_sticky_bombs(module: StickyBombUpdateModule, delta: Float,
+                        get_target_pos: fn(Int) -> (Float, Float, Float, Float)) -> Collection<(Int, Float, Float, Float, Float)> {
+    // Returns collection of (target_id, damage, x, y, z) for bombs that detonate
+    let detonations = Collection<(Int, Float, Float, Float, Float)>{}
+    let to_remove = Collection<Int>{}
+
+    for bomb in module.active_bombs {
+        // Get target position
+        let target_pos = get_target_pos(bomb.target_id)
+        update_bomb_position(bomb, target_pos.0, target_pos.1, target_pos.2, target_pos.3)
+
+        if bomb.state == StickyBombState::Attaching {
+            bomb.attachment_progress = bomb.attachment_progress + delta / bomb.config.attachment_time
+            if bomb.attachment_progress >= 1.0 {
+                complete_attachment(module, bomb.bomb_id)
+            }
+
+        } else if bomb.state == StickyBombState::Countdown {
+            bomb.fuse_remaining = bomb.fuse_remaining - delta
+
+            if bomb.fuse_remaining <= 0.0 {
+                let result = detonate_bomb(module, bomb.bomb_id)
+                if result.0 > 0 {
+                    detonations.add(result)
+
+                    // Chain reaction for daisy bombs
+                    if bomb.config.bomb_type == StickyBombType::Daisy {
+                        trigger_chain_reaction(module, bomb.world_x, bomb.world_y, bomb.config.damage_radius * 2.0)
+                    }
+                }
+                to_remove.add(bomb.bomb_id)
+            }
+
+        } else if bomb.state == StickyBombState::Detonated {
+            to_remove.add(bomb.bomb_id)
+        }
+
+        // Handle removal
+        if bomb.is_being_removed {
+            bomb.removal_progress = bomb.removal_progress + delta / bomb.config.removal_time
+            if bomb.removal_progress >= 1.0 {
+                complete_remove_bomb(module, bomb.bomb_id)
+                to_remove.add(bomb.bomb_id)
+            }
+        }
+    }
+
+    // Clean up detonated/removed bombs
+    let new_bombs = Collection<StickyBomb>{}
+    for bomb in module.active_bombs {
+        let should_remove = false
+        for id in to_remove {
+            if bomb.bomb_id == id {
+                should_remove = true
+                break
+            }
+        }
+        if !should_remove {
+            new_bombs.add(bomb)
+        }
+    }
+    module.active_bombs = new_bombs
+
+    return detonations
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get bombs on a target
+fn get_bombs_on_target(module: StickyBombUpdateModule, target_id: Int) -> Collection<Int> {
+    if module.bombs_by_target.has(target_id) {
+        return module.bombs_by_target.get(target_id)
+    }
+    return Collection<Int>{}
+}
+
+/// Get bomb count on target
+fn get_bomb_count_on_target(module: StickyBombUpdateModule, target_id: Int) -> Int {
+    if module.bombs_by_target.has(target_id) {
+        return module.bombs_by_target.get(target_id).len()
+    }
+    return 0
+}
+
+/// Get bomb state
+fn get_bomb_state(module: StickyBombUpdateModule, bomb_id: Int) -> StickyBombState {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            return bomb.state
+        }
+    }
+    return StickyBombState::Inactive
+}
+
+/// Get bomb fuse remaining
+fn get_bomb_fuse(module: StickyBombUpdateModule, bomb_id: Int) -> Float {
+    for bomb in module.active_bombs {
+        if bomb.bomb_id == bomb_id {
+            return bomb.fuse_remaining
+        }
+    }
+    return 0.0
+}
+
+/// Get active bomb count
+fn get_active_bomb_count(module: StickyBombUpdateModule) -> Int {
+    return module.active_bombs.len()
+}
+
+/// Check if target has bombs
+fn target_has_bombs(module: StickyBombUpdateModule, target_id: Int) -> Bool {
+    return get_bomb_count_on_target(module, target_id) > 0
+}
+
+// ============================================================================
+// Target Destroyed Handler
+// ============================================================================
+
+/// Handle target being destroyed (detonate all attached bombs)
+fn on_target_destroyed(module: StickyBombUpdateModule, target_id: Int) -> Collection<(Int, Float, Float, Float, Float)> {
+    let detonations = Collection<(Int, Float, Float, Float, Float)>{}
+
+    for bomb in module.active_bombs {
+        if bomb.target_id == target_id {
+            if bomb.state == StickyBombState::Attached || bomb.state == StickyBombState::Countdown {
+                let result = detonate_bomb(module, bomb.bomb_id)
+                if result.0 > 0 {
+                    detonations.add(result)
+                }
+            }
+        }
+    }
+
+    // Clear target tracking
+    if module.bombs_by_target.has(target_id) {
+        module.bombs_by_target.remove(target_id)
+    }
+
+    return detonations
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+fn cos_approx(angle: Float) -> Float {
+    return sin_approx(angle + 1.5708)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_bomb_attachment() -> Bool {
+    let module = create_sticky_bomb_update("TestBombs")
+
+    let bomb_id = attach_bomb(module, 100, "Vehicle", 1, 1, 0.0, 0.0, 1.0)
+    assert(bomb_id > 0, "Should create bomb")
+    assert(get_active_bomb_count(module) == 1, "Should have 1 active bomb")
+    assert(target_has_bombs(module, 100) == true, "Target should have bombs")
+
+    return true
+}
+
+fn test_bomb_detonation() -> Bool {
+    let module = create_sticky_bomb_update("DetonationTest")
+    module.config.fuse_time = 0.5
+
+    let bomb_id = attach_bomb(module, 100, "Vehicle", 1, 1, 0.0, 0.0, 1.0)
+    complete_attachment(module, bomb_id)
+
+    // Mock target position function
+    fn mock_pos(id: Int) -> (Float, Float, Float, Float) {
+        return (100.0, 100.0, 0.0, 0.0)
+    }
+
+    // Update until detonation
+    for i in 0..10 {
+        let detonations = update_sticky_bombs(module, 0.1, mock_pos)
+        if detonations.len() > 0 {
+            assert(detonations.get(0).0 == 100, "Should detonate on target")
+            return true
+        }
+    }
+
+    assert(false, "Bomb should have detonated")
+    return false
+}
+
+fn test_max_bombs_per_target() -> Bool {
+    let module = create_sticky_bomb_update("MaxBombsTest")
+    module.config.max_bombs_per_target = 2
+
+    let bomb1 = attach_bomb(module, 100, "Vehicle", 1, 1, 0.0, 0.0, 1.0)
+    let bomb2 = attach_bomb(module, 100, "Vehicle", 1, 1, 1.0, 0.0, 1.0)
+    let bomb3 = attach_bomb(module, 100, "Vehicle", 1, 1, 2.0, 0.0, 1.0)
+
+    assert(bomb1 > 0, "First bomb should attach")
+    assert(bomb2 > 0, "Second bomb should attach")
+    assert(bomb3 == -2, "Third bomb should fail (max reached)")
+
+    return true
+}
+
+fn test_bomb_removal() -> Bool {
+    let module = create_sticky_bomb_update("RemovalTest")
+    module.config.can_be_removed = true
+    module.config.removal_time = 0.5
+
+    let bomb_id = attach_bomb(module, 100, "Vehicle", 1, 1, 0.0, 0.0, 1.0)
+    complete_attachment(module, bomb_id)
+
+    let started = start_remove_bomb(module, bomb_id)
+    assert(started == true, "Should start removal")
+
+    // Update removal
+    fn mock_pos(id: Int) -> (Float, Float, Float, Float) {
+        return (100.0, 100.0, 0.0, 0.0)
+    }
+
+    for i in 0..10 {
+        update_sticky_bombs(module, 0.1, mock_pos)
+    }
+
+    assert(get_active_bomb_count(module) == 0, "Bomb should be removed")
+
+    return true
+}
+
+fn test_target_destroyed() -> Bool {
+    let module = create_sticky_bomb_update("TargetDestroyedTest")
+
+    attach_bomb(module, 100, "Vehicle", 1, 1, 0.0, 0.0, 1.0)
+    complete_attachment(module, 1)
+
+    let detonations = on_target_destroyed(module, 100)
+    assert(detonations.len() == 1, "Should detonate when target destroyed")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_bomb_attachment(), "Bomb attachment test failed")
+    assert(test_bomb_detonation(), "Bomb detonation test failed")
+    assert(test_max_bombs_per_target(), "Max bombs per target test failed")
+    assert(test_bomb_removal(), "Bomb removal test failed")
+    assert(test_target_destroyed(), "Target destroyed test failed")
+    return true
+}

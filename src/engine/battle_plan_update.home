@@ -1,0 +1,690 @@
+// Battle Plan Update - General's Battle Plan Abilities
+// Based on Thyme engine BattlePlanUpdate
+// Handles plan activation, buff application, and battle doctrine effects
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Battle Plan Configuration
+// ============================================================================
+
+enum BattlePlanType {
+    None,
+    SearchAndDestroy,   // USA: Aggressive bonus
+    BombardmentPlan,    // USA: Artillery/air support bonus
+    HoldTheLine,        // USA: Defensive bonus
+    Nationalism,        // China: Horde bonus
+    Fanaticism,         // GLA: Suicide/explosive bonus
+}
+
+enum BattlePlanState {
+    Inactive,           // No plan active
+    Activating,         // Plan being activated
+    Active,             // Plan in effect
+    Deactivating,       // Plan expiring
+}
+
+struct BattlePlanBuff {
+    buff_type: String,
+    value: Float,
+    is_percentage: Bool,
+}
+
+fn create_buff(buff_type: String, value: Float, is_percentage: Bool) -> BattlePlanBuff {
+    return BattlePlanBuff {
+        buff_type: buff_type,
+        value: value,
+        is_percentage: is_percentage,
+    }
+}
+
+struct BattlePlanConfig {
+    plan_type: BattlePlanType,
+    name: String,
+    description: String,
+
+    // Timing
+    activation_time: Float,
+    duration: Float,                // 0 = permanent until deactivated
+    cooldown: Float,
+
+    // Cost
+    cost_per_second: Float,         // Resource drain while active
+
+    // Buffs
+    damage_bonus: Float,            // % increase
+    armor_bonus: Float,             // % increase
+    speed_bonus: Float,             // % increase
+    rate_of_fire_bonus: Float,      // % increase
+    range_bonus: Float,             // % increase
+    sight_bonus: Float,             // % increase
+    experience_bonus: Float,        // % increase
+
+    // Special bonuses
+    heal_rate: Float,               // HP per second while active
+    morale_bonus: Float,            // Morale system bonus
+    suppression_resistance: Float,  // Resistance to suppression
+
+    // Restrictions
+    affects_infantry: Bool,
+    affects_vehicles: Bool,
+    affects_aircraft: Bool,
+    affects_buildings: Bool,
+    requires_command_center: Bool,
+
+    // Visual
+    activation_fx: String,
+    active_fx: String,
+    deactivation_fx: String,
+    unit_fx: String,                // Effect on affected units
+}
+
+fn create_search_and_destroy_config() -> BattlePlanConfig {
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::SearchAndDestroy,
+        name: "Search and Destroy",
+        description: "Increases damage and aggression of all units",
+        activation_time: 2.0,
+        duration: 0.0,  // Permanent until toggled
+        cooldown: 30.0,
+        cost_per_second: 5.0,
+        damage_bonus: 0.20,
+        armor_bonus: 0.0,
+        speed_bonus: 0.10,
+        rate_of_fire_bonus: 0.10,
+        range_bonus: 0.0,
+        sight_bonus: 0.10,
+        experience_bonus: 0.25,
+        heal_rate: 0.0,
+        morale_bonus: 0.0,
+        suppression_resistance: 0.0,
+        affects_infantry: true,
+        affects_vehicles: true,
+        affects_aircraft: true,
+        affects_buildings: false,
+        requires_command_center: true,
+        activation_fx: "FX_SearchAndDestroyActivate",
+        active_fx: "FX_SearchAndDestroyActive",
+        deactivation_fx: "FX_SearchAndDestroyDeactivate",
+        unit_fx: "FX_SearchAndDestroyUnit",
+    }
+}
+
+fn create_bombardment_config() -> BattlePlanConfig {
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::BombardmentPlan,
+        name: "Bombardment",
+        description: "Increases effectiveness of artillery and air support",
+        activation_time: 2.0,
+        duration: 0.0,
+        cooldown: 30.0,
+        cost_per_second: 5.0,
+        damage_bonus: 0.25,
+        armor_bonus: 0.0,
+        speed_bonus: 0.0,
+        rate_of_fire_bonus: 0.25,
+        range_bonus: 0.15,
+        sight_bonus: 0.20,
+        experience_bonus: 0.0,
+        heal_rate: 0.0,
+        morale_bonus: 0.0,
+        suppression_resistance: 0.0,
+        affects_infantry: false,
+        affects_vehicles: true,
+        affects_aircraft: true,
+        affects_buildings: false,
+        requires_command_center: true,
+        activation_fx: "FX_BombardmentActivate",
+        active_fx: "FX_BombardmentActive",
+        deactivation_fx: "FX_BombardmentDeactivate",
+        unit_fx: "FX_BombardmentUnit",
+    }
+}
+
+fn create_hold_the_line_config() -> BattlePlanConfig {
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::HoldTheLine,
+        name: "Hold the Line",
+        description: "Increases armor and defensive capabilities",
+        activation_time: 2.0,
+        duration: 0.0,
+        cooldown: 30.0,
+        cost_per_second: 5.0,
+        damage_bonus: 0.0,
+        armor_bonus: 0.25,
+        speed_bonus: -0.10,  // Slower but tougher
+        rate_of_fire_bonus: 0.0,
+        range_bonus: 0.0,
+        sight_bonus: 0.0,
+        experience_bonus: 0.0,
+        heal_rate: 2.0,
+        morale_bonus: 0.25,
+        suppression_resistance: 0.50,
+        affects_infantry: true,
+        affects_vehicles: true,
+        affects_aircraft: false,
+        affects_buildings: true,
+        requires_command_center: true,
+        activation_fx: "FX_HoldTheLineActivate",
+        active_fx: "FX_HoldTheLineActive",
+        deactivation_fx: "FX_HoldTheLineDeactivate",
+        unit_fx: "FX_HoldTheLineUnit",
+    }
+}
+
+fn create_nationalism_config() -> BattlePlanConfig {
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::Nationalism,
+        name: "Nationalism",
+        description: "Enhances horde bonus effectiveness",
+        activation_time: 1.0,
+        duration: 0.0,
+        cooldown: 20.0,
+        cost_per_second: 3.0,
+        damage_bonus: 0.25,
+        armor_bonus: 0.10,
+        speed_bonus: 0.05,
+        rate_of_fire_bonus: 0.15,
+        range_bonus: 0.0,
+        sight_bonus: 0.0,
+        experience_bonus: 0.0,
+        heal_rate: 0.0,
+        morale_bonus: 0.50,
+        suppression_resistance: 0.25,
+        affects_infantry: true,
+        affects_vehicles: true,
+        affects_aircraft: false,
+        affects_buildings: false,
+        requires_command_center: false,
+        activation_fx: "FX_NationalismActivate",
+        active_fx: "FX_NationalismActive",
+        deactivation_fx: "FX_NationalismDeactivate",
+        unit_fx: "FX_NationalismUnit",
+    }
+}
+
+fn create_fanaticism_config() -> BattlePlanConfig {
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::Fanaticism,
+        name: "Fanaticism",
+        description: "Units become suicidal but deal massive damage",
+        activation_time: 0.5,
+        duration: 60.0,  // Limited duration
+        cooldown: 120.0,
+        cost_per_second: 0.0,  // No cost, but risky
+        damage_bonus: 0.50,
+        armor_bonus: -0.25,  // More vulnerable
+        speed_bonus: 0.25,
+        rate_of_fire_bonus: 0.25,
+        range_bonus: 0.0,
+        sight_bonus: 0.0,
+        experience_bonus: 0.0,
+        heal_rate: -5.0,  // Taking damage over time
+        morale_bonus: 1.0,
+        suppression_resistance: 1.0,  // Immune to suppression
+        affects_infantry: true,
+        affects_vehicles: false,
+        affects_aircraft: false,
+        affects_buildings: false,
+        requires_command_center: false,
+        activation_fx: "FX_FanaticismActivate",
+        active_fx: "FX_FanaticismActive",
+        deactivation_fx: "FX_FanaticismDeactivate",
+        unit_fx: "FX_FanaticismUnit",
+    }
+}
+
+// ============================================================================
+// Battle Plan Update Module
+// ============================================================================
+
+struct BattlePlanUpdateModule {
+    base: UpdateModule,
+
+    // Available plans
+    available_plans: Map<BattlePlanType, BattlePlanConfig>,
+
+    // Active plan
+    active_plan: BattlePlanType,
+    state: BattlePlanState,
+    activation_progress: Float,
+    duration_remaining: Float,
+    cooldowns: Map<BattlePlanType, Float>,
+
+    // Affected units
+    affected_unit_ids: Collection<Int>,
+
+    // Owner
+    owner_player_id: Int,
+    command_center_id: Int,
+
+    // Statistics
+    total_activations: Int,
+    total_cost: Float,
+}
+
+fn create_battle_plan_update(tag: String, player_id: Int) -> BattlePlanUpdateModule {
+    let module = BattlePlanUpdateModule {
+        base: create_update_module(tag, UpdateType::Ability),
+        available_plans: Map<BattlePlanType, BattlePlanConfig>{},
+        active_plan: BattlePlanType::None,
+        state: BattlePlanState::Inactive,
+        activation_progress: 0.0,
+        duration_remaining: 0.0,
+        cooldowns: Map<BattlePlanType, Float>{},
+        affected_unit_ids: Collection<Int>{},
+        owner_player_id: player_id,
+        command_center_id: 0,
+        total_activations: 0,
+        total_cost: 0.0,
+    }
+
+    // Initialize cooldowns
+    module.cooldowns.set(BattlePlanType::SearchAndDestroy, 0.0)
+    module.cooldowns.set(BattlePlanType::BombardmentPlan, 0.0)
+    module.cooldowns.set(BattlePlanType::HoldTheLine, 0.0)
+    module.cooldowns.set(BattlePlanType::Nationalism, 0.0)
+    module.cooldowns.set(BattlePlanType::Fanaticism, 0.0)
+
+    return module
+}
+
+/// Add available battle plan
+fn add_available_plan(module: BattlePlanUpdateModule, config: BattlePlanConfig) {
+    module.available_plans.set(config.plan_type, config)
+}
+
+// ============================================================================
+// Plan Activation
+// ============================================================================
+
+/// Check if plan can be activated
+fn can_activate_plan(module: BattlePlanUpdateModule, plan_type: BattlePlanType, has_command_center: Bool) -> Bool {
+    // Check if plan is available
+    if !module.available_plans.has(plan_type) {
+        return false
+    }
+
+    // Check if another plan is active
+    if module.state != BattlePlanState::Inactive {
+        return false
+    }
+
+    // Check cooldown
+    if module.cooldowns.has(plan_type) {
+        if module.cooldowns.get(plan_type) > 0.0 {
+            return false
+        }
+    }
+
+    // Check command center requirement
+    let config = module.available_plans.get(plan_type)
+    if config.requires_command_center && !has_command_center {
+        return false
+    }
+
+    return true
+}
+
+/// Activate battle plan
+fn activate_plan(module: BattlePlanUpdateModule, plan_type: BattlePlanType) -> Bool {
+    if !module.available_plans.has(plan_type) {
+        return false
+    }
+
+    let config = module.available_plans.get(plan_type)
+
+    module.active_plan = plan_type
+    module.state = BattlePlanState::Activating
+    module.activation_progress = 0.0
+    module.duration_remaining = config.duration
+    module.total_activations = module.total_activations + 1
+
+    return true
+}
+
+/// Deactivate current plan
+fn deactivate_plan(module: BattlePlanUpdateModule) {
+    if module.state == BattlePlanState::Active || module.state == BattlePlanState::Activating {
+        module.state = BattlePlanState::Deactivating
+
+        // Start cooldown
+        if module.available_plans.has(module.active_plan) {
+            let config = module.available_plans.get(module.active_plan)
+            module.cooldowns.set(module.active_plan, config.cooldown)
+        }
+    }
+}
+
+/// Complete deactivation
+fn complete_deactivation(module: BattlePlanUpdateModule) {
+    module.state = BattlePlanState::Inactive
+    module.active_plan = BattlePlanType::None
+    module.affected_unit_ids = Collection<Int>{}
+}
+
+// ============================================================================
+// Buff Application
+// ============================================================================
+
+/// Get buffs for a unit type
+fn get_unit_buffs(module: BattlePlanUpdateModule, is_infantry: Bool, is_vehicle: Bool, is_aircraft: Bool, is_building: Bool) -> Collection<BattlePlanBuff> {
+    let buffs = Collection<BattlePlanBuff>{}
+
+    if module.state != BattlePlanState::Active {
+        return buffs
+    }
+
+    if !module.available_plans.has(module.active_plan) {
+        return buffs
+    }
+
+    let config = module.available_plans.get(module.active_plan)
+
+    // Check if unit type is affected
+    let affected = false
+    if is_infantry && config.affects_infantry { affected = true }
+    if is_vehicle && config.affects_vehicles { affected = true }
+    if is_aircraft && config.affects_aircraft { affected = true }
+    if is_building && config.affects_buildings { affected = true }
+
+    if !affected {
+        return buffs
+    }
+
+    // Add applicable buffs
+    if config.damage_bonus != 0.0 {
+        buffs.add(create_buff("DAMAGE", config.damage_bonus, true))
+    }
+    if config.armor_bonus != 0.0 {
+        buffs.add(create_buff("ARMOR", config.armor_bonus, true))
+    }
+    if config.speed_bonus != 0.0 {
+        buffs.add(create_buff("SPEED", config.speed_bonus, true))
+    }
+    if config.rate_of_fire_bonus != 0.0 {
+        buffs.add(create_buff("RATE_OF_FIRE", config.rate_of_fire_bonus, true))
+    }
+    if config.range_bonus != 0.0 {
+        buffs.add(create_buff("RANGE", config.range_bonus, true))
+    }
+    if config.sight_bonus != 0.0 {
+        buffs.add(create_buff("SIGHT", config.sight_bonus, true))
+    }
+    if config.experience_bonus != 0.0 {
+        buffs.add(create_buff("EXPERIENCE", config.experience_bonus, true))
+    }
+    if config.heal_rate != 0.0 {
+        buffs.add(create_buff("HEAL_RATE", config.heal_rate, false))
+    }
+    if config.suppression_resistance != 0.0 {
+        buffs.add(create_buff("SUPPRESSION_RESISTANCE", config.suppression_resistance, true))
+    }
+
+    return buffs
+}
+
+/// Add unit to affected list
+fn add_affected_unit(module: BattlePlanUpdateModule, unit_id: Int) {
+    if !module.affected_unit_ids.contains(unit_id) {
+        module.affected_unit_ids.add(unit_id)
+    }
+}
+
+/// Remove unit from affected list
+fn remove_affected_unit(module: BattlePlanUpdateModule, unit_id: Int) {
+    let new_list = Collection<Int>{}
+    for id in module.affected_unit_ids {
+        if id != unit_id {
+            new_list.add(id)
+        }
+    }
+    module.affected_unit_ids = new_list
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update battle plan
+fn update_battle_plan(module: BattlePlanUpdateModule, delta: Float, resources: Float) -> (Float, Bool) {
+    // Returns (cost_this_frame, plan_ended)
+
+    // Update cooldowns
+    for plan_type in module.cooldowns.keys() {
+        let cooldown = module.cooldowns.get(plan_type)
+        if cooldown > 0.0 {
+            module.cooldowns.set(plan_type, cooldown - delta)
+        }
+    }
+
+    let cost = 0.0
+    let plan_ended = false
+
+    if module.state == BattlePlanState::Activating {
+        if module.available_plans.has(module.active_plan) {
+            let config = module.available_plans.get(module.active_plan)
+            module.activation_progress = module.activation_progress + delta / config.activation_time
+
+            if module.activation_progress >= 1.0 {
+                module.state = BattlePlanState::Active
+                module.activation_progress = 1.0
+            }
+        }
+
+    } else if module.state == BattlePlanState::Active {
+        if module.available_plans.has(module.active_plan) {
+            let config = module.available_plans.get(module.active_plan)
+
+            // Check duration
+            if config.duration > 0.0 {
+                module.duration_remaining = module.duration_remaining - delta
+                if module.duration_remaining <= 0.0 {
+                    deactivate_plan(module)
+                    plan_ended = true
+                }
+            }
+
+            // Apply cost
+            cost = config.cost_per_second * delta
+            module.total_cost = module.total_cost + cost
+
+            // Check if can afford
+            if cost > resources {
+                deactivate_plan(module)
+                plan_ended = true
+            }
+        }
+
+    } else if module.state == BattlePlanState::Deactivating {
+        // Quick deactivation
+        complete_deactivation(module)
+        plan_ended = true
+    }
+
+    return (cost, plan_ended)
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Check if any plan is active
+fn is_plan_active(module: BattlePlanUpdateModule) -> Bool {
+    return module.state == BattlePlanState::Active
+}
+
+/// Get active plan type
+fn get_active_plan_type(module: BattlePlanUpdateModule) -> BattlePlanType {
+    return module.active_plan
+}
+
+/// Get plan state
+fn get_plan_state(module: BattlePlanUpdateModule) -> BattlePlanState {
+    return module.state
+}
+
+/// Get cooldown remaining
+fn get_cooldown_remaining(module: BattlePlanUpdateModule, plan_type: BattlePlanType) -> Float {
+    if module.cooldowns.has(plan_type) {
+        return module.cooldowns.get(plan_type)
+    }
+    return 0.0
+}
+
+/// Get duration remaining
+fn get_duration_remaining(module: BattlePlanUpdateModule) -> Float {
+    return module.duration_remaining
+}
+
+/// Get affected unit count
+fn get_affected_unit_count(module: BattlePlanUpdateModule) -> Int {
+    return module.affected_unit_ids.len()
+}
+
+/// Get plan config
+fn get_plan_config(module: BattlePlanUpdateModule, plan_type: BattlePlanType) -> BattlePlanConfig {
+    if module.available_plans.has(plan_type) {
+        return module.available_plans.get(plan_type)
+    }
+    return BattlePlanConfig {
+        plan_type: BattlePlanType::None,
+        name: "",
+        description: "",
+        activation_time: 0.0,
+        duration: 0.0,
+        cooldown: 0.0,
+        cost_per_second: 0.0,
+        damage_bonus: 0.0,
+        armor_bonus: 0.0,
+        speed_bonus: 0.0,
+        rate_of_fire_bonus: 0.0,
+        range_bonus: 0.0,
+        sight_bonus: 0.0,
+        experience_bonus: 0.0,
+        heal_rate: 0.0,
+        morale_bonus: 0.0,
+        suppression_resistance: 0.0,
+        affects_infantry: false,
+        affects_vehicles: false,
+        affects_aircraft: false,
+        affects_buildings: false,
+        requires_command_center: false,
+        activation_fx: "",
+        active_fx: "",
+        deactivation_fx: "",
+        unit_fx: "",
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_plan_creation() -> Bool {
+    let module = create_battle_plan_update("TestPlan", 1)
+
+    add_available_plan(module, create_search_and_destroy_config())
+    add_available_plan(module, create_hold_the_line_config())
+
+    assert(module.available_plans.has(BattlePlanType::SearchAndDestroy), "Should have S&D")
+    assert(module.available_plans.has(BattlePlanType::HoldTheLine), "Should have HTL")
+
+    return true
+}
+
+fn test_plan_activation() -> Bool {
+    let module = create_battle_plan_update("ActivationTest", 1)
+    add_available_plan(module, create_search_and_destroy_config())
+
+    let activated = activate_plan(module, BattlePlanType::SearchAndDestroy)
+    assert(activated == true, "Should activate")
+    assert(module.state == BattlePlanState::Activating, "Should be activating")
+
+    // Update to complete activation
+    for i in 0..30 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    assert(is_plan_active(module) == true, "Should be active")
+
+    return true
+}
+
+fn test_plan_buffs() -> Bool {
+    let module = create_battle_plan_update("BuffTest", 1)
+    add_available_plan(module, create_search_and_destroy_config())
+
+    activate_plan(module, BattlePlanType::SearchAndDestroy)
+    for i in 0..30 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    let buffs = get_unit_buffs(module, true, false, false, false)  // Infantry
+    assert(buffs.len() > 0, "Should have buffs for infantry")
+
+    let building_buffs = get_unit_buffs(module, false, false, false, true)  // Building
+    assert(building_buffs.len() == 0, "Should not have buffs for buildings")
+
+    return true
+}
+
+fn test_plan_cooldown() -> Bool {
+    let module = create_battle_plan_update("CooldownTest", 1)
+    let config = create_search_and_destroy_config()
+    config.cooldown = 1.0
+    add_available_plan(module, config)
+
+    activate_plan(module, BattlePlanType::SearchAndDestroy)
+    for i in 0..30 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    deactivate_plan(module)
+    update_battle_plan(module, 0.1, 1000.0)
+
+    let cooldown = get_cooldown_remaining(module, BattlePlanType::SearchAndDestroy)
+    assert(cooldown > 0.0, "Should have cooldown")
+
+    // Wait out cooldown
+    for i in 0..15 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    let cooldown2 = get_cooldown_remaining(module, BattlePlanType::SearchAndDestroy)
+    assert(cooldown2 == 0.0, "Cooldown should expire")
+
+    return true
+}
+
+fn test_plan_duration() -> Bool {
+    let module = create_battle_plan_update("DurationTest", 1)
+    let config = create_fanaticism_config()
+    config.duration = 1.0
+    add_available_plan(module, config)
+
+    activate_plan(module, BattlePlanType::Fanaticism)
+    for i in 0..10 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    assert(is_plan_active(module) == true, "Should be active")
+
+    for i in 0..15 {
+        update_battle_plan(module, 0.1, 1000.0)
+    }
+
+    assert(is_plan_active(module) == false, "Should expire after duration")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_plan_creation(), "Plan creation test failed")
+    assert(test_plan_activation(), "Plan activation test failed")
+    assert(test_plan_buffs(), "Plan buffs test failed")
+    assert(test_plan_cooldown(), "Plan cooldown test failed")
+    assert(test_plan_duration(), "Plan duration test failed")
+    return true
+}

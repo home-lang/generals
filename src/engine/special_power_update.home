@@ -1,0 +1,736 @@
+// Special Power Update - General Powers System
+// Based on Thyme engine SpecialPowerUpdate
+// Handles power charging, targeting, effect application
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Special Power Types
+// ============================================================================
+
+enum PowerType {
+    None,
+    // USA Powers
+    Paradrop,           // Drop paratroopers
+    A10Strike,          // A10 missile run
+    FuelAirBomb,        // Massive explosion
+    SpectreGunship,     // AC130 support
+    DaisyCutter,        // Large bomb
+    CarpetBomb,         // B52 carpet bombing
+    NuclearMissile,     // Superweapon
+
+    // China Powers
+    ArtilleryBarrage,   // Artillery strike
+    ClusterMines,       // Drop mines
+    CashHack,           // Steal money
+    EMP,                // Disable vehicles
+    NuclearStorm,       // Superweapon
+
+    // GLA Powers
+    AnthraxBomb,        // Poison area
+    RebelAmbush,        // Spawn rebels
+    SneakAttack,        // Tunnel anywhere
+    ScudStorm,          // Superweapon
+    GPSScrambler,       // Hide from radar
+}
+
+enum PowerState {
+    Unavailable,        // Not researched/unlocked
+    Charging,           // Building up charge
+    Ready,              // Ready to use
+    Targeting,          // Player selecting target
+    Executing,          // Power in progress
+    Cooldown,           // After use cooldown
+}
+
+enum TargetType {
+    None,               // No targeting needed
+    Point,              // Target a location
+    Area,               // Target an area
+    Unit,               // Target a specific unit
+    Building,           // Target a building
+    Path,               // Target a path (like A10 strike)
+}
+
+// ============================================================================
+// Special Power Configuration
+// ============================================================================
+
+struct SpecialPowerConfig {
+    power_type: PowerType,
+    name: String,
+    description: String,
+
+    // Timing
+    charge_time: Float,             // Time to fully charge (seconds)
+    duration: Float,                // How long effect lasts
+    cooldown_time: Float,           // Time before can use again
+
+    // Targeting
+    target_type: TargetType,
+    range: Float,                   // 0 = unlimited/global
+    radius: Float,                  // Effect radius
+    min_range: Float,               // Minimum distance from owned units
+
+    // Cost
+    cost_money: Int,
+    cost_per_use: Int,              // Additional cost per use
+
+    // Requirements
+    required_sciences: Collection<String>,
+    required_building: String,
+    general_point_cost: Int,
+
+    // Effect
+    damage: Float,
+    damage_type: String,
+    spawn_object: String,           // Object to spawn
+    spawn_count: Int,               // Number to spawn
+    fx_on_use: String,
+    fx_on_target: String,
+
+    // Restrictions
+    max_uses: Int,                  // 0 = unlimited
+    shared_cooldown_group: String,  // Powers that share cooldown
+    disabled_in_multiplayer: Bool,
+}
+
+fn default_power_config() -> SpecialPowerConfig {
+    return SpecialPowerConfig {
+        power_type: PowerType::None,
+        name: "",
+        description: "",
+        charge_time: 300.0,
+        duration: 10.0,
+        cooldown_time: 0.0,
+        target_type: TargetType::Point,
+        range: 0.0,
+        radius: 50.0,
+        min_range: 0.0,
+        cost_money: 0,
+        cost_per_use: 0,
+        required_sciences: Collection<String>{},
+        required_building: "",
+        general_point_cost: 1,
+        damage: 0.0,
+        damage_type: "",
+        spawn_object: "",
+        spawn_count: 0,
+        fx_on_use: "",
+        fx_on_target: "",
+        max_uses: 0,
+        shared_cooldown_group: "",
+        disabled_in_multiplayer: false,
+    }
+}
+
+// ============================================================================
+// Pre-built Power Configs
+// ============================================================================
+
+fn create_paradrop_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::Paradrop
+    config.name = "Paradrop"
+    config.description = "Drop Rangers from a transport plane"
+    config.charge_time = 240.0
+    config.target_type = TargetType::Point
+    config.radius = 30.0
+    config.spawn_object = "AmericaInfantryRanger"
+    config.spawn_count = 5
+    config.fx_on_use = "FX_ParadropPlane"
+    config.fx_on_target = "FX_ParadropLanding"
+    return config
+}
+
+fn create_a10_strike_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::A10Strike
+    config.name = "A10 Thunderbolt Strike"
+    config.description = "Call in A10 for a missile strike run"
+    config.charge_time = 300.0
+    config.target_type = TargetType::Path
+    config.radius = 20.0
+    config.damage = 500.0
+    config.damage_type = "EXPLOSION"
+    config.fx_on_use = "FX_A10StrikeIncoming"
+    config.fx_on_target = "FX_A10StrikeMissiles"
+    return config
+}
+
+fn create_fuel_air_bomb_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::FuelAirBomb
+    config.name = "Fuel Air Bomb"
+    config.description = "Massive thermobaric explosion"
+    config.charge_time = 360.0
+    config.target_type = TargetType::Point
+    config.radius = 100.0
+    config.damage = 1000.0
+    config.damage_type = "EXPLOSION"
+    config.general_point_cost = 3
+    config.fx_on_use = "FX_FuelAirBombDrop"
+    config.fx_on_target = "FX_FuelAirBombExplosion"
+    return config
+}
+
+fn create_artillery_barrage_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::ArtilleryBarrage
+    config.name = "Artillery Barrage"
+    config.description = "Rain artillery shells on target area"
+    config.charge_time = 180.0
+    config.duration = 15.0
+    config.target_type = TargetType::Area
+    config.radius = 75.0
+    config.damage = 100.0
+    config.damage_type = "EXPLOSION"
+    config.fx_on_use = "FX_ArtilleryFire"
+    config.fx_on_target = "FX_ArtilleryImpact"
+    return config
+}
+
+fn create_emp_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::EMP
+    config.name = "EMP Pulse"
+    config.description = "Disable vehicles and power in area"
+    config.charge_time = 240.0
+    config.duration = 30.0
+    config.target_type = TargetType::Point
+    config.radius = 150.0
+    config.damage = 0.0
+    config.fx_on_use = "FX_EMPBurst"
+    config.fx_on_target = "FX_EMPEffect"
+    return config
+}
+
+fn create_rebel_ambush_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::RebelAmbush
+    config.name = "Rebel Ambush"
+    config.description = "Spawn rebels at target location"
+    config.charge_time = 120.0
+    config.target_type = TargetType::Point
+    config.radius = 20.0
+    config.spawn_object = "GLAInfantryRebel"
+    config.spawn_count = 8
+    config.fx_on_target = "FX_RebelAmbush"
+    return config
+}
+
+fn create_scud_storm_config() -> SpecialPowerConfig {
+    let config = default_power_config()
+    config.power_type = PowerType::ScudStorm
+    config.name = "Scud Storm"
+    config.description = "Launch devastating Scud missiles"
+    config.charge_time = 300.0
+    config.target_type = TargetType::Point
+    config.radius = 200.0
+    config.damage = 2000.0
+    config.damage_type = "EXPLOSION_ANTHRAX"
+    config.required_building = "GLAScudStorm"
+    config.fx_on_use = "FX_ScudStormLaunch"
+    config.fx_on_target = "FX_ScudStormImpact"
+    return config
+}
+
+// ============================================================================
+// Special Power Instance
+// ============================================================================
+
+struct SpecialPower {
+    power_id: Int,
+    config: SpecialPowerConfig,
+    state: PowerState,
+
+    // Timing
+    charge_progress: Float,         // 0.0 to 1.0
+    duration_remaining: Float,
+    cooldown_remaining: Float,
+
+    // Usage
+    times_used: Int,
+
+    // Target
+    target_x: Float,
+    target_y: Float,
+    target_z: Float,
+    target_end_x: Float,            // For path targeting
+    target_end_y: Float,
+    target_unit_id: Int,
+
+    // Owner
+    owner_player_id: Int,
+    source_building_id: Int,
+}
+
+fn create_special_power(id: Int, config: SpecialPowerConfig) -> SpecialPower {
+    return SpecialPower {
+        power_id: id,
+        config: config,
+        state: PowerState::Charging,
+        charge_progress: 0.0,
+        duration_remaining: 0.0,
+        cooldown_remaining: 0.0,
+        times_used: 0,
+        target_x: 0.0,
+        target_y: 0.0,
+        target_z: 0.0,
+        target_end_x: 0.0,
+        target_end_y: 0.0,
+        target_unit_id: 0,
+        owner_player_id: 0,
+        source_building_id: 0,
+    }
+}
+
+// ============================================================================
+// Special Power Update Module
+// ============================================================================
+
+struct SpecialPowerUpdateModule {
+    base: UpdateModule,
+
+    // Powers by player
+    player_powers: Map<Int, Collection<SpecialPower>>,
+
+    // Global tracking
+    all_powers: Map<Int, SpecialPower>,
+    next_power_id: Int,
+
+    // Shared cooldowns
+    shared_cooldowns: Map<String, Float>,
+
+    // Statistics
+    total_uses: Int,
+}
+
+fn create_special_power_update(tag: String) -> SpecialPowerUpdateModule {
+    return SpecialPowerUpdateModule {
+        base: create_update_module(tag, UpdateType::Ability),
+        player_powers: Map<Int, Collection<SpecialPower>>{},
+        all_powers: Map<Int, SpecialPower>{},
+        next_power_id: 1,
+        shared_cooldowns: Map<String, Float>{},
+        total_uses: 0,
+    }
+}
+
+// ============================================================================
+// Power Management
+// ============================================================================
+
+/// Grant power to player
+fn grant_power(module: SpecialPowerUpdateModule, player_id: Int, config: SpecialPowerConfig) -> Int {
+    let power = create_special_power(module.next_power_id, config)
+    power.owner_player_id = player_id
+    module.next_power_id = module.next_power_id + 1
+
+    // Add to player's powers
+    if !module.player_powers.has(player_id) {
+        module.player_powers.set(player_id, Collection<SpecialPower>{})
+    }
+    module.player_powers.get(player_id).add(power)
+
+    // Add to global tracking
+    module.all_powers.set(power.power_id, power)
+
+    return power.power_id
+}
+
+/// Revoke power from player
+fn revoke_power(module: SpecialPowerUpdateModule, power_id: Int) {
+    if module.all_powers.has(power_id) {
+        let power = module.all_powers.get(power_id)
+        let player_id = power.owner_player_id
+
+        // Remove from player list
+        if module.player_powers.has(player_id) {
+            let powers = module.player_powers.get(player_id)
+            let new_powers = Collection<SpecialPower>{}
+            for p in powers {
+                if p.power_id != power_id {
+                    new_powers.add(p)
+                }
+            }
+            module.player_powers.set(player_id, new_powers)
+        }
+
+        module.all_powers.remove(power_id)
+    }
+}
+
+/// Get player's powers
+fn get_player_powers(module: SpecialPowerUpdateModule, player_id: Int) -> Collection<SpecialPower> {
+    if module.player_powers.has(player_id) {
+        return module.player_powers.get(player_id)
+    }
+    return Collection<SpecialPower>{}
+}
+
+// ============================================================================
+// Power Activation
+// ============================================================================
+
+/// Check if power can be used
+fn can_use_power(module: SpecialPowerUpdateModule, power_id: Int) -> Bool {
+    if !module.all_powers.has(power_id) {
+        return false
+    }
+
+    let power = module.all_powers.get(power_id)
+
+    // Check state
+    if power.state != PowerState::Ready {
+        return false
+    }
+
+    // Check max uses
+    if power.config.max_uses > 0 && power.times_used >= power.config.max_uses {
+        return false
+    }
+
+    // Check shared cooldown
+    if power.config.shared_cooldown_group.len() > 0 {
+        if module.shared_cooldowns.has(power.config.shared_cooldown_group) {
+            if module.shared_cooldowns.get(power.config.shared_cooldown_group) > 0.0 {
+                return false
+            }
+        }
+    }
+
+    return true
+}
+
+/// Begin targeting for power
+fn begin_targeting(module: SpecialPowerUpdateModule, power_id: Int) -> Bool {
+    if !can_use_power(module, power_id) {
+        return false
+    }
+
+    let power = module.all_powers.get(power_id)
+    power.state = PowerState::Targeting
+    return true
+}
+
+/// Cancel targeting
+fn cancel_targeting(module: SpecialPowerUpdateModule, power_id: Int) {
+    if module.all_powers.has(power_id) {
+        let power = module.all_powers.get(power_id)
+        if power.state == PowerState::Targeting {
+            power.state = PowerState::Ready
+        }
+    }
+}
+
+/// Execute power at target
+fn execute_power(module: SpecialPowerUpdateModule, power_id: Int, target_x: Float, target_y: Float, target_z: Float) -> Bool {
+    if !module.all_powers.has(power_id) {
+        return false
+    }
+
+    let power = module.all_powers.get(power_id)
+
+    if power.state != PowerState::Targeting && power.state != PowerState::Ready {
+        return false
+    }
+
+    power.target_x = target_x
+    power.target_y = target_y
+    power.target_z = target_z
+    power.state = PowerState::Executing
+    power.duration_remaining = power.config.duration
+    power.times_used = power.times_used + 1
+    module.total_uses = module.total_uses + 1
+
+    return true
+}
+
+/// Execute power with path (for A10 strike etc)
+fn execute_power_path(module: SpecialPowerUpdateModule, power_id: Int,
+                       start_x: Float, start_y: Float,
+                       end_x: Float, end_y: Float) -> Bool {
+    if !module.all_powers.has(power_id) {
+        return false
+    }
+
+    let power = module.all_powers.get(power_id)
+
+    if power.state != PowerState::Targeting && power.state != PowerState::Ready {
+        return false
+    }
+
+    power.target_x = start_x
+    power.target_y = start_y
+    power.target_z = 0.0
+    power.target_end_x = end_x
+    power.target_end_y = end_y
+    power.state = PowerState::Executing
+    power.duration_remaining = power.config.duration
+    power.times_used = power.times_used + 1
+    module.total_uses = module.total_uses + 1
+
+    return true
+}
+
+/// Execute power on unit
+fn execute_power_unit(module: SpecialPowerUpdateModule, power_id: Int, target_unit_id: Int) -> Bool {
+    if !module.all_powers.has(power_id) {
+        return false
+    }
+
+    let power = module.all_powers.get(power_id)
+
+    if power.state != PowerState::Targeting && power.state != PowerState::Ready {
+        return false
+    }
+
+    power.target_unit_id = target_unit_id
+    power.state = PowerState::Executing
+    power.duration_remaining = power.config.duration
+    power.times_used = power.times_used + 1
+    module.total_uses = module.total_uses + 1
+
+    return true
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update all powers
+fn update_special_powers(module: SpecialPowerUpdateModule, delta: Float) -> Collection<(Int, PowerState)> {
+    // Returns collection of (power_id, new_state) for state changes
+    let state_changes = Collection<(Int, PowerState)>{}
+
+    // Update shared cooldowns
+    for group in module.shared_cooldowns.keys() {
+        let cooldown = module.shared_cooldowns.get(group)
+        if cooldown > 0.0 {
+            module.shared_cooldowns.set(group, cooldown - delta)
+        }
+    }
+
+    // Update each power
+    for power_id in module.all_powers.keys() {
+        let power = module.all_powers.get(power_id)
+        let old_state = power.state
+
+        if power.state == PowerState::Charging {
+            power.charge_progress = power.charge_progress + delta / power.config.charge_time
+
+            if power.charge_progress >= 1.0 {
+                power.charge_progress = 1.0
+                power.state = PowerState::Ready
+            }
+
+        } else if power.state == PowerState::Executing {
+            power.duration_remaining = power.duration_remaining - delta
+
+            if power.duration_remaining <= 0.0 {
+                // Start cooldown
+                if power.config.cooldown_time > 0.0 {
+                    power.state = PowerState::Cooldown
+                    power.cooldown_remaining = power.config.cooldown_time
+
+                    // Set shared cooldown
+                    if power.config.shared_cooldown_group.len() > 0 {
+                        module.shared_cooldowns.set(power.config.shared_cooldown_group, power.config.cooldown_time)
+                    }
+                } else {
+                    // Start recharging
+                    power.state = PowerState::Charging
+                    power.charge_progress = 0.0
+                }
+            }
+
+        } else if power.state == PowerState::Cooldown {
+            power.cooldown_remaining = power.cooldown_remaining - delta
+
+            if power.cooldown_remaining <= 0.0 {
+                power.state = PowerState::Charging
+                power.charge_progress = 0.0
+            }
+        }
+
+        if power.state != old_state {
+            state_changes.add((power_id, power.state))
+        }
+    }
+
+    return state_changes
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get power state
+fn get_power_state(module: SpecialPowerUpdateModule, power_id: Int) -> PowerState {
+    if module.all_powers.has(power_id) {
+        return module.all_powers.get(power_id).state
+    }
+    return PowerState::Unavailable
+}
+
+/// Get charge progress
+fn get_charge_progress(module: SpecialPowerUpdateModule, power_id: Int) -> Float {
+    if module.all_powers.has(power_id) {
+        return module.all_powers.get(power_id).charge_progress
+    }
+    return 0.0
+}
+
+/// Get time until ready
+fn get_time_until_ready(module: SpecialPowerUpdateModule, power_id: Int) -> Float {
+    if !module.all_powers.has(power_id) {
+        return 0.0
+    }
+
+    let power = module.all_powers.get(power_id)
+
+    if power.state == PowerState::Charging {
+        return (1.0 - power.charge_progress) * power.config.charge_time
+    } else if power.state == PowerState::Cooldown {
+        return power.cooldown_remaining + power.config.charge_time
+    }
+
+    return 0.0
+}
+
+/// Get power target type
+fn get_target_type(module: SpecialPowerUpdateModule, power_id: Int) -> TargetType {
+    if module.all_powers.has(power_id) {
+        return module.all_powers.get(power_id).config.target_type
+    }
+    return TargetType::None
+}
+
+/// Get power radius
+fn get_power_radius(module: SpecialPowerUpdateModule, power_id: Int) -> Float {
+    if module.all_powers.has(power_id) {
+        return module.all_powers.get(power_id).config.radius
+    }
+    return 0.0
+}
+
+/// Check if power is ready
+fn is_power_ready(module: SpecialPowerUpdateModule, power_id: Int) -> Bool {
+    return get_power_state(module, power_id) == PowerState::Ready
+}
+
+/// Get all ready powers for player
+fn get_ready_powers(module: SpecialPowerUpdateModule, player_id: Int) -> Collection<Int> {
+    let ready = Collection<Int>{}
+
+    if module.player_powers.has(player_id) {
+        for power in module.player_powers.get(player_id) {
+            if power.state == PowerState::Ready {
+                ready.add(power.power_id)
+            }
+        }
+    }
+
+    return ready
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_power_creation() -> Bool {
+    let module = create_special_power_update("TestPowers")
+
+    let power_id = grant_power(module, 1, create_paradrop_config())
+    assert(power_id > 0, "Should create power")
+    assert(get_power_state(module, power_id) == PowerState::Charging, "Should be charging")
+
+    return true
+}
+
+fn test_power_charging() -> Bool {
+    let module = create_special_power_update("ChargingTest")
+
+    let config = create_paradrop_config()
+    config.charge_time = 1.0
+
+    let power_id = grant_power(module, 1, config)
+
+    // Update until charged
+    for i in 0..15 {
+        update_special_powers(module, 0.1)
+    }
+
+    assert(is_power_ready(module, power_id) == true, "Should be ready")
+
+    return true
+}
+
+fn test_power_execution() -> Bool {
+    let module = create_special_power_update("ExecutionTest")
+
+    let config = create_rebel_ambush_config()
+    config.charge_time = 0.0
+
+    let power_id = grant_power(module, 1, config)
+    module.all_powers.get(power_id).state = PowerState::Ready
+
+    let executed = execute_power(module, power_id, 100.0, 100.0, 0.0)
+    assert(executed == true, "Should execute")
+    assert(get_power_state(module, power_id) == PowerState::Executing, "Should be executing")
+
+    return true
+}
+
+fn test_power_cooldown() -> Bool {
+    let module = create_special_power_update("CooldownTest")
+
+    let config = create_artillery_barrage_config()
+    config.charge_time = 0.0
+    config.duration = 0.5
+    config.cooldown_time = 1.0
+
+    let power_id = grant_power(module, 1, config)
+    module.all_powers.get(power_id).state = PowerState::Ready
+
+    execute_power(module, power_id, 100.0, 100.0, 0.0)
+
+    // Wait for execution to complete
+    for i in 0..10 {
+        update_special_powers(module, 0.1)
+    }
+
+    assert(get_power_state(module, power_id) == PowerState::Cooldown, "Should be on cooldown")
+
+    return true
+}
+
+fn test_multiple_players() -> Bool {
+    let module = create_special_power_update("MultiPlayerTest")
+
+    let config = create_paradrop_config()
+    config.charge_time = 0.0
+
+    grant_power(module, 1, config)
+    grant_power(module, 2, config)
+    grant_power(module, 1, create_a10_strike_config())
+
+    let player1_powers = get_player_powers(module, 1)
+    let player2_powers = get_player_powers(module, 2)
+
+    assert(player1_powers.len() == 2, "Player 1 should have 2 powers")
+    assert(player2_powers.len() == 1, "Player 2 should have 1 power")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_power_creation(), "Power creation test failed")
+    assert(test_power_charging(), "Power charging test failed")
+    assert(test_power_execution(), "Power execution test failed")
+    assert(test_power_cooldown(), "Power cooldown test failed")
+    assert(test_multiple_players(), "Multiple players test failed")
+    return true
+}

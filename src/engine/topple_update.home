@@ -1,0 +1,654 @@
+// Topple Update - Building and Tree Toppling System
+// Based on Thyme engine ToppleUpdate
+// Handles topple direction, crush damage, animation
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Topple Configuration
+// ============================================================================
+
+enum ToppleState {
+    Standing,           // Upright
+    Shaking,            // About to fall
+    Falling,            // In process of falling
+    Fallen,             // On the ground
+    Disintegrating,     // Breaking apart
+    Gone,               // Completely removed
+}
+
+enum ToppleType {
+    Tree,               // Trees/poles
+    Building,           // Structures
+    Tower,              // Tall structures
+    Wall,               // Wall segments
+    Debris,             // Already fallen debris
+}
+
+enum ToppleCause {
+    Damage,             // Destroyed by weapons
+    Impact,             // Hit by vehicle/unit
+    Explosion,          // Nearby explosion
+    Bulldoze,           // Deliberate clearing
+    Natural,            // Decay/time
+}
+
+struct ToppleConfig {
+    topple_type: ToppleType,
+
+    // Timing
+    shake_duration: Float,          // Time shaking before fall
+    fall_duration: Float,           // Time to complete fall
+    lie_duration: Float,            // Time lying before disappear (0 = permanent)
+    disintegrate_duration: Float,   // Time to fully disappear
+
+    // Physics
+    initial_velocity: Float,        // Starting fall speed
+    acceleration: Float,            // Fall acceleration (gravity)
+    max_velocity: Float,            // Max fall speed
+    bounce_factor: Float,           // Bounce on impact (0-1)
+    rotation_speed: Float,          // How fast it rotates while falling
+
+    // Damage
+    crush_damage: Float,            // Damage to units under it
+    crush_radius: Float,            // Area affected by crushing
+    can_crush_infantry: Bool,
+    can_crush_vehicles: Bool,
+    can_crush_buildings: Bool,
+
+    // Direction
+    preferred_direction: Float,     // Angle in radians (0 = random)
+    direction_randomness: Float,    // How much to randomize direction
+
+    // Audio/Visual
+    shake_fx: String,
+    fall_fx: String,
+    impact_fx: String,
+    dust_fx: String,
+    shake_sound: String,
+    fall_sound: String,
+    impact_sound: String,
+
+    // Debris
+    spawn_debris: Bool,
+    debris_object: String,
+    debris_count: Int,
+}
+
+fn default_topple_config() -> ToppleConfig {
+    return ToppleConfig {
+        topple_type: ToppleType::Building,
+        shake_duration: 0.5,
+        fall_duration: 1.5,
+        lie_duration: 30.0,
+        disintegrate_duration: 2.0,
+        initial_velocity: 0.0,
+        acceleration: 9.8,
+        max_velocity: 50.0,
+        bounce_factor: 0.2,
+        rotation_speed: 1.5,
+        crush_damage: 500.0,
+        crush_radius: 30.0,
+        can_crush_infantry: true,
+        can_crush_vehicles: false,
+        can_crush_buildings: false,
+        preferred_direction: 0.0,
+        direction_randomness: 6.28,
+        shake_fx: "FX_BuildingShake",
+        fall_fx: "FX_BuildingFall",
+        impact_fx: "FX_BuildingImpact",
+        dust_fx: "FX_DustCloud",
+        shake_sound: "Building_Shake",
+        fall_sound: "Building_Fall",
+        impact_sound: "Building_Impact",
+        spawn_debris: true,
+        debris_object: "BuildingDebris",
+        debris_count: 5,
+    }
+}
+
+fn create_tree_topple_config() -> ToppleConfig {
+    let config = default_topple_config()
+    config.topple_type = ToppleType::Tree
+    config.shake_duration = 0.3
+    config.fall_duration = 1.0
+    config.lie_duration = 60.0
+    config.crush_damage = 100.0
+    config.crush_radius = 15.0
+    config.can_crush_infantry = true
+    config.can_crush_vehicles = false
+    config.rotation_speed = 2.0
+    config.shake_fx = "FX_TreeShake"
+    config.fall_fx = "FX_TreeFall"
+    config.impact_fx = "FX_TreeImpact"
+    config.shake_sound = "Tree_Shake"
+    config.fall_sound = "Tree_Fall"
+    config.impact_sound = "Tree_Impact"
+    config.spawn_debris = false
+    return config
+}
+
+fn create_tower_topple_config() -> ToppleConfig {
+    let config = default_topple_config()
+    config.topple_type = ToppleType::Tower
+    config.shake_duration = 1.0
+    config.fall_duration = 2.5
+    config.lie_duration = 120.0
+    config.crush_damage = 1000.0
+    config.crush_radius = 50.0
+    config.can_crush_infantry = true
+    config.can_crush_vehicles = true
+    config.rotation_speed = 1.0
+    config.debris_count = 10
+    return config
+}
+
+// ============================================================================
+// Topple Instance
+// ============================================================================
+
+struct ToppleInstance {
+    instance_id: Int,
+    config: ToppleConfig,
+    state: ToppleState,
+    cause: ToppleCause,
+
+    // Position
+    base_x: Float,
+    base_y: Float,
+    base_z: Float,
+
+    // Rotation (topple angle)
+    rotation_x: Float,              // Pitch (forward/backward tilt)
+    rotation_y: Float,              // Roll (side tilt)
+    rotation_z: Float,              // Yaw (direction facing)
+
+    // Fall direction
+    fall_direction: Float,          // Direction of fall in radians
+
+    // Physics state
+    fall_velocity: Float,
+    fall_angle: Float,              // Current angle from vertical (0 = upright, PI/2 = fallen)
+
+    // Timing
+    state_time: Float,              // Time in current state
+    total_time: Float,              // Total time since topple started
+
+    // Flags
+    has_dealt_crush_damage: Bool,
+    impact_position_x: Float,
+    impact_position_y: Float,
+
+    // Source
+    source_object_id: Int,
+    source_object_type: String,
+}
+
+fn create_topple_instance(id: Int, config: ToppleConfig) -> ToppleInstance {
+    return ToppleInstance {
+        instance_id: id,
+        config: config,
+        state: ToppleState::Standing,
+        cause: ToppleCause::Damage,
+        base_x: 0.0,
+        base_y: 0.0,
+        base_z: 0.0,
+        rotation_x: 0.0,
+        rotation_y: 0.0,
+        rotation_z: 0.0,
+        fall_direction: 0.0,
+        fall_velocity: 0.0,
+        fall_angle: 0.0,
+        state_time: 0.0,
+        total_time: 0.0,
+        has_dealt_crush_damage: false,
+        impact_position_x: 0.0,
+        impact_position_y: 0.0,
+        source_object_id: 0,
+        source_object_type: "",
+    }
+}
+
+// ============================================================================
+// Topple Update Module
+// ============================================================================
+
+struct ToppleUpdateModule {
+    base: UpdateModule,
+
+    // Active topples
+    topples: Map<Int, ToppleInstance>,
+    next_id: Int,
+
+    // Pending crush damage
+    pending_crush: Collection<(Float, Float, Float, Float)>,  // (x, y, damage, radius)
+
+    // Statistics
+    total_toppled: Int,
+    total_crush_damage: Float,
+}
+
+fn create_topple_update(tag: String) -> ToppleUpdateModule {
+    return ToppleUpdateModule {
+        base: create_update_module(tag, UpdateType::Physics),
+        topples: Map<Int, ToppleInstance>{},
+        next_id: 1,
+        pending_crush: Collection<(Float, Float, Float, Float)>{},
+        total_toppled: 0,
+        total_crush_damage: 0.0,
+    }
+}
+
+// ============================================================================
+// Topple Operations
+// ============================================================================
+
+/// Start a topple
+fn start_topple(module: ToppleUpdateModule, config: ToppleConfig,
+                 x: Float, y: Float, z: Float,
+                 cause: ToppleCause, source_id: Int) -> Int {
+    let instance = create_topple_instance(module.next_id, config)
+    module.next_id = module.next_id + 1
+
+    instance.base_x = x
+    instance.base_y = y
+    instance.base_z = z
+    instance.cause = cause
+    instance.source_object_id = source_id
+    instance.state = ToppleState::Shaking
+
+    // Calculate fall direction
+    instance.fall_direction = calculate_fall_direction(config, x, y, cause)
+
+    // Calculate impact position
+    let fall_dist = 20.0  // Approximate object height
+    instance.impact_position_x = x + cos_approx(instance.fall_direction) * fall_dist
+    instance.impact_position_y = y + sin_approx(instance.fall_direction) * fall_dist
+
+    module.topples.set(instance.instance_id, instance)
+    module.total_toppled = module.total_toppled + 1
+
+    return instance.instance_id
+}
+
+/// Calculate fall direction based on cause and position
+fn calculate_fall_direction(config: ToppleConfig, x: Float, y: Float, cause: ToppleCause) -> Float {
+    let direction = config.preferred_direction
+
+    if config.direction_randomness > 0.0 {
+        // Add randomness - using position as pseudo-random seed
+        let pseudo_random = sin_approx(x * 12.345 + y * 67.89) * 0.5 + 0.5
+        direction = direction + (pseudo_random - 0.5) * config.direction_randomness
+    }
+
+    // Normalize to 0-2PI
+    while direction < 0.0 { direction = direction + 6.28318 }
+    while direction > 6.28318 { direction = direction - 6.28318 }
+
+    return direction
+}
+
+/// Force topple in specific direction
+fn start_topple_directed(module: ToppleUpdateModule, config: ToppleConfig,
+                          x: Float, y: Float, z: Float,
+                          direction: Float, cause: ToppleCause) -> Int {
+    let id = start_topple(module, config, x, y, z, cause, 0)
+
+    if module.topples.has(id) {
+        let instance = module.topples.get(id)
+        instance.fall_direction = direction
+
+        // Recalculate impact position
+        let fall_dist = 20.0
+        instance.impact_position_x = x + cos_approx(direction) * fall_dist
+        instance.impact_position_y = y + sin_approx(direction) * fall_dist
+    }
+
+    return id
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update single topple instance
+fn update_topple_instance(instance: ToppleInstance, delta: Float, module: ToppleUpdateModule) -> Bool {
+    // Returns true if should be removed
+
+    instance.state_time = instance.state_time + delta
+    instance.total_time = instance.total_time + delta
+
+    if instance.state == ToppleState::Shaking {
+        // Apply shake effect
+        let shake_intensity = 1.0 - (instance.state_time / instance.config.shake_duration)
+        instance.rotation_x = sin_approx(instance.state_time * 20.0) * 0.05 * shake_intensity
+        instance.rotation_y = cos_approx(instance.state_time * 25.0) * 0.05 * shake_intensity
+
+        if instance.state_time >= instance.config.shake_duration {
+            instance.state = ToppleState::Falling
+            instance.state_time = 0.0
+            instance.fall_velocity = instance.config.initial_velocity
+        }
+
+    } else if instance.state == ToppleState::Falling {
+        // Apply falling physics
+        instance.fall_velocity = instance.fall_velocity + instance.config.acceleration * delta
+        if instance.fall_velocity > instance.config.max_velocity {
+            instance.fall_velocity = instance.config.max_velocity
+        }
+
+        // Update fall angle
+        instance.fall_angle = instance.fall_angle + instance.config.rotation_speed * delta
+
+        // Convert to rotation based on fall direction
+        instance.rotation_x = sin_approx(instance.fall_direction) * instance.fall_angle
+        instance.rotation_y = cos_approx(instance.fall_direction) * instance.fall_angle
+
+        // Check if fallen (90 degrees = PI/2)
+        if instance.fall_angle >= 1.5708 {
+            instance.fall_angle = 1.5708
+            instance.state = ToppleState::Fallen
+            instance.state_time = 0.0
+
+            // Apply bounce
+            if instance.config.bounce_factor > 0.0 {
+                instance.fall_velocity = -instance.fall_velocity * instance.config.bounce_factor
+            }
+
+            // Deal crush damage
+            if !instance.has_dealt_crush_damage {
+                instance.has_dealt_crush_damage = true
+                module.pending_crush.add((
+                    instance.impact_position_x,
+                    instance.impact_position_y,
+                    instance.config.crush_damage,
+                    instance.config.crush_radius
+                ))
+                module.total_crush_damage = module.total_crush_damage + instance.config.crush_damage
+            }
+        }
+
+    } else if instance.state == ToppleState::Fallen {
+        // Handle bounce
+        if instance.fall_velocity < 0.0 {
+            instance.fall_velocity = instance.fall_velocity + instance.config.acceleration * delta * 2.0
+            instance.fall_angle = instance.fall_angle + instance.fall_velocity * delta * 0.1
+
+            if instance.fall_angle > 1.5708 {
+                instance.fall_angle = 1.5708
+                instance.fall_velocity = 0.0
+            }
+
+            instance.rotation_x = sin_approx(instance.fall_direction) * instance.fall_angle
+            instance.rotation_y = cos_approx(instance.fall_direction) * instance.fall_angle
+        }
+
+        // Check for transition to disintegrating
+        if instance.config.lie_duration > 0.0 && instance.state_time >= instance.config.lie_duration {
+            instance.state = ToppleState::Disintegrating
+            instance.state_time = 0.0
+        }
+
+    } else if instance.state == ToppleState::Disintegrating {
+        if instance.state_time >= instance.config.disintegrate_duration {
+            instance.state = ToppleState::Gone
+            return true  // Remove
+        }
+    } else if instance.state == ToppleState::Gone {
+        return true  // Remove
+    }
+
+    return false
+}
+
+/// Update all topples
+fn update_topples(module: ToppleUpdateModule, delta: Float) -> Collection<(Float, Float, Float, Float)> {
+    // Returns crush damage events (x, y, damage, radius)
+    module.pending_crush = Collection<(Float, Float, Float, Float)>{}
+    let to_remove = Collection<Int>{}
+
+    for id in module.topples.keys() {
+        let instance = module.topples.get(id)
+        let should_remove = update_topple_instance(instance, delta, module)
+        if should_remove {
+            to_remove.add(id)
+        }
+    }
+
+    // Remove finished topples
+    for id in to_remove {
+        module.topples.remove(id)
+    }
+
+    return module.pending_crush
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get topple state
+fn get_topple_state(module: ToppleUpdateModule, id: Int) -> ToppleState {
+    if module.topples.has(id) {
+        return module.topples.get(id).state
+    }
+    return ToppleState::Gone
+}
+
+/// Get topple rotation
+fn get_topple_rotation(module: ToppleUpdateModule, id: Int) -> (Float, Float, Float) {
+    if module.topples.has(id) {
+        let instance = module.topples.get(id)
+        return (instance.rotation_x, instance.rotation_y, instance.rotation_z)
+    }
+    return (0.0, 0.0, 0.0)
+}
+
+/// Get topple progress (0.0 to 1.0)
+fn get_topple_progress(module: ToppleUpdateModule, id: Int) -> Float {
+    if module.topples.has(id) {
+        let instance = module.topples.get(id)
+        return instance.fall_angle / 1.5708  // Divide by 90 degrees
+    }
+    return 0.0
+}
+
+/// Get fade amount for disintegrating (0.0 = solid, 1.0 = gone)
+fn get_fade_amount(module: ToppleUpdateModule, id: Int) -> Float {
+    if module.topples.has(id) {
+        let instance = module.topples.get(id)
+        if instance.state == ToppleState::Disintegrating {
+            return instance.state_time / instance.config.disintegrate_duration
+        } else if instance.state == ToppleState::Gone {
+            return 1.0
+        }
+    }
+    return 0.0
+}
+
+/// Get active topple count
+fn get_active_topple_count(module: ToppleUpdateModule) -> Int {
+    return module.topples.len()
+}
+
+/// Check if position is in danger zone (will be crushed)
+fn is_in_crush_zone(module: ToppleUpdateModule, x: Float, y: Float) -> Bool {
+    for id in module.topples.keys() {
+        let instance = module.topples.get(id)
+        if instance.state == ToppleState::Falling {
+            let dx = instance.impact_position_x - x
+            let dy = instance.impact_position_y - y
+            let dist = sqrt(dx * dx + dy * dy)
+            if dist <= instance.config.crush_radius {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// Get impact position for a topple
+fn get_impact_position(module: ToppleUpdateModule, id: Int) -> (Float, Float) {
+    if module.topples.has(id) {
+        let instance = module.topples.get(id)
+        return (instance.impact_position_x, instance.impact_position_y)
+    }
+    return (0.0, 0.0)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+fn cos_approx(angle: Float) -> Float {
+    return sin_approx(angle + 1.5708)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_topple_creation() -> Bool {
+    let module = create_topple_update("TestTopple")
+
+    let id = start_topple(module, default_topple_config(), 100.0, 100.0, 0.0, ToppleCause::Damage, 0)
+    assert(id > 0, "Should create topple")
+    assert(get_topple_state(module, id) == ToppleState::Shaking, "Should be shaking")
+
+    return true
+}
+
+fn test_topple_shake_to_fall() -> Bool {
+    let module = create_topple_update("ShakeToFallTest")
+    let config = default_topple_config()
+    config.shake_duration = 0.5
+
+    let id = start_topple(module, config, 100.0, 100.0, 0.0, ToppleCause::Explosion, 0)
+
+    // Update through shake phase
+    for i in 0..10 {
+        update_topples(module, 0.1)
+    }
+
+    assert(get_topple_state(module, id) == ToppleState::Falling, "Should be falling")
+
+    return true
+}
+
+fn test_topple_complete_fall() -> Bool {
+    let module = create_topple_update("CompleteFallTest")
+    let config = default_topple_config()
+    config.shake_duration = 0.1
+    config.fall_duration = 1.0
+
+    let id = start_topple(module, config, 100.0, 100.0, 0.0, ToppleCause::Impact, 0)
+
+    // Update through entire fall
+    for i in 0..30 {
+        update_topples(module, 0.1)
+    }
+
+    assert(get_topple_state(module, id) == ToppleState::Fallen, "Should be fallen")
+    assert(get_topple_progress(module, id) == 1.0, "Progress should be 1.0")
+
+    return true
+}
+
+fn test_crush_damage() -> Bool {
+    let module = create_topple_update("CrushDamageTest")
+    let config = default_topple_config()
+    config.shake_duration = 0.1
+    config.crush_damage = 500.0
+    config.crush_radius = 30.0
+
+    let id = start_topple(module, config, 100.0, 100.0, 0.0, ToppleCause::Damage, 0)
+
+    // Update until fallen
+    let found_crush = false
+    for i in 0..30 {
+        let crushes = update_topples(module, 0.1)
+        if crushes.len() > 0 {
+            assert(crushes.get(0).2 == 500.0, "Should have correct damage")
+            found_crush = true
+            break
+        }
+    }
+
+    assert(found_crush == true, "Should have generated crush damage")
+
+    return true
+}
+
+fn test_directed_topple() -> Bool {
+    let module = create_topple_update("DirectedTest")
+    let config = default_topple_config()
+
+    let direction = 1.5708  // 90 degrees
+    let id = start_topple_directed(module, config, 100.0, 100.0, 0.0, direction, ToppleCause::Bulldoze)
+
+    let impact = get_impact_position(module, id)
+    // Impact should be roughly in the direction specified
+    let dx = impact.0 - 100.0
+    let dy = impact.1 - 100.0
+
+    assert(dy > 0.0, "Should fall in positive Y direction")
+
+    return true
+}
+
+fn test_disintegration() -> Bool {
+    let module = create_topple_update("DisintegrationTest")
+    let config = default_topple_config()
+    config.shake_duration = 0.1
+    config.lie_duration = 0.5
+    config.disintegrate_duration = 0.5
+
+    let id = start_topple(module, config, 100.0, 100.0, 0.0, ToppleCause::Natural, 0)
+
+    // Update until disintegrating
+    for i in 0..50 {
+        update_topples(module, 0.1)
+        if get_topple_state(module, id) == ToppleState::Disintegrating {
+            break
+        }
+    }
+
+    assert(get_topple_state(module, id) == ToppleState::Disintegrating, "Should be disintegrating")
+
+    // Continue until gone
+    for i in 0..20 {
+        update_topples(module, 0.1)
+    }
+
+    // Should be removed
+    assert(get_active_topple_count(module) == 0, "Should be removed")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_topple_creation(), "Topple creation test failed")
+    assert(test_topple_shake_to_fall(), "Shake to fall test failed")
+    assert(test_topple_complete_fall(), "Complete fall test failed")
+    assert(test_crush_damage(), "Crush damage test failed")
+    assert(test_directed_topple(), "Directed topple test failed")
+    assert(test_disintegration(), "Disintegration test failed")
+    return true
+}

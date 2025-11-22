@@ -1,0 +1,754 @@
+// Post Processing - Post-Processing Filter System
+// Based on Thyme engine post-processing effects
+// Handles motion blur, crossfade, black & white, and other screen effects
+
+from basics import Collection, Map
+
+// ============================================================================
+// Post-Processing Types
+// ============================================================================
+
+enum FilterType {
+    None,
+    MotionBlur,
+    CrossFade,
+    BlackAndWhite,
+    Sepia,
+    Vignette,
+    Bloom,
+    ColorCorrection,
+    FilmGrain,
+    Sharpen,
+    GaussianBlur,
+    RadialBlur,
+    ScreenShake,
+}
+
+enum BlendMode {
+    Normal,             // Standard blend
+    Additive,           // Add to base
+    Multiply,           // Multiply with base
+    Screen,             // Screen blend
+    Overlay,            // Overlay blend
+    SoftLight,          // Soft light blend
+}
+
+// ============================================================================
+// Motion Blur Filter
+// ============================================================================
+
+struct MotionBlurConfig {
+    enabled: Bool,
+    strength: Float,            // 0.0 to 1.0
+    sample_count: Int,          // Number of blur samples
+    velocity_scale: Float,      // How much velocity affects blur
+    max_blur_radius: Float,     // Maximum blur in pixels
+    center_x: Float,            // Blur center (for radial)
+    center_y: Float,
+    is_radial: Bool,            // Radial vs directional blur
+}
+
+fn default_motion_blur_config() -> MotionBlurConfig {
+    return MotionBlurConfig {
+        enabled: false,
+        strength: 0.5,
+        sample_count: 8,
+        velocity_scale: 1.0,
+        max_blur_radius: 32.0,
+        center_x: 0.5,
+        center_y: 0.5,
+        is_radial: false,
+    }
+}
+
+struct MotionBlurFilter {
+    config: MotionBlurConfig,
+
+    // Velocity buffer (per-pixel velocities)
+    velocity_buffer_width: Int,
+    velocity_buffer_height: Int,
+    velocity_x: Collection<Float>,
+    velocity_y: Collection<Float>,
+
+    // Camera velocity
+    camera_vel_x: Float,
+    camera_vel_y: Float,
+    camera_vel_z: Float,
+
+    // Object velocities
+    object_velocities: Map<Int, (Float, Float, Float)>,
+}
+
+fn create_motion_blur_filter() -> MotionBlurFilter {
+    return MotionBlurFilter {
+        config: default_motion_blur_config(),
+        velocity_buffer_width: 0,
+        velocity_buffer_height: 0,
+        velocity_x: Collection<Float>{},
+        velocity_y: Collection<Float>{},
+        camera_vel_x: 0.0,
+        camera_vel_y: 0.0,
+        camera_vel_z: 0.0,
+        object_velocities: Map<Int, (Float, Float, Float)>{},
+    }
+}
+
+/// Initialize velocity buffer
+fn init_velocity_buffer(filter: MotionBlurFilter, width: Int, height: Int) {
+    filter.velocity_buffer_width = width
+    filter.velocity_buffer_height = height
+
+    filter.velocity_x = Collection<Float>{}
+    filter.velocity_y = Collection<Float>{}
+
+    for i in 0..(width * height) {
+        filter.velocity_x.add(0.0)
+        filter.velocity_y.add(0.0)
+    }
+}
+
+/// Set camera velocity
+fn set_camera_velocity(filter: MotionBlurFilter, vx: Float, vy: Float, vz: Float) {
+    filter.camera_vel_x = vx
+    filter.camera_vel_y = vy
+    filter.camera_vel_z = vz
+}
+
+/// Set object velocity
+fn set_object_velocity(filter: MotionBlurFilter, object_id: Int, vx: Float, vy: Float, vz: Float) {
+    filter.object_velocities.set(object_id, (vx, vy, vz))
+}
+
+/// Clear object velocities
+fn clear_velocities(filter: MotionBlurFilter) {
+    filter.object_velocities = Map<Int, (Float, Float, Float)>{}
+}
+
+/// Update velocity buffer pixel
+fn set_pixel_velocity(filter: MotionBlurFilter, x: Int, y: Int, vx: Float, vy: Float) {
+    let idx = y * filter.velocity_buffer_width + x
+    if idx >= 0 && idx < filter.velocity_x.len() {
+        filter.velocity_x.set(idx, vx)
+        filter.velocity_y.set(idx, vy)
+    }
+}
+
+/// Get blur amount at pixel
+fn get_blur_amount(filter: MotionBlurFilter, x: Int, y: Int) -> (Float, Float) {
+    if !filter.config.enabled {
+        return (0.0, 0.0)
+    }
+
+    let idx = y * filter.velocity_buffer_width + x
+    if idx >= 0 && idx < filter.velocity_x.len() {
+        let vx = filter.velocity_x.get(idx) * filter.config.strength * filter.config.velocity_scale
+        let vy = filter.velocity_y.get(idx) * filter.config.strength * filter.config.velocity_scale
+
+        // Clamp to max radius
+        let len = sqrt(vx * vx + vy * vy)
+        if len > filter.config.max_blur_radius {
+            let scale = filter.config.max_blur_radius / len
+            vx = vx * scale
+            vy = vy * scale
+        }
+
+        return (vx, vy)
+    }
+    return (0.0, 0.0)
+}
+
+// ============================================================================
+// Cross Fade Filter
+// ============================================================================
+
+struct CrossFadeConfig {
+    enabled: Bool,
+    fade_color_r: Float,
+    fade_color_g: Float,
+    fade_color_b: Float,
+    fade_alpha: Float,          // 0.0 = full scene, 1.0 = full color
+    fade_duration: Float,
+    is_fading_in: Bool,         // true = fading to scene, false = fading to color
+}
+
+fn default_crossfade_config() -> CrossFadeConfig {
+    return CrossFadeConfig {
+        enabled: false,
+        fade_color_r: 0.0,
+        fade_color_g: 0.0,
+        fade_color_b: 0.0,
+        fade_alpha: 0.0,
+        fade_duration: 1.0,
+        is_fading_in: true,
+    }
+}
+
+struct CrossFadeFilter {
+    config: CrossFadeConfig,
+
+    // State
+    current_alpha: Float,
+    target_alpha: Float,
+    fade_speed: Float,
+    is_active: Bool,
+
+    // Callback tracking
+    on_complete_id: Int,
+}
+
+fn create_crossfade_filter() -> CrossFadeFilter {
+    return CrossFadeFilter {
+        config: default_crossfade_config(),
+        current_alpha: 0.0,
+        target_alpha: 0.0,
+        fade_speed: 1.0,
+        is_active: false,
+        on_complete_id: 0,
+    }
+}
+
+/// Start fade to black (or fade color)
+fn fade_to_black(filter: CrossFadeFilter, duration: Float) {
+    filter.config.enabled = true
+    filter.target_alpha = 1.0
+    filter.fade_speed = 1.0 / duration
+    filter.config.is_fading_in = false
+    filter.is_active = true
+}
+
+/// Start fade from black (to scene)
+fn fade_from_black(filter: CrossFadeFilter, duration: Float) {
+    filter.config.enabled = true
+    filter.current_alpha = 1.0
+    filter.target_alpha = 0.0
+    filter.fade_speed = 1.0 / duration
+    filter.config.is_fading_in = true
+    filter.is_active = true
+}
+
+/// Start crossfade between scenes
+fn crossfade(filter: CrossFadeFilter, to_alpha: Float, duration: Float) {
+    filter.config.enabled = true
+    filter.target_alpha = to_alpha
+    filter.fade_speed = 1.0 / duration
+    filter.is_active = true
+}
+
+/// Set fade color
+fn set_fade_color(filter: CrossFadeFilter, r: Float, g: Float, b: Float) {
+    filter.config.fade_color_r = r
+    filter.config.fade_color_g = g
+    filter.config.fade_color_b = b
+}
+
+/// Update crossfade
+fn update_crossfade(filter: CrossFadeFilter, delta: Float) -> Bool {
+    // Returns true if fade completed this frame
+    if !filter.is_active {
+        return false
+    }
+
+    let change = filter.fade_speed * delta
+
+    if filter.current_alpha < filter.target_alpha {
+        filter.current_alpha = filter.current_alpha + change
+        if filter.current_alpha >= filter.target_alpha {
+            filter.current_alpha = filter.target_alpha
+            filter.is_active = false
+            return true
+        }
+    } else if filter.current_alpha > filter.target_alpha {
+        filter.current_alpha = filter.current_alpha - change
+        if filter.current_alpha <= filter.target_alpha {
+            filter.current_alpha = filter.target_alpha
+            filter.is_active = false
+            return true
+        }
+    } else {
+        filter.is_active = false
+        return true
+    }
+
+    return false
+}
+
+/// Get current fade color with alpha
+fn get_fade_color(filter: CrossFadeFilter) -> (Float, Float, Float, Float) {
+    return (filter.config.fade_color_r, filter.config.fade_color_g,
+            filter.config.fade_color_b, filter.current_alpha)
+}
+
+// ============================================================================
+// Black & White Filter
+// ============================================================================
+
+struct BWConfig {
+    enabled: Bool,
+    saturation: Float,          // 0.0 = full B&W, 1.0 = full color
+    contrast: Float,            // Contrast adjustment
+    brightness: Float,          // Brightness adjustment
+    red_weight: Float,          // Luminance weights
+    green_weight: Float,
+    blue_weight: Float,
+    tint_r: Float,              // Optional tint color
+    tint_g: Float,
+    tint_b: Float,
+    tint_strength: Float,
+}
+
+fn default_bw_config() -> BWConfig {
+    return BWConfig {
+        enabled: false,
+        saturation: 0.0,
+        contrast: 1.0,
+        brightness: 0.0,
+        red_weight: 0.2126,     // Standard luminance weights
+        green_weight: 0.7152,
+        blue_weight: 0.0722,
+        tint_r: 1.0,
+        tint_g: 1.0,
+        tint_b: 1.0,
+        tint_strength: 0.0,
+    }
+}
+
+struct BWFilter {
+    config: BWConfig,
+
+    // Animation
+    target_saturation: Float,
+    saturation_speed: Float,
+    is_animating: Bool,
+}
+
+fn create_bw_filter() -> BWFilter {
+    return BWFilter {
+        config: default_bw_config(),
+        target_saturation: 0.0,
+        saturation_speed: 0.0,
+        is_animating: false,
+    }
+}
+
+/// Enable B&W effect
+fn enable_bw(filter: BWFilter) {
+    filter.config.enabled = true
+    filter.config.saturation = 0.0
+}
+
+/// Disable B&W effect
+fn disable_bw(filter: BWFilter) {
+    filter.config.enabled = false
+    filter.config.saturation = 1.0
+}
+
+/// Animate to B&W
+fn animate_to_bw(filter: BWFilter, duration: Float) {
+    filter.config.enabled = true
+    filter.target_saturation = 0.0
+    filter.saturation_speed = filter.config.saturation / duration
+    filter.is_animating = true
+}
+
+/// Animate to color
+fn animate_to_color(filter: BWFilter, duration: Float) {
+    filter.target_saturation = 1.0
+    filter.saturation_speed = (1.0 - filter.config.saturation) / duration
+    filter.is_animating = true
+}
+
+/// Set sepia tone
+fn set_sepia(filter: BWFilter) {
+    filter.config.enabled = true
+    filter.config.saturation = 0.0
+    filter.config.tint_r = 1.1
+    filter.config.tint_g = 0.9
+    filter.config.tint_b = 0.7
+    filter.config.tint_strength = 0.5
+}
+
+/// Update B&W filter
+fn update_bw(filter: BWFilter, delta: Float) {
+    if !filter.is_animating {
+        return
+    }
+
+    if filter.config.saturation < filter.target_saturation {
+        filter.config.saturation = filter.config.saturation + filter.saturation_speed * delta
+        if filter.config.saturation >= filter.target_saturation {
+            filter.config.saturation = filter.target_saturation
+            filter.is_animating = false
+        }
+    } else if filter.config.saturation > filter.target_saturation {
+        filter.config.saturation = filter.config.saturation - filter.saturation_speed * delta
+        if filter.config.saturation <= filter.target_saturation {
+            filter.config.saturation = filter.target_saturation
+            filter.is_animating = false
+
+            // Disable if fully colored
+            if filter.config.saturation >= 1.0 {
+                filter.config.enabled = false
+            }
+        }
+    }
+}
+
+/// Calculate B&W color
+fn apply_bw_color(filter: BWFilter, r: Float, g: Float, b: Float) -> (Float, Float, Float) {
+    if !filter.config.enabled {
+        return (r, g, b)
+    }
+
+    // Calculate luminance
+    let lum = r * filter.config.red_weight +
+              g * filter.config.green_weight +
+              b * filter.config.blue_weight
+
+    // Interpolate between original and luminance
+    let sat = filter.config.saturation
+    let out_r = lum + (r - lum) * sat
+    let out_g = lum + (g - lum) * sat
+    let out_b = lum + (b - lum) * sat
+
+    // Apply contrast
+    out_r = (out_r - 0.5) * filter.config.contrast + 0.5
+    out_g = (out_g - 0.5) * filter.config.contrast + 0.5
+    out_b = (out_b - 0.5) * filter.config.contrast + 0.5
+
+    // Apply brightness
+    out_r = out_r + filter.config.brightness
+    out_g = out_g + filter.config.brightness
+    out_b = out_b + filter.config.brightness
+
+    // Apply tint
+    if filter.config.tint_strength > 0.0 {
+        out_r = out_r + (filter.config.tint_r - out_r) * filter.config.tint_strength
+        out_g = out_g + (filter.config.tint_g - out_g) * filter.config.tint_strength
+        out_b = out_b + (filter.config.tint_b - out_b) * filter.config.tint_strength
+    }
+
+    // Clamp
+    if out_r < 0.0 { out_r = 0.0 }
+    if out_r > 1.0 { out_r = 1.0 }
+    if out_g < 0.0 { out_g = 0.0 }
+    if out_g > 1.0 { out_g = 1.0 }
+    if out_b < 0.0 { out_b = 0.0 }
+    if out_b > 1.0 { out_b = 1.0 }
+
+    return (out_r, out_g, out_b)
+}
+
+// ============================================================================
+// Post-Processing Manager
+// ============================================================================
+
+struct PostProcessManager {
+    // Filters
+    motion_blur: MotionBlurFilter,
+    crossfade: CrossFadeFilter,
+    bw: BWFilter,
+
+    // Screen shake
+    shake_enabled: Bool,
+    shake_intensity: Float,
+    shake_duration: Float,
+    shake_time: Float,
+    shake_offset_x: Float,
+    shake_offset_y: Float,
+
+    // Vignette
+    vignette_enabled: Bool,
+    vignette_intensity: Float,
+    vignette_radius: Float,
+
+    // Film grain
+    grain_enabled: Bool,
+    grain_intensity: Float,
+    grain_time: Float,
+
+    // Bloom
+    bloom_enabled: Bool,
+    bloom_threshold: Float,
+    bloom_intensity: Float,
+    bloom_radius: Float,
+}
+
+fn create_post_process_manager() -> PostProcessManager {
+    return PostProcessManager {
+        motion_blur: create_motion_blur_filter(),
+        crossfade: create_crossfade_filter(),
+        bw: create_bw_filter(),
+        shake_enabled: false,
+        shake_intensity: 0.0,
+        shake_duration: 0.0,
+        shake_time: 0.0,
+        shake_offset_x: 0.0,
+        shake_offset_y: 0.0,
+        vignette_enabled: false,
+        vignette_intensity: 0.5,
+        vignette_radius: 0.5,
+        grain_enabled: false,
+        grain_intensity: 0.1,
+        grain_time: 0.0,
+        bloom_enabled: false,
+        bloom_threshold: 0.8,
+        bloom_intensity: 1.0,
+        bloom_radius: 4.0,
+    }
+}
+
+/// Start screen shake
+fn start_screen_shake(mgr: PostProcessManager, intensity: Float, duration: Float) {
+    mgr.shake_enabled = true
+    mgr.shake_intensity = intensity
+    mgr.shake_duration = duration
+    mgr.shake_time = 0.0
+}
+
+/// Stop screen shake
+fn stop_screen_shake(mgr: PostProcessManager) {
+    mgr.shake_enabled = false
+    mgr.shake_offset_x = 0.0
+    mgr.shake_offset_y = 0.0
+}
+
+/// Enable vignette
+fn enable_vignette(mgr: PostProcessManager, intensity: Float, radius: Float) {
+    mgr.vignette_enabled = true
+    mgr.vignette_intensity = intensity
+    mgr.vignette_radius = radius
+}
+
+/// Enable film grain
+fn enable_film_grain(mgr: PostProcessManager, intensity: Float) {
+    mgr.grain_enabled = true
+    mgr.grain_intensity = intensity
+}
+
+/// Enable bloom
+fn enable_bloom(mgr: PostProcessManager, threshold: Float, intensity: Float, radius: Float) {
+    mgr.bloom_enabled = true
+    mgr.bloom_threshold = threshold
+    mgr.bloom_intensity = intensity
+    mgr.bloom_radius = radius
+}
+
+/// Update all post-processing effects
+fn update_post_processing(mgr: PostProcessManager, delta: Float) {
+    // Update motion blur
+    // (velocity buffer updated externally)
+
+    // Update crossfade
+    update_crossfade(mgr.crossfade, delta)
+
+    // Update B&W
+    update_bw(mgr.bw, delta)
+
+    // Update screen shake
+    if mgr.shake_enabled {
+        mgr.shake_time = mgr.shake_time + delta
+        if mgr.shake_time >= mgr.shake_duration {
+            stop_screen_shake(mgr)
+        } else {
+            // Decaying shake
+            let decay = 1.0 - (mgr.shake_time / mgr.shake_duration)
+            let intensity = mgr.shake_intensity * decay
+
+            // Random offset (using time as pseudo-random)
+            mgr.shake_offset_x = sin_approx(mgr.shake_time * 50.0) * intensity
+            mgr.shake_offset_y = cos_approx(mgr.shake_time * 47.0) * intensity
+        }
+    }
+
+    // Update film grain time
+    if mgr.grain_enabled {
+        mgr.grain_time = mgr.grain_time + delta
+    }
+}
+
+/// Get current shake offset
+fn get_shake_offset(mgr: PostProcessManager) -> (Float, Float) {
+    return (mgr.shake_offset_x, mgr.shake_offset_y)
+}
+
+/// Get vignette at UV position
+fn get_vignette(mgr: PostProcessManager, u: Float, v: Float) -> Float {
+    if !mgr.vignette_enabled {
+        return 1.0
+    }
+
+    // Distance from center
+    let dx = u - 0.5
+    let dy = v - 0.5
+    let dist = sqrt(dx * dx + dy * dy) * 2.0  // 0 to ~1.414
+
+    // Vignette falloff
+    let vignette = 1.0 - (dist - mgr.vignette_radius) * mgr.vignette_intensity
+    if vignette < 0.0 { vignette = 0.0 }
+    if vignette > 1.0 { vignette = 1.0 }
+
+    return vignette
+}
+
+/// Get film grain at position
+fn get_film_grain(mgr: PostProcessManager, u: Float, v: Float) -> Float {
+    if !mgr.grain_enabled {
+        return 0.0
+    }
+
+    // Simple noise based on position and time
+    let noise = sin_approx(u * 1000.0 + mgr.grain_time * 100.0) *
+                cos_approx(v * 1000.0 + mgr.grain_time * 97.0) * 0.5 + 0.5
+
+    return (noise - 0.5) * mgr.grain_intensity
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+fn cos_approx(angle: Float) -> Float {
+    return sin_approx(angle + 1.5708)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_motion_blur() -> Bool {
+    let filter = create_motion_blur_filter()
+    filter.config.enabled = true
+    filter.config.strength = 0.5
+
+    init_velocity_buffer(filter, 64, 64)
+    set_pixel_velocity(filter, 32, 32, 10.0, 5.0)
+
+    let blur = get_blur_amount(filter, 32, 32)
+    assert(blur.0 != 0.0, "Should have blur X")
+    assert(blur.1 != 0.0, "Should have blur Y")
+
+    return true
+}
+
+fn test_crossfade() -> Bool {
+    let filter = create_crossfade_filter()
+
+    // Fade to black
+    fade_to_black(filter, 1.0)
+    assert(filter.is_active == true, "Should be active")
+
+    // Update
+    for i in 0..15 {
+        update_crossfade(filter, 0.1)
+    }
+
+    let color = get_fade_color(filter)
+    assert(color.3 == 1.0, "Should be fully faded")
+
+    return true
+}
+
+fn test_fade_from_black() -> Bool {
+    let filter = create_crossfade_filter()
+
+    fade_from_black(filter, 1.0)
+    assert(filter.current_alpha == 1.0, "Should start at black")
+
+    for i in 0..15 {
+        update_crossfade(filter, 0.1)
+    }
+
+    let color = get_fade_color(filter)
+    assert(color.3 == 0.0, "Should be fully visible")
+
+    return true
+}
+
+fn test_bw_effect() -> Bool {
+    let filter = create_bw_filter()
+    enable_bw(filter)
+
+    let result = apply_bw_color(filter, 1.0, 0.5, 0.0)
+
+    // Should be grayscale
+    assert(result.0 == result.1, "R should equal G")
+    assert(result.1 == result.2, "G should equal B")
+
+    return true
+}
+
+fn test_bw_animation() -> Bool {
+    let filter = create_bw_filter()
+    filter.config.saturation = 1.0
+
+    animate_to_bw(filter, 1.0)
+    assert(filter.is_animating == true, "Should be animating")
+
+    for i in 0..15 {
+        update_bw(filter, 0.1)
+    }
+
+    assert(filter.config.saturation == 0.0, "Should be fully B&W")
+
+    return true
+}
+
+fn test_screen_shake() -> Bool {
+    let mgr = create_post_process_manager()
+
+    start_screen_shake(mgr, 10.0, 0.5)
+    assert(mgr.shake_enabled == true, "Should be shaking")
+
+    update_post_processing(mgr, 0.1)
+    let offset1 = get_shake_offset(mgr)
+    assert(offset1.0 != 0.0 || offset1.1 != 0.0, "Should have offset")
+
+    // Wait for shake to end
+    for i in 0..10 {
+        update_post_processing(mgr, 0.1)
+    }
+
+    assert(mgr.shake_enabled == false, "Shake should end")
+
+    return true
+}
+
+fn test_vignette() -> Bool {
+    let mgr = create_post_process_manager()
+
+    enable_vignette(mgr, 0.5, 0.5)
+
+    let center = get_vignette(mgr, 0.5, 0.5)
+    let corner = get_vignette(mgr, 0.0, 0.0)
+
+    assert(center > corner, "Center should be brighter than corner")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_motion_blur(), "Motion blur test failed")
+    assert(test_crossfade(), "Crossfade test failed")
+    assert(test_fade_from_black(), "Fade from black test failed")
+    assert(test_bw_effect(), "B&W effect test failed")
+    assert(test_bw_animation(), "B&W animation test failed")
+    assert(test_screen_shake(), "Screen shake test failed")
+    assert(test_vignette(), "Vignette test failed")
+    return true
+}

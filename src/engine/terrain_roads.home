@@ -1,0 +1,679 @@
+// Terrain Roads - Road Rendering System
+// Based on Thyme engine TerrainRoads
+// Handles road splines, texture mapping, and road mesh generation
+
+from basics import Collection, Map
+
+// ============================================================================
+// Road Configuration
+// ============================================================================
+
+enum RoadType {
+    Dirt,               // Unpaved roads
+    Paved,              // Asphalt roads
+    Concrete,           // Heavy-duty roads
+    Highway,            // Multi-lane highways
+    Bridge,             // Bridge surface
+    Runway,             // Airfield runway
+}
+
+enum RoadCap {
+    None,               // No end cap
+    Round,              // Rounded end
+    Square,             // Square end
+    Taper,              // Tapered end
+}
+
+struct RoadSegment {
+    segment_id: Int,
+
+    // Start point
+    start_x: Float,
+    start_y: Float,
+    start_z: Float,
+
+    // End point
+    end_x: Float,
+    end_y: Float,
+    end_z: Float,
+
+    // Control points for curves (Bezier)
+    ctrl1_x: Float,
+    ctrl1_y: Float,
+    ctrl2_x: Float,
+    ctrl2_y: Float,
+
+    // Properties
+    width: Float,
+    road_type: RoadType,
+    is_curved: Bool,
+
+    // Connections
+    prev_segment: Int,
+    next_segment: Int,
+
+    // Visual
+    texture_offset: Float,
+    texture_scale: Float,
+}
+
+fn create_road_segment(id: Int) -> RoadSegment {
+    return RoadSegment {
+        segment_id: id,
+        start_x: 0.0,
+        start_y: 0.0,
+        start_z: 0.0,
+        end_x: 0.0,
+        end_y: 0.0,
+        end_z: 0.0,
+        ctrl1_x: 0.0,
+        ctrl1_y: 0.0,
+        ctrl2_x: 0.0,
+        ctrl2_y: 0.0,
+        width: 10.0,
+        road_type: RoadType::Paved,
+        is_curved: false,
+        prev_segment: -1,
+        next_segment: -1,
+        texture_offset: 0.0,
+        texture_scale: 1.0,
+    }
+}
+
+struct RoadVertex {
+    x: Float,
+    y: Float,
+    z: Float,
+    u: Float,
+    v: Float,
+    normal_x: Float,
+    normal_y: Float,
+    normal_z: Float,
+}
+
+fn create_road_vertex(x: Float, y: Float, z: Float) -> RoadVertex {
+    return RoadVertex {
+        x: x,
+        y: y,
+        z: z,
+        u: 0.0,
+        v: 0.0,
+        normal_x: 0.0,
+        normal_y: 0.0,
+        normal_z: 1.0,
+    }
+}
+
+struct RoadConfig {
+    // Segment settings
+    segments_per_curve: Int,        // Tessellation for curves
+    height_offset: Float,           // Offset above terrain
+
+    // Default widths by type
+    dirt_width: Float,
+    paved_width: Float,
+    concrete_width: Float,
+    highway_width: Float,
+
+    // Texture settings
+    texture_length: Float,          // Road texture repeat length
+
+    // Visual
+    enable_decals: Bool,
+    decal_fade_start: Float,
+    decal_fade_end: Float,
+}
+
+fn default_road_config() -> RoadConfig {
+    return RoadConfig {
+        segments_per_curve: 16,
+        height_offset: 0.1,
+        dirt_width: 8.0,
+        paved_width: 10.0,
+        concrete_width: 12.0,
+        highway_width: 20.0,
+        texture_length: 20.0,
+        enable_decals: true,
+        decal_fade_start: 100.0,
+        decal_fade_end: 200.0,
+    }
+}
+
+// ============================================================================
+// Road Network
+// ============================================================================
+
+struct RoadJunction {
+    junction_id: Int,
+    x: Float,
+    y: Float,
+    z: Float,
+    connected_segments: Collection<Int>,
+    junction_type: Int,             // 2-way, 3-way, 4-way, etc.
+}
+
+fn create_junction(id: Int, x: Float, y: Float, z: Float) -> RoadJunction {
+    return RoadJunction {
+        junction_id: id,
+        x: x,
+        y: y,
+        z: z,
+        connected_segments: Collection<Int>{},
+        junction_type: 0,
+    }
+}
+
+struct RoadNetwork {
+    config: RoadConfig,
+
+    // Segments
+    segments: Collection<RoadSegment>,
+    segment_map: Map<Int, Int>,     // id -> index
+
+    // Junctions
+    junctions: Collection<RoadJunction>,
+
+    // Mesh data
+    vertices: Collection<RoadVertex>,
+    indices: Collection<Int>,
+
+    // By type
+    segments_by_type: Map<RoadType, Collection<Int>>,
+
+    // ID tracking
+    next_segment_id: Int,
+    next_junction_id: Int,
+}
+
+fn create_road_network() -> RoadNetwork {
+    return RoadNetwork {
+        config: default_road_config(),
+        segments: Collection<RoadSegment>{},
+        segment_map: Map<Int, Int>{},
+        junctions: Collection<RoadJunction>{},
+        vertices: Collection<RoadVertex>{},
+        indices: Collection<Int>{},
+        segments_by_type: Map<RoadType, Collection<Int>>{},
+        next_segment_id: 1,
+        next_junction_id: 1,
+    }
+}
+
+// ============================================================================
+// Road Creation
+// ============================================================================
+
+/// Add a straight road segment
+fn add_road_segment(network: RoadNetwork, start_x: Float, start_y: Float, start_z: Float,
+                    end_x: Float, end_y: Float, end_z: Float,
+                    width: Float, road_type: RoadType) -> Int {
+    let segment = create_road_segment(network.next_segment_id)
+    network.next_segment_id = network.next_segment_id + 1
+
+    segment.start_x = start_x
+    segment.start_y = start_y
+    segment.start_z = start_z + network.config.height_offset
+    segment.end_x = end_x
+    segment.end_y = end_y
+    segment.end_z = end_z + network.config.height_offset
+    segment.width = width
+    segment.road_type = road_type
+    segment.is_curved = false
+
+    let idx = network.segments.len()
+    network.segments.add(segment)
+    network.segment_map.set(segment.segment_id, idx)
+
+    // Track by type
+    if !network.segments_by_type.has(road_type) {
+        network.segments_by_type.set(road_type, Collection<Int>{})
+    }
+    network.segments_by_type.get(road_type).add(segment.segment_id)
+
+    return segment.segment_id
+}
+
+/// Add a curved road segment
+fn add_curved_road(network: RoadNetwork, start_x: Float, start_y: Float, start_z: Float,
+                   end_x: Float, end_y: Float, end_z: Float,
+                   ctrl1_x: Float, ctrl1_y: Float, ctrl2_x: Float, ctrl2_y: Float,
+                   width: Float, road_type: RoadType) -> Int {
+    let segment = create_road_segment(network.next_segment_id)
+    network.next_segment_id = network.next_segment_id + 1
+
+    segment.start_x = start_x
+    segment.start_y = start_y
+    segment.start_z = start_z + network.config.height_offset
+    segment.end_x = end_x
+    segment.end_y = end_y
+    segment.end_z = end_z + network.config.height_offset
+    segment.ctrl1_x = ctrl1_x
+    segment.ctrl1_y = ctrl1_y
+    segment.ctrl2_x = ctrl2_x
+    segment.ctrl2_y = ctrl2_y
+    segment.width = width
+    segment.road_type = road_type
+    segment.is_curved = true
+
+    let idx = network.segments.len()
+    network.segments.add(segment)
+    network.segment_map.set(segment.segment_id, idx)
+
+    if !network.segments_by_type.has(road_type) {
+        network.segments_by_type.set(road_type, Collection<Int>{})
+    }
+    network.segments_by_type.get(road_type).add(segment.segment_id)
+
+    return segment.segment_id
+}
+
+/// Connect two segments
+fn connect_segments(network: RoadNetwork, seg1_id: Int, seg2_id: Int) {
+    if !network.segment_map.has(seg1_id) || !network.segment_map.has(seg2_id) {
+        return
+    }
+
+    let idx1 = network.segment_map.get(seg1_id)
+    let idx2 = network.segment_map.get(seg2_id)
+
+    let seg1 = network.segments.get(idx1)
+    let seg2 = network.segments.get(idx2)
+
+    seg1.next_segment = seg2_id
+    seg2.prev_segment = seg1_id
+}
+
+/// Create a junction
+fn add_junction(network: RoadNetwork, x: Float, y: Float, z: Float) -> Int {
+    let junction = create_junction(network.next_junction_id, x, y, z)
+    network.next_junction_id = network.next_junction_id + 1
+    network.junctions.add(junction)
+    return junction.junction_id
+}
+
+/// Connect segment to junction
+fn connect_to_junction(network: RoadNetwork, segment_id: Int, junction_id: Int) {
+    for i in 0..network.junctions.len() {
+        let junction = network.junctions.get(i)
+        if junction.junction_id == junction_id {
+            junction.connected_segments.add(segment_id)
+            junction.junction_type = junction.connected_segments.len()
+            break
+        }
+    }
+}
+
+// ============================================================================
+// Mesh Generation
+// ============================================================================
+
+/// Generate mesh for all roads
+fn generate_road_mesh(network: RoadNetwork, get_height: fn(Float, Float) -> Float) {
+    network.vertices = Collection<RoadVertex>{}
+    network.indices = Collection<Int>{}
+
+    for i in 0..network.segments.len() {
+        let segment = network.segments.get(i)
+        generate_segment_mesh(network, segment, get_height)
+    }
+
+    // Generate junction meshes
+    for i in 0..network.junctions.len() {
+        let junction = network.junctions.get(i)
+        if junction.connected_segments.len() >= 3 {
+            generate_junction_mesh(network, junction, get_height)
+        }
+    }
+}
+
+/// Generate mesh for a single segment
+fn generate_segment_mesh(network: RoadNetwork, segment: RoadSegment, get_height: fn(Float, Float) -> Float) {
+    let num_steps = 2
+    if segment.is_curved {
+        num_steps = network.config.segments_per_curve
+    }
+
+    let half_width = segment.width / 2.0
+    let accumulated_length = 0.0
+
+    for step in 0..num_steps + 1 {
+        let t = step as Float / num_steps as Float
+
+        // Get point along road
+        let pos = get_road_point(segment, t)
+        let px = pos.0
+        let py = pos.1
+
+        // Get terrain height
+        let pz = get_height(px, py) + network.config.height_offset
+
+        // Get direction
+        let dir = get_road_direction(segment, t)
+        let dx = dir.0
+        let dy = dir.1
+
+        // Perpendicular for width
+        let perp_x = -dy
+        let perp_y = dx
+
+        // Calculate length for texture coordinate
+        if step > 0 {
+            let prev_pos = get_road_point(segment, (step - 1) as Float / num_steps as Float)
+            let seg_dx = px - prev_pos.0
+            let seg_dy = py - prev_pos.1
+            accumulated_length = accumulated_length + sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
+        }
+
+        let v_coord = (segment.texture_offset + accumulated_length) / network.config.texture_length * segment.texture_scale
+
+        // Left vertex
+        let v_left = create_road_vertex(
+            px + perp_x * half_width,
+            py + perp_y * half_width,
+            pz
+        )
+        v_left.u = 0.0
+        v_left.v = v_coord
+
+        // Right vertex
+        let v_right = create_road_vertex(
+            px - perp_x * half_width,
+            py - perp_y * half_width,
+            pz
+        )
+        v_right.u = 1.0
+        v_right.v = v_coord
+
+        // Add vertices
+        let base_idx = network.vertices.len()
+        network.vertices.add(v_left)
+        network.vertices.add(v_right)
+
+        // Add indices for quad (two triangles)
+        if step > 0 {
+            let prev_left = base_idx - 2
+            let prev_right = base_idx - 1
+            let curr_left = base_idx
+            let curr_right = base_idx + 1
+
+            // Triangle 1
+            network.indices.add(prev_left)
+            network.indices.add(curr_left)
+            network.indices.add(prev_right)
+
+            // Triangle 2
+            network.indices.add(prev_right)
+            network.indices.add(curr_left)
+            network.indices.add(curr_right)
+        }
+    }
+}
+
+/// Generate mesh for junction (circular intersection)
+fn generate_junction_mesh(network: RoadNetwork, junction: RoadJunction, get_height: fn(Float, Float) -> Float) {
+    let radius = 15.0  // Junction radius
+    let segments = 16
+
+    let center_idx = network.vertices.len()
+
+    // Center vertex
+    let center = create_road_vertex(junction.x, junction.y, junction.z)
+    center.u = 0.5
+    center.v = 0.5
+    network.vertices.add(center)
+
+    // Outer ring
+    for i in 0..segments {
+        let angle = i as Float * 6.28318 / segments as Float
+        let x = junction.x + cos_approx(angle) * radius
+        let y = junction.y + sin_approx(angle) * radius
+        let z = get_height(x, y) + network.config.height_offset
+
+        let v = create_road_vertex(x, y, z)
+        v.u = 0.5 + cos_approx(angle) * 0.5
+        v.v = 0.5 + sin_approx(angle) * 0.5
+        network.vertices.add(v)
+
+        // Triangle from center
+        if i > 0 {
+            network.indices.add(center_idx)
+            network.indices.add(center_idx + i)
+            network.indices.add(center_idx + i + 1)
+        }
+    }
+
+    // Close the circle
+    network.indices.add(center_idx)
+    network.indices.add(center_idx + segments)
+    network.indices.add(center_idx + 1)
+}
+
+/// Get point along road segment (0 to 1)
+fn get_road_point(segment: RoadSegment, t: Float) -> (Float, Float) {
+    if !segment.is_curved {
+        // Linear interpolation
+        let x = segment.start_x + (segment.end_x - segment.start_x) * t
+        let y = segment.start_y + (segment.end_y - segment.start_y) * t
+        return (x, y)
+    }
+
+    // Cubic Bezier curve
+    let t2 = t * t
+    let t3 = t2 * t
+    let mt = 1.0 - t
+    let mt2 = mt * mt
+    let mt3 = mt2 * mt
+
+    let x = mt3 * segment.start_x +
+            3.0 * mt2 * t * segment.ctrl1_x +
+            3.0 * mt * t2 * segment.ctrl2_x +
+            t3 * segment.end_x
+
+    let y = mt3 * segment.start_y +
+            3.0 * mt2 * t * segment.ctrl1_y +
+            3.0 * mt * t2 * segment.ctrl2_y +
+            t3 * segment.end_y
+
+    return (x, y)
+}
+
+/// Get direction along road segment (normalized)
+fn get_road_direction(segment: RoadSegment, t: Float) -> (Float, Float) {
+    if !segment.is_curved {
+        let dx = segment.end_x - segment.start_x
+        let dy = segment.end_y - segment.start_y
+        let len = sqrt(dx * dx + dy * dy)
+        if len > 0.0 {
+            return (dx / len, dy / len)
+        }
+        return (1.0, 0.0)
+    }
+
+    // Bezier derivative
+    let t2 = t * t
+    let mt = 1.0 - t
+    let mt2 = mt * mt
+
+    let dx = 3.0 * mt2 * (segment.ctrl1_x - segment.start_x) +
+             6.0 * mt * t * (segment.ctrl2_x - segment.ctrl1_x) +
+             3.0 * t2 * (segment.end_x - segment.ctrl2_x)
+
+    let dy = 3.0 * mt2 * (segment.ctrl1_y - segment.start_y) +
+             6.0 * mt * t * (segment.ctrl2_y - segment.ctrl1_y) +
+             3.0 * t2 * (segment.end_y - segment.ctrl2_y)
+
+    let len = sqrt(dx * dx + dy * dy)
+    if len > 0.0 {
+        return (dx / len, dy / len)
+    }
+    return (1.0, 0.0)
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get road segment count
+fn get_segment_count(network: RoadNetwork) -> Int {
+    return network.segments.len()
+}
+
+/// Get road at position
+fn get_road_at(network: RoadNetwork, x: Float, y: Float, max_dist: Float) -> Int {
+    let closest_id = -1
+    let closest_dist = max_dist
+
+    for i in 0..network.segments.len() {
+        let segment = network.segments.get(i)
+
+        // Simple distance check (more accurate would check along segment)
+        let cx = (segment.start_x + segment.end_x) / 2.0
+        let cy = (segment.start_y + segment.end_y) / 2.0
+
+        let dx = x - cx
+        let dy = y - cy
+        let dist = sqrt(dx * dx + dy * dy)
+
+        if dist < closest_dist {
+            closest_dist = dist
+            closest_id = segment.segment_id
+        }
+    }
+
+    return closest_id
+}
+
+/// Get segments by type
+fn get_roads_by_type(network: RoadNetwork, road_type: RoadType) -> Collection<Int> {
+    if network.segments_by_type.has(road_type) {
+        return network.segments_by_type.get(road_type)
+    }
+    return Collection<Int>{}
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin_approx(angle: Float) -> Float {
+    let x = angle
+    while x > 3.14159 { x = x - 6.28318 }
+    while x < -3.14159 { x = x + 6.28318 }
+    return x - x * x * x / 6.0 + x * x * x * x * x / 120.0
+}
+
+fn cos_approx(angle: Float) -> Float {
+    return sin_approx(angle + 1.5708)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_road_creation() -> Bool {
+    let network = create_road_network()
+
+    let id = add_road_segment(network, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 10.0, RoadType::Paved)
+    assert(id > 0, "Should create segment")
+    assert(get_segment_count(network) == 1, "Should have 1 segment")
+
+    return true
+}
+
+fn test_curved_road() -> Bool {
+    let network = create_road_network()
+
+    let id = add_curved_road(network, 0.0, 0.0, 0.0, 100.0, 100.0, 0.0,
+                             50.0, 0.0, 100.0, 50.0, 10.0, RoadType::Paved)
+
+    assert(id > 0, "Should create curved segment")
+
+    // Test point interpolation
+    if network.segment_map.has(id) {
+        let idx = network.segment_map.get(id)
+        let segment = network.segments.get(idx)
+
+        let start = get_road_point(segment, 0.0)
+        assert(start.0 == 0.0, "Start should be at origin")
+
+        let end = get_road_point(segment, 1.0)
+        assert(end.0 == 100.0, "End should be at 100")
+
+        let mid = get_road_point(segment, 0.5)
+        // Mid-point of bezier should not be exact center
+        assert(mid.0 > 30.0 && mid.0 < 70.0, "Mid should be between start and end")
+    }
+
+    return true
+}
+
+fn test_road_mesh() -> Bool {
+    let network = create_road_network()
+
+    add_road_segment(network, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 10.0, RoadType::Paved)
+
+    fn flat_height(x: Float, y: Float) -> Float {
+        return 0.0
+    }
+
+    generate_road_mesh(network, flat_height)
+
+    assert(network.vertices.len() > 0, "Should have vertices")
+    assert(network.indices.len() > 0, "Should have indices")
+
+    return true
+}
+
+fn test_road_connection() -> Bool {
+    let network = create_road_network()
+
+    let id1 = add_road_segment(network, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 10.0, RoadType::Paved)
+    let id2 = add_road_segment(network, 100.0, 0.0, 0.0, 200.0, 50.0, 0.0, 10.0, RoadType::Paved)
+
+    connect_segments(network, id1, id2)
+
+    let seg1 = network.segments.get(0)
+    let seg2 = network.segments.get(1)
+
+    assert(seg1.next_segment == id2, "Segment 1 should link to segment 2")
+    assert(seg2.prev_segment == id1, "Segment 2 should link back to segment 1")
+
+    return true
+}
+
+fn test_junction() -> Bool {
+    let network = create_road_network()
+
+    let j_id = add_junction(network, 100.0, 100.0, 0.0)
+
+    let id1 = add_road_segment(network, 0.0, 100.0, 0.0, 100.0, 100.0, 0.0, 10.0, RoadType::Paved)
+    let id2 = add_road_segment(network, 100.0, 100.0, 0.0, 200.0, 100.0, 0.0, 10.0, RoadType::Paved)
+    let id3 = add_road_segment(network, 100.0, 100.0, 0.0, 100.0, 200.0, 0.0, 10.0, RoadType::Paved)
+
+    connect_to_junction(network, id1, j_id)
+    connect_to_junction(network, id2, j_id)
+    connect_to_junction(network, id3, j_id)
+
+    assert(network.junctions.len() == 1, "Should have 1 junction")
+    assert(network.junctions.get(0).junction_type == 3, "Should be 3-way junction")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_road_creation(), "Road creation test failed")
+    assert(test_curved_road(), "Curved road test failed")
+    assert(test_road_mesh(), "Road mesh test failed")
+    assert(test_road_connection(), "Road connection test failed")
+    assert(test_junction(), "Junction test failed")
+    return true
+}

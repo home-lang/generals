@@ -1,7 +1,7 @@
 # Thyme Parity Implementation TODO
 
 **Goal**: Achieve 100% feature parity with Thyme engine (~/Code/thyme)
-**Current Status**: 166 Home files implemented (was 147, added 19 this session)
+**Current Status**: 180 Home files implemented (was 166, added 14 this session)
 **Target**: Full game functionality matching original C&C Generals Zero Hour
 
 ---
@@ -19,7 +19,7 @@
   - HealDelay, HealAmount, Radius
   - TriggeredBy conditions
 
-- [ ] `bridge_behavior.home` - Bridge destruction/repair logic
+- [x] `bridge_behavior.home` - Bridge destruction/repair logic ✓
   - Bridge segments
   - Damage thresholds
   - Collapse animation
@@ -31,11 +31,11 @@
   - Overcharge bonus
   - Destruction risk
 
-- [ ] `parking_place_behavior.home` - Aircraft parking/docking
+- [x] `parking_place_behavior.home` - Aircraft parking/docking ✓
   - Landing pad management
   - Aircraft queueing
 
-- [ ] `rebuild_hole_behavior.home` - Building foundation after destruction
+- [x] `rebuild_hole_behavior.home` - Building foundation after destruction ✓
   - Rebuild timer
   - Foundation visuals
 

@@ -1,0 +1,760 @@
+// Damage Module - Enhanced Damage Handling System
+// Based on Thyme engine DamageModule
+// Handles damage types, resistances, thresholds, and damage application
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, create_behavior_module, ModuleType
+
+// ============================================================================
+// Damage Types
+// ============================================================================
+
+enum DamageType {
+    // Standard damage types
+    Default,
+    Explosion,
+    Crush,
+    Armor_Piercing,
+    Small_Arms,
+    Gattling,
+    Radiation,
+    Flame,
+    Laser,
+    Sniper,
+    Poison,
+    Anthrax,
+
+    // Special damage types
+    Subdual,            // Non-lethal (affects morale)
+    Unresistable,       // Ignores all armor
+    Water,              // Drowning damage
+    Surrender,          // Forces surrender
+    JetMissile,         // Jet missile damage
+    JetInfantry,        // Strafing run damage
+    Stealthjet,         // Stealth jet damage
+    Aurora,             // Aurora bomber damage
+
+    // Status effects
+    Kill_Pilot,         // Directly kills pilot
+    Disguise,           // Reveals disguised units
+    Status_Clear,       // Clears status effects
+}
+
+enum ArmorType {
+    None,               // No armor
+    Infantry,           // Basic infantry armor
+    Light,              // Light vehicles
+    Medium,             // Medium tanks
+    Heavy,              // Heavy tanks
+    Aircraft,           // Air units
+    Helicopter,         // Rotary aircraft
+    Building,           // Structures
+    Bunker,             // Hardened structures
+    Tank_Destroyer,     // Anti-tank armor
+    Amphibious,         // Amphibious vehicles
+    Super,              // Superweapon structures
+}
+
+// ============================================================================
+// Damage Configuration
+// ============================================================================
+
+struct DamageResistance {
+    damage_type: DamageType,
+    resistance: Float,          // 0.0 = full damage, 1.0 = immune
+}
+
+fn create_resistance(damage_type: DamageType, resistance: Float) -> DamageResistance {
+    return DamageResistance {
+        damage_type: damage_type,
+        resistance: resistance,
+    }
+}
+
+struct DamageThreshold {
+    threshold_percent: Float,   // Health % to trigger
+    fx_list: String,            // FX to play
+    model_change: String,       // Model condition to set
+    ocl: String,                // Object Creation List to spawn
+}
+
+fn create_threshold(percent: Float, fx: String) -> DamageThreshold {
+    return DamageThreshold {
+        threshold_percent: percent,
+        fx_list: fx,
+        model_change: "",
+        ocl: "",
+    }
+}
+
+struct DamageModuleConfig {
+    // Base stats
+    max_health: Float,
+    initial_health: Float,
+
+    // Armor
+    armor_type: ArmorType,
+    base_armor: Float,              // Flat damage reduction
+
+    // Resistances
+    resistances: Collection<DamageResistance>,
+
+    // Thresholds
+    damage_thresholds: Collection<DamageThreshold>,
+
+    // Healing
+    can_be_healed: Bool,
+    heal_rate: Float,               // Passive heal per second
+    heal_delay: Float,              // Delay after damage before healing
+
+    // Death
+    death_type: DamageType,         // Preferred death animation type
+    can_be_repaired: Bool,
+    repair_cost_percent: Float,     // Cost as % of max health
+
+    // Special
+    immune_to_friendly_fire: Bool,
+    show_damage_fx: Bool,
+    damage_fx: String,
+}
+
+fn default_damage_config() -> DamageModuleConfig {
+    return DamageModuleConfig {
+        max_health: 100.0,
+        initial_health: 100.0,
+        armor_type: ArmorType::None,
+        base_armor: 0.0,
+        resistances: Collection<DamageResistance>{},
+        damage_thresholds: Collection<DamageThreshold>{},
+        can_be_healed: true,
+        heal_rate: 0.0,
+        heal_delay: 5.0,
+        death_type: DamageType::Default,
+        can_be_repaired: false,
+        repair_cost_percent: 0.5,
+        immune_to_friendly_fire: false,
+        show_damage_fx: true,
+        damage_fx: "FX_HitEffect",
+    }
+}
+
+// ============================================================================
+// Pre-built Armor Configurations
+// ============================================================================
+
+fn create_infantry_damage_config() -> DamageModuleConfig {
+    let config = default_damage_config()
+    config.max_health = 100.0
+    config.armor_type = ArmorType::Infantry
+    config.base_armor = 0.0
+
+    // Infantry resistances
+    config.resistances.add(create_resistance(DamageType::Explosion, 0.5))   // 50% resistance
+    config.resistances.add(create_resistance(DamageType::Crush, -0.5))      // 50% extra damage
+    config.resistances.add(create_resistance(DamageType::Sniper, -1.0))     // Double damage
+
+    // Thresholds
+    config.damage_thresholds.add(create_threshold(0.5, "FX_InfantryWounded"))
+
+    return config
+}
+
+fn create_tank_damage_config() -> DamageModuleConfig {
+    let config = default_damage_config()
+    config.max_health = 400.0
+    config.armor_type = ArmorType::Heavy
+    config.base_armor = 25.0
+    config.can_be_repaired = true
+
+    // Tank resistances
+    config.resistances.add(create_resistance(DamageType::Small_Arms, 0.9))  // 90% resistance
+    config.resistances.add(create_resistance(DamageType::Gattling, 0.75))   // 75% resistance
+    config.resistances.add(create_resistance(DamageType::Sniper, 0.95))     // 95% resistance
+    config.resistances.add(create_resistance(DamageType::Armor_Piercing, 0.0))  // No resistance
+
+    // Thresholds
+    config.damage_thresholds.add(create_threshold(0.75, "FX_TankDamagedLight"))
+    config.damage_thresholds.add(create_threshold(0.5, "FX_TankDamagedMedium"))
+    config.damage_thresholds.add(create_threshold(0.25, "FX_TankDamagedHeavy"))
+
+    return config
+}
+
+fn create_aircraft_damage_config() -> DamageModuleConfig {
+    let config = default_damage_config()
+    config.max_health = 200.0
+    config.armor_type = ArmorType::Aircraft
+    config.base_armor = 10.0
+    config.can_be_repaired = true
+
+    // Aircraft resistances
+    config.resistances.add(create_resistance(DamageType::Armor_Piercing, 0.3))
+    config.resistances.add(create_resistance(DamageType::Gattling, -0.25))  // Extra vulnerable
+
+    // Thresholds
+    config.damage_thresholds.add(create_threshold(0.5, "FX_AircraftDamaged"))
+    config.damage_thresholds.add(create_threshold(0.25, "FX_AircraftCritical"))
+
+    return config
+}
+
+fn create_building_damage_config() -> DamageModuleConfig {
+    let config = default_damage_config()
+    config.max_health = 2000.0
+    config.armor_type = ArmorType::Building
+    config.base_armor = 50.0
+    config.can_be_repaired = true
+
+    // Building resistances
+    config.resistances.add(create_resistance(DamageType::Small_Arms, 0.95))
+    config.resistances.add(create_resistance(DamageType::Sniper, 1.0))      // Immune
+    config.resistances.add(create_resistance(DamageType::Crush, 1.0))       // Immune
+
+    // Thresholds
+    config.damage_thresholds.add(create_threshold(0.75, "FX_BuildingDamaged1"))
+    config.damage_thresholds.add(create_threshold(0.5, "FX_BuildingDamaged2"))
+    config.damage_thresholds.add(create_threshold(0.25, "FX_BuildingDamaged3"))
+
+    return config
+}
+
+// ============================================================================
+// Damage Event
+// ============================================================================
+
+struct DamageEvent {
+    source_id: Int,
+    source_player_id: Int,
+    damage_type: DamageType,
+    raw_damage: Float,
+    final_damage: Float,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    is_critical: Bool,
+    is_from_behind: Bool,
+}
+
+fn create_damage_event(source_id: Int, damage_type: DamageType, damage: Float) -> DamageEvent {
+    return DamageEvent {
+        source_id: source_id,
+        source_player_id: 0,
+        damage_type: damage_type,
+        raw_damage: damage,
+        final_damage: damage,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        is_critical: false,
+        is_from_behind: false,
+    }
+}
+
+// ============================================================================
+// Damage Module
+// ============================================================================
+
+struct DamageModule {
+    base: BehaviorModule,
+    config: DamageModuleConfig,
+
+    // Health state
+    current_health: Float,
+    max_health: Float,
+
+    // Damage tracking
+    damage_received: Float,
+    time_since_damage: Float,
+
+    // Threshold tracking
+    triggered_thresholds: Collection<Float>,
+
+    // Status
+    is_alive: Bool,
+    is_repairing: Bool,
+    repair_progress: Float,
+
+    // Damage history (for tracking)
+    recent_damage: Collection<DamageEvent>,
+    total_damage_taken: Float,
+    kill_source_id: Int,
+    kill_damage_type: DamageType,
+}
+
+fn create_damage_module(tag: String) -> DamageModule {
+    let config = default_damage_config()
+    return DamageModule {
+        base: create_behavior_module(tag, ModuleType::Damage),
+        config: config,
+        current_health: config.initial_health,
+        max_health: config.max_health,
+        damage_received: 0.0,
+        time_since_damage: 999.0,
+        triggered_thresholds: Collection<Float>{},
+        is_alive: true,
+        is_repairing: false,
+        repair_progress: 0.0,
+        recent_damage: Collection<DamageEvent>{},
+        total_damage_taken: 0.0,
+        kill_source_id: 0,
+        kill_damage_type: DamageType::Default,
+    }
+}
+
+fn create_damage_module_with_config(tag: String, config: DamageModuleConfig) -> DamageModule {
+    return DamageModule {
+        base: create_behavior_module(tag, ModuleType::Damage),
+        config: config,
+        current_health: config.initial_health,
+        max_health: config.max_health,
+        damage_received: 0.0,
+        time_since_damage: 999.0,
+        triggered_thresholds: Collection<Float>{},
+        is_alive: true,
+        is_repairing: false,
+        repair_progress: 0.0,
+        recent_damage: Collection<DamageEvent>{},
+        total_damage_taken: 0.0,
+        kill_source_id: 0,
+        kill_damage_type: DamageType::Default,
+    }
+}
+
+// ============================================================================
+// Damage Calculation
+// ============================================================================
+
+/// Get resistance for damage type
+fn get_resistance(module: DamageModule, damage_type: DamageType) -> Float {
+    for resistance in module.config.resistances {
+        if resistance.damage_type == damage_type {
+            return resistance.resistance
+        }
+    }
+    return 0.0  // No resistance
+}
+
+/// Calculate final damage after armor and resistances
+fn calculate_damage(module: DamageModule, event: DamageEvent) -> Float {
+    let damage = event.raw_damage
+
+    // Check for unresistable damage
+    if event.damage_type == DamageType::Unresistable {
+        return damage
+    }
+
+    // Apply base armor
+    damage = damage - module.config.base_armor
+    if damage < 0.0 {
+        damage = 0.0
+    }
+
+    // Apply resistance
+    let resistance = get_resistance(module, event.damage_type)
+    damage = damage * (1.0 - resistance)
+
+    // Minimum damage (1 if any damage was dealt)
+    if event.raw_damage > 0.0 && damage < 1.0 {
+        damage = 1.0
+    }
+
+    // Critical hit bonus
+    if event.is_critical {
+        damage = damage * 1.5
+    }
+
+    // Behind bonus
+    if event.is_from_behind {
+        damage = damage * 1.25
+    }
+
+    return damage
+}
+
+// ============================================================================
+// Damage Application
+// ============================================================================
+
+/// Apply damage to module
+fn apply_damage(module: DamageModule, event: DamageEvent) -> (Float, Bool, Collection<String>) {
+    // Returns (damage_dealt, is_dead, fx_list_to_play)
+    let fx_to_play = Collection<String>{}
+
+    if !module.is_alive {
+        return (0.0, false, fx_to_play)
+    }
+
+    // Calculate final damage
+    let final_damage = calculate_damage(module, event)
+    event.final_damage = final_damage
+
+    // Apply damage
+    module.current_health = module.current_health - final_damage
+    module.damage_received = module.damage_received + final_damage
+    module.total_damage_taken = module.total_damage_taken + final_damage
+    module.time_since_damage = 0.0
+
+    // Track damage event
+    module.recent_damage.add(event)
+    if module.recent_damage.len() > 10 {
+        // Keep only last 10 events
+        let new_recent = Collection<DamageEvent>{}
+        for i in 1..module.recent_damage.len() {
+            new_recent.add(module.recent_damage.get(i))
+        }
+        module.recent_damage = new_recent
+    }
+
+    // Show damage FX
+    if module.config.show_damage_fx {
+        fx_to_play.add(module.config.damage_fx)
+    }
+
+    // Check thresholds
+    let health_percent = module.current_health / module.max_health
+
+    for threshold in module.config.damage_thresholds {
+        if health_percent <= threshold.threshold_percent {
+            // Check if already triggered
+            let already_triggered = false
+            for t in module.triggered_thresholds {
+                if t == threshold.threshold_percent {
+                    already_triggered = true
+                    break
+                }
+            }
+
+            if !already_triggered {
+                module.triggered_thresholds.add(threshold.threshold_percent)
+                if threshold.fx_list.len() > 0 {
+                    fx_to_play.add(threshold.fx_list)
+                }
+            }
+        }
+    }
+
+    // Check for death
+    if module.current_health <= 0.0 {
+        module.current_health = 0.0
+        module.is_alive = false
+        module.kill_source_id = event.source_id
+        module.kill_damage_type = event.damage_type
+        return (final_damage, true, fx_to_play)
+    }
+
+    return (final_damage, false, fx_to_play)
+}
+
+/// Apply healing
+fn apply_healing(module: DamageModule, amount: Float) -> Float {
+    if !module.is_alive || !module.config.can_be_healed {
+        return 0.0
+    }
+
+    let actual_heal = amount
+    if module.current_health + actual_heal > module.max_health {
+        actual_heal = module.max_health - module.current_health
+    }
+
+    module.current_health = module.current_health + actual_heal
+
+    // Reset triggered thresholds that we're above now
+    let new_triggered = Collection<Float>{}
+    let health_percent = module.current_health / module.max_health
+    for t in module.triggered_thresholds {
+        if health_percent < t {
+            new_triggered.add(t)
+        }
+    }
+    module.triggered_thresholds = new_triggered
+
+    return actual_heal
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update damage module
+fn update_damage(module: DamageModule, delta: Float) {
+    if !module.is_alive {
+        return
+    }
+
+    module.time_since_damage = module.time_since_damage + delta
+
+    // Passive healing
+    if module.config.heal_rate > 0.0 && module.time_since_damage >= module.config.heal_delay {
+        apply_healing(module, module.config.heal_rate * delta)
+    }
+}
+
+// ============================================================================
+// Repair System
+// ============================================================================
+
+/// Start repair
+fn start_repair(module: DamageModule) -> Bool {
+    if !module.is_alive || !module.config.can_be_repaired {
+        return false
+    }
+
+    if module.current_health >= module.max_health {
+        return false  // Already full health
+    }
+
+    module.is_repairing = true
+    module.repair_progress = 0.0
+    return true
+}
+
+/// Update repair
+fn update_repair(module: DamageModule, repair_rate: Float, delta: Float) -> Float {
+    // Returns cost of repair this frame
+    if !module.is_repairing {
+        return 0.0
+    }
+
+    let repair_amount = repair_rate * delta
+    let actual_repair = apply_healing(module, repair_amount)
+
+    // Calculate cost
+    let cost = actual_repair * module.config.repair_cost_percent
+
+    // Update progress
+    module.repair_progress = module.current_health / module.max_health
+
+    // Check if complete
+    if module.current_health >= module.max_health {
+        module.is_repairing = false
+    }
+
+    return cost
+}
+
+/// Cancel repair
+fn cancel_repair(module: DamageModule) {
+    module.is_repairing = false
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get health percentage
+fn get_health_percent(module: DamageModule) -> Float {
+    return module.current_health / module.max_health
+}
+
+/// Check if damaged
+fn is_damaged(module: DamageModule) -> Bool {
+    return module.current_health < module.max_health
+}
+
+/// Check if critically damaged (below 25%)
+fn is_critical(module: DamageModule) -> Bool {
+    return get_health_percent(module) <= 0.25
+}
+
+/// Check if alive
+fn is_unit_alive(module: DamageModule) -> Bool {
+    return module.is_alive
+}
+
+/// Get effective armor against damage type
+fn get_effective_armor(module: DamageModule, damage_type: DamageType) -> Float {
+    let resistance = get_resistance(module, damage_type)
+    return module.config.base_armor + (resistance * 100.0)  // Return as percentage
+}
+
+/// Get recent damage sources
+fn get_recent_damage_sources(module: DamageModule) -> Collection<Int> {
+    let sources = Collection<Int>{}
+    for event in module.recent_damage {
+        if !sources.contains(event.source_id) {
+            sources.add(event.source_id)
+        }
+    }
+    return sources
+}
+
+/// Get kill info
+fn get_kill_info(module: DamageModule) -> (Int, DamageType) {
+    return (module.kill_source_id, module.kill_damage_type)
+}
+
+// ============================================================================
+// Damage Manager
+// ============================================================================
+
+struct DamageManager {
+    modules: Map<Int, DamageModule>,
+    next_id: Int,
+
+    // Statistics
+    total_damage_dealt: Float,
+    total_kills: Int,
+}
+
+fn create_damage_manager() -> DamageManager {
+    return DamageManager {
+        modules: Map<Int, DamageModule>{},
+        next_id: 1,
+        total_damage_dealt: 0.0,
+        total_kills: 0,
+    }
+}
+
+/// Register damage module
+fn register_damage_module(mgr: DamageManager, module: DamageModule) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    module.base.module_id = id
+    mgr.modules.set(id, module)
+    return id
+}
+
+/// Get damage module
+fn get_damage_module(mgr: DamageManager, id: Int) -> DamageModule {
+    if mgr.modules.has(id) {
+        return mgr.modules.get(id)
+    }
+    return create_damage_module("")
+}
+
+/// Process damage event
+fn process_damage(mgr: DamageManager, target_id: Int, event: DamageEvent) -> (Float, Bool) {
+    if !mgr.modules.has(target_id) {
+        return (0.0, false)
+    }
+
+    let module = mgr.modules.get(target_id)
+    let result = apply_damage(module, event)
+
+    mgr.total_damage_dealt = mgr.total_damage_dealt + result.0
+    if result.1 {
+        mgr.total_kills = mgr.total_kills + 1
+    }
+
+    return (result.0, result.1)
+}
+
+/// Update all modules
+fn update_all_damage(mgr: DamageManager, delta: Float) {
+    for id in mgr.modules.keys() {
+        let module = mgr.modules.get(id)
+        update_damage(module, delta)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_damage_creation() -> Bool {
+    let module = create_damage_module("TestDamage")
+
+    assert(module.current_health == 100.0, "Should have 100 health")
+    assert(module.is_alive == true, "Should be alive")
+    assert(get_health_percent(module) == 1.0, "Should be at 100%")
+
+    return true
+}
+
+fn test_damage_application() -> Bool {
+    let module = create_damage_module("DamageTest")
+
+    let event = create_damage_event(1, DamageType::Explosion, 30.0)
+    let result = apply_damage(module, event)
+
+    assert(result.0 == 30.0, "Should deal 30 damage")
+    assert(result.1 == false, "Should not be dead")
+    assert(module.current_health == 70.0, "Should have 70 health")
+
+    return true
+}
+
+fn test_resistance() -> Bool {
+    let config = create_tank_damage_config()
+    let module = create_damage_module_with_config("TankTest", config)
+
+    // Small arms should be resisted
+    let event = create_damage_event(1, DamageType::Small_Arms, 100.0)
+    let result = apply_damage(module, event)
+
+    // Tank has 25 base armor and 90% small arms resistance
+    // After armor: 75, after resistance: 7.5
+    assert(result.0 < 20.0, "Small arms should be heavily resisted")
+
+    return true
+}
+
+fn test_death() -> Bool {
+    let module = create_damage_module("DeathTest")
+    module.current_health = 50.0
+
+    let event = create_damage_event(100, DamageType::Explosion, 100.0)
+    let result = apply_damage(module, event)
+
+    assert(result.1 == true, "Should be dead")
+    assert(module.is_alive == false, "Should not be alive")
+    assert(module.kill_source_id == 100, "Kill source should be recorded")
+
+    return true
+}
+
+fn test_healing() -> Bool {
+    let module = create_damage_module("HealTest")
+    module.current_health = 50.0
+
+    let healed = apply_healing(module, 30.0)
+    assert(healed == 30.0, "Should heal 30")
+    assert(module.current_health == 80.0, "Should have 80 health")
+
+    // Can't over-heal
+    let healed2 = apply_healing(module, 50.0)
+    assert(healed2 == 20.0, "Should only heal 20")
+    assert(module.current_health == 100.0, "Should be at max")
+
+    return true
+}
+
+fn test_thresholds() -> Bool {
+    let config = default_damage_config()
+    config.damage_thresholds.add(create_threshold(0.5, "FX_HalfHealth"))
+    let module = create_damage_module_with_config("ThresholdTest", config)
+
+    // Damage below threshold
+    let event = create_damage_event(1, DamageType::Default, 60.0)
+    let result = apply_damage(module, event)
+
+    assert(result.2.len() > 0, "Should trigger threshold FX")
+
+    return true
+}
+
+fn test_passive_healing() -> Bool {
+    let config = default_damage_config()
+    config.heal_rate = 10.0
+    config.heal_delay = 1.0
+    let module = create_damage_module_with_config("PassiveHealTest", config)
+    module.current_health = 50.0
+    module.time_since_damage = 5.0  // Past heal delay
+
+    // Update should trigger passive healing
+    update_damage(module, 1.0)
+    assert(module.current_health == 60.0, "Should heal 10")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_damage_creation(), "Damage creation test failed")
+    assert(test_damage_application(), "Damage application test failed")
+    assert(test_resistance(), "Resistance test failed")
+    assert(test_death(), "Death test failed")
+    assert(test_healing(), "Healing test failed")
+    assert(test_thresholds(), "Thresholds test failed")
+    assert(test_passive_healing(), "Passive healing test failed")
+    return true
+}

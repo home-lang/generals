@@ -1,0 +1,628 @@
+// Parking Place Behavior - Aircraft Parking and Docking
+// Based on Thyme engine ParkingPlaceBehavior
+// Handles landing pad management, aircraft queueing, repair/rearm
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, create_behavior_module, ModuleType
+
+// ============================================================================
+// Parking Configuration
+// ============================================================================
+
+enum ParkingSpotState {
+    Empty,          // No aircraft
+    Reserved,       // Reserved for incoming aircraft
+    Occupied,       // Aircraft parked
+    Departing,      // Aircraft leaving
+}
+
+enum AircraftState {
+    Approaching,    // Flying to pad
+    Landing,        // Landing sequence
+    Parked,         // On the pad
+    Rearming,       // Being rearmed
+    Repairing,      // Being repaired
+    Refueling,      // Being refueled
+    TakingOff,      // Takeoff sequence
+    Departing,      // Left the pad
+}
+
+struct ParkingSpot {
+    spot_id: Int,
+    state: ParkingSpotState,
+    aircraft_id: Int,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    heading: Float,             // Direction aircraft faces when parked
+    approach_path_id: Int,      // Index into approach paths
+    departure_path_id: Int,     // Index into departure paths
+    is_vtol_only: Bool,         // Only VTOL aircraft can use
+    spot_size: Int,             // 1=small, 2=medium, 3=large
+}
+
+fn create_parking_spot(id: Int) -> ParkingSpot {
+    return ParkingSpot {
+        spot_id: id,
+        state: ParkingSpotState::Empty,
+        aircraft_id: 0,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        heading: 0.0,
+        approach_path_id: 0,
+        departure_path_id: 0,
+        is_vtol_only: false,
+        spot_size: 1,
+    }
+}
+
+struct AircraftInfo {
+    aircraft_id: Int,
+    state: AircraftState,
+    assigned_spot: Int,
+    ammo_current: Int,
+    ammo_max: Int,
+    health_current: Float,
+    health_max: Float,
+    fuel_current: Float,
+    fuel_max: Float,
+    is_vtol: Bool,
+    size_class: Int,
+    rearm_time_remaining: Float,
+    repair_time_remaining: Float,
+    refuel_time_remaining: Float,
+}
+
+fn create_aircraft_info(id: Int) -> AircraftInfo {
+    return AircraftInfo {
+        aircraft_id: id,
+        state: AircraftState::Approaching,
+        assigned_spot: -1,
+        ammo_current: 0,
+        ammo_max: 4,
+        health_current: 100.0,
+        health_max: 100.0,
+        fuel_current: 100.0,
+        fuel_max: 100.0,
+        is_vtol: false,
+        size_class: 1,
+        rearm_time_remaining: 0.0,
+        repair_time_remaining: 0.0,
+        refuel_time_remaining: 0.0,
+    }
+}
+
+struct ParkingConfig {
+    num_spots: Int,
+    heal_rate: Float,           // Health per second
+    rearm_rate: Float,          // Ammo per second
+    refuel_rate: Float,         // Fuel per second
+    approach_height: Float,     // Height for approach
+    landing_speed: Float,       // Speed during landing
+    takeoff_speed: Float,       // Speed during takeoff
+    queue_max_size: Int,        // Max aircraft waiting
+    auto_repair: Bool,          // Automatically repair
+    auto_rearm: Bool,           // Automatically rearm
+    auto_refuel: Bool,          // Automatically refuel
+    allows_vtol: Bool,          // Can VTOL aircraft use
+    allows_runway: Bool,        // Can runway aircraft use
+    fx_landing: String,
+    fx_takeoff: String,
+}
+
+fn default_parking_config() -> ParkingConfig {
+    return ParkingConfig {
+        num_spots: 4,
+        heal_rate: 10.0,
+        rearm_rate: 1.0,
+        refuel_rate: 20.0,
+        approach_height: 100.0,
+        landing_speed: 50.0,
+        takeoff_speed: 75.0,
+        queue_max_size: 8,
+        auto_repair: true,
+        auto_rearm: true,
+        auto_refuel: true,
+        allows_vtol: true,
+        allows_runway: true,
+        fx_landing: "FX_AircraftLand",
+        fx_takeoff: "FX_AircraftTakeoff",
+    }
+}
+
+// ============================================================================
+// Parking Place Behavior
+// ============================================================================
+
+struct ParkingPlaceBehavior {
+    base: BehaviorModule,
+    config: ParkingConfig,
+
+    // Spots
+    spots: Collection<ParkingSpot>,
+
+    // Aircraft tracking
+    aircraft: Map<Int, AircraftInfo>,
+    queue: Collection<Int>,     // Aircraft waiting for spot
+
+    // Statistics
+    total_landings: Int,
+    total_takeoffs: Int,
+    total_repairs: Int,
+    total_rearms: Int,
+}
+
+fn create_parking_place_behavior(tag: String) -> ParkingPlaceBehavior {
+    let config = default_parking_config()
+    let spots = Collection<ParkingSpot>{}
+
+    // Create parking spots in a row
+    for i in 0..config.num_spots {
+        let spot = create_parking_spot(i)
+        spot.position_x = i as Float * 30.0
+        spot.position_y = 0.0
+        spot.heading = 0.0
+        spot.approach_path_id = i
+        spot.departure_path_id = i
+        spots.add(spot)
+    }
+
+    return ParkingPlaceBehavior {
+        base: create_behavior_module(tag, ModuleType::Behavior),
+        config: config,
+        spots: spots,
+        aircraft: Map<Int, AircraftInfo>{},
+        queue: Collection<Int>{},
+        total_landings: 0,
+        total_takeoffs: 0,
+        total_repairs: 0,
+        total_rearms: 0,
+    }
+}
+
+// ============================================================================
+// Spot Management
+// ============================================================================
+
+/// Find available spot for aircraft
+fn find_available_spot(parking: ParkingPlaceBehavior, is_vtol: Bool, size_class: Int) -> Int {
+    for i in 0..parking.spots.len() {
+        let spot = parking.spots.get(i)
+        if spot.state == ParkingSpotState::Empty {
+            // Check VTOL compatibility
+            if spot.is_vtol_only && !is_vtol {
+                continue
+            }
+            if !parking.config.allows_vtol && is_vtol {
+                continue
+            }
+            if !parking.config.allows_runway && !is_vtol {
+                continue
+            }
+
+            // Check size
+            if spot.spot_size < size_class {
+                continue
+            }
+
+            return i
+        }
+    }
+    return -1
+}
+
+/// Reserve a spot for incoming aircraft
+fn reserve_spot(parking: ParkingPlaceBehavior, spot_idx: Int, aircraft_id: Int) -> Bool {
+    if spot_idx < 0 || spot_idx >= parking.spots.len() {
+        return false
+    }
+
+    let spot = parking.spots.get(spot_idx)
+    if spot.state != ParkingSpotState::Empty {
+        return false
+    }
+
+    spot.state = ParkingSpotState::Reserved
+    spot.aircraft_id = aircraft_id
+    return true
+}
+
+/// Occupy a spot (aircraft has landed)
+fn occupy_spot(parking: ParkingPlaceBehavior, spot_idx: Int, aircraft_id: Int) {
+    if spot_idx < 0 || spot_idx >= parking.spots.len() {
+        return
+    }
+
+    let spot = parking.spots.get(spot_idx)
+    spot.state = ParkingSpotState::Occupied
+    spot.aircraft_id = aircraft_id
+
+    // Update aircraft info
+    if parking.aircraft.has(aircraft_id) {
+        let info = parking.aircraft.get(aircraft_id)
+        info.state = AircraftState::Parked
+        info.assigned_spot = spot_idx
+    }
+
+    parking.total_landings = parking.total_landings + 1
+}
+
+/// Release a spot
+fn release_spot(parking: ParkingPlaceBehavior, spot_idx: Int) {
+    if spot_idx < 0 || spot_idx >= parking.spots.len() {
+        return
+    }
+
+    let spot = parking.spots.get(spot_idx)
+    let aircraft_id = spot.aircraft_id
+
+    spot.state = ParkingSpotState::Empty
+    spot.aircraft_id = 0
+
+    // Check queue for next aircraft
+    if parking.queue.len() > 0 {
+        let next_id = parking.queue.get(0)
+        parking.queue = remove_from_queue(parking.queue, next_id)
+        if parking.aircraft.has(next_id) {
+            let info = parking.aircraft.get(next_id)
+            reserve_spot(parking, spot_idx, next_id)
+        }
+    }
+
+    parking.total_takeoffs = parking.total_takeoffs + 1
+}
+
+// ============================================================================
+// Aircraft Management
+// ============================================================================
+
+/// Request landing
+fn request_landing(parking: ParkingPlaceBehavior, aircraft_id: Int, is_vtol: Bool, size_class: Int) -> Int {
+    // Create aircraft info
+    let info = create_aircraft_info(aircraft_id)
+    info.is_vtol = is_vtol
+    info.size_class = size_class
+    parking.aircraft.set(aircraft_id, info)
+
+    // Try to find available spot
+    let spot_idx = find_available_spot(parking, is_vtol, size_class)
+
+    if spot_idx >= 0 {
+        // Reserve the spot
+        reserve_spot(parking, spot_idx, aircraft_id)
+        info.assigned_spot = spot_idx
+        info.state = AircraftState::Approaching
+        return spot_idx
+    } else {
+        // Add to queue
+        if parking.queue.len() < parking.config.queue_max_size {
+            parking.queue.add(aircraft_id)
+            return -2  // Queued
+        }
+        return -1  // No space
+    }
+}
+
+/// Complete landing
+fn complete_landing(parking: ParkingPlaceBehavior, aircraft_id: Int) {
+    if !parking.aircraft.has(aircraft_id) {
+        return
+    }
+
+    let info = parking.aircraft.get(aircraft_id)
+    occupy_spot(parking, info.assigned_spot, aircraft_id)
+    info.state = AircraftState::Parked
+
+    // Start auto-servicing
+    if parking.config.auto_repair && info.health_current < info.health_max {
+        info.state = AircraftState::Repairing
+        info.repair_time_remaining = (info.health_max - info.health_current) / parking.config.heal_rate
+    } else if parking.config.auto_rearm && info.ammo_current < info.ammo_max {
+        info.state = AircraftState::Rearming
+        info.rearm_time_remaining = (info.ammo_max - info.ammo_current) as Float / parking.config.rearm_rate
+    } else if parking.config.auto_refuel && info.fuel_current < info.fuel_max {
+        info.state = AircraftState::Refueling
+        info.refuel_time_remaining = (info.fuel_max - info.fuel_current) / parking.config.refuel_rate
+    }
+}
+
+/// Request takeoff
+fn request_takeoff(parking: ParkingPlaceBehavior, aircraft_id: Int) -> Bool {
+    if !parking.aircraft.has(aircraft_id) {
+        return false
+    }
+
+    let info = parking.aircraft.get(aircraft_id)
+    if info.state != AircraftState::Parked {
+        return false  // Still being serviced
+    }
+
+    info.state = AircraftState::TakingOff
+
+    let spot_idx = info.assigned_spot
+    if spot_idx >= 0 && spot_idx < parking.spots.len() {
+        let spot = parking.spots.get(spot_idx)
+        spot.state = ParkingSpotState::Departing
+    }
+
+    return true
+}
+
+/// Complete takeoff
+fn complete_takeoff(parking: ParkingPlaceBehavior, aircraft_id: Int) {
+    if !parking.aircraft.has(aircraft_id) {
+        return
+    }
+
+    let info = parking.aircraft.get(aircraft_id)
+    release_spot(parking, info.assigned_spot)
+    info.state = AircraftState::Departing
+    info.assigned_spot = -1
+
+    // Remove aircraft tracking
+    parking.aircraft.remove(aircraft_id)
+}
+
+/// Cancel landing/queue
+fn cancel_landing(parking: ParkingPlaceBehavior, aircraft_id: Int) {
+    // Remove from queue
+    parking.queue = remove_from_queue(parking.queue, aircraft_id)
+
+    // Release reserved spot
+    if parking.aircraft.has(aircraft_id) {
+        let info = parking.aircraft.get(aircraft_id)
+        if info.assigned_spot >= 0 {
+            let spot = parking.spots.get(info.assigned_spot)
+            if spot.state == ParkingSpotState::Reserved {
+                spot.state = ParkingSpotState::Empty
+                spot.aircraft_id = 0
+            }
+        }
+        parking.aircraft.remove(aircraft_id)
+    }
+}
+
+// ============================================================================
+// Servicing
+// ============================================================================
+
+/// Update aircraft servicing
+fn update_servicing(parking: ParkingPlaceBehavior, delta: Float) {
+    for aircraft_id in parking.aircraft.keys() {
+        let info = parking.aircraft.get(aircraft_id)
+
+        if info.state == AircraftState::Repairing {
+            info.health_current = info.health_current + parking.config.heal_rate * delta
+            info.repair_time_remaining = info.repair_time_remaining - delta
+
+            if info.health_current >= info.health_max {
+                info.health_current = info.health_max
+                parking.total_repairs = parking.total_repairs + 1
+
+                // Move to next service
+                if parking.config.auto_rearm && info.ammo_current < info.ammo_max {
+                    info.state = AircraftState::Rearming
+                    info.rearm_time_remaining = (info.ammo_max - info.ammo_current) as Float / parking.config.rearm_rate
+                } else if parking.config.auto_refuel && info.fuel_current < info.fuel_max {
+                    info.state = AircraftState::Refueling
+                } else {
+                    info.state = AircraftState::Parked
+                }
+            }
+
+        } else if info.state == AircraftState::Rearming {
+            info.rearm_time_remaining = info.rearm_time_remaining - delta
+
+            if info.rearm_time_remaining <= 0.0 {
+                info.ammo_current = info.ammo_max
+                parking.total_rearms = parking.total_rearms + 1
+
+                // Move to next service
+                if parking.config.auto_refuel && info.fuel_current < info.fuel_max {
+                    info.state = AircraftState::Refueling
+                    info.refuel_time_remaining = (info.fuel_max - info.fuel_current) / parking.config.refuel_rate
+                } else {
+                    info.state = AircraftState::Parked
+                }
+            }
+
+        } else if info.state == AircraftState::Refueling {
+            info.fuel_current = info.fuel_current + parking.config.refuel_rate * delta
+            info.refuel_time_remaining = info.refuel_time_remaining - delta
+
+            if info.fuel_current >= info.fuel_max {
+                info.fuel_current = info.fuel_max
+                info.state = AircraftState::Parked
+            }
+        }
+    }
+}
+
+/// Update parking place
+fn update_parking_place(parking: ParkingPlaceBehavior, delta: Float) {
+    update_servicing(parking, delta)
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get number of free spots
+fn get_free_spot_count(parking: ParkingPlaceBehavior) -> Int {
+    let count = 0
+    for i in 0..parking.spots.len() {
+        let spot = parking.spots.get(i)
+        if spot.state == ParkingSpotState::Empty {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// Get queue length
+fn get_queue_length(parking: ParkingPlaceBehavior) -> Int {
+    return parking.queue.len()
+}
+
+/// Get aircraft state
+fn get_aircraft_state(parking: ParkingPlaceBehavior, aircraft_id: Int) -> AircraftState {
+    if parking.aircraft.has(aircraft_id) {
+        return parking.aircraft.get(aircraft_id).state
+    }
+    return AircraftState::Departing
+}
+
+/// Check if aircraft is ready
+fn is_aircraft_ready(parking: ParkingPlaceBehavior, aircraft_id: Int) -> Bool {
+    if !parking.aircraft.has(aircraft_id) {
+        return false
+    }
+    return parking.aircraft.get(aircraft_id).state == AircraftState::Parked
+}
+
+/// Get spot position
+fn get_spot_position(parking: ParkingPlaceBehavior, spot_idx: Int) -> (Float, Float, Float) {
+    if spot_idx < 0 || spot_idx >= parking.spots.len() {
+        return (0.0, 0.0, 0.0)
+    }
+    let spot = parking.spots.get(spot_idx)
+    return (spot.position_x, spot.position_y, spot.position_z)
+}
+
+/// Get approach position (above landing pad)
+fn get_approach_position(parking: ParkingPlaceBehavior, spot_idx: Int) -> (Float, Float, Float) {
+    if spot_idx < 0 || spot_idx >= parking.spots.len() {
+        return (0.0, 0.0, 0.0)
+    }
+    let spot = parking.spots.get(spot_idx)
+    return (spot.position_x, spot.position_y, spot.position_z + parking.config.approach_height)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn remove_from_queue(queue: Collection<Int>, id: Int) -> Collection<Int> {
+    let new_queue = Collection<Int>{}
+    for item in queue {
+        if item != id {
+            new_queue.add(item)
+        }
+    }
+    return new_queue
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_parking_creation() -> Bool {
+    let parking = create_parking_place_behavior("TestParking")
+
+    assert(parking.spots.len() == 4, "Should have 4 spots")
+    assert(get_free_spot_count(parking) == 4, "All spots should be free")
+
+    return true
+}
+
+fn test_landing_request() -> Bool {
+    let parking = create_parking_place_behavior("LandingTest")
+
+    let spot = request_landing(parking, 100, true, 1)
+    assert(spot >= 0, "Should get valid spot")
+    assert(get_free_spot_count(parking) == 3, "Should have 3 free spots")
+
+    let spot2 = request_landing(parking, 101, true, 1)
+    assert(spot2 >= 0, "Should get second spot")
+    assert(spot2 != spot, "Should be different spot")
+
+    return true
+}
+
+fn test_full_landing_cycle() -> Bool {
+    let parking = create_parking_place_behavior("CycleTest")
+
+    // Request landing
+    let spot = request_landing(parking, 100, true, 1)
+
+    // Complete landing
+    complete_landing(parking, 100)
+    assert(get_aircraft_state(parking, 100) != AircraftState::Approaching, "Should not be approaching")
+
+    // Wait for servicing (simulate)
+    for i in 0..100 {
+        update_servicing(parking, 0.1)
+    }
+
+    // Request takeoff
+    if parking.aircraft.has(100) {
+        let info = parking.aircraft.get(100)
+        info.state = AircraftState::Parked
+    }
+
+    let can_takeoff = request_takeoff(parking, 100)
+    assert(can_takeoff == true, "Should be able to takeoff")
+
+    // Complete takeoff
+    complete_takeoff(parking, 100)
+    assert(get_free_spot_count(parking) == 4, "All spots should be free again")
+
+    return true
+}
+
+fn test_queue() -> Bool {
+    let parking = create_parking_place_behavior("QueueTest")
+
+    // Fill all spots
+    for i in 0..4 {
+        request_landing(parking, 100 + i, true, 1)
+    }
+    assert(get_free_spot_count(parking) == 0, "All spots taken")
+
+    // Request one more (should queue)
+    let result = request_landing(parking, 200, true, 1)
+    assert(result == -2, "Should be queued")
+    assert(get_queue_length(parking) == 1, "Queue should have 1")
+
+    return true
+}
+
+fn test_servicing() -> Bool {
+    let parking = create_parking_place_behavior("ServicingTest")
+
+    // Request and complete landing
+    request_landing(parking, 100, true, 1)
+    complete_landing(parking, 100)
+
+    // Set aircraft as damaged
+    if parking.aircraft.has(100) {
+        let info = parking.aircraft.get(100)
+        info.health_current = 50.0
+        info.health_max = 100.0
+        info.state = AircraftState::Repairing
+        info.repair_time_remaining = 5.0
+    }
+
+    // Update servicing
+    for i in 0..60 {
+        update_servicing(parking, 0.1)
+    }
+
+    // Check health restored
+    if parking.aircraft.has(100) {
+        let info = parking.aircraft.get(100)
+        assert(info.health_current == 100.0, "Should be fully repaired")
+    }
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_parking_creation(), "Parking creation test failed")
+    assert(test_landing_request(), "Landing request test failed")
+    assert(test_full_landing_cycle(), "Full landing cycle test failed")
+    assert(test_queue(), "Queue test failed")
+    assert(test_servicing(), "Servicing test failed")
+    return true
+}

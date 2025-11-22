@@ -1,0 +1,669 @@
+// Terrain Visual - Terrain Mesh Rendering System
+// Based on Thyme engine TerrainVisual
+// Handles LOD system, texture blending, and terrain mesh generation
+
+from basics import Collection, Map
+
+// ============================================================================
+// Terrain Configuration
+// ============================================================================
+
+enum TerrainLOD {
+    LOD0,           // Highest detail (close)
+    LOD1,           // Medium detail
+    LOD2,           // Low detail
+    LOD3,           // Lowest detail (far)
+}
+
+struct TerrainChunk {
+    chunk_id: Int,
+    chunk_x: Int,
+    chunk_y: Int,
+
+    // Bounds
+    min_x: Float,
+    min_y: Float,
+    max_x: Float,
+    max_y: Float,
+    min_z: Float,
+    max_z: Float,
+
+    // LOD state
+    current_lod: TerrainLOD,
+    target_lod: TerrainLOD,
+    lod_blend: Float,           // Blend between LODs (0-1)
+
+    // Mesh data indices
+    vertex_offset: Int,
+    vertex_count: Int,
+    index_offset: Int,
+    index_count: Int,
+
+    // Per-LOD counts
+    lod_index_counts: Collection<Int>,
+
+    // Visibility
+    is_visible: Bool,
+    distance_to_camera: Float,
+
+    // Textures
+    blend_texture_id: Int,
+    tile_textures: Collection<Int>,
+}
+
+fn create_terrain_chunk(id: Int, x: Int, y: Int) -> TerrainChunk {
+    return TerrainChunk {
+        chunk_id: id,
+        chunk_x: x,
+        chunk_y: y,
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 0.0,
+        max_y: 0.0,
+        min_z: 0.0,
+        max_z: 0.0,
+        current_lod: TerrainLOD::LOD0,
+        target_lod: TerrainLOD::LOD0,
+        lod_blend: 1.0,
+        vertex_offset: 0,
+        vertex_count: 0,
+        index_offset: 0,
+        index_count: 0,
+        lod_index_counts: Collection<Int>{},
+        is_visible: true,
+        distance_to_camera: 0.0,
+        blend_texture_id: 0,
+        tile_textures: Collection<Int>{},
+    }
+}
+
+struct TerrainConfig {
+    // Chunk settings
+    chunk_size: Float,              // World units per chunk
+    chunks_x: Int,                  // Number of chunks in X
+    chunks_y: Int,                  // Number of chunks in Y
+    vertices_per_chunk: Int,        // Vertices per chunk edge
+
+    // LOD settings
+    lod0_distance: Float,           // Distance for highest LOD
+    lod1_distance: Float,
+    lod2_distance: Float,
+    lod3_distance: Float,
+    lod_blend_range: Float,         // Blend range between LODs
+
+    // Height
+    height_scale: Float,            // Multiplier for height values
+    min_height: Float,
+    max_height: Float,
+
+    // Texturing
+    texture_repeat: Float,          // How often textures tile
+    blend_sharpness: Float,         // Blend map sharpness
+
+    // Visual
+    enable_shadows: Bool,
+    shadow_bias: Float,
+    enable_specular: Bool,
+    specular_power: Float,
+}
+
+fn default_terrain_config() -> TerrainConfig {
+    return TerrainConfig {
+        chunk_size: 128.0,
+        chunks_x: 8,
+        chunks_y: 8,
+        vertices_per_chunk: 33,
+        lod0_distance: 100.0,
+        lod1_distance: 200.0,
+        lod2_distance: 400.0,
+        lod3_distance: 800.0,
+        lod_blend_range: 20.0,
+        height_scale: 1.0,
+        min_height: -50.0,
+        max_height: 100.0,
+        texture_repeat: 8.0,
+        blend_sharpness: 2.0,
+        enable_shadows: true,
+        shadow_bias: 0.001,
+        enable_specular: true,
+        specular_power: 32.0,
+    }
+}
+
+// ============================================================================
+// Terrain Vertex
+// ============================================================================
+
+struct TerrainVertex {
+    x: Float,
+    y: Float,
+    z: Float,               // Height
+    normal_x: Float,
+    normal_y: Float,
+    normal_z: Float,
+    u: Float,               // Texture coordinate
+    v: Float,
+    blend_u: Float,         // Blend map coordinate
+    blend_v: Float,
+}
+
+fn create_terrain_vertex(x: Float, y: Float, z: Float) -> TerrainVertex {
+    return TerrainVertex {
+        x: x,
+        y: y,
+        z: z,
+        normal_x: 0.0,
+        normal_y: 0.0,
+        normal_z: 1.0,
+        u: 0.0,
+        v: 0.0,
+        blend_u: 0.0,
+        blend_v: 0.0,
+    }
+}
+
+// ============================================================================
+// Terrain Visual Manager
+// ============================================================================
+
+struct TerrainVisual {
+    config: TerrainConfig,
+
+    // Chunks
+    chunks: Collection<TerrainChunk>,
+    chunk_map: Map<Int, Int>,       // (chunk_x * 1000 + chunk_y) -> chunk index
+
+    // Height data
+    heightmap: Collection<Float>,
+    heightmap_width: Int,
+    heightmap_height: Int,
+
+    // Vertex/Index buffers
+    vertices: Collection<TerrainVertex>,
+    indices: Collection<Int>,
+
+    // Camera for LOD calculations
+    camera_x: Float,
+    camera_y: Float,
+    camera_z: Float,
+
+    // Statistics
+    visible_chunks: Int,
+    total_triangles: Int,
+}
+
+fn create_terrain_visual(config: TerrainConfig) -> TerrainVisual {
+    return TerrainVisual {
+        config: config,
+        chunks: Collection<TerrainChunk>{},
+        chunk_map: Map<Int, Int>{},
+        heightmap: Collection<Float>{},
+        heightmap_width: 0,
+        heightmap_height: 0,
+        vertices: Collection<TerrainVertex>{},
+        indices: Collection<Int>{},
+        camera_x: 0.0,
+        camera_y: 0.0,
+        camera_z: 0.0,
+        visible_chunks: 0,
+        total_triangles: 0,
+    }
+}
+
+// ============================================================================
+// Terrain Generation
+// ============================================================================
+
+/// Initialize terrain from heightmap data
+fn init_terrain(terrain: TerrainVisual, heightmap: Collection<Float>, width: Int, height: Int) {
+    terrain.heightmap = heightmap
+    terrain.heightmap_width = width
+    terrain.heightmap_height = height
+
+    // Create chunks
+    let chunk_id = 0
+    for cy in 0..terrain.config.chunks_y {
+        for cx in 0..terrain.config.chunks_x {
+            let chunk = create_terrain_chunk(chunk_id, cx, cy)
+
+            // Set bounds
+            chunk.min_x = cx as Float * terrain.config.chunk_size
+            chunk.min_y = cy as Float * terrain.config.chunk_size
+            chunk.max_x = chunk.min_x + terrain.config.chunk_size
+            chunk.max_y = chunk.min_y + terrain.config.chunk_size
+
+            // Generate chunk mesh
+            generate_chunk_mesh(terrain, chunk)
+
+            terrain.chunks.add(chunk)
+
+            let key = cx * 1000 + cy
+            terrain.chunk_map.set(key, chunk_id)
+
+            chunk_id = chunk_id + 1
+        }
+    }
+}
+
+/// Generate mesh for a single chunk
+fn generate_chunk_mesh(terrain: TerrainVisual, chunk: TerrainChunk) {
+    let verts_per_edge = terrain.config.vertices_per_chunk
+    let chunk_size = terrain.config.chunk_size
+    let step = chunk_size / (verts_per_edge - 1) as Float
+
+    chunk.vertex_offset = terrain.vertices.len()
+
+    // Generate vertices
+    for vy in 0..verts_per_edge {
+        for vx in 0..verts_per_edge {
+            let world_x = chunk.min_x + vx as Float * step
+            let world_y = chunk.min_y + vy as Float * step
+
+            // Sample height
+            let height = sample_height(terrain, world_x, world_y)
+
+            let vertex = create_terrain_vertex(world_x, world_y, height)
+
+            // Texture coordinates
+            vertex.u = vx as Float / (verts_per_edge - 1) as Float * terrain.config.texture_repeat
+            vertex.v = vy as Float / (verts_per_edge - 1) as Float * terrain.config.texture_repeat
+
+            // Blend map coordinates
+            vertex.blend_u = (world_x / (terrain.config.chunks_x as Float * chunk_size))
+            vertex.blend_v = (world_y / (terrain.config.chunks_y as Float * chunk_size))
+
+            terrain.vertices.add(vertex)
+
+            // Track height bounds
+            if height < chunk.min_z {
+                chunk.min_z = height
+            }
+            if height > chunk.max_z {
+                chunk.max_z = height
+            }
+        }
+    }
+
+    chunk.vertex_count = verts_per_edge * verts_per_edge
+
+    // Generate indices for each LOD level
+    chunk.index_offset = terrain.indices.len()
+    chunk.lod_index_counts = Collection<Int>{}
+
+    // LOD 0 - full detail
+    let lod0_count = generate_indices_for_lod(terrain, chunk, 1)
+    chunk.lod_index_counts.add(lod0_count)
+
+    // LOD 1 - half detail
+    let lod1_count = generate_indices_for_lod(terrain, chunk, 2)
+    chunk.lod_index_counts.add(lod1_count)
+
+    // LOD 2 - quarter detail
+    let lod2_count = generate_indices_for_lod(terrain, chunk, 4)
+    chunk.lod_index_counts.add(lod2_count)
+
+    // LOD 3 - eighth detail
+    let lod3_count = generate_indices_for_lod(terrain, chunk, 8)
+    chunk.lod_index_counts.add(lod3_count)
+
+    chunk.index_count = lod0_count  // Default to highest detail
+
+    // Calculate normals
+    calculate_chunk_normals(terrain, chunk)
+}
+
+/// Generate indices for a specific LOD level
+fn generate_indices_for_lod(terrain: TerrainVisual, chunk: TerrainChunk, step: Int) -> Int {
+    let verts_per_edge = terrain.config.vertices_per_chunk
+    let count = 0
+
+    let y = 0
+    while y < verts_per_edge - 1 {
+        let x = 0
+        while x < verts_per_edge - 1 {
+            let base = chunk.vertex_offset + y * verts_per_edge + x
+
+            // Triangle 1
+            terrain.indices.add(base)
+            terrain.indices.add(base + verts_per_edge * step)
+            terrain.indices.add(base + step)
+            count = count + 3
+
+            // Triangle 2
+            terrain.indices.add(base + step)
+            terrain.indices.add(base + verts_per_edge * step)
+            terrain.indices.add(base + verts_per_edge * step + step)
+            count = count + 3
+
+            x = x + step
+        }
+        y = y + step
+    }
+
+    return count
+}
+
+/// Calculate normals for chunk vertices
+fn calculate_chunk_normals(terrain: TerrainVisual, chunk: TerrainChunk) {
+    let step = terrain.config.chunk_size / (terrain.config.vertices_per_chunk - 1) as Float
+
+    for i in chunk.vertex_offset..(chunk.vertex_offset + chunk.vertex_count) {
+        let vertex = terrain.vertices.get(i)
+
+        // Sample neighboring heights
+        let h_left = sample_height(terrain, vertex.x - step, vertex.y)
+        let h_right = sample_height(terrain, vertex.x + step, vertex.y)
+        let h_down = sample_height(terrain, vertex.x, vertex.y - step)
+        let h_up = sample_height(terrain, vertex.x, vertex.y + step)
+
+        // Calculate normal from height differences
+        vertex.normal_x = (h_left - h_right) / (2.0 * step)
+        vertex.normal_y = (h_down - h_up) / (2.0 * step)
+        vertex.normal_z = 1.0
+
+        // Normalize
+        let len = sqrt(vertex.normal_x * vertex.normal_x +
+                       vertex.normal_y * vertex.normal_y +
+                       vertex.normal_z * vertex.normal_z)
+        if len > 0.0 {
+            vertex.normal_x = vertex.normal_x / len
+            vertex.normal_y = vertex.normal_y / len
+            vertex.normal_z = vertex.normal_z / len
+        }
+    }
+}
+
+/// Sample height from heightmap
+fn sample_height(terrain: TerrainVisual, world_x: Float, world_y: Float) -> Float {
+    if terrain.heightmap.len() == 0 {
+        return 0.0
+    }
+
+    // Convert world to heightmap coordinates
+    let total_width = terrain.config.chunks_x as Float * terrain.config.chunk_size
+    let total_height = terrain.config.chunks_y as Float * terrain.config.chunk_size
+
+    let u = world_x / total_width
+    let v = world_y / total_height
+
+    // Clamp
+    if u < 0.0 { u = 0.0 }
+    if u > 1.0 { u = 1.0 }
+    if v < 0.0 { v = 0.0 }
+    if v > 1.0 { v = 1.0 }
+
+    // Bilinear interpolation
+    let fx = u * (terrain.heightmap_width - 1) as Float
+    let fy = v * (terrain.heightmap_height - 1) as Float
+
+    let x0 = fx as Int
+    let y0 = fy as Int
+    let x1 = x0 + 1
+    let y1 = y0 + 1
+
+    if x1 >= terrain.heightmap_width { x1 = terrain.heightmap_width - 1 }
+    if y1 >= terrain.heightmap_height { y1 = terrain.heightmap_height - 1 }
+
+    let tx = fx - x0 as Float
+    let ty = fy - y0 as Float
+
+    let h00 = get_height_at(terrain, x0, y0)
+    let h10 = get_height_at(terrain, x1, y0)
+    let h01 = get_height_at(terrain, x0, y1)
+    let h11 = get_height_at(terrain, x1, y1)
+
+    // Bilinear interpolation
+    let h0 = h00 * (1.0 - tx) + h10 * tx
+    let h1 = h01 * (1.0 - tx) + h11 * tx
+    let height = h0 * (1.0 - ty) + h1 * ty
+
+    return height * terrain.config.height_scale
+}
+
+/// Get height at specific heightmap coordinate
+fn get_height_at(terrain: TerrainVisual, x: Int, y: Int) -> Float {
+    if x < 0 || x >= terrain.heightmap_width || y < 0 || y >= terrain.heightmap_height {
+        return 0.0
+    }
+    let index = y * terrain.heightmap_width + x
+    if index < terrain.heightmap.len() {
+        return terrain.heightmap.get(index)
+    }
+    return 0.0
+}
+
+// ============================================================================
+// LOD Management
+// ============================================================================
+
+/// Update camera position for LOD calculations
+fn set_camera_position(terrain: TerrainVisual, x: Float, y: Float, z: Float) {
+    terrain.camera_x = x
+    terrain.camera_y = y
+    terrain.camera_z = z
+}
+
+/// Update LOD for all chunks based on camera position
+fn update_lod(terrain: TerrainVisual) {
+    terrain.visible_chunks = 0
+    terrain.total_triangles = 0
+
+    for i in 0..terrain.chunks.len() {
+        let chunk = terrain.chunks.get(i)
+
+        // Calculate distance to chunk center
+        let center_x = (chunk.min_x + chunk.max_x) / 2.0
+        let center_y = (chunk.min_y + chunk.max_y) / 2.0
+
+        let dx = center_x - terrain.camera_x
+        let dy = center_y - terrain.camera_y
+        chunk.distance_to_camera = sqrt(dx * dx + dy * dy)
+
+        // Determine target LOD
+        if chunk.distance_to_camera < terrain.config.lod0_distance {
+            chunk.target_lod = TerrainLOD::LOD0
+        } else if chunk.distance_to_camera < terrain.config.lod1_distance {
+            chunk.target_lod = TerrainLOD::LOD1
+        } else if chunk.distance_to_camera < terrain.config.lod2_distance {
+            chunk.target_lod = TerrainLOD::LOD2
+        } else {
+            chunk.target_lod = TerrainLOD::LOD3
+        }
+
+        // Smooth LOD transition
+        if chunk.target_lod != chunk.current_lod {
+            chunk.lod_blend = chunk.lod_blend - 0.1
+            if chunk.lod_blend <= 0.0 {
+                chunk.current_lod = chunk.target_lod
+                chunk.lod_blend = 1.0
+            }
+        }
+
+        // Set index count based on LOD
+        let lod_index = 0
+        if chunk.current_lod == TerrainLOD::LOD0 { lod_index = 0 }
+        else if chunk.current_lod == TerrainLOD::LOD1 { lod_index = 1 }
+        else if chunk.current_lod == TerrainLOD::LOD2 { lod_index = 2 }
+        else { lod_index = 3 }
+
+        if lod_index < chunk.lod_index_counts.len() {
+            chunk.index_count = chunk.lod_index_counts.get(lod_index)
+        }
+
+        // Update visibility (simple frustum cull would go here)
+        chunk.is_visible = true
+
+        if chunk.is_visible {
+            terrain.visible_chunks = terrain.visible_chunks + 1
+            terrain.total_triangles = terrain.total_triangles + chunk.index_count / 3
+        }
+    }
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get height at world position
+fn get_terrain_height(terrain: TerrainVisual, x: Float, y: Float) -> Float {
+    return sample_height(terrain, x, y)
+}
+
+/// Get normal at world position
+fn get_terrain_normal(terrain: TerrainVisual, x: Float, y: Float) -> (Float, Float, Float) {
+    let step = 1.0
+
+    let h_left = sample_height(terrain, x - step, y)
+    let h_right = sample_height(terrain, x + step, y)
+    let h_down = sample_height(terrain, x, y - step)
+    let h_up = sample_height(terrain, x, y + step)
+
+    let nx = (h_left - h_right) / (2.0 * step)
+    let ny = (h_down - h_up) / (2.0 * step)
+    let nz = 1.0
+
+    let len = sqrt(nx * nx + ny * ny + nz * nz)
+    return (nx / len, ny / len, nz / len)
+}
+
+/// Get chunk at world position
+fn get_chunk_at(terrain: TerrainVisual, x: Float, y: Float) -> Int {
+    let cx = (x / terrain.config.chunk_size) as Int
+    let cy = (y / terrain.config.chunk_size) as Int
+
+    let key = cx * 1000 + cy
+    if terrain.chunk_map.has(key) {
+        return terrain.chunk_map.get(key)
+    }
+    return -1
+}
+
+/// Get visible chunk count
+fn get_visible_chunks(terrain: TerrainVisual) -> Int {
+    return terrain.visible_chunks
+}
+
+/// Get total triangle count
+fn get_total_triangles(terrain: TerrainVisual) -> Int {
+    return terrain.total_triangles
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_terrain_creation() -> Bool {
+    let config = default_terrain_config()
+    config.chunks_x = 2
+    config.chunks_y = 2
+
+    let terrain = create_terrain_visual(config)
+
+    // Create simple heightmap
+    let heightmap = Collection<Float>{}
+    for i in 0..256 {
+        heightmap.add(0.5)
+    }
+
+    init_terrain(terrain, heightmap, 16, 16)
+
+    assert(terrain.chunks.len() == 4, "Should have 4 chunks")
+    assert(terrain.vertices.len() > 0, "Should have vertices")
+
+    return true
+}
+
+fn test_height_sampling() -> Bool {
+    let config = default_terrain_config()
+    config.chunks_x = 1
+    config.chunks_y = 1
+    config.height_scale = 10.0
+
+    let terrain = create_terrain_visual(config)
+
+    let heightmap = Collection<Float>{}
+    for y in 0..16 {
+        for x in 0..16 {
+            heightmap.add((x + y) as Float / 30.0)
+        }
+    }
+
+    init_terrain(terrain, heightmap, 16, 16)
+
+    let height = get_terrain_height(terrain, 64.0, 64.0)
+    assert(height > 0.0, "Should have positive height")
+
+    return true
+}
+
+fn test_lod_update() -> Bool {
+    let config = default_terrain_config()
+    config.chunks_x = 2
+    config.chunks_y = 2
+    config.lod0_distance = 100.0
+    config.lod1_distance = 200.0
+
+    let terrain = create_terrain_visual(config)
+
+    let heightmap = Collection<Float>{}
+    for i in 0..256 {
+        heightmap.add(0.0)
+    }
+    init_terrain(terrain, heightmap, 16, 16)
+
+    // Set camera close to first chunk
+    set_camera_position(terrain, 64.0, 64.0, 50.0)
+    update_lod(terrain)
+
+    let chunk = terrain.chunks.get(0)
+    assert(chunk.target_lod == TerrainLOD::LOD0, "Close chunk should be LOD0")
+
+    // Set camera far away
+    set_camera_position(terrain, 1000.0, 1000.0, 50.0)
+    update_lod(terrain)
+
+    assert(chunk.target_lod != TerrainLOD::LOD0, "Far chunk should not be LOD0")
+
+    return true
+}
+
+fn test_chunk_lookup() -> Bool {
+    let config = default_terrain_config()
+    config.chunks_x = 4
+    config.chunks_y = 4
+    config.chunk_size = 100.0
+
+    let terrain = create_terrain_visual(config)
+
+    let heightmap = Collection<Float>{}
+    for i in 0..256 {
+        heightmap.add(0.0)
+    }
+    init_terrain(terrain, heightmap, 16, 16)
+
+    let chunk_idx = get_chunk_at(terrain, 150.0, 250.0)
+    assert(chunk_idx >= 0, "Should find chunk")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_terrain_creation(), "Terrain creation test failed")
+    assert(test_height_sampling(), "Height sampling test failed")
+    assert(test_lod_update(), "LOD update test failed")
+    assert(test_chunk_lookup(), "Chunk lookup test failed")
+    return true
+}

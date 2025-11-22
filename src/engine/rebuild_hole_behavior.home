@@ -1,0 +1,661 @@
+// Rebuild Hole Behavior - Building Foundation After Destruction
+// Based on Thyme engine RebuildHoleBehavior
+// Handles rebuild timer, foundation visuals, reconstruction
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, create_behavior_module, ModuleType
+
+// ============================================================================
+// Rebuild Hole Configuration
+// ============================================================================
+
+enum RebuildHoleState {
+    Active,         // Foundation is present, can rebuild
+    Rebuilding,     // Construction in progress
+    Complete,       // Building reconstructed
+    Expired,        // Foundation has expired
+    Captured,       // Foundation captured by enemy
+}
+
+struct RebuildHoleConfig {
+    // Timing
+    expire_time: Float,             // How long foundation stays (0 = infinite)
+    rebuild_time: Float,            // Time to rebuild
+    rebuild_cost_multiplier: Float, // Cost multiplier (usually discount)
+
+    // Visual
+    foundation_model: String,
+    rubble_model: String,
+    construction_fx: String,
+    completion_fx: String,
+
+    // Behavior
+    can_be_captured: Bool,
+    capture_time: Float,
+    requires_worker: Bool,          // Needs dozer/worker to rebuild
+    auto_rebuild: Bool,             // Automatically starts rebuilding
+    blocks_construction: Bool,      // Blocks other construction in area
+
+    // Building reference
+    original_building_type: String,
+    rebuild_building_type: String,  // May differ from original
+}
+
+fn default_rebuild_hole_config() -> RebuildHoleConfig {
+    return RebuildHoleConfig {
+        expire_time: 300.0,         // 5 minutes
+        rebuild_time: 30.0,         // 30 seconds
+        rebuild_cost_multiplier: 0.75,  // 25% discount
+        foundation_model: "Foundation",
+        rubble_model: "BuildingRubble",
+        construction_fx: "FX_Construction",
+        completion_fx: "FX_ConstructionComplete",
+        can_be_captured: true,
+        capture_time: 15.0,
+        requires_worker: true,
+        auto_rebuild: false,
+        blocks_construction: true,
+        original_building_type: "",
+        rebuild_building_type: "",
+    }
+}
+
+// ============================================================================
+// Rebuild Hole Behavior
+// ============================================================================
+
+struct RebuildHoleBehavior {
+    base: BehaviorModule,
+    config: RebuildHoleConfig,
+
+    // State
+    state: RebuildHoleState,
+    time_remaining: Float,          // Time until expire (in Active) or completion (in Rebuilding)
+    rebuild_progress: Float,        // 0.0 to 1.0
+
+    // Position
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    rotation: Float,
+
+    // Ownership
+    owner_player_id: Int,
+    original_owner_id: Int,
+
+    // Worker
+    worker_id: Int,                 // ID of worker doing rebuild
+    has_worker: Bool,
+
+    // Capture
+    capturer_id: Int,               // ID of capturing unit
+    capture_progress: Float,        // 0.0 to 1.0
+
+    // Building reference
+    original_building_id: Int,
+    rebuilt_building_id: Int,
+
+    // Statistics
+    times_rebuilt: Int,
+}
+
+fn create_rebuild_hole_behavior(tag: String, building_type: String) -> RebuildHoleBehavior {
+    let config = default_rebuild_hole_config()
+    config.original_building_type = building_type
+    config.rebuild_building_type = building_type
+
+    return RebuildHoleBehavior {
+        base: create_behavior_module(tag, ModuleType::Behavior),
+        config: config,
+        state: RebuildHoleState::Active,
+        time_remaining: config.expire_time,
+        rebuild_progress: 0.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        rotation: 0.0,
+        owner_player_id: 0,
+        original_owner_id: 0,
+        worker_id: 0,
+        has_worker: false,
+        capturer_id: 0,
+        capture_progress: 0.0,
+        original_building_id: 0,
+        rebuilt_building_id: 0,
+        times_rebuilt: 0,
+    }
+}
+
+// ============================================================================
+// Rebuild Operations
+// ============================================================================
+
+/// Initialize from destroyed building
+fn init_from_building(hole: RebuildHoleBehavior, building_id: Int, player_id: Int,
+                       x: Float, y: Float, z: Float, rotation: Float) {
+    hole.original_building_id = building_id
+    hole.owner_player_id = player_id
+    hole.original_owner_id = player_id
+    hole.position_x = x
+    hole.position_y = y
+    hole.position_z = z
+    hole.rotation = rotation
+    hole.time_remaining = hole.config.expire_time
+    hole.state = RebuildHoleState::Active
+}
+
+/// Start rebuild with worker
+fn start_rebuild_with_worker(hole: RebuildHoleBehavior, worker_id: Int) -> Bool {
+    if hole.state != RebuildHoleState::Active {
+        return false
+    }
+
+    if hole.config.requires_worker && worker_id <= 0 {
+        return false
+    }
+
+    hole.worker_id = worker_id
+    hole.has_worker = true
+    hole.state = RebuildHoleState::Rebuilding
+    hole.time_remaining = hole.config.rebuild_time
+    hole.rebuild_progress = 0.0
+
+    return true
+}
+
+/// Start rebuild without worker (for auto-rebuild)
+fn start_auto_rebuild(hole: RebuildHoleBehavior) -> Bool {
+    if hole.state != RebuildHoleState::Active {
+        return false
+    }
+
+    if hole.config.requires_worker {
+        return false
+    }
+
+    hole.state = RebuildHoleState::Rebuilding
+    hole.time_remaining = hole.config.rebuild_time
+    hole.rebuild_progress = 0.0
+
+    return true
+}
+
+/// Cancel rebuild
+fn cancel_rebuild(hole: RebuildHoleBehavior) {
+    if hole.state == RebuildHoleState::Rebuilding {
+        hole.state = RebuildHoleState::Active
+        hole.worker_id = 0
+        hole.has_worker = false
+        hole.rebuild_progress = 0.0
+
+        // Reset expire timer
+        if hole.config.expire_time > 0.0 {
+            hole.time_remaining = hole.config.expire_time
+        }
+    }
+}
+
+/// Worker left the rebuild site
+fn on_worker_left(hole: RebuildHoleBehavior) {
+    if hole.state == RebuildHoleState::Rebuilding && hole.config.requires_worker {
+        // Pause rebuild - don't cancel, just pause
+        hole.has_worker = false
+        hole.worker_id = 0
+    }
+}
+
+/// Worker returned to rebuild site
+fn on_worker_returned(hole: RebuildHoleBehavior, worker_id: Int) {
+    if hole.state == RebuildHoleState::Rebuilding {
+        hole.has_worker = true
+        hole.worker_id = worker_id
+    }
+}
+
+// ============================================================================
+// Capture System
+// ============================================================================
+
+/// Start capture by enemy unit
+fn start_capture(hole: RebuildHoleBehavior, capturer_id: Int, capturer_player_id: Int) -> Bool {
+    if !hole.config.can_be_captured {
+        return false
+    }
+
+    if hole.state != RebuildHoleState::Active {
+        return false
+    }
+
+    if capturer_player_id == hole.owner_player_id {
+        return false  // Can't capture own foundation
+    }
+
+    hole.capturer_id = capturer_id
+    hole.capture_progress = 0.0
+
+    return true
+}
+
+/// Update capture progress
+fn update_capture(hole: RebuildHoleBehavior, delta: Float, capturer_player_id: Int) -> Bool {
+    if hole.capturer_id <= 0 {
+        return false
+    }
+
+    hole.capture_progress = hole.capture_progress + delta / hole.config.capture_time
+
+    if hole.capture_progress >= 1.0 {
+        // Capture complete
+        hole.capture_progress = 1.0
+        hole.owner_player_id = capturer_player_id
+        hole.state = RebuildHoleState::Captured
+        hole.capturer_id = 0
+
+        // Reset for new owner
+        hole.state = RebuildHoleState::Active
+        if hole.config.expire_time > 0.0 {
+            hole.time_remaining = hole.config.expire_time
+        }
+
+        return true
+    }
+
+    return false
+}
+
+/// Cancel capture
+fn cancel_capture(hole: RebuildHoleBehavior) {
+    hole.capturer_id = 0
+    hole.capture_progress = 0.0
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Update rebuild hole
+fn update_rebuild_hole(hole: RebuildHoleBehavior, delta: Float) -> Int {
+    // Returns: 0 = nothing, 1 = expired, 2 = rebuild complete
+
+    if hole.state == RebuildHoleState::Active {
+        // Check for expiration
+        if hole.config.expire_time > 0.0 {
+            hole.time_remaining = hole.time_remaining - delta
+
+            if hole.time_remaining <= 0.0 {
+                hole.state = RebuildHoleState::Expired
+                return 1  // Expired
+            }
+        }
+
+        // Check for auto-rebuild
+        if hole.config.auto_rebuild {
+            start_auto_rebuild(hole)
+        }
+
+    } else if hole.state == RebuildHoleState::Rebuilding {
+        // Only progress if worker is present (or not required)
+        if !hole.config.requires_worker || hole.has_worker {
+            hole.time_remaining = hole.time_remaining - delta
+            hole.rebuild_progress = 1.0 - (hole.time_remaining / hole.config.rebuild_time)
+
+            if hole.rebuild_progress > 1.0 {
+                hole.rebuild_progress = 1.0
+            }
+
+            if hole.time_remaining <= 0.0 {
+                // Rebuild complete
+                hole.state = RebuildHoleState::Complete
+                hole.rebuild_progress = 1.0
+                hole.times_rebuilt = hole.times_rebuilt + 1
+                return 2  // Complete
+            }
+        }
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Check if can rebuild
+fn can_rebuild(hole: RebuildHoleBehavior) -> Bool {
+    return hole.state == RebuildHoleState::Active
+}
+
+/// Check if is rebuilding
+fn is_rebuilding(hole: RebuildHoleBehavior) -> Bool {
+    return hole.state == RebuildHoleState::Rebuilding
+}
+
+/// Check if is complete
+fn is_rebuild_complete(hole: RebuildHoleBehavior) -> Bool {
+    return hole.state == RebuildHoleState::Complete
+}
+
+/// Check if has expired
+fn has_expired(hole: RebuildHoleBehavior) -> Bool {
+    return hole.state == RebuildHoleState::Expired
+}
+
+/// Get rebuild progress (0.0 to 1.0)
+fn get_rebuild_progress(hole: RebuildHoleBehavior) -> Float {
+    return hole.rebuild_progress
+}
+
+/// Get time until expire
+fn get_time_until_expire(hole: RebuildHoleBehavior) -> Float {
+    if hole.state == RebuildHoleState::Active {
+        return hole.time_remaining
+    }
+    return 0.0
+}
+
+/// Get time until rebuild complete
+fn get_time_until_complete(hole: RebuildHoleBehavior) -> Float {
+    if hole.state == RebuildHoleState::Rebuilding {
+        return hole.time_remaining
+    }
+    return 0.0
+}
+
+/// Get rebuild cost
+fn get_rebuild_cost(hole: RebuildHoleBehavior, original_cost: Int) -> Int {
+    return (original_cost as Float * hole.config.rebuild_cost_multiplier) as Int
+}
+
+/// Get capture progress
+fn get_capture_progress(hole: RebuildHoleBehavior) -> Float {
+    return hole.capture_progress
+}
+
+/// Check if is being captured
+fn is_being_captured(hole: RebuildHoleBehavior) -> Bool {
+    return hole.capturer_id > 0
+}
+
+/// Get building type to rebuild
+fn get_rebuild_building_type(hole: RebuildHoleBehavior) -> String {
+    return hole.config.rebuild_building_type
+}
+
+/// Check if needs worker
+fn needs_worker(hole: RebuildHoleBehavior) -> Bool {
+    return hole.config.requires_worker
+}
+
+/// Check if has worker
+fn has_worker_assigned(hole: RebuildHoleBehavior) -> Bool {
+    return hole.has_worker
+}
+
+// ============================================================================
+// Rebuild Hole Manager
+// ============================================================================
+
+struct RebuildHoleManager {
+    holes: Map<Int, RebuildHoleBehavior>,
+    next_id: Int,
+    holes_by_player: Map<Int, Collection<Int>>,
+    holes_by_position: Collection<(Float, Float, Int)>,
+}
+
+fn create_rebuild_hole_manager() -> RebuildHoleManager {
+    return RebuildHoleManager {
+        holes: Map<Int, RebuildHoleBehavior>{},
+        next_id: 1,
+        holes_by_player: Map<Int, Collection<Int>>{},
+        holes_by_position: Collection<(Float, Float, Int)>{},
+    }
+}
+
+/// Register rebuild hole
+fn register_rebuild_hole(mgr: RebuildHoleManager, hole: RebuildHoleBehavior) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    hole.base.module_id = id
+    mgr.holes.set(id, hole)
+
+    // Track by player
+    let player_id = hole.owner_player_id
+    if !mgr.holes_by_player.has(player_id) {
+        mgr.holes_by_player.set(player_id, Collection<Int>{})
+    }
+    mgr.holes_by_player.get(player_id).add(id)
+
+    // Track by position
+    mgr.holes_by_position.add((hole.position_x, hole.position_y, id))
+
+    return id
+}
+
+/// Get rebuild hole
+fn get_rebuild_hole(mgr: RebuildHoleManager, id: Int) -> RebuildHoleBehavior {
+    if mgr.holes.has(id) {
+        return mgr.holes.get(id)
+    }
+    return create_rebuild_hole_behavior("", "")
+}
+
+/// Remove rebuild hole
+fn remove_rebuild_hole(mgr: RebuildHoleManager, id: Int) {
+    if mgr.holes.has(id) {
+        let hole = mgr.holes.get(id)
+
+        // Remove from player tracking
+        let player_id = hole.owner_player_id
+        if mgr.holes_by_player.has(player_id) {
+            let player_holes = mgr.holes_by_player.get(player_id)
+            let new_holes = Collection<Int>{}
+            for h_id in player_holes {
+                if h_id != id {
+                    new_holes.add(h_id)
+                }
+            }
+            mgr.holes_by_player.set(player_id, new_holes)
+        }
+
+        // Remove from position tracking
+        let new_positions = Collection<(Float, Float, Int)>{}
+        for pos in mgr.holes_by_position {
+            if pos.2 != id {
+                new_positions.add(pos)
+            }
+        }
+        mgr.holes_by_position = new_positions
+
+        mgr.holes.remove(id)
+    }
+}
+
+/// Update all rebuild holes
+fn update_all_rebuild_holes(mgr: RebuildHoleManager, delta: Float) -> Collection<(Int, Int)> {
+    // Returns collection of (hole_id, event_type) where event_type: 1=expired, 2=complete
+    let events = Collection<(Int, Int)>{}
+    let to_remove = Collection<Int>{}
+
+    for id in mgr.holes.keys() {
+        let hole = mgr.holes.get(id)
+        let result = update_rebuild_hole(hole, delta)
+
+        if result == 1 {
+            // Expired
+            events.add((id, 1))
+            to_remove.add(id)
+        } else if result == 2 {
+            // Complete
+            events.add((id, 2))
+            // Don't remove - wait for building to spawn
+        }
+    }
+
+    // Remove expired holes
+    for id in to_remove {
+        remove_rebuild_hole(mgr, id)
+    }
+
+    return events
+}
+
+/// Find rebuild hole at position
+fn find_hole_at_position(mgr: RebuildHoleManager, x: Float, y: Float, radius: Float) -> Int {
+    for pos in mgr.holes_by_position {
+        let dx = pos.0 - x
+        let dy = pos.1 - y
+        let dist = sqrt(dx * dx + dy * dy)
+        if dist <= radius {
+            return pos.2
+        }
+    }
+    return 0
+}
+
+/// Get player's rebuild holes
+fn get_player_rebuild_holes(mgr: RebuildHoleManager, player_id: Int) -> Collection<Int> {
+    if mgr.holes_by_player.has(player_id) {
+        return mgr.holes_by_player.get(player_id)
+    }
+    return Collection<Int>{}
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_rebuild_hole_creation() -> Bool {
+    let hole = create_rebuild_hole_behavior("TestHole", "CommandCenter")
+
+    assert(hole.state == RebuildHoleState::Active, "Should be active")
+    assert(hole.config.original_building_type == "CommandCenter", "Should have building type")
+    assert(can_rebuild(hole) == true, "Should be able to rebuild")
+
+    return true
+}
+
+fn test_rebuild_process() -> Bool {
+    let hole = create_rebuild_hole_behavior("RebuildTest", "Barracks")
+    hole.config.rebuild_time = 1.0
+    hole.config.requires_worker = false
+
+    // Start rebuild
+    let started = start_auto_rebuild(hole)
+    assert(started == true, "Should start rebuild")
+    assert(is_rebuilding(hole) == true, "Should be rebuilding")
+
+    // Update until complete
+    for i in 0..15 {
+        update_rebuild_hole(hole, 0.1)
+    }
+
+    assert(is_rebuild_complete(hole) == true, "Should be complete")
+
+    return true
+}
+
+fn test_rebuild_with_worker() -> Bool {
+    let hole = create_rebuild_hole_behavior("WorkerTest", "Factory")
+    hole.config.rebuild_time = 1.0
+    hole.config.requires_worker = true
+
+    // Can't start without worker
+    let started = start_auto_rebuild(hole)
+    assert(started == false, "Should not start without worker")
+
+    // Start with worker
+    let started2 = start_rebuild_with_worker(hole, 100)
+    assert(started2 == true, "Should start with worker")
+    assert(has_worker_assigned(hole) == true, "Should have worker")
+
+    // Worker leaves - rebuild pauses
+    on_worker_left(hole)
+    assert(has_worker_assigned(hole) == false, "Worker should be gone")
+
+    let progress1 = get_rebuild_progress(hole)
+    update_rebuild_hole(hole, 0.5)
+    let progress2 = get_rebuild_progress(hole)
+    assert(progress1 == progress2, "Progress should not change without worker")
+
+    // Worker returns
+    on_worker_returned(hole, 100)
+    update_rebuild_hole(hole, 0.5)
+    let progress3 = get_rebuild_progress(hole)
+    assert(progress3 > progress2, "Progress should resume with worker")
+
+    return true
+}
+
+fn test_expiration() -> Bool {
+    let hole = create_rebuild_hole_behavior("ExpireTest", "Tower")
+    hole.config.expire_time = 1.0
+
+    // Update until expired
+    for i in 0..15 {
+        let result = update_rebuild_hole(hole, 0.1)
+        if result == 1 {
+            assert(has_expired(hole) == true, "Should be expired")
+            return true
+        }
+    }
+
+    assert(false, "Should have expired")
+    return false
+}
+
+fn test_capture() -> Bool {
+    let hole = create_rebuild_hole_behavior("CaptureTest", "Bunker")
+    hole.config.can_be_captured = true
+    hole.config.capture_time = 1.0
+    hole.owner_player_id = 1
+
+    // Start capture
+    let started = start_capture(hole, 200, 2)
+    assert(started == true, "Should start capture")
+    assert(is_being_captured(hole) == true, "Should be capturing")
+
+    // Update capture
+    for i in 0..15 {
+        let completed = update_capture(hole, 0.1, 2)
+        if completed {
+            assert(hole.owner_player_id == 2, "Should be captured by player 2")
+            return true
+        }
+    }
+
+    assert(false, "Capture should have completed")
+    return false
+}
+
+fn test_rebuild_cost() -> Bool {
+    let hole = create_rebuild_hole_behavior("CostTest", "PowerPlant")
+    hole.config.rebuild_cost_multiplier = 0.5
+
+    let cost = get_rebuild_cost(hole, 1000)
+    assert(cost == 500, "Should be half cost")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_rebuild_hole_creation(), "Rebuild hole creation test failed")
+    assert(test_rebuild_process(), "Rebuild process test failed")
+    assert(test_rebuild_with_worker(), "Rebuild with worker test failed")
+    assert(test_expiration(), "Expiration test failed")
+    assert(test_capture(), "Capture test failed")
+    assert(test_rebuild_cost(), "Rebuild cost test failed")
+    return true
+}

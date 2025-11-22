@@ -1,0 +1,605 @@
+// Bridge Behavior - Bridge Destruction and Repair Logic
+// Based on Thyme engine BridgeBehavior
+// Handles bridge segments, damage thresholds, collapse animation
+
+from basics import Collection, Map
+from behavior_module import BehaviorModule, create_behavior_module, ModuleType
+
+// ============================================================================
+// Bridge Configuration
+// ============================================================================
+
+enum BridgeState {
+    Intact,         // Fully functional
+    Damaged,        // Partially damaged but passable
+    Destroyed,      // Collapsed, impassable
+    Repairing,      // Being repaired
+}
+
+enum BridgeType {
+    Straight,       // Simple straight bridge
+    Curved,         // Curved bridge segment
+    Ramp,           // Bridge ramp/approach
+    Tower,          // Bridge tower support
+}
+
+struct BridgeSegment {
+    segment_id: Int,
+    segment_type: BridgeType,
+    health: Float,
+    max_health: Float,
+    position_x: Float,
+    position_y: Float,
+    position_z: Float,
+    rotation: Float,
+    is_destroyed: Bool,
+    collapse_progress: Float,
+    collapse_direction: Float,    // Direction of collapse
+}
+
+fn create_bridge_segment(id: Int, segment_type: BridgeType) -> BridgeSegment {
+    return BridgeSegment {
+        segment_id: id,
+        segment_type: segment_type,
+        health: 1000.0,
+        max_health: 1000.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        rotation: 0.0,
+        is_destroyed: false,
+        collapse_progress: 0.0,
+        collapse_direction: 0.0,
+    }
+}
+
+struct BridgeConfig {
+    bridge_type: BridgeType,
+    segment_count: Int,
+    segment_length: Float,
+    segment_width: Float,
+    max_health_per_segment: Float,
+    damage_threshold_light: Float,      // % for light damage visuals
+    damage_threshold_heavy: Float,      // % for heavy damage visuals
+    damage_threshold_collapse: Float,   // % for collapse
+    collapse_speed: Float,              // How fast segments fall
+    repair_rate: Float,                 // Health per second when repairing
+    can_be_repaired: Bool,
+    blocks_pathfinding_when_destroyed: Bool,
+    fx_on_damage: String,
+    fx_on_collapse: String,
+    fx_on_repair: String,
+    debris_object: String,              // Object spawned on collapse
+}
+
+fn default_bridge_config() -> BridgeConfig {
+    return BridgeConfig {
+        bridge_type: BridgeType::Straight,
+        segment_count: 3,
+        segment_length: 50.0,
+        segment_width: 20.0,
+        max_health_per_segment: 1000.0,
+        damage_threshold_light: 0.75,
+        damage_threshold_heavy: 0.50,
+        damage_threshold_collapse: 0.0,
+        collapse_speed: 2.0,
+        repair_rate: 50.0,
+        can_be_repaired: true,
+        blocks_pathfinding_when_destroyed: true,
+        fx_on_damage: "FX_BridgeDamage",
+        fx_on_collapse: "FX_BridgeCollapse",
+        fx_on_repair: "FX_BridgeRepair",
+        debris_object: "BridgeDebris",
+    }
+}
+
+// ============================================================================
+// Bridge Behavior Module
+// ============================================================================
+
+struct BridgeBehavior {
+    base: BehaviorModule,
+    config: BridgeConfig,
+
+    // State
+    state: BridgeState,
+    segments: Collection<BridgeSegment>,
+    total_health: Float,
+    max_total_health: Float,
+
+    // Collapse animation
+    is_collapsing: Bool,
+    collapse_frame: Int,
+    collapse_start_segment: Int,
+
+    // Repair
+    is_being_repaired: Bool,
+    repair_progress: Float,
+    repairer_id: Int,
+
+    // Pathfinding
+    pathfinding_blocked: Bool,
+
+    // Tower links
+    tower_ids: Collection<Int>,
+}
+
+fn create_bridge_behavior(tag: String) -> BridgeBehavior {
+    let config = default_bridge_config()
+    let segments = Collection<BridgeSegment>{}
+
+    // Create default segments
+    for i in 0..config.segment_count {
+        let segment = create_bridge_segment(i, config.bridge_type)
+        segment.max_health = config.max_health_per_segment
+        segment.health = config.max_health_per_segment
+        segment.position_x = i as Float * config.segment_length
+        segments.add(segment)
+    }
+
+    let total = config.max_health_per_segment * config.segment_count as Float
+
+    return BridgeBehavior {
+        base: create_behavior_module(tag, ModuleType::Behavior),
+        config: config,
+        state: BridgeState::Intact,
+        segments: segments,
+        total_health: total,
+        max_total_health: total,
+        is_collapsing: false,
+        collapse_frame: 0,
+        collapse_start_segment: 0,
+        is_being_repaired: false,
+        repair_progress: 0.0,
+        repairer_id: 0,
+        pathfinding_blocked: false,
+        tower_ids: Collection<Int>{},
+    }
+}
+
+// ============================================================================
+// Bridge Operations
+// ============================================================================
+
+/// Apply damage to bridge
+fn damage_bridge(bridge: BridgeBehavior, damage: Float, hit_x: Float, hit_y: Float) -> Bool {
+    if bridge.state == BridgeState::Destroyed {
+        return false
+    }
+
+    // Find nearest segment
+    let nearest_segment = 0
+    let nearest_dist = 999999.0
+
+    for i in 0..bridge.segments.len() {
+        let segment = bridge.segments.get(i)
+        let dx = segment.position_x - hit_x
+        let dy = segment.position_y - hit_y
+        let dist = sqrt(dx * dx + dy * dy)
+
+        if dist < nearest_dist {
+            nearest_dist = dist
+            nearest_segment = i
+        }
+    }
+
+    // Apply damage to segment
+    let segment = bridge.segments.get(nearest_segment)
+    segment.health = segment.health - damage
+    bridge.total_health = bridge.total_health - damage
+
+    if segment.health <= 0.0 {
+        segment.health = 0.0
+        segment.is_destroyed = true
+
+        // Start collapse
+        start_collapse(bridge, nearest_segment)
+        return true
+    }
+
+    // Update state based on health percentage
+    let health_pct = bridge.total_health / bridge.max_total_health
+
+    if health_pct <= bridge.config.damage_threshold_collapse {
+        bridge.state = BridgeState::Destroyed
+        start_full_collapse(bridge)
+    } else if health_pct <= bridge.config.damage_threshold_heavy {
+        bridge.state = BridgeState::Damaged
+    }
+
+    return false
+}
+
+/// Start collapse from a segment
+fn start_collapse(bridge: BridgeBehavior, start_segment: Int) {
+    bridge.is_collapsing = true
+    bridge.collapse_start_segment = start_segment
+    bridge.collapse_frame = 0
+
+    let segment = bridge.segments.get(start_segment)
+    segment.collapse_direction = 1.0  // Fall downward
+}
+
+/// Start full bridge collapse
+fn start_full_collapse(bridge: BridgeBehavior) {
+    bridge.state = BridgeState::Destroyed
+    bridge.is_collapsing = true
+    bridge.collapse_frame = 0
+
+    for i in 0..bridge.segments.len() {
+        let segment = bridge.segments.get(i)
+        segment.is_destroyed = true
+        segment.collapse_direction = 1.0
+    }
+
+    if bridge.config.blocks_pathfinding_when_destroyed {
+        bridge.pathfinding_blocked = true
+    }
+}
+
+/// Update bridge collapse animation
+fn update_collapse(bridge: BridgeBehavior, delta: Float) {
+    if !bridge.is_collapsing {
+        return
+    }
+
+    let all_collapsed = true
+
+    for i in 0..bridge.segments.len() {
+        let segment = bridge.segments.get(i)
+        if segment.is_destroyed && segment.collapse_progress < 1.0 {
+            segment.collapse_progress = segment.collapse_progress + delta * bridge.config.collapse_speed
+            segment.position_z = segment.position_z - delta * bridge.config.collapse_speed * 50.0
+
+            if segment.collapse_progress >= 1.0 {
+                segment.collapse_progress = 1.0
+            } else {
+                all_collapsed = false
+            }
+        }
+    }
+
+    if all_collapsed {
+        bridge.is_collapsing = false
+        bridge.state = BridgeState::Destroyed
+    }
+
+    bridge.collapse_frame = bridge.collapse_frame + 1
+}
+
+/// Start repair
+fn start_repair(bridge: BridgeBehavior, repairer_id: Int) -> Bool {
+    if !bridge.config.can_be_repaired {
+        return false
+    }
+
+    if bridge.state == BridgeState::Intact {
+        return false
+    }
+
+    bridge.is_being_repaired = true
+    bridge.repairer_id = repairer_id
+    bridge.state = BridgeState::Repairing
+    return true
+}
+
+/// Stop repair
+fn stop_repair(bridge: BridgeBehavior) {
+    bridge.is_being_repaired = false
+    bridge.repairer_id = 0
+
+    // Revert to damaged state if not fully repaired
+    if bridge.total_health < bridge.max_total_health {
+        let health_pct = bridge.total_health / bridge.max_total_health
+        if health_pct > bridge.config.damage_threshold_heavy {
+            bridge.state = BridgeState::Damaged
+        }
+    } else {
+        bridge.state = BridgeState::Intact
+    }
+}
+
+/// Update repair
+fn update_repair(bridge: BridgeBehavior, delta: Float) -> Bool {
+    if !bridge.is_being_repaired {
+        return false
+    }
+
+    let repair_amount = bridge.config.repair_rate * delta
+    let repaired = false
+
+    // Repair segments one at a time
+    for i in 0..bridge.segments.len() {
+        let segment = bridge.segments.get(i)
+        if segment.health < segment.max_health {
+            segment.health = segment.health + repair_amount
+            bridge.total_health = bridge.total_health + repair_amount
+
+            if segment.health >= segment.max_health {
+                segment.health = segment.max_health
+                segment.is_destroyed = false
+                segment.collapse_progress = 0.0
+                segment.position_z = 0.0  // Reset position
+            }
+
+            repaired = true
+            break  // Only repair one segment per update
+        }
+    }
+
+    // Check if fully repaired
+    if bridge.total_health >= bridge.max_total_health {
+        bridge.total_health = bridge.max_total_health
+        bridge.state = BridgeState::Intact
+        bridge.is_being_repaired = false
+        bridge.pathfinding_blocked = false
+        return true
+    }
+
+    return repaired
+}
+
+/// Update bridge
+fn update_bridge(bridge: BridgeBehavior, delta: Float) {
+    if bridge.is_collapsing {
+        update_collapse(bridge, delta)
+    }
+
+    if bridge.is_being_repaired {
+        update_repair(bridge, delta)
+    }
+}
+
+// ============================================================================
+// Bridge Queries
+// ============================================================================
+
+/// Check if bridge is passable
+fn is_bridge_passable(bridge: BridgeBehavior) -> Bool {
+    return bridge.state != BridgeState::Destroyed && !bridge.pathfinding_blocked
+}
+
+/// Get segment at position
+fn get_segment_at(bridge: BridgeBehavior, x: Float, y: Float) -> Int {
+    let nearest = -1
+    let nearest_dist = 999999.0
+
+    for i in 0..bridge.segments.len() {
+        let segment = bridge.segments.get(i)
+        let dx = segment.position_x - x
+        let dy = segment.position_y - y
+        let dist = sqrt(dx * dx + dy * dy)
+
+        if dist < nearest_dist && dist < bridge.config.segment_length {
+            nearest_dist = dist
+            nearest = i
+        }
+    }
+
+    return nearest
+}
+
+/// Check if segment is passable
+fn is_segment_passable(bridge: BridgeBehavior, segment_idx: Int) -> Bool {
+    if segment_idx < 0 || segment_idx >= bridge.segments.len() {
+        return false
+    }
+
+    let segment = bridge.segments.get(segment_idx)
+    return !segment.is_destroyed
+}
+
+/// Get bridge health percentage
+fn get_bridge_health_pct(bridge: BridgeBehavior) -> Float {
+    return bridge.total_health / bridge.max_total_health
+}
+
+/// Get segment health percentage
+fn get_segment_health_pct(bridge: BridgeBehavior, segment_idx: Int) -> Float {
+    if segment_idx < 0 || segment_idx >= bridge.segments.len() {
+        return 0.0
+    }
+
+    let segment = bridge.segments.get(segment_idx)
+    return segment.health / segment.max_health
+}
+
+/// Get damage state for visuals
+fn get_damage_state(bridge: BridgeBehavior) -> Int {
+    let health_pct = get_bridge_health_pct(bridge)
+
+    if health_pct <= bridge.config.damage_threshold_collapse {
+        return 3  // Destroyed
+    } else if health_pct <= bridge.config.damage_threshold_heavy {
+        return 2  // Heavy damage
+    } else if health_pct <= bridge.config.damage_threshold_light {
+        return 1  // Light damage
+    } else {
+        return 0  // Intact
+    }
+}
+
+// ============================================================================
+// Tower Link Management
+// ============================================================================
+
+/// Link bridge to tower
+fn link_tower(bridge: BridgeBehavior, tower_id: Int) {
+    if !bridge.tower_ids.contains(tower_id) {
+        bridge.tower_ids.add(tower_id)
+    }
+}
+
+/// Unlink tower
+fn unlink_tower(bridge: BridgeBehavior, tower_id: Int) {
+    let new_towers = Collection<Int>{}
+    for id in bridge.tower_ids {
+        if id != tower_id {
+            new_towers.add(id)
+        }
+    }
+    bridge.tower_ids = new_towers
+}
+
+/// Notify tower destroyed (causes bridge collapse)
+fn on_tower_destroyed(bridge: BridgeBehavior, tower_id: Int) {
+    if bridge.tower_ids.contains(tower_id) {
+        unlink_tower(bridge, tower_id)
+        start_full_collapse(bridge)
+    }
+}
+
+// ============================================================================
+// Bridge Manager
+// ============================================================================
+
+struct BridgeManager {
+    bridges: Map<Int, BridgeBehavior>,
+    next_id: Int,
+}
+
+fn create_bridge_manager() -> BridgeManager {
+    return BridgeManager {
+        bridges: Map<Int, BridgeBehavior>{},
+        next_id: 1,
+    }
+}
+
+/// Register bridge
+fn register_bridge(mgr: BridgeManager, bridge: BridgeBehavior) -> Int {
+    let id = mgr.next_id
+    mgr.next_id = mgr.next_id + 1
+    bridge.base.module_id = id
+    mgr.bridges.set(id, bridge)
+    return id
+}
+
+/// Get bridge
+fn get_bridge(mgr: BridgeManager, id: Int) -> BridgeBehavior {
+    if mgr.bridges.has(id) {
+        return mgr.bridges.get(id)
+    }
+    return create_bridge_behavior("")
+}
+
+/// Update all bridges
+fn update_all_bridges(mgr: BridgeManager, delta: Float) {
+    for id in mgr.bridges.keys() {
+        let bridge = mgr.bridges.get(id)
+        update_bridge(bridge, delta)
+    }
+}
+
+/// Find bridge at position
+fn find_bridge_at(mgr: BridgeManager, x: Float, y: Float) -> Int {
+    for id in mgr.bridges.keys() {
+        let bridge = mgr.bridges.get(id)
+        if get_segment_at(bridge, x, y) >= 0 {
+            return id
+        }
+    }
+    return 0
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_bridge_creation() -> Bool {
+    let bridge = create_bridge_behavior("TestBridge")
+
+    assert(bridge.state == BridgeState::Intact, "Should be intact")
+    assert(bridge.segments.len() == 3, "Should have 3 segments")
+    assert(is_bridge_passable(bridge) == true, "Should be passable")
+
+    return true
+}
+
+fn test_bridge_damage() -> Bool {
+    let bridge = create_bridge_behavior("DamageTest")
+    let initial_health = bridge.total_health
+
+    damage_bridge(bridge, 100.0, 0.0, 0.0)
+    assert(bridge.total_health < initial_health, "Health should decrease")
+
+    return true
+}
+
+fn test_bridge_collapse() -> Bool {
+    let bridge = create_bridge_behavior("CollapseTest")
+
+    // Destroy a segment
+    let segment = bridge.segments.get(1)
+    segment.health = 0.0
+    segment.is_destroyed = true
+    start_collapse(bridge, 1)
+
+    assert(bridge.is_collapsing == true, "Should be collapsing")
+
+    // Update collapse
+    for i in 0..100 {
+        update_collapse(bridge, 0.1)
+    }
+
+    assert(bridge.segments.get(1).collapse_progress == 1.0, "Segment should be collapsed")
+
+    return true
+}
+
+fn test_bridge_repair() -> Bool {
+    let bridge = create_bridge_behavior("RepairTest")
+
+    // Damage bridge
+    damage_bridge(bridge, 500.0, 0.0, 0.0)
+    let damaged_health = bridge.total_health
+
+    // Start repair
+    start_repair(bridge, 1)
+    assert(bridge.is_being_repaired == true, "Should be repairing")
+
+    // Update repair
+    for i in 0..100 {
+        update_repair(bridge, 0.1)
+    }
+
+    assert(bridge.total_health > damaged_health, "Health should increase")
+
+    return true
+}
+
+fn test_bridge_passability() -> Bool {
+    let bridge = create_bridge_behavior("PassableTest")
+
+    assert(is_bridge_passable(bridge) == true, "Should be passable initially")
+
+    start_full_collapse(bridge)
+    for i in 0..100 {
+        update_collapse(bridge, 0.1)
+    }
+
+    assert(is_bridge_passable(bridge) == false, "Should not be passable after collapse")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_bridge_creation(), "Bridge creation test failed")
+    assert(test_bridge_damage(), "Bridge damage test failed")
+    assert(test_bridge_collapse(), "Bridge collapse test failed")
+    assert(test_bridge_repair(), "Bridge repair test failed")
+    assert(test_bridge_passability(), "Bridge passability test failed")
+    return true
+}

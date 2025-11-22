@@ -1,0 +1,696 @@
+// Terrain Tex - Terrain Texture Management System
+// Based on Thyme engine TerrainTex
+// Handles blend maps, macro textures, and multi-texture terrain rendering
+
+from basics import Collection, Map
+
+// ============================================================================
+// Terrain Texture Types
+// ============================================================================
+
+enum TerrainTextureType {
+    Grass,
+    Dirt,
+    Sand,
+    Rock,
+    Snow,
+    Mud,
+    Water,
+    Concrete,
+    Asphalt,
+    GrassDesert,
+    Cliff,
+    Beach,
+}
+
+struct TerrainTexture {
+    texture_id: Int,
+    name: String,
+    texture_type: TerrainTextureType,
+
+    // Texture file
+    diffuse_path: String,
+    normal_path: String,
+    specular_path: String,
+
+    // Tiling
+    tile_u: Float,
+    tile_v: Float,
+    rotation: Float,
+
+    // Material properties
+    specular_power: Float,
+    specular_intensity: Float,
+    roughness: Float,
+
+    // Blending
+    blend_priority: Int,            // Higher priority blends on top
+    blend_sharpness: Float,
+
+    // Transitions
+    cliff_texture_id: Int,          // Texture to use on steep slopes
+    cliff_angle_min: Float,         // Angle to start cliff blend
+    cliff_angle_max: Float,         // Angle to fully use cliff texture
+
+    // Flags
+    is_passable: Bool,
+    movement_cost: Float,           // Movement speed modifier
+}
+
+fn create_terrain_texture(id: Int, name: String, tex_type: TerrainTextureType) -> TerrainTexture {
+    return TerrainTexture {
+        texture_id: id,
+        name: name,
+        texture_type: tex_type,
+        diffuse_path: "",
+        normal_path: "",
+        specular_path: "",
+        tile_u: 1.0,
+        tile_v: 1.0,
+        rotation: 0.0,
+        specular_power: 32.0,
+        specular_intensity: 0.5,
+        roughness: 0.5,
+        blend_priority: 0,
+        blend_sharpness: 2.0,
+        cliff_texture_id: -1,
+        cliff_angle_min: 0.7,       // ~45 degrees
+        cliff_angle_max: 0.5,       // ~60 degrees
+        is_passable: true,
+        movement_cost: 1.0,
+    }
+}
+
+// ============================================================================
+// Pre-built Textures
+// ============================================================================
+
+fn create_grass_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Grass", TerrainTextureType::Grass)
+    tex.diffuse_path = "Art/Terrain/grass_diffuse.tga"
+    tex.normal_path = "Art/Terrain/grass_normal.tga"
+    tex.tile_u = 8.0
+    tex.tile_v = 8.0
+    tex.roughness = 0.7
+    tex.movement_cost = 1.0
+    return tex
+}
+
+fn create_dirt_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Dirt", TerrainTextureType::Dirt)
+    tex.diffuse_path = "Art/Terrain/dirt_diffuse.tga"
+    tex.normal_path = "Art/Terrain/dirt_normal.tga"
+    tex.tile_u = 10.0
+    tex.tile_v = 10.0
+    tex.roughness = 0.8
+    tex.movement_cost = 1.0
+    return tex
+}
+
+fn create_sand_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Sand", TerrainTextureType::Sand)
+    tex.diffuse_path = "Art/Terrain/sand_diffuse.tga"
+    tex.normal_path = "Art/Terrain/sand_normal.tga"
+    tex.tile_u = 12.0
+    tex.tile_v = 12.0
+    tex.roughness = 0.9
+    tex.specular_intensity = 0.3
+    tex.movement_cost = 1.2  // Slightly slower on sand
+    return tex
+}
+
+fn create_rock_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Rock", TerrainTextureType::Rock)
+    tex.diffuse_path = "Art/Terrain/rock_diffuse.tga"
+    tex.normal_path = "Art/Terrain/rock_normal.tga"
+    tex.tile_u = 6.0
+    tex.tile_v = 6.0
+    tex.roughness = 0.4
+    tex.specular_intensity = 0.8
+    tex.movement_cost = 1.3
+    return tex
+}
+
+fn create_snow_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Snow", TerrainTextureType::Snow)
+    tex.diffuse_path = "Art/Terrain/snow_diffuse.tga"
+    tex.normal_path = "Art/Terrain/snow_normal.tga"
+    tex.tile_u = 8.0
+    tex.tile_v = 8.0
+    tex.roughness = 0.6
+    tex.specular_intensity = 1.0
+    tex.movement_cost = 1.5
+    return tex
+}
+
+fn create_cliff_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "Cliff", TerrainTextureType::Cliff)
+    tex.diffuse_path = "Art/Terrain/cliff_diffuse.tga"
+    tex.normal_path = "Art/Terrain/cliff_normal.tga"
+    tex.tile_u = 4.0
+    tex.tile_v = 8.0
+    tex.roughness = 0.3
+    tex.is_passable = false
+    tex.movement_cost = 10.0  // Nearly impassable
+    return tex
+}
+
+fn create_water_texture(id: Int) -> TerrainTexture {
+    let tex = create_terrain_texture(id, "ShallowWater", TerrainTextureType::Water)
+    tex.diffuse_path = "Art/Terrain/water_diffuse.tga"
+    tex.normal_path = "Art/Terrain/water_normal.tga"
+    tex.tile_u = 4.0
+    tex.tile_v = 4.0
+    tex.roughness = 0.1
+    tex.specular_intensity = 1.0
+    tex.specular_power = 64.0
+    tex.is_passable = false
+    tex.movement_cost = 5.0
+    return tex
+}
+
+// ============================================================================
+// Blend Map
+// ============================================================================
+
+struct BlendChannel {
+    texture_id: Int,
+    data: Collection<Float>,        // 0.0 to 1.0 blend values
+}
+
+fn create_blend_channel(texture_id: Int, width: Int, height: Int) -> BlendChannel {
+    let data = Collection<Float>{}
+    for i in 0..(width * height) {
+        data.add(0.0)
+    }
+    return BlendChannel {
+        texture_id: texture_id,
+        data: data,
+    }
+}
+
+struct BlendMap {
+    width: Int,
+    height: Int,
+
+    // Up to 4 textures per blend map (RGBA channels)
+    channels: Collection<BlendChannel>,
+
+    // For tiling multiple blend maps
+    tile_x: Int,
+    tile_y: Int,
+}
+
+fn create_blend_map(width: Int, height: Int) -> BlendMap {
+    return BlendMap {
+        width: width,
+        height: height,
+        channels: Collection<BlendChannel>{},
+        tile_x: 0,
+        tile_y: 0,
+    }
+}
+
+/// Add channel to blend map
+fn add_blend_channel(blend_map: BlendMap, texture_id: Int) -> Int {
+    if blend_map.channels.len() >= 4 {
+        return -1  // Max 4 channels per blend map
+    }
+
+    let channel = create_blend_channel(texture_id, blend_map.width, blend_map.height)
+    blend_map.channels.add(channel)
+    return blend_map.channels.len() - 1
+}
+
+/// Set blend value at position
+fn set_blend_value(blend_map: BlendMap, channel: Int, x: Int, y: Int, value: Float) {
+    if channel < 0 || channel >= blend_map.channels.len() {
+        return
+    }
+
+    let ch = blend_map.channels.get(channel)
+    let idx = y * blend_map.width + x
+
+    if idx >= 0 && idx < ch.data.len() {
+        if value < 0.0 { value = 0.0 }
+        if value > 1.0 { value = 1.0 }
+        ch.data.set(idx, value)
+    }
+}
+
+/// Get blend value at position
+fn get_blend_value(blend_map: BlendMap, channel: Int, x: Int, y: Int) -> Float {
+    if channel < 0 || channel >= blend_map.channels.len() {
+        return 0.0
+    }
+
+    let ch = blend_map.channels.get(channel)
+    let idx = y * blend_map.width + x
+
+    if idx >= 0 && idx < ch.data.len() {
+        return ch.data.get(idx)
+    }
+    return 0.0
+}
+
+/// Sample blend map with bilinear interpolation
+fn sample_blend(blend_map: BlendMap, channel: Int, u: Float, v: Float) -> Float {
+    if channel < 0 || channel >= blend_map.channels.len() {
+        return 0.0
+    }
+
+    let fx = u * (blend_map.width - 1) as Float
+    let fy = v * (blend_map.height - 1) as Float
+
+    let x0 = fx as Int
+    let y0 = fy as Int
+    let x1 = x0 + 1
+    let y1 = y0 + 1
+
+    if x1 >= blend_map.width { x1 = blend_map.width - 1 }
+    if y1 >= blend_map.height { y1 = blend_map.height - 1 }
+
+    let tx = fx - x0 as Float
+    let ty = fy - y0 as Float
+
+    let v00 = get_blend_value(blend_map, channel, x0, y0)
+    let v10 = get_blend_value(blend_map, channel, x1, y0)
+    let v01 = get_blend_value(blend_map, channel, x0, y1)
+    let v11 = get_blend_value(blend_map, channel, x1, y1)
+
+    let v0 = v00 * (1.0 - tx) + v10 * tx
+    let v1 = v01 * (1.0 - tx) + v11 * tx
+
+    return v0 * (1.0 - ty) + v1 * ty
+}
+
+// ============================================================================
+// Terrain Texture Manager
+// ============================================================================
+
+struct TerrainTexManager {
+    // Textures
+    textures: Map<Int, TerrainTexture>,
+    texture_by_name: Map<String, Int>,
+    next_texture_id: Int,
+
+    // Blend maps
+    blend_maps: Collection<BlendMap>,
+    blend_maps_x: Int,              // Number of blend maps in X
+    blend_maps_y: Int,              // Number of blend maps in Y
+
+    // Global settings
+    blend_map_resolution: Int,
+    terrain_width: Float,
+    terrain_height: Float,
+
+    // Macro texture (for distant LOD)
+    macro_texture_path: String,
+    macro_texture_scale: Float,
+
+    // Default texture
+    default_texture_id: Int,
+}
+
+fn create_terrain_tex_manager() -> TerrainTexManager {
+    return TerrainTexManager {
+        textures: Map<Int, TerrainTexture>{},
+        texture_by_name: Map<String, Int>{},
+        next_texture_id: 1,
+        blend_maps: Collection<BlendMap>{},
+        blend_maps_x: 1,
+        blend_maps_y: 1,
+        blend_map_resolution: 256,
+        terrain_width: 1024.0,
+        terrain_height: 1024.0,
+        macro_texture_path: "",
+        macro_texture_scale: 1.0,
+        default_texture_id: 0,
+    }
+}
+
+/// Register a terrain texture
+fn register_texture(mgr: TerrainTexManager, texture: TerrainTexture) -> Int {
+    let id = mgr.next_texture_id
+    mgr.next_texture_id = mgr.next_texture_id + 1
+    texture.texture_id = id
+
+    mgr.textures.set(id, texture)
+    mgr.texture_by_name.set(texture.name, id)
+
+    // Set as default if first texture
+    if mgr.default_texture_id == 0 {
+        mgr.default_texture_id = id
+    }
+
+    return id
+}
+
+/// Get texture by ID
+fn get_texture(mgr: TerrainTexManager, id: Int) -> TerrainTexture {
+    if mgr.textures.has(id) {
+        return mgr.textures.get(id)
+    }
+    return create_terrain_texture(0, "Unknown", TerrainTextureType::Grass)
+}
+
+/// Get texture by name
+fn get_texture_by_name(mgr: TerrainTexManager, name: String) -> Int {
+    if mgr.texture_by_name.has(name) {
+        return mgr.texture_by_name.get(name)
+    }
+    return 0
+}
+
+/// Initialize blend maps
+fn init_blend_maps(mgr: TerrainTexManager, maps_x: Int, maps_y: Int, resolution: Int) {
+    mgr.blend_maps_x = maps_x
+    mgr.blend_maps_y = maps_y
+    mgr.blend_map_resolution = resolution
+    mgr.blend_maps = Collection<BlendMap>{}
+
+    for y in 0..maps_y {
+        for x in 0..maps_x {
+            let blend_map = create_blend_map(resolution, resolution)
+            blend_map.tile_x = x
+            blend_map.tile_y = y
+            mgr.blend_maps.add(blend_map)
+        }
+    }
+}
+
+/// Get blend map at tile position
+fn get_blend_map(mgr: TerrainTexManager, tile_x: Int, tile_y: Int) -> BlendMap {
+    let idx = tile_y * mgr.blend_maps_x + tile_x
+    if idx >= 0 && idx < mgr.blend_maps.len() {
+        return mgr.blend_maps.get(idx)
+    }
+    return create_blend_map(1, 1)
+}
+
+/// Get blend map at world position
+fn get_blend_map_at(mgr: TerrainTexManager, world_x: Float, world_y: Float) -> BlendMap {
+    let tile_size_x = mgr.terrain_width / mgr.blend_maps_x as Float
+    let tile_size_y = mgr.terrain_height / mgr.blend_maps_y as Float
+
+    let tile_x = (world_x / tile_size_x) as Int
+    let tile_y = (world_y / tile_size_y) as Int
+
+    if tile_x < 0 { tile_x = 0 }
+    if tile_x >= mgr.blend_maps_x { tile_x = mgr.blend_maps_x - 1 }
+    if tile_y < 0 { tile_y = 0 }
+    if tile_y >= mgr.blend_maps_y { tile_y = mgr.blend_maps_y - 1 }
+
+    return get_blend_map(mgr, tile_x, tile_y)
+}
+
+// ============================================================================
+// Texture Sampling
+// ============================================================================
+
+/// Get blend weights at world position
+fn get_blend_weights(mgr: TerrainTexManager, world_x: Float, world_y: Float) -> Collection<(Int, Float)> {
+    // Returns collection of (texture_id, weight)
+    let weights = Collection<(Int, Float)>{}
+
+    let blend_map = get_blend_map_at(mgr, world_x, world_y)
+
+    // Calculate local UV within blend map
+    let tile_size_x = mgr.terrain_width / mgr.blend_maps_x as Float
+    let tile_size_y = mgr.terrain_height / mgr.blend_maps_y as Float
+
+    let local_x = world_x - blend_map.tile_x as Float * tile_size_x
+    let local_y = world_y - blend_map.tile_y as Float * tile_size_y
+
+    let u = local_x / tile_size_x
+    let v = local_y / tile_size_y
+
+    // Sample each channel
+    let total_weight = 0.0
+
+    for i in 0..blend_map.channels.len() {
+        let channel = blend_map.channels.get(i)
+        let weight = sample_blend(blend_map, i, u, v)
+
+        if weight > 0.001 {
+            weights.add((channel.texture_id, weight))
+            total_weight = total_weight + weight
+        }
+    }
+
+    // Add default texture if no weights
+    if weights.len() == 0 {
+        weights.add((mgr.default_texture_id, 1.0))
+    }
+
+    // Normalize weights
+    if total_weight > 0.0 && total_weight != 1.0 {
+        let new_weights = Collection<(Int, Float)>{}
+        for w in weights {
+            new_weights.add((w.0, w.1 / total_weight))
+        }
+        return new_weights
+    }
+
+    return weights
+}
+
+/// Get dominant texture at position
+fn get_dominant_texture(mgr: TerrainTexManager, world_x: Float, world_y: Float) -> Int {
+    let weights = get_blend_weights(mgr, world_x, world_y)
+
+    let max_weight = 0.0
+    let dominant_id = mgr.default_texture_id
+
+    for w in weights {
+        if w.1 > max_weight {
+            max_weight = w.1
+            dominant_id = w.0
+        }
+    }
+
+    return dominant_id
+}
+
+/// Get movement cost at position
+fn get_movement_cost(mgr: TerrainTexManager, world_x: Float, world_y: Float) -> Float {
+    let weights = get_blend_weights(mgr, world_x, world_y)
+
+    let total_cost = 0.0
+
+    for w in weights {
+        let tex = get_texture(mgr, w.0)
+        total_cost = total_cost + tex.movement_cost * w.1
+    }
+
+    return total_cost
+}
+
+/// Check if position is passable
+fn is_terrain_passable(mgr: TerrainTexManager, world_x: Float, world_y: Float) -> Bool {
+    let tex_id = get_dominant_texture(mgr, world_x, world_y)
+    let tex = get_texture(mgr, tex_id)
+    return tex.is_passable
+}
+
+// ============================================================================
+// Painting
+// ============================================================================
+
+/// Paint texture at world position
+fn paint_texture(mgr: TerrainTexManager, texture_id: Int, world_x: Float, world_y: Float, radius: Float, strength: Float) {
+    // Get affected blend maps
+    let min_x = world_x - radius
+    let min_y = world_y - radius
+    let max_x = world_x + radius
+    let max_y = world_y + radius
+
+    // For each blend map that might be affected
+    for i in 0..mgr.blend_maps.len() {
+        let blend_map = mgr.blend_maps.get(i)
+
+        // Find or add channel for this texture
+        let channel_idx = -1
+        for c in 0..blend_map.channels.len() {
+            if blend_map.channels.get(c).texture_id == texture_id {
+                channel_idx = c
+                break
+            }
+        }
+
+        if channel_idx < 0 {
+            channel_idx = add_blend_channel(blend_map, texture_id)
+        }
+
+        if channel_idx < 0 {
+            continue  // Blend map full
+        }
+
+        // Calculate affected pixels
+        let tile_size_x = mgr.terrain_width / mgr.blend_maps_x as Float
+        let tile_size_y = mgr.terrain_height / mgr.blend_maps_y as Float
+        let pixel_size_x = tile_size_x / blend_map.width as Float
+        let pixel_size_y = tile_size_y / blend_map.height as Float
+
+        for py in 0..blend_map.height {
+            for px in 0..blend_map.width {
+                // World position of this pixel
+                let pixel_world_x = blend_map.tile_x as Float * tile_size_x + px as Float * pixel_size_x
+                let pixel_world_y = blend_map.tile_y as Float * tile_size_y + py as Float * pixel_size_y
+
+                // Distance from paint center
+                let dx = pixel_world_x - world_x
+                let dy = pixel_world_y - world_y
+                let dist = sqrt(dx * dx + dy * dy)
+
+                if dist < radius {
+                    // Calculate paint amount (falloff)
+                    let falloff = 1.0 - (dist / radius)
+                    let paint_amount = strength * falloff * falloff  // Smooth falloff
+
+                    // Get current value
+                    let current = get_blend_value(blend_map, channel_idx, px, py)
+                    let new_value = current + paint_amount
+                    if new_value > 1.0 { new_value = 1.0 }
+
+                    // Set new value
+                    set_blend_value(blend_map, channel_idx, px, py, new_value)
+
+                    // Reduce other channels proportionally
+                    for c in 0..blend_map.channels.len() {
+                        if c != channel_idx {
+                            let other_value = get_blend_value(blend_map, c, px, py)
+                            let reduced = other_value * (1.0 - paint_amount * 0.5)
+                            set_blend_value(blend_map, c, px, py, reduced)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt(x: Float) -> Float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_texture_registration() -> Bool {
+    let mgr = create_terrain_tex_manager()
+
+    let grass = create_grass_texture(0)
+    let grass_id = register_texture(mgr, grass)
+
+    let dirt = create_dirt_texture(0)
+    let dirt_id = register_texture(mgr, dirt)
+
+    assert(grass_id > 0, "Should register grass")
+    assert(dirt_id > 0, "Should register dirt")
+    assert(dirt_id != grass_id, "IDs should be unique")
+
+    let found_id = get_texture_by_name(mgr, "Grass")
+    assert(found_id == grass_id, "Should find by name")
+
+    return true
+}
+
+fn test_blend_map() -> Bool {
+    let blend_map = create_blend_map(64, 64)
+
+    let ch1 = add_blend_channel(blend_map, 1)
+    let ch2 = add_blend_channel(blend_map, 2)
+
+    assert(ch1 == 0, "First channel should be 0")
+    assert(ch2 == 1, "Second channel should be 1")
+
+    set_blend_value(blend_map, 0, 32, 32, 0.75)
+    let value = get_blend_value(blend_map, 0, 32, 32)
+    assert(value == 0.75, "Should store value")
+
+    return true
+}
+
+fn test_blend_sampling() -> Bool {
+    let blend_map = create_blend_map(4, 4)
+    add_blend_channel(blend_map, 1)
+
+    // Set corner values
+    set_blend_value(blend_map, 0, 0, 0, 0.0)
+    set_blend_value(blend_map, 0, 3, 0, 1.0)
+    set_blend_value(blend_map, 0, 0, 3, 1.0)
+    set_blend_value(blend_map, 0, 3, 3, 0.0)
+
+    // Sample center - should be blend of all corners
+    let center = sample_blend(blend_map, 0, 0.5, 0.5)
+    assert(center > 0.3 && center < 0.7, "Center should be blended")
+
+    return true
+}
+
+fn test_blend_weights() -> Bool {
+    let mgr = create_terrain_tex_manager()
+    mgr.terrain_width = 256.0
+    mgr.terrain_height = 256.0
+
+    let grass = create_grass_texture(0)
+    let grass_id = register_texture(mgr, grass)
+
+    init_blend_maps(mgr, 1, 1, 64)
+
+    // Add grass to blend map
+    let blend_map = get_blend_map(mgr, 0, 0)
+    add_blend_channel(blend_map, grass_id)
+    set_blend_value(blend_map, 0, 32, 32, 1.0)
+
+    let weights = get_blend_weights(mgr, 128.0, 128.0)
+    assert(weights.len() > 0, "Should have weights")
+
+    return true
+}
+
+fn test_movement_cost() -> Bool {
+    let mgr = create_terrain_tex_manager()
+    mgr.terrain_width = 256.0
+    mgr.terrain_height = 256.0
+
+    let sand = create_sand_texture(0)
+    let sand_id = register_texture(mgr, sand)
+
+    init_blend_maps(mgr, 1, 1, 64)
+
+    let blend_map = get_blend_map(mgr, 0, 0)
+    add_blend_channel(blend_map, sand_id)
+
+    // Fill with sand
+    for y in 0..64 {
+        for x in 0..64 {
+            set_blend_value(blend_map, 0, x, y, 1.0)
+        }
+    }
+
+    let cost = get_movement_cost(mgr, 128.0, 128.0)
+    assert(cost > 1.0, "Sand should have movement penalty")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_texture_registration(), "Texture registration test failed")
+    assert(test_blend_map(), "Blend map test failed")
+    assert(test_blend_sampling(), "Blend sampling test failed")
+    assert(test_blend_weights(), "Blend weights test failed")
+    assert(test_movement_cost(), "Movement cost test failed")
+    return true
+}

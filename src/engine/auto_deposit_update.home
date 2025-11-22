@@ -1,0 +1,732 @@
+// Auto Deposit Update - Automatic Resource Deposit System
+// Based on Thyme engine AutoDepositUpdate
+// Handles automatic resource deposits like supply docks and oil derricks
+
+from basics import Collection, Map
+from update_module import UpdateModule, create_update_module, UpdateType
+
+// ============================================================================
+// Auto Deposit Configuration
+// ============================================================================
+
+enum DepositType {
+    OilDerrick,         // Captured oil derricks
+    SupplyDock,         // China supply docks
+    BlackMarket,        // GLA black market
+    HackerIncome,       // China hacker income
+    Bounty,             // GLA bounty from kills
+    InternetCenter,     // China internet center
+}
+
+enum DepositState {
+    Inactive,           // Not producing
+    Active,             // Producing income
+    Paused,             // Temporarily paused
+    Depleted,           // Resource exhausted
+    Captured,           // Being captured by enemy
+}
+
+struct AutoDepositConfig {
+    deposit_type: DepositType,
+    name: String,
+
+    // Income
+    deposit_amount: Int,            // Amount per deposit
+    deposit_interval: Float,        // Seconds between deposits
+    initial_bonus: Int,             // One-time bonus on capture/build
+
+    // Limits
+    max_deposits: Int,              // 0 = unlimited
+    total_capacity: Int,            // Max total that can be earned (0 = unlimited)
+
+    // Modifiers
+    upgrade_multiplier: Float,      // Bonus from upgrades
+    veterancy_bonus: Float,         // Bonus per vet level
+
+    // Requirements
+    requires_power: Bool,
+    requires_worker: Bool,
+    min_workers: Int,               // Minimum workers needed
+
+    // Visual
+    deposit_fx: String,
+    upgrade_fx: String,
+}
+
+fn create_oil_derrick_config() -> AutoDepositConfig {
+    return AutoDepositConfig {
+        deposit_type: DepositType::OilDerrick,
+        name: "Oil Derrick",
+        deposit_amount: 200,
+        deposit_interval: 12.0,
+        initial_bonus: 1000,
+        max_deposits: 0,
+        total_capacity: 0,
+        upgrade_multiplier: 1.0,
+        veterancy_bonus: 0.0,
+        requires_power: false,
+        requires_worker: false,
+        min_workers: 0,
+        deposit_fx: "FX_OilDerrickIncome",
+        upgrade_fx: "",
+    }
+}
+
+fn create_supply_dock_config() -> AutoDepositConfig {
+    return AutoDepositConfig {
+        deposit_type: DepositType::SupplyDock,
+        name: "Supply Dock",
+        deposit_amount: 600,
+        deposit_interval: 30.0,
+        initial_bonus: 0,
+        max_deposits: 0,
+        total_capacity: 0,
+        upgrade_multiplier: 1.0,
+        veterancy_bonus: 0.0,
+        requires_power: true,
+        requires_worker: false,
+        min_workers: 0,
+        deposit_fx: "FX_SupplyDockIncome",
+        upgrade_fx: "",
+    }
+}
+
+fn create_black_market_config() -> AutoDepositConfig {
+    return AutoDepositConfig {
+        deposit_type: DepositType::BlackMarket,
+        name: "Black Market",
+        deposit_amount: 200,
+        deposit_interval: 8.0,
+        initial_bonus: 0,
+        max_deposits: 0,
+        total_capacity: 0,
+        upgrade_multiplier: 1.0,
+        veterancy_bonus: 0.0,
+        requires_power: false,
+        requires_worker: false,
+        min_workers: 0,
+        deposit_fx: "FX_BlackMarketIncome",
+        upgrade_fx: "",
+    }
+}
+
+fn create_hacker_config() -> AutoDepositConfig {
+    return AutoDepositConfig {
+        deposit_type: DepositType::HackerIncome,
+        name: "Hacker",
+        deposit_amount: 5,
+        deposit_interval: 1.0,
+        initial_bonus: 0,
+        max_deposits: 0,
+        total_capacity: 0,
+        upgrade_multiplier: 1.0,
+        veterancy_bonus: 0.25,
+        requires_power: false,
+        requires_worker: false,
+        min_workers: 0,
+        deposit_fx: "FX_HackerIncome",
+        upgrade_fx: "",
+    }
+}
+
+fn create_internet_center_config() -> AutoDepositConfig {
+    return AutoDepositConfig {
+        deposit_type: DepositType::InternetCenter,
+        name: "Internet Center",
+        deposit_amount: 50,
+        deposit_interval: 5.0,
+        initial_bonus: 0,
+        max_deposits: 0,
+        total_capacity: 0,
+        upgrade_multiplier: 2.0,  // Doubles with full hackers
+        veterancy_bonus: 0.0,
+        requires_power: true,
+        requires_worker: true,
+        min_workers: 1,
+        deposit_fx: "FX_InternetCenterIncome",
+        upgrade_fx: "FX_InternetCenterUpgrade",
+    }
+}
+
+// ============================================================================
+// Auto Deposit Instance
+// ============================================================================
+
+struct AutoDepositInstance {
+    instance_id: Int,
+    config: AutoDepositConfig,
+    state: DepositState,
+
+    // Owner
+    owner_player_id: Int,
+    building_id: Int,               // Source building
+
+    // Timing
+    time_until_deposit: Float,
+    total_time_active: Float,
+
+    // Counts
+    deposits_made: Int,
+    total_deposited: Int,
+
+    // Modifiers
+    current_multiplier: Float,
+    veterancy_level: Int,
+
+    // Worker tracking
+    worker_count: Int,
+    worker_ids: Collection<Int>,
+
+    // Power state
+    has_power: Bool,
+}
+
+fn create_auto_deposit_instance(id: Int, config: AutoDepositConfig, player_id: Int) -> AutoDepositInstance {
+    return AutoDepositInstance {
+        instance_id: id,
+        config: config,
+        state: DepositState::Inactive,
+        owner_player_id: player_id,
+        building_id: 0,
+        time_until_deposit: config.deposit_interval,
+        total_time_active: 0.0,
+        deposits_made: 0,
+        total_deposited: 0,
+        current_multiplier: 1.0,
+        veterancy_level: 0,
+        worker_count: 0,
+        worker_ids: Collection<Int>{},
+        has_power: true,
+    }
+}
+
+// ============================================================================
+// Auto Deposit Update Module
+// ============================================================================
+
+struct AutoDepositUpdateModule {
+    base: UpdateModule,
+
+    // All deposit sources
+    deposits: Map<Int, AutoDepositInstance>,
+    next_id: Int,
+
+    // By player
+    deposits_by_player: Map<Int, Collection<Int>>,
+
+    // By type
+    deposits_by_type: Map<DepositType, Collection<Int>>,
+
+    // Pending income events
+    pending_income: Collection<(Int, Int)>,  // (player_id, amount)
+
+    // Statistics
+    total_income_generated: Int,
+}
+
+fn create_auto_deposit_update(tag: String) -> AutoDepositUpdateModule {
+    return AutoDepositUpdateModule {
+        base: create_update_module(tag, UpdateType::Economy),
+        deposits: Map<Int, AutoDepositInstance>{},
+        next_id: 1,
+        deposits_by_player: Map<Int, Collection<Int>>{},
+        deposits_by_type: Map<DepositType, Collection<Int>>{},
+        pending_income: Collection<(Int, Int)>{},
+        total_income_generated: 0,
+    }
+}
+
+// ============================================================================
+// Deposit Management
+// ============================================================================
+
+/// Register new deposit source
+fn register_deposit(module: AutoDepositUpdateModule, config: AutoDepositConfig, player_id: Int, building_id: Int) -> Int {
+    let instance = create_auto_deposit_instance(module.next_id, config, player_id)
+    instance.building_id = building_id
+    module.next_id = module.next_id + 1
+
+    module.deposits.set(instance.instance_id, instance)
+
+    // Track by player
+    if !module.deposits_by_player.has(player_id) {
+        module.deposits_by_player.set(player_id, Collection<Int>{})
+    }
+    module.deposits_by_player.get(player_id).add(instance.instance_id)
+
+    // Track by type
+    if !module.deposits_by_type.has(config.deposit_type) {
+        module.deposits_by_type.set(config.deposit_type, Collection<Int>{})
+    }
+    module.deposits_by_type.get(config.deposit_type).add(instance.instance_id)
+
+    return instance.instance_id
+}
+
+/// Unregister deposit source
+fn unregister_deposit(module: AutoDepositUpdateModule, id: Int) {
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+
+        // Remove from player tracking
+        if module.deposits_by_player.has(instance.owner_player_id) {
+            let player_deps = module.deposits_by_player.get(instance.owner_player_id)
+            let new_deps = Collection<Int>{}
+            for dep_id in player_deps {
+                if dep_id != id {
+                    new_deps.add(dep_id)
+                }
+            }
+            module.deposits_by_player.set(instance.owner_player_id, new_deps)
+        }
+
+        // Remove from type tracking
+        if module.deposits_by_type.has(instance.config.deposit_type) {
+            let type_deps = module.deposits_by_type.get(instance.config.deposit_type)
+            let new_type_deps = Collection<Int>{}
+            for dep_id in type_deps {
+                if dep_id != id {
+                    new_type_deps.add(dep_id)
+                }
+            }
+            module.deposits_by_type.set(instance.config.deposit_type, new_type_deps)
+        }
+
+        module.deposits.remove(id)
+    }
+}
+
+/// Activate deposit source
+fn activate_deposit(module: AutoDepositUpdateModule, id: Int) -> Int {
+    // Returns initial bonus if any
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+        instance.state = DepositState::Active
+        instance.time_until_deposit = instance.config.deposit_interval
+
+        // Return initial bonus
+        if instance.config.initial_bonus > 0 {
+            module.pending_income.add((instance.owner_player_id, instance.config.initial_bonus))
+            return instance.config.initial_bonus
+        }
+    }
+    return 0
+}
+
+/// Deactivate deposit source
+fn deactivate_deposit(module: AutoDepositUpdateModule, id: Int) {
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+        instance.state = DepositState::Inactive
+    }
+}
+
+/// Pause deposit source
+fn pause_deposit(module: AutoDepositUpdateModule, id: Int) {
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+        if instance.state == DepositState::Active {
+            instance.state = DepositState::Paused
+        }
+    }
+}
+
+/// Resume deposit source
+fn resume_deposit(module: AutoDepositUpdateModule, id: Int) {
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+        if instance.state == DepositState::Paused {
+            instance.state = DepositState::Active
+        }
+    }
+}
+
+// ============================================================================
+// Worker Management
+// ============================================================================
+
+/// Add worker to deposit source
+fn add_worker(module: AutoDepositUpdateModule, deposit_id: Int, worker_id: Int) -> Bool {
+    if !module.deposits.has(deposit_id) {
+        return false
+    }
+
+    let instance = module.deposits.get(deposit_id)
+    if !instance.worker_ids.contains(worker_id) {
+        instance.worker_ids.add(worker_id)
+        instance.worker_count = instance.worker_count + 1
+
+        // Update multiplier based on workers
+        update_multiplier(instance)
+
+        return true
+    }
+    return false
+}
+
+/// Remove worker from deposit source
+fn remove_worker(module: AutoDepositUpdateModule, deposit_id: Int, worker_id: Int) {
+    if module.deposits.has(deposit_id) {
+        let instance = module.deposits.get(deposit_id)
+        let new_workers = Collection<Int>{}
+        for id in instance.worker_ids {
+            if id != worker_id {
+                new_workers.add(id)
+            }
+        }
+        instance.worker_ids = new_workers
+        instance.worker_count = instance.worker_ids.len()
+
+        update_multiplier(instance)
+    }
+}
+
+/// Update multiplier based on workers
+fn update_multiplier(instance: AutoDepositInstance) {
+    instance.current_multiplier = instance.config.upgrade_multiplier
+
+    // Worker bonus (linear scaling)
+    if instance.config.requires_worker && instance.worker_count > 0 {
+        let worker_bonus = (instance.worker_count as Float - 1.0) * 0.25
+        instance.current_multiplier = instance.current_multiplier + worker_bonus
+    }
+
+    // Veterancy bonus
+    if instance.config.veterancy_bonus > 0.0 && instance.veterancy_level > 0 {
+        instance.current_multiplier = instance.current_multiplier + (instance.veterancy_level as Float * instance.config.veterancy_bonus)
+    }
+}
+
+// ============================================================================
+// Power Management
+// ============================================================================
+
+/// Set power state
+fn set_power_state(module: AutoDepositUpdateModule, deposit_id: Int, has_power: Bool) {
+    if module.deposits.has(deposit_id) {
+        let instance = module.deposits.get(deposit_id)
+        instance.has_power = has_power
+
+        // Auto-pause if needs power and doesn't have it
+        if instance.config.requires_power && !has_power {
+            if instance.state == DepositState::Active {
+                instance.state = DepositState::Paused
+            }
+        } else if instance.config.requires_power && has_power {
+            if instance.state == DepositState::Paused {
+                instance.state = DepositState::Active
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Capture System
+// ============================================================================
+
+/// Transfer ownership (for captured buildings)
+fn transfer_ownership(module: AutoDepositUpdateModule, deposit_id: Int, new_player_id: Int) -> Int {
+    // Returns initial bonus for new owner
+    if module.deposits.has(deposit_id) {
+        let instance = module.deposits.get(deposit_id)
+        let old_player_id = instance.owner_player_id
+
+        // Update player tracking
+        if module.deposits_by_player.has(old_player_id) {
+            let old_deps = module.deposits_by_player.get(old_player_id)
+            let new_old_deps = Collection<Int>{}
+            for id in old_deps {
+                if id != deposit_id {
+                    new_old_deps.add(id)
+                }
+            }
+            module.deposits_by_player.set(old_player_id, new_old_deps)
+        }
+
+        if !module.deposits_by_player.has(new_player_id) {
+            module.deposits_by_player.set(new_player_id, Collection<Int>{})
+        }
+        module.deposits_by_player.get(new_player_id).add(deposit_id)
+
+        instance.owner_player_id = new_player_id
+
+        // Give initial bonus to new owner
+        if instance.config.initial_bonus > 0 {
+            module.pending_income.add((new_player_id, instance.config.initial_bonus))
+            return instance.config.initial_bonus
+        }
+    }
+    return 0
+}
+
+// ============================================================================
+// Update
+// ============================================================================
+
+/// Check if deposit should produce
+fn should_produce(instance: AutoDepositInstance) -> Bool {
+    if instance.state != DepositState::Active {
+        return false
+    }
+
+    if instance.config.requires_power && !instance.has_power {
+        return false
+    }
+
+    if instance.config.requires_worker && instance.worker_count < instance.config.min_workers {
+        return false
+    }
+
+    if instance.config.max_deposits > 0 && instance.deposits_made >= instance.config.max_deposits {
+        return false
+    }
+
+    if instance.config.total_capacity > 0 && instance.total_deposited >= instance.config.total_capacity {
+        return false
+    }
+
+    return true
+}
+
+/// Calculate deposit amount
+fn calculate_deposit(instance: AutoDepositInstance) -> Int {
+    let base_amount = instance.config.deposit_amount as Float
+    let final_amount = base_amount * instance.current_multiplier
+
+    return final_amount as Int
+}
+
+/// Update all deposits
+fn update_auto_deposits(module: AutoDepositUpdateModule, delta: Float) -> Collection<(Int, Int)> {
+    // Returns collection of (player_id, amount) for deposits made
+    module.pending_income = Collection<(Int, Int)>{}
+
+    for id in module.deposits.keys() {
+        let instance = module.deposits.get(id)
+
+        if should_produce(instance) {
+            instance.total_time_active = instance.total_time_active + delta
+            instance.time_until_deposit = instance.time_until_deposit - delta
+
+            if instance.time_until_deposit <= 0.0 {
+                // Make deposit
+                let amount = calculate_deposit(instance)
+
+                module.pending_income.add((instance.owner_player_id, amount))
+                module.total_income_generated = module.total_income_generated + amount
+
+                instance.deposits_made = instance.deposits_made + 1
+                instance.total_deposited = instance.total_deposited + amount
+                instance.time_until_deposit = instance.config.deposit_interval
+
+                // Check if depleted
+                if instance.config.max_deposits > 0 && instance.deposits_made >= instance.config.max_deposits {
+                    instance.state = DepositState::Depleted
+                }
+                if instance.config.total_capacity > 0 && instance.total_deposited >= instance.config.total_capacity {
+                    instance.state = DepositState::Depleted
+                }
+            }
+        }
+    }
+
+    return module.pending_income
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+/// Get deposit state
+fn get_deposit_state(module: AutoDepositUpdateModule, id: Int) -> DepositState {
+    if module.deposits.has(id) {
+        return module.deposits.get(id).state
+    }
+    return DepositState::Inactive
+}
+
+/// Get income rate (per second)
+fn get_income_rate(module: AutoDepositUpdateModule, id: Int) -> Float {
+    if module.deposits.has(id) {
+        let instance = module.deposits.get(id)
+        if !should_produce(instance) {
+            return 0.0
+        }
+        let amount = calculate_deposit(instance) as Float
+        return amount / instance.config.deposit_interval
+    }
+    return 0.0
+}
+
+/// Get player total income rate
+fn get_player_income_rate(module: AutoDepositUpdateModule, player_id: Int) -> Float {
+    let total = 0.0
+
+    if module.deposits_by_player.has(player_id) {
+        for id in module.deposits_by_player.get(player_id) {
+            total = total + get_income_rate(module, id)
+        }
+    }
+
+    return total
+}
+
+/// Get time until next deposit
+fn get_time_until_deposit(module: AutoDepositUpdateModule, id: Int) -> Float {
+    if module.deposits.has(id) {
+        return module.deposits.get(id).time_until_deposit
+    }
+    return 0.0
+}
+
+/// Get total deposited
+fn get_total_deposited(module: AutoDepositUpdateModule, id: Int) -> Int {
+    if module.deposits.has(id) {
+        return module.deposits.get(id).total_deposited
+    }
+    return 0
+}
+
+/// Get player deposit count by type
+fn get_player_deposit_count(module: AutoDepositUpdateModule, player_id: Int, deposit_type: DepositType) -> Int {
+    let count = 0
+
+    if module.deposits_by_player.has(player_id) {
+        for id in module.deposits_by_player.get(player_id) {
+            if module.deposits.has(id) {
+                let instance = module.deposits.get(id)
+                if instance.config.deposit_type == deposit_type {
+                    count = count + 1
+                }
+            }
+        }
+    }
+
+    return count
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_deposit_creation() -> Bool {
+    let module = create_auto_deposit_update("TestDeposit")
+
+    let id = register_deposit(module, create_oil_derrick_config(), 1, 100)
+    assert(id > 0, "Should create deposit")
+    assert(get_deposit_state(module, id) == DepositState::Inactive, "Should be inactive")
+
+    return true
+}
+
+fn test_deposit_activation() -> Bool {
+    let module = create_auto_deposit_update("ActivationTest")
+
+    let config = create_oil_derrick_config()
+    let id = register_deposit(module, config, 1, 100)
+
+    let bonus = activate_deposit(module, id)
+    assert(bonus == 1000, "Should receive initial bonus")
+    assert(get_deposit_state(module, id) == DepositState::Active, "Should be active")
+
+    return true
+}
+
+fn test_deposit_income() -> Bool {
+    let module = create_auto_deposit_update("IncomeTest")
+
+    let config = create_oil_derrick_config()
+    config.deposit_interval = 1.0
+    config.deposit_amount = 100
+
+    let id = register_deposit(module, config, 1, 100)
+    activate_deposit(module, id)
+
+    // Update until deposit
+    for i in 0..15 {
+        let income = update_auto_deposits(module, 0.1)
+        if income.len() > 0 {
+            assert(income.get(0).0 == 1, "Should be player 1")
+            assert(income.get(0).1 == 100, "Should be 100")
+            return true
+        }
+    }
+
+    assert(false, "Should have received income")
+    return false
+}
+
+fn test_power_requirement() -> Bool {
+    let module = create_auto_deposit_update("PowerTest")
+
+    let config = create_supply_dock_config()
+    config.deposit_interval = 1.0
+
+    let id = register_deposit(module, config, 1, 100)
+    activate_deposit(module, id)
+
+    // Remove power
+    set_power_state(module, id, false)
+    assert(get_deposit_state(module, id) == DepositState::Paused, "Should pause without power")
+
+    // Restore power
+    set_power_state(module, id, true)
+    assert(get_deposit_state(module, id) == DepositState::Active, "Should resume with power")
+
+    return true
+}
+
+fn test_ownership_transfer() -> Bool {
+    let module = create_auto_deposit_update("TransferTest")
+
+    let config = create_oil_derrick_config()
+    let id = register_deposit(module, config, 1, 100)
+    activate_deposit(module, id)
+
+    // Transfer to player 2
+    let bonus = transfer_ownership(module, id, 2)
+    assert(bonus == 1000, "New owner should get bonus")
+
+    if module.deposits.has(id) {
+        assert(module.deposits.get(id).owner_player_id == 2, "Should be owned by player 2")
+    }
+
+    return true
+}
+
+fn test_worker_bonus() -> Bool {
+    let module = create_auto_deposit_update("WorkerTest")
+
+    let config = create_internet_center_config()
+    config.requires_worker = true
+    config.min_workers = 1
+
+    let id = register_deposit(module, config, 1, 100)
+    activate_deposit(module, id)
+
+    // No income without workers
+    let rate1 = get_income_rate(module, id)
+    assert(rate1 == 0.0, "No income without workers")
+
+    // Add worker
+    add_worker(module, id, 200)
+    let rate2 = get_income_rate(module, id)
+    assert(rate2 > 0.0, "Should have income with worker")
+
+    // Add more workers
+    add_worker(module, id, 201)
+    let rate3 = get_income_rate(module, id)
+    assert(rate3 > rate2, "More workers should increase income")
+
+    return true
+}
+
+fn run_all_tests() -> Bool {
+    assert(test_deposit_creation(), "Deposit creation test failed")
+    assert(test_deposit_activation(), "Deposit activation test failed")
+    assert(test_deposit_income(), "Deposit income test failed")
+    assert(test_power_requirement(), "Power requirement test failed")
+    assert(test_ownership_transfer(), "Ownership transfer test failed")
+    assert(test_worker_bonus(), "Worker bonus test failed")
+    return true
+}
