@@ -23,360 +23,24 @@ struct ArchivedFileInfo {
 // Directory tree node for organizing archived files
 struct ArchivedDirectory {
     name: string
-    files: []ArchivedFileInfo
     file_count: usize
-    subdirectories: []*ArchivedDirectory
     subdir_count: usize
     allocator: Allocator
-
-    fn init(allocator: Allocator, name: string): ArchivedDirectory {
-        return ArchivedDirectory {
-            name: name
-            files: allocator.alloc(ArchivedFileInfo, 256)
-            file_count: 0
-            subdirectories: allocator.alloc(*ArchivedDirectory, 64)
-            subdir_count: 0
-            allocator: allocator
-        }
-    }
-
-    fn add_file(mut self, file_info: ArchivedFileInfo) {
-        if self.file_count < self.files.len {
-            self.files[self.file_count] = file_info
-            self.file_count += 1
-        }
-    }
-
-    fn find_file(&self, filename: string): ?ArchivedFileInfo {
-        for i in 0..self.file_count {
-            if string_eq(self.files[i].filename, filename) {
-                return self.files[i]
-            }
-        }
-        return null
-    }
-
-    fn add_subdirectory(mut self, dir: *ArchivedDirectory) {
-        if self.subdir_count < self.subdirectories.len {
-            self.subdirectories[self.subdir_count] = dir
-            self.subdir_count += 1
-        }
-    }
-
-    fn find_subdirectory(&self, name: string): ?*ArchivedDirectory {
-        for i in 0..self.subdir_count {
-            if string_eq(self.subdirectories[i].name, name) {
-                return self.subdirectories[i]
-            }
-        }
-        return null
-    }
-
-    fn deinit(mut self) {
-        for i in 0..self.subdir_count {
-            self.subdirectories[i].deinit()
-            self.allocator.free(self.subdirectories[i])
-        }
-        self.allocator.free(self.files)
-        self.allocator.free(self.subdirectories)
-    }
 }
 
 // Archive file reader (.big format)
 struct ArchiveFile {
     path: string
     name: string
-    data: []u8  // Memory-mapped or loaded archive data
     root_directory: ArchivedDirectory
     file_count: usize
     priority: i32
     allocator: Allocator
-
-    fn init(allocator: Allocator): ArchiveFile {
-        return ArchiveFile {
-            path: ""
-            name: ""
-            data: []
-            root_directory: ArchivedDirectory.init(allocator, "")
-            file_count: 0
-            priority: 0
-            allocator: allocator
-        }
-    }
-
-    fn open(mut self, path: string): bool {
-        self.path = path
-        self.name = extract_filename(path)
-
-        // TODO: Load archive file from disk
-        // For now, placeholder
-        // Should use Zig 0.16-dev async I/O for efficient loading
-
-        // Parse archive header
-        if !self.parse_header() {
-            return false
-        }
-
-        // Build directory tree
-        if !self.parse_directory_tree() {
-            return false
-        }
-
-        return true
-    }
-
-    fn has_file(&self, path: string): bool {
-        return self.find_file(path) != null
-    }
-
-    fn get_file_info(&self, path: string): ?FileInfo {
-        if self.find_file(path) {
-            let info = self.find_file(path).?
-            return FileInfo {
-                size: info.size
-                timestamp: info.timestamp
-                is_directory: false
-                is_archive: true
-            }
-        }
-        return null
-    }
-
-    fn open_file(&self, path: string): ?File {
-        if self.find_file(path) {
-            let info = self.find_file(path).?
-
-            // Create file handle pointing to archive data
-            let file_data = self.data[info.offset..(info.offset + info.size)]
-
-            return File {
-                path: path
-                access_mode: FILE_READ | FILE_BINARY
-                is_open: true
-                position: 0
-                size: info.size
-                handle: null
-                archive_data: file_data
-            }
-        }
-        return null
-    }
-
-    fn list_files(&self, directory: string, pattern: string, recursive: bool): []DirectoryEntry {
-        let mut entries = self.allocator.alloc(DirectoryEntry, 256)
-        let mut count: usize = 0
-
-        // Navigate to directory
-        let dir = self.navigate_to_directory(directory)
-        if dir {
-            self.collect_files_recursive(dir.?, pattern, recursive, &mut entries, &mut count)
-        }
-
-        return entries[0..count]
-    }
-
-    fn set_priority(mut self, priority: i32) {
-        self.priority = priority
-    }
-
-    fn close(mut self) {
-        self.root_directory.deinit()
-        if self.data.len > 0 {
-            self.allocator.free(self.data)
-        }
-    }
-
-    // Private methods
-
-    fn parse_header(mut self): bool {
-        // .big file format header:
-        // - 4 bytes: signature "BIG "
-        // - 4 bytes: archive size
-        // - 4 bytes: file count
-        // - 4 bytes: first file offset
-
-        if self.data.len < 16 {
-            return false
-        }
-
-        let signature = read_u32_be(&self.data[0])
-        if signature != ARCHIVE_SIGNATURE {
-            return false
-        }
-
-        let archive_size = read_u32_be(&self.data[4])
-        self.file_count = @intCast(usize, read_u32_be(&self.data[8]))
-
-        return true
-    }
-
-    fn parse_directory_tree(mut self): bool {
-        // Read file table from archive
-        let mut offset: usize = 16  // After header
-
-        for i in 0..self.file_count {
-            // Each entry:
-            // - 4 bytes: file offset
-            // - 4 bytes: file size
-            // - N bytes: null-terminated filename
-
-            if offset + 8 > self.data.len {
-                return false
-            }
-
-            let file_offset = @intCast(usize, read_u32_be(&self.data[offset]))
-            let file_size = @intCast(usize, read_u32_be(&self.data[offset + 4]))
-            offset += 8
-
-            // Read filename
-            let filename_start = offset
-            while offset < self.data.len and self.data[offset] != 0 {
-                offset += 1
-            }
-
-            let filename = self.data[filename_start..offset]
-            offset += 1  // Skip null terminator
-
-            // Add file to directory tree
-            self.add_file_to_tree(filename, file_offset, file_size)
-        }
-
-        return true
-    }
-
-    fn add_file_to_tree(mut self, path: []u8, offset: usize, size: usize) {
-        // Split path into directory components
-        let mut current_dir = &self.root_directory
-        let mut path_start: usize = 0
-        let mut i: usize = 0
-
-        while i < path.len {
-            if path[i] == "/" or path[i] == '\\' {
-                // Found directory separator
-                let dir_name = path[path_start..i]
-
-                // Find or create subdirectory
-                let mut subdir = current_dir.find_subdirectory(dir_name)
-                if !subdir {
-                    // Create new subdirectory
-                    let new_dir = self.allocator.alloc(ArchivedDirectory, 1)
-                    new_dir[0] = ArchivedDirectory.init(self.allocator, dir_name)
-                    current_dir.add_subdirectory(&new_dir[0])
-                    subdir = &new_dir[0]
-                }
-
-                current_dir = subdir.?
-                path_start = i + 1
-            }
-            i += 1
-        }
-
-        // Add file to current directory
-        let filename = path[path_start..path.len]
-        current_dir.add_file(ArchivedFileInfo {
-            filename: filename
-            offset: offset
-            size: size
-            timestamp: 0
-        })
-    }
-
-    fn find_file(&self, path: string): ?ArchivedFileInfo {
-        // Navigate directory tree to find file
-        let mut current_dir = &self.root_directory
-        let mut path_start: usize = 0
-        let mut i: usize = 0
-
-        while i < path.len {
-            if path[i] == "/" or path[i] == '\\' {
-                let dir_name = path[path_start..i]
-
-                let subdir = current_dir.find_subdirectory(dir_name)
-                if !subdir {
-                    return null
-                }
-
-                current_dir = subdir.?
-                path_start = i + 1
-            }
-            i += 1
-        }
-
-        // Find file in current directory
-        let filename = path[path_start..path.len]
-        return current_dir.find_file(filename)
-    }
-
-    fn navigate_to_directory(&self, path: string): ?*ArchivedDirectory {
-        let mut current_dir = &self.root_directory
-
-        if path.len == 0 {
-            return current_dir
-        }
-
-        let mut path_start: usize = 0
-        let mut i: usize = 0
-
-        while i < path.len {
-            if path[i] == "/" or path[i] == '\\' {
-                let dir_name = path[path_start..i]
-
-                let subdir = current_dir.find_subdirectory(dir_name)
-                if !subdir {
-                    return null
-                }
-
-                current_dir = subdir.?
-                path_start = i + 1
-            }
-            i += 1
-        }
-
-        return current_dir
-    }
-
-    fn collect_files_recursive(
-        self,
-        dir: *ArchivedDirectory,
         pattern: string,
         recursive: bool,
-        entries: *[]DirectoryEntry,
-        count: *usize
-    ) {
-        // Add files matching pattern
-        for i in 0..dir.file_count {
-            if wildcard_match(dir.files[i].filename, pattern) {
-                if count.* < entries.len {
-                    entries.*[count.*] = DirectoryEntry {
                         name: dir.files[i].filename
                         is_directory: false
                         size: dir.files[i].size
-                    }
-                    count.* += 1
-                }
-            }
-        }
-
-        // Recursively search subdirectories
-        if recursive {
-            for i in 0..dir.subdir_count {
-                self.collect_files_recursive(
-                    dir.subdirectories[i],
-                    pattern,
-                    recursive,
-                    entries,
-                    count
-                )
-            }
-        }
-    }
-
-    fn deinit(mut self) {
-        self.root_directory.deinit()
-        if self.data.len > 0 {
-            self.allocator.free(self.data)
-        }
-    }
 }
 
 // Utility functions
@@ -392,9 +56,9 @@ fn read_u32_be(data: []u8): u32 {
 fn extract_filename(path: string): string {
     // Extract filename from full path
     let mut i = path.len
-    while i > 0 {
+    while (i > 0) {
         i -= 1
-        if path[i] == "/" or path[i] == '\\' {
+        if (path[i] == "/" or path[i] == '\\') {
             return path[(i + 1)..path.len]
         }
     }
@@ -405,7 +69,7 @@ fn wildcard_match(str: string, pattern: string): bool {
     // Simple wildcard matching (* and ?)
     // TODO: Implement proper wildcard matching
     // For now, just check if pattern is "*" (match all)
-    if pattern.len == 1 and pattern[0] == "*" {
+    if (pattern.len == 1 and pattern[0] == "*") {
         return true
     }
 
@@ -415,61 +79,8 @@ fn wildcard_match(str: string, pattern: string): bool {
 
 // Global archive manager
 struct ArchiveManager {
-    archives: []*ArchiveFile
     archive_count: usize
     allocator: Allocator
-
-    fn init(allocator: Allocator): ArchiveManager {
-        return ArchiveManager {
-            archives: allocator.alloc(*ArchiveFile, 32)
-            archive_count: 0
-            allocator: allocator
-        }
-    }
-
-    fn load_archive(mut self, path: string, priority: i32): bool {
-        if self.archive_count >= self.archives.len {
-            return false
-        }
-
-        let archive = self.allocator.alloc(ArchiveFile, 1)
-        archive[0] = ArchiveFile.init(self.allocator)
-
-        if !archive[0].open(path) {
-            self.allocator.free(archive)
-            return false
-        }
-
-        archive[0].set_priority(priority)
-        self.archives[self.archive_count] = &archive[0]
-        self.archive_count += 1
-
-        // Sort by priority (higher priority first)
-        self.sort_by_priority()
-
-        return true
-    }
-
-    fn sort_by_priority(mut self) {
-        // Simple bubble sort by priority
-        for i in 0..self.archive_count {
-            for j in (i + 1)..self.archive_count {
-                if self.archives[j].priority > self.archives[i].priority {
-                    let temp = self.archives[i]
-                    self.archives[i] = self.archives[j]
-                    self.archives[j] = temp
-                }
-            }
-        }
-    }
-
-    fn deinit(mut self) {
-        for i in 0..self.archive_count {
-            self.archives[i].deinit()
-            self.allocator.free(self.archives[i])
-        }
-        self.allocator.free(self.archives)
-    }
 }
 
 var g_archive_manager: ?ArchiveManager = null
@@ -479,14 +90,14 @@ export fn init_archive_system(allocator: Allocator) {
 }
 
 export fn shutdown_archive_system() {
-    if g_archive_manager {
+    if (g_archive_manager) {
         g_archive_manager.?.deinit()
         g_archive_manager = null
     }
 }
 
 export fn load_archive(path: string, priority: i32): bool {
-    if g_archive_manager {
+    if (g_archive_manager) {
         return g_archive_manager.?.load_archive(path, priority)
     }
     return false

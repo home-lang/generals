@@ -35,118 +35,6 @@ struct TerrainBrush {
     strength: f64,
     falloff: f64,
     edit_mode: TerrainEditMode,
-
-    fn init(): TerrainBrush {
-        return TerrainBrush {
-            shape: BrushShape::CIRCLE,
-            radius: 5.0,
-            strength: 1.0,
-            falloff: 0.5,
-            edit_mode: TerrainEditMode::RAISE,
-        }
-    }
-
-    fn apply(&self, heightmap: HeightMap, x: i32, y: i32, delta_time: f64) {
-        let affected_cells = self.get_affected_cells(x, y, heightmap.width, heightmap.height)
-
-        for i in 0..affected_cells.count() {
-            let cell = affected_cells.get(i)
-            let distance = self.distance_to_center(cell.x, cell.y, x, y)
-            let influence = self.calculate_influence(distance)
-
-            if influence > 0.0 {
-                self.apply_to_cell(heightmap, cell.x, cell.y, influence, delta_time)
-            }
-        }
-    }
-
-    fn get_affected_cells(&self, center_x: i32, center_y: i32, map_width: i32, map_height: i32): Vec<GridCell> {
-        let cells = Vec::new()
-        let radius_int = self.radius as Int
-
-        match self.shape {
-            BrushShape::CIRCLE => {
-                let start_x = max(0, center_x - radius_int)
-                let end_x = min(map_width - 1, center_x + radius_int)
-                let start_y = max(0, center_y - radius_int)
-                let end_y = min(map_height - 1, center_y + radius_int)
-
-                for y in start_y..end_y {
-                    for x in start_x..end_x {
-                        let dist = self.distance_to_center(x, y, center_x, center_y)
-                        if dist <= self.radius {
-                            cells.add(GridCell::init(x, y))
-                        }
-                    }
-                }
-            },
-            BrushShape::SQUARE => {
-                let start_x = max(0, center_x - radius_int)
-                let end_x = min(map_width - 1, center_x + radius_int)
-                let start_y = max(0, center_y - radius_int)
-                let end_y = min(map_height - 1, center_y + radius_int)
-
-                for y in start_y..end_y {
-                    for x in start_x..end_x {
-                        cells.add(GridCell::init(x, y))
-                    }
-                }
-            },
-            _ => {},
-        }
-
-        return cells
-    }
-
-    fn distance_to_center(&self, x: i32, y: i32, center_x: i32, center_y: i32): f64 {
-        let dx = (x - center_x) as Float
-        let dy = (y - center_y) as Float
-        return sqrt(dx * dx + dy * dy)
-    }
-
-    fn calculate_influence(&self, distance: f64): f64 {
-        if distance > self.radius {
-            return 0.0
-        }
-
-        let normalized_dist = distance / self.radius
-        let influence = 1.0 - normalized_dist
-
-        // Apply falloff curve
-        return pow(influence, self.falloff)
-    }
-
-    fn apply_to_cell(&self, heightmap: HeightMap, x: i32, y: i32, influence: f64, delta_time: f64) {
-        let current_height = heightmap.get_height(x, y)
-        let change = self.strength * influence * delta_time
-
-        match self.edit_mode {
-            TerrainEditMode::RAISE => heightmap.set_height(x, y, current_height + change),
-            TerrainEditMode::LOWER => heightmap.set_height(x, y, current_height - change),
-            TerrainEditMode::FLATTEN => {
-                let target_height = heightmap.get_height(x, y)
-                heightmap.set_height(x, y, target_height)
-            },
-            TerrainEditMode::SMOOTH => {
-                let avg = heightmap.get_average_height_around(x, y)
-                let new_height = current_height + (avg - current_height) * influence * delta_time
-                heightmap.set_height(x, y, new_height)
-            },
-            _ => {},
-        }
-    }
-
-    fn set_radius(&self, radius: f64) {
-        self.radius = radius
-    }
-
-    fn set_strength(&self, strength: f64) {
-        self.strength = strength
-    }
-
-    fn set_edit_mode(&self, mode: TerrainEditMode) {
-        self.edit_mode = mode
-    }
 }
 
 // Texture painter
@@ -155,70 +43,6 @@ struct TexturePainter {
     brush_size: f64,
     brush_strength: f64,
     blend_mode: TextureBlendMode,
-
-    fn init(): TexturePainter {
-        return TexturePainter {
-            current_texture: 0,
-            brush_size: 5.0,
-            brush_strength: 1.0,
-            blend_mode: TextureBlendMode::REPLACE,
-        }
-    }
-
-    fn paint(&self, texture_map: TextureMap, x: i32, y: i32) {
-        let radius = self.brush_size as Int
-
-        for dy in -radius..radius {
-            for dx in -radius..radius {
-                let tx = x + dx
-                let ty = y + dy
-
-                if tx >= 0 && tx < texture_map.width && ty >= 0 && ty < texture_map.height {
-                    let dist = sqrt((dx * dx + dy * dy) as Float)
-                    if dist <= self.brush_size {
-                        let influence = self.calculate_influence(dist)
-                        self.apply_texture(texture_map, tx, ty, influence)
-                    }
-                }
-            }
-        }
-    }
-
-    fn calculate_influence(&self, distance: f64): f64 {
-        if distance > self.brush_size {
-            return 0.0
-        }
-        return 1.0 - (distance / self.brush_size)
-    }
-
-    fn apply_texture(&self, texture_map: TextureMap, x: i32, y: i32, influence: f64) {
-        match self.blend_mode {
-            TextureBlendMode::REPLACE => {
-                texture_map.set_texture(x, y, self.current_texture, influence * self.brush_strength)
-            },
-            TextureBlendMode::ADD => {
-                let current = texture_map.get_texture_weight(x, y, self.current_texture)
-                texture_map.set_texture(x, y, self.current_texture, current + influence * self.brush_strength)
-            },
-            TextureBlendMode::SUBTRACT => {
-                let current = texture_map.get_texture_weight(x, y, self.current_texture)
-                texture_map.set_texture(x, y, self.current_texture, current - influence * self.brush_strength)
-            },
-            _ => {},
-        }
-    }
-
-    fn select_texture(&self, texture_id: i32) {
-        self.current_texture = texture_id
-    }
-
-    fn set_brush_size(&self, size: f64) {
-        self.brush_size = size
-    }
-
-    fn set_blend_mode(&self, mode: TextureBlendMode) {
-        self.blend_mode = mode
-    }
 }
 
 // Object placement tool
@@ -228,148 +52,12 @@ struct ObjectPlacementTool {
     grid_size: f64,
     rotation: f64,
     preview_object: PlacedObject?,
-
-    fn init(): ObjectPlacementTool {
-        return ObjectPlacementTool {
-            current_template: "",
-            snap_to_grid: true,
-            grid_size: 1.0,
-            rotation: 0.0,
-            preview_object: null,
-        }
-    }
-
-    fn place_object(&self, objects: Vec<PlacedObject>, x: f64, y: f64): PlacedObject {
-        let final_x = x
-        let final_y = y
-
-        if self.snap_to_grid {
-            final_x = self.snap_to_grid_coord(x)
-            final_y = self.snap_to_grid_coord(y)
-        }
-
-        let obj = PlacedObject::init(self.current_template, final_x, final_y, self.rotation)
-        objects.add(obj)
-
-        return obj
-    }
-
-    fn snap_to_grid_coord(&self, coord: f64): f64 {
-        return (coord / self.grid_size).floor() * self.grid_size
-    }
-
-    fn rotate_object(&self, angle: f64) {
-        self.rotation = self.rotation + angle
-        if self.rotation >= 360.0 {
-            self.rotation = self.rotation - 360.0
-        } else if self.rotation < 0.0 {
-            self.rotation = self.rotation + 360.0
-        }
-    }
-
-    fn select_template(&self, template: string) {
-        self.current_template = template
-    }
-
-    fn toggle_grid_snap(&self) {
-        self.snap_to_grid = !self.snap_to_grid
-    }
-
-    fn set_grid_size(&self, size: f64) {
-        self.grid_size = size
-    }
-
-    fn update_preview(&self, x: f64, y: f64) {
-        let final_x = x
-        let final_y = y
-
-        if self.snap_to_grid {
-            final_x = self.snap_to_grid_coord(x)
-            final_y = self.snap_to_grid_coord(y)
-        }
-
-        self.preview_object = PlacedObject::init(self.current_template, final_x, final_y, self.rotation)
-    }
-
-    fn clear_preview(&self) {
-        self.preview_object = null
-    }
 }
 
 // Trigger editor
 struct TriggerEditor {
     triggers: Vec<EditorTrigger>,
     selected_trigger: i32,
-
-    fn init(): TriggerEditor {
-        return TriggerEditor {
-            triggers: Vec::new(),
-            selected_trigger: -1,
-        }
-    }
-
-    fn create_trigger(&self, name: string): i32 {
-        let trigger = EditorTrigger::init(self.triggers.count(), name)
-        self.triggers.add(trigger)
-        return self.triggers.count() - 1
-    }
-
-    fn delete_trigger(&self, id: i32) {
-        for i in 0..self.triggers.count() {
-            let trigger = self.triggers.get(i)
-            if trigger.id == id {
-                self.triggers.remove_at(i)
-                return
-            }
-        }
-    }
-
-    fn add_condition(&self, trigger_id: i32, condition_type: string, params: string) {
-        for i in 0..self.triggers.count() {
-            let trigger = self.triggers.get(i)
-            if trigger.id == trigger_id {
-                trigger.add_condition(condition_type, params)
-                return
-            }
-        }
-    }
-
-    fn add_action(&self, trigger_id: i32, action_type: string, params: string) {
-        for i in 0..self.triggers.count() {
-            let trigger = self.triggers.get(i)
-            if trigger.id == trigger_id {
-                trigger.add_action(action_type, params)
-                return
-            }
-        }
-    }
-
-    fn select_trigger(&self, id: i32) {
-        self.selected_trigger = id
-    }
-
-    fn get_selected_trigger(&self): EditorTrigger? {
-        for i in 0..self.triggers.count() {
-            let trigger = self.triggers.get(i)
-            if trigger.id == self.selected_trigger {
-                return trigger
-            }
-        }
-        return null
-    }
-
-    fn get_trigger_count(&self): i32 {
-        return self.triggers.count()
-    }
-
-    fn export_triggers(&self): string {
-        let result = ""
-        for i in 0..self.triggers.count() {
-            let trigger = self.triggers.get(i)
-            result = result + trigger.to_string()
-        }
-        return result
-    }
 }
 
 // Lighting editor
@@ -379,158 +67,12 @@ struct LightingEditor {
     sun_direction: Vec3,
     sun_color: Color,
     sun_intensity: f64,
-
-    fn init(): LightingEditor {
-        return LightingEditor {
-            lights: Vec::new(),
-            ambient_light: Color::init(0.2, 0.2, 0.2, 1.0),
-            sun_direction: Vec3::init(0.5, -1.0, 0.5),
-            sun_color: Color::init(1.0, 0.95, 0.9, 1.0),
-            sun_intensity: 1.0,
-        }
-    }
-
-    fn add_point_light(&self, x: f64, y: f64, z: f64, color: Color, radius: f64): i32 {
-        let light = EditorLight::init_point(self.lights.count(), x, y, z, color, radius)
-        self.lights.add(light)
-        return self.lights.count() - 1
-    }
-
-    fn add_spot_light(&self, x: f64, y: f64, z: f64, dir_x: f64, dir_y: f64, dir_z: f64, color: Color, angle: f64): i32 {
-        let light = EditorLight::init_spot(self.lights.count(), x, y, z, dir_x, dir_y, dir_z, color, angle)
-        self.lights.add(light)
-        return self.lights.count() - 1
-    }
-
-    fn remove_light(&self, id: i32) {
-        for i in 0..self.lights.count() {
-            let light = self.lights.get(i)
-            if light.id == id {
-                self.lights.remove_at(i)
-                return
-            }
-        }
-    }
-
-    fn set_ambient_light(&self, r: f64, g: f64, b: f64) {
-        self.ambient_light = Color::init(r, g, b, 1.0)
-    }
-
-    fn set_sun_direction(&self, x: f64, y: f64, z: f64) {
-        self.sun_direction = Vec3::init(x, y, z)
-    }
-
-    fn set_sun_color(&self, r: f64, g: f64, b: f64) {
-        self.sun_color = Color::init(r, g, b, 1.0)
-    }
-
-    fn set_sun_intensity(&self, intensity: f64) {
-        self.sun_intensity = intensity
-    }
-
-    fn get_light_count(&self): i32 {
-        return self.lights.count()
-    }
 }
 
 // Map validator
 struct MapValidator {
     errors: Vec<ValidationError>,
     warnings: Vec<ValidationWarning>,
-
-    fn init(): MapValidator {
-        return MapValidator {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-        }
-    }
-
-    fn validate(&self, map: EditorMap): bool {
-        self.errors.clear()
-        self.warnings.clear()
-
-        self.check_spawn_points(map)
-        self.check_terrain(map)
-        self.check_objects(map)
-        self.check_triggers(map)
-
-        return self.errors.count() == 0
-    }
-
-    fn check_spawn_points(&self, map: EditorMap) {
-        let spawn_count = 0
-
-        for i in 0..map.objects.count() {
-            let obj = map.objects.get(i)
-            if obj.template == "SpawnPoint" {
-                spawn_count = spawn_count + 1
-            }
-        }
-
-        if spawn_count < 2 {
-            self.errors.add(ValidationError::init("Not enough spawn points (minimum 2)"))
-        }
-
-        if spawn_count > 8 {
-            self.warnings.add(ValidationWarning::init("Many spawn points (maximum recommended: 8)"))
-        }
-    }
-
-    fn check_terrain(&self, map: EditorMap) {
-        // Check for terrain anomalies
-        if map.heightmap.width < 64 || map.heightmap.height < 64 {
-            self.errors.add(ValidationError::init("Map too small (minimum 64x64)"))
-        }
-    }
-
-    fn check_objects(&self, map: EditorMap) {
-        // Check for overlapping objects
-        let overlap_count = 0
-
-        for i in 0..map.objects.count() {
-            let obj1 = map.objects.get(i)
-            for j in (i + 1)..map.objects.count() {
-                let obj2 = map.objects.get(j)
-                if self.objects_overlap(obj1, obj2) {
-                    overlap_count = overlap_count + 1
-                }
-            }
-        }
-
-        if overlap_count > 0 {
-            self.warnings.add(ValidationWarning::init("Objects overlapping: " + overlap_count.to_string()))
-        }
-    }
-
-    fn check_triggers(&self, map: EditorMap) {
-        // Validate trigger logic
-        for i in 0..map.triggers.count() {
-            let trigger = map.triggers.get(i)
-            if trigger.conditions.count() == 0 {
-                self.warnings.add(ValidationWarning::init("Trigger '" + trigger.name + "' has no conditions"))
-            }
-            if trigger.actions.count() == 0 {
-                self.warnings.add(ValidationWarning::init("Trigger '" + trigger.name + "' has no actions"))
-            }
-        }
-    }
-
-    fn objects_overlap(&self, obj1: PlacedObject, obj2: PlacedObject): bool {
-        let dist = sqrt((obj1.x - obj2.x) * (obj1.x - obj2.x) + (obj1.y - obj2.y) * (obj1.y - obj2.y))
-        return dist < 2.0
-    }
-
-    fn has_errors(&self): bool {
-        return self.errors.count() > 0
-    }
-
-    fn get_error_count(&self): i32 {
-        return self.errors.count()
-    }
-
-    fn get_warning_count(&self): i32 {
-        return self.warnings.count()
-    }
 }
 
 // Map editor main
@@ -544,108 +86,6 @@ struct MapEditor {
     lighting_editor: LightingEditor,
     validator: MapValidator,
     is_playtest_mode: bool,
-
-    fn init(map_width: i32, map_height: i32): MapEditor {
-        return MapEditor {
-            mode: EditorMode::TERRAIN,
-            map: EditorMap::init(map_width, map_height),
-            terrain_brush: TerrainBrush::init(),
-            texture_painter: TexturePainter::init(),
-            object_tool: ObjectPlacementTool::init(),
-            trigger_editor: TriggerEditor::init(),
-            lighting_editor: LightingEditor::init(),
-            validator: MapValidator::init(),
-            is_playtest_mode: false,
-        }
-    }
-
-    fn set_mode(&self, mode: EditorMode) {
-        self.mode = mode
-
-        if mode == EditorMode::PLAYTEST {
-            self.enter_playtest_mode()
-        } else if self.is_playtest_mode {
-            self.exit_playtest_mode()
-        }
-    }
-
-    fn update(&self, delta_time: f64) {
-        if self.is_playtest_mode {
-            // Update game simulation
-            return
-        }
-
-        match self.mode {
-            EditorMode::TERRAIN => {},
-            EditorMode::TEXTURE => {},
-            EditorMode::OBJECTS => {},
-            EditorMode::TRIGGERS => {},
-            EditorMode::LIGHTING => {},
-            _ => {},
-        }
-    }
-
-    fn handle_mouse_click(&self, x: f64, y: f64, button: i32) {
-        match self.mode {
-            EditorMode::TERRAIN => {
-                if button == 0 {
-                    let grid_x = x as Int
-                    let grid_y = y as Int
-                    self.terrain_brush.apply(self.map.heightmap, grid_x, grid_y, 0.016)
-                }
-            },
-            EditorMode::TEXTURE => {
-                if button == 0 {
-                    let grid_x = x as Int
-                    let grid_y = y as Int
-                    self.texture_painter.paint(self.map.texture_map, grid_x, grid_y)
-                }
-            },
-            EditorMode::OBJECTS => {
-                if button == 0 {
-                    self.object_tool.place_object(self.map.objects, x, y)
-                }
-            },
-            _ => {},
-        }
-    }
-
-    fn save_map(&self, filename: string): bool {
-        // Validate before saving
-        if !self.validator.validate(self.map) {
-            return false
-        }
-
-        // TODO: Implement actual file saving
-        return true
-    }
-
-    fn load_map(&self, filename: string): bool {
-        // TODO: Implement actual file loading
-        return false
-    }
-
-    fn validate_map(&self): bool {
-        return self.validator.validate(self.map)
-    }
-
-    fn enter_playtest_mode(&self) {
-        self.is_playtest_mode = true
-        // Initialize game state from editor state
-    }
-
-    fn exit_playtest_mode(&self) {
-        self.is_playtest_mode = false
-        // Restore editor state
-    }
-
-    fn get_error_count(&self): i32 {
-        return self.validator.get_error_count()
-    }
-
-    fn get_warning_count(&self): i32 {
-        return self.validator.get_warning_count()
-    }
 }
 
 // Helper structs
@@ -653,135 +93,17 @@ struct HeightMap {
     width: i32,
     height: i32,
     heights: Vec<Vec<f64>>,
-
-    fn init(width: i32, height: i32): HeightMap {
-        let heights = Vec::new()
-
-        for y in 0..height {
-            let row = Vec::new()
-            for x in 0..width {
-                row.add(0.0)
-            }
-            heights.add(row)
-        }
-
-        return HeightMap {
-            width: width,
-            height: height,
-            heights: heights,
-        }
-    }
-
-    fn get_height(&self, x: i32, y: i32): f64 {
-        if x >= 0 && x < self.width && y >= 0 && y < self.height {
-            let row = self.heights.get(y)
-            return row.get(x)
-        }
-        return 0.0
-    }
-
-    fn set_height(&self, x: i32, y: i32, height: f64) {
-        if x >= 0 && x < self.width && y >= 0 && y < self.height {
-            let row = self.heights.get(y)
-            row.set(x, height)
-        }
-    }
-
-    fn get_average_height_around(&self, x: i32, y: i32): f64 {
-        let sum = 0.0
-        let count = 0
-
-        for dy in -1..1 {
-            for dx in -1..1 {
-                let nx = x + dx
-                let ny = y + dy
-                if nx >= 0 && nx < self.width && ny >= 0 && ny < self.height {
-                    sum = sum + self.get_height(nx, ny)
-                    count = count + 1
-                }
-            }
-        }
-
-        if count > 0 {
-            return sum / count as Float
-        }
-        return 0.0
-    }
 }
 
 struct TextureMap {
     width: i32,
     height: i32,
     texture_layers: Vec<TextureLayer>,
-
-    fn init(width: i32, height: i32): TextureMap {
-        return TextureMap {
-            width: width,
-            height: height,
-            texture_layers: Vec::new(),
-        }
-    }
-
-    fn set_texture(&self, x: i32, y: i32, texture_id: i32, weight: f64) {
-        // Find or create layer
-        let layer = self.get_or_create_layer(texture_id)
-        layer.set_weight(x, y, weight)
-    }
-
-    fn get_texture_weight(&self, x: i32, y: i32, texture_id: i32): f64 {
-        for i in 0..self.texture_layers.count() {
-            let layer = self.texture_layers.get(i)
-            if layer.texture_id == texture_id {
-                return layer.get_weight(x, y)
-            }
-        }
-        return 0.0
-    }
-
-    fn get_or_create_layer(&self, texture_id: i32): TextureLayer {
-        for i in 0..self.texture_layers.count() {
-            let layer = self.texture_layers.get(i)
-            if layer.texture_id == texture_id {
-                return layer
-            }
-        }
-
-        let new_layer = TextureLayer::init(texture_id, self.width, self.height)
-        self.texture_layers.add(new_layer)
-        return new_layer
-    }
 }
 
 struct TextureLayer {
     texture_id: i32,
     weights: Vec<Vec<f64>>,
-
-    fn init(texture_id: i32, width: i32, height: i32): TextureLayer {
-        let weights = Vec::new()
-
-        for y in 0..height {
-            let row = Vec::new()
-            for x in 0..width {
-                row.add(0.0)
-            }
-            weights.add(row)
-        }
-
-        return TextureLayer {
-            texture_id: texture_id,
-            weights: weights,
-        }
-    }
-
-    fn set_weight(&self, x: i32, y: i32, weight: f64) {
-        let row = self.weights.get(y)
-        row.set(x, weight)
-    }
-
-    fn get_weight(&self, x: i32, y: i32): f64 {
-        let row = self.weights.get(y)
-        return row.get(x)
-    }
 }
 
 struct PlacedObject {
@@ -789,15 +111,6 @@ struct PlacedObject {
     x: f64,
     y: f64,
     rotation: f64,
-
-    fn init(template: string, x: f64, y: f64, rotation: f64): PlacedObject {
-        return PlacedObject {
-            template: template,
-            x: x,
-            y: y,
-            rotation: rotation,
-        }
-    }
 }
 
 struct EditorTrigger {
@@ -805,27 +118,6 @@ struct EditorTrigger {
     name: string,
     conditions: Vec<string>,
     actions: Vec<string>,
-
-    fn init(id: i32, name: string): EditorTrigger {
-        return EditorTrigger {
-            id: id,
-            name: name,
-            conditions: Vec::new(),
-            actions: Vec::new(),
-        }
-    }
-
-    fn add_condition(&self, condition_type: string, params: string) {
-        self.conditions.add(condition_type + ":" + params)
-    }
-
-    fn add_action(&self, action_type: string, params: string) {
-        self.actions.add(action_type + ":" + params)
-    }
-
-    fn to_string(&self): string {
-        return "Trigger: " + self.name
-    }
 }
 
 enum LightType {
@@ -842,30 +134,6 @@ struct EditorLight {
     color: Color,
     radius: f64,
     angle: f64,
-
-    fn init_point(id: i32, x: f64, y: f64, z: f64, color: Color, radius: f64): EditorLight {
-        return EditorLight {
-            id: id,
-            light_type: LightType::POINT,
-            position: Vec3::init(x, y, z),
-            direction: Vec3::init(0.0, 0.0, 0.0),
-            color: color,
-            radius: radius,
-            angle: 0.0,
-        }
-    }
-
-    fn init_spot(id: i32, x: f64, y: f64, z: f64, dir_x: f64, dir_y: f64, dir_z: f64, color: Color, angle: f64): EditorLight {
-        return EditorLight {
-            id: id,
-            light_type: LightType::SPOT,
-            position: Vec3::init(x, y, z),
-            direction: Vec3::init(dir_x, dir_y, dir_z),
-            color: color,
-            radius: 0.0,
-            angle: angle,
-        }
-    }
 }
 
 struct EditorMap {
@@ -875,42 +143,19 @@ struct EditorMap {
     texture_map: TextureMap,
     objects: Vec<PlacedObject>,
     triggers: Vec<EditorTrigger>,
-
-    fn init(width: i32, height: i32): EditorMap {
-        return EditorMap {
-            width: width,
-            height: height,
-            heightmap: HeightMap::init(width, height),
-            texture_map: TextureMap::init(width, height),
-            objects: Vec::new(),
-            triggers: Vec::new(),
-        }
-    }
 }
 
 struct ValidationError {
     message: string,
-
-    fn init(message: string): ValidationError {
-        return ValidationError { message: message }
-    }
 }
 
 struct ValidationWarning {
     message: string,
-
-    fn init(message: string): ValidationWarning {
-        return ValidationWarning { message: message }
-    }
 }
 
 struct GridCell {
     x: i32,
     y: i32,
-
-    fn init(x: i32, y: i32): GridCell {
-        return GridCell { x: x, y: y }
-    }
 }
 
 struct Color {
@@ -918,20 +163,12 @@ struct Color {
     g: f64,
     b: f64,
     a: f64,
-
-    fn init(r: f64, g: f64, b: f64, a: f64): Color {
-        return Color { r: r, g: g, b: b, a: a }
-    }
 }
 
 struct Vec3 {
     x: f64,
     y: f64,
     z: f64,
-
-    fn init(x: f64, y: f64, z: f64): Vec3 {
-        return Vec3 { x: x, y: y, z: z }
-    }
 }
 
 enum TextureBlendMode {
@@ -942,30 +179,30 @@ enum TextureBlendMode {
 
 // Helper functions
 fn max(a: i32, b: i32): i32 {
-    if a > b {
+    if (a > b) {
         return a
     }
     return b
 }
 
 fn min(a: i32, b: i32): i32 {
-    if a < b {
+    if (a < b) {
         return a
     }
     return b
 }
 
 fn sqrt(x: f64): f64 {
-    if x <= 0.0 {
+    if (x <= 0.0) {
         return 0.0
     }
     let guess = x / 2.0
     let epsilon = 0.01
     let max_iter = 10
     let iter = 0
-    while iter < max_iter {
+    while (iter < max_iter) {
         let next = (guess + x / guess) / 2.0
-        if abs(next - guess) < epsilon {
+        if (abs(next - guess) < epsilon) {
             return next
         }
         guess = next
@@ -975,7 +212,7 @@ fn sqrt(x: f64): f64 {
 }
 
 fn abs(x: f64): f64 {
-    if x < 0.0 {
+    if (x < 0.0) {
         return -x
     }
     return x
@@ -983,7 +220,7 @@ fn abs(x: f64): f64 {
 
 fn pow(base: f64, exp: f64): f64 {
     // Simple approximation for positive exponents
-    if exp == 0.0 {
+    if (exp == 0.0) {
         return 1.0
     }
     let result = base

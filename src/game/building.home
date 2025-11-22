@@ -71,505 +71,54 @@ struct ProductionItem {
 struct BuildingDefinition {
     type: BuildingType
     name: string
-
-    // Stats
     max_health: f32
     armor: f32
     build_cost: u32
     build_time: f32
-
-    // Size & placement
     width: f32
     height: f32
     can_place_on_water: bool
     requires_power: bool
-
-    // Power
     power_production: i32
     power_consumption: i32
-
-    // Production
     can_produce_units: bool
     production_queue_size: usize
-    producible_units: []UnitType
     producible_count: usize
-
-    // Defense
     has_weapon: bool
     weapon_range: f32
     weapon_damage: f32
     weapon_fire_rate: f32
-
-    // Special
     provides_tech: bool
     tech_unlock: string
     garrison_slots: u32
-
-    // Model
     model_name: string
     build_animation: string
-
-    fn init(): BuildingDefinition {
-        return BuildingDefinition {
-            type: BuildingType.Command_Center
-            name: "Unknown Building"
-            max_health: 1000.0
-            armor: 100.0
-            build_cost: 2000
-            build_time: 30.0
-            width: 4.0
-            height: 4.0
-            can_place_on_water: false
-            requires_power: false
-            power_production: 0
-            power_consumption: 0
-            can_produce_units: false
-            production_queue_size: 5
-            producible_units: []
-            producible_count: 0
-            has_weapon: false
-            weapon_range: 0.0
-            weapon_damage: 0.0
-            weapon_fire_rate: 0.0
-            provides_tech: false
-            tech_unlock: ""
-            garrison_slots: 0
-            model_name: "default_building"
-            build_animation: "construct"
-        }
-    }
 }
 
 // Building instance
 struct Building {
     entity: Entity
-    definition: *BuildingDefinition
-
-    // State
     state: BuildingState
     health: f32
     construction_progress: f32  // 0.0 to 1.0
     is_powered: bool
     is_operational: bool
-
-    // Position & orientation
     position: Vec3
     rotation: f32  // Rotation in radians
     footprint: BoxCollider
-
-    // Production
-    production_queue: []ProductionItem
     queue_count: usize
-    current_production: ?ProductionItem
     is_producing: bool
-
-    // Defense
-    target_enemy: ?Entity
     time_until_next_fire: f32
-
-    // Garrison
-    garrisoned_units: []Entity
     garrison_count: usize
-
-    // Owner
     player_id: u32
     team_id: u32
-
-    fn init(entity: Entity, definition: *BuildingDefinition, player_id: u32, allocator: Allocator): Building {
-        return Building {
-            entity: entity
-            definition: definition
-            state: BuildingState.Placing
-            health: definition.max_health
-            construction_progress: 0.0
-            is_powered: true
-            is_operational: false
-            position: Vec3.init(0.0, 0.0, 0.0)
-            rotation: 0.0
-            footprint: BoxCollider.init(Vec3.init(0.0, 0.0, 0.0), Vec3.init(0.0, 0.0, 0.0))
-            production_queue: allocator.alloc(ProductionItem, definition.production_queue_size)
-            queue_count: 0
-            current_production: null
-            is_producing: false
-            target_enemy: null
-            time_until_next_fire: 0.0
-            garrisoned_units: allocator.alloc(Entity, definition.garrison_slots)
-            garrison_count: 0
-            player_id: player_id
-            team_id: player_id
-        }
-    }
-
-    fn start_construction(mut self) {
-        self.state = BuildingState.Constructing
-        self.construction_progress = 0.0
-        self.is_operational = false
-    }
-
-    fn update(mut self, delta_time: f32) {
-        match self.state {
-            BuildingState.Constructing => {
-                self.update_construction(delta_time)
-            }
-            BuildingState.Active => {
-                self.update_active(delta_time)
-            }
-            BuildingState.Damaged => {
-                self.update_damaged(delta_time)
-            }
-            _ => {}
-        }
-    }
-
-    fn update_construction(mut self, delta_time: f32) {
-        // Increase construction progress
-        let build_rate = 1.0 / self.definition.build_time
-        self.construction_progress += build_rate * delta_time
-
-        if self.construction_progress >= 1.0 {
-            self.construction_progress = 1.0
-            self.complete_construction()
-        }
-
-        // Update health based on construction progress
-        self.health = self.definition.max_health * self.construction_progress
-    }
-
-    fn complete_construction(mut self) {
-        self.state = BuildingState.Active
-        self.is_operational = true
-        self.health = self.definition.max_health
-
-        // Play completion sound/effect
-        // TODO: Trigger construction complete event
-    }
-
-    fn update_active(mut self, delta_time: f32) {
-        // Check power
-        self.check_power_status()
-
-        if !self.is_powered and self.definition.requires_power {
-            self.is_operational = false
-            return
-        }
-
-        self.is_operational = true
-
-        // Update production
-        if self.definition.can_produce_units and self.is_producing {
-            self.update_production(delta_time)
-        }
-
-        // Update defense weapon
-        if self.definition.has_weapon {
-            self.update_weapon(delta_time)
-        }
-    }
-
-    fn update_damaged(mut self, delta_time: f32) {
-        // Buildings in damaged state have reduced functionality
-        self.is_operational = false
-    }
-
-    fn update_production(mut self, delta_time: f32) {
-        if !self.current_production {
-            // Check queue for next item
-            if self.queue_count > 0 {
-                self.current_production = self.production_queue[0]
-                self.is_producing = true
-            } else {
-                self.is_producing = false
-                return
-            }
-        }
-
-        if self.current_production {
-            let item = &self.current_production.?
-
-            if item.is_paused {
-                return
-            }
-
-            // Increase production progress
-            let build_rate = 1.0 / item.build_time
-            item.progress += build_rate * delta_time
-
-            if item.progress >= 1.0 {
-                // Unit is ready!
-                self.complete_production()
-            }
-        }
-    }
-
-    fn complete_production(mut self) {
-        if !self.current_production {
-            return
-        }
-
-        let item = self.current_production.?
-
-        // Spawn unit near building
-        let spawn_offset = Vec3.init(5.0, 0.0, 0.0)
-        let spawn_pos = vec3_add(self.position, spawn_offset)
-
-        create_unit(item.unit_type, spawn_pos, self.player_id)
-
-        // Remove from queue
-        self.current_production = null
-        self.remove_from_queue(0)
-    }
-
-    fn update_weapon(mut self, delta_time: f32) {
-        if self.time_until_next_fire > 0.0 {
-            self.time_until_next_fire -= delta_time
-        }
-
-        // TODO: Scan for enemies, fire weapon when ready
-    }
-
-    fn check_power_status(mut self) {
-        // TODO: Query power grid to check if building is powered
-        self.is_powered = true
-    }
-
-    fn queue_unit(mut self, unit_type: UnitType, build_time: f32, cost: u32): bool {
-        if !self.definition.can_produce_units {
-            return false
-        }
-
-        if self.queue_count >= self.definition.production_queue_size {
-            return false
-        }
-
-        // Check if this building can produce this unit type
-        let mut can_produce = false
-        for i in 0..self.definition.producible_count {
-            if self.definition.producible_units[i] == unit_type {
-                can_produce = true
-                break
-            }
-        }
-
-        if !can_produce {
-            return false
-        }
-
-        // Add to queue
-        self.production_queue[self.queue_count] = ProductionItem {
-            unit_type: unit_type
-            progress: 0.0
-            build_time: build_time
-            cost: cost
-            is_paused: false
-        }
-
-        self.queue_count += 1
-        return true
-    }
-
-    fn cancel_production(mut self, queue_index: usize): bool {
-        if queue_index >= self.queue_count {
-            return false
-        }
-
-        // Refund partial cost
-        // TODO: Refund resources to player
-
-        // If canceling current production, reset
-        if queue_index == 0 {
-            self.current_production = null
-        }
-
-        self.remove_from_queue(queue_index)
-        return true
-    }
-
-    fn remove_from_queue(mut self, index: usize) {
-        if index >= self.queue_count {
-            return
-        }
-
-        // Shift queue down
-        for i in index..(self.queue_count - 1) {
-            self.production_queue[i] = self.production_queue[i + 1]
-        }
-
-        self.queue_count -= 1
-    }
-
-    fn pause_production(mut self) {
-        if self.current_production {
-            self.current_production.?.is_paused = true
-        }
-    }
-
-    fn resume_production(mut self) {
-        if self.current_production {
-            self.current_production.?.is_paused = false
-        }
-    }
-
-    fn take_damage(mut self, damage: f32) {
-        let actual_damage = damage - self.definition.armor
-        if actual_damage < 0.0 {
-            return
-        }
-
-        self.health -= actual_damage
-
-        if self.health <= 0.0 {
-            self.health = 0.0
-            self.state = BuildingState.Destroyed
-            self.is_operational = false
-        } else if self.health < self.definition.max_health * 0.25 {
-            self.state = BuildingState.Disabled
-            self.is_operational = false
-        } else if self.health < self.definition.max_health * 0.5 {
-            self.state = BuildingState.Damaged
-        }
-    }
-
-    fn repair(mut self, amount: f32) {
-        self.health += amount
-        if self.health > self.definition.max_health {
-            self.health = self.definition.max_health
-        }
-
-        // Update state based on health
-        if self.health > self.definition.max_health * 0.5 {
-            if self.state == BuildingState.Damaged or self.state == BuildingState.Disabled {
-                self.state = BuildingState.Active
-                self.is_operational = true
-            }
-        }
-    }
-
-    fn sell(mut self) {
-        self.state = BuildingState.Selling
-        // TODO: Play selling animation
-        // TODO: Refund partial cost
-        // TODO: Destroy building after animation
-    }
-
-    fn garrison_unit(mut self, entity: Entity): bool {
-        if self.garrison_count >= self.definition.garrison_slots {
-            return false
-        }
-
-        self.garrisoned_units[self.garrison_count] = entity
-        self.garrison_count += 1
-
-        // Hide unit from world
-        // TODO: Remove unit from world rendering
-
-        return true
-    }
-
-    fn eject_garrison(mut self): []Entity {
-        let units = self.garrisoned_units[0..self.garrison_count]
-        self.garrison_count = 0
-
-        // Spawn units around building
-        // TODO: Place units outside building
-
-        return units
-    }
-
-    fn can_place_at(&self, position: Vec3, world_bounds: BoxCollider): bool {
-        // Check if position is within world bounds
-        if !world_bounds.contains_point(position) {
-            return false
-        }
-
-        // TODO: Check for collisions with other buildings
-        // TODO: Check terrain suitability
-
-        return true
-    }
 }
 
 // Building manager
 struct BuildingManager {
-    buildings: []Building
     building_count: usize
-    definitions: []BuildingDefinition
     definition_count: usize
     allocator: Allocator
-
-    fn init(allocator: Allocator): BuildingManager {
-        return BuildingManager {
-            buildings: allocator.alloc(Building, 512)
-            building_count: 0
-            definitions: allocator.alloc(BuildingDefinition, 64)
-            definition_count: 0
-            allocator: allocator
-        }
-    }
-
-    fn register_definition(mut self, def: BuildingDefinition) {
-        if self.definition_count < self.definitions.len {
-            self.definitions[self.definition_count] = def
-            self.definition_count += 1
-        }
-    }
-
-    fn create_building(mut self, type: BuildingType, position: Vec3, player_id: u32, world: *World): ?Entity {
-        // Find definition
-        let mut def: ?*BuildingDefinition = null
-        for i in 0..self.definition_count {
-            if self.definitions[i].type == type {
-                def = &self.definitions[i]
-                break
-            }
-        }
-
-        if !def {
-            return null
-        }
-
-        // Create entity
-        let entity = world.create_entity()
-
-        // Add components
-        let mut transform = Transform.init()
-        transform.position = position
-        world.add_transform(entity, transform)
-        world.add_health(entity, def.?.max_health)
-        world.add_selectable(entity)
-        world.add_team(entity, player_id)
-
-        // Create building instance
-        if self.building_count < self.buildings.len {
-            self.buildings[self.building_count] = Building.init(entity, def.?, player_id, self.allocator)
-            self.buildings[self.building_count].position = position
-            self.buildings[self.building_count].start_construction()
-            self.building_count += 1
-        }
-
-        return entity
-    }
-
-    fn update(mut self, delta_time: f32) {
-        for i in 0..self.building_count {
-            if self.buildings[i].state != BuildingState.Destroyed {
-                self.buildings[i].update(delta_time)
-            }
-        }
-    }
-
-    fn get_building_by_entity(&self, entity: Entity): ?*Building {
-        for i in 0..self.building_count {
-            if self.buildings[i].entity.equals(entity) {
-                return &self.buildings[i]
-            }
-        }
-        return null
-    }
-
-    fn deinit(mut self) {
-        self.allocator.free(self.buildings)
-        self.allocator.free(self.definitions)
-    }
 }
 
 // Global building manager
@@ -583,16 +132,16 @@ export fn init_building_manager(allocator: Allocator) {
 }
 
 export fn shutdown_building_manager() {
-    if g_building_manager {
+    if (g_building_manager) {
         g_building_manager.?.deinit()
         g_building_manager = null
     }
 }
 
 export fn create_building(type: BuildingType, position: Vec3, player_id: u32): ?Entity {
-    if g_building_manager {
+    if (g_building_manager) {
         let world = get_world()
-        if world {
+        if (world) {
             return g_building_manager.?.create_building(type, position, player_id, world.?)
         }
     }
@@ -600,13 +149,13 @@ export fn create_building(type: BuildingType, position: Vec3, player_id: u32): ?
 }
 
 export fn update_buildings(delta_time: f32) {
-    if g_building_manager {
+    if (g_building_manager) {
         g_building_manager.?.update(delta_time)
     }
 }
 
 fn register_default_buildings() {
-    if !g_building_manager {
+    if (!g_building_manager) {
         return
     }
 

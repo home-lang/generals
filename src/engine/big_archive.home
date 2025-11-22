@@ -37,102 +37,12 @@ struct ArchivedFileInfo {
     base_name: string,    // Just the filename (after last /)
     position: i32,        // Offset in the BIG file
     size: i32,            // File size in bytes
-
-    fn init(name: string, position: i32, size: i32): ArchivedFileInfo {
-        // Find base name (after last /)
-        let base_start = 0
-        for i in 0..name.len() {
-            if name.char_at(i) == "/" {
-                base_start = i + 1
-            }
-        }
-        let base_name = name.substring(base_start, name.len())
-
-        let info = ArchivedFileInfo {
-            name: name,
-            base_name: base_name,
-            position: position,
-            size: size,
-        }
-        return info
-    }
 }
 
 // Binary reader for parsing archive data
 struct BigReader {
     data: Vec<i32>,  // Raw byte array
     position: i32,          // Current read position
-
-    fn init(data: Vec<i32>): BigReader {
-        let reader = BigReader {
-            data: data,
-            position: 0,
-        }
-        return reader
-    }
-
-    fn read_u8(&self): i32 {
-        if self.position >= self.data.len() {
-            return 0
-        }
-        let value = self.data.get(self.position)
-        self.position = self.position + 1
-        return value
-    }
-
-    // Read u32 little-endian (archive size)
-    fn read_u32_le(&self): i32 {
-        let b0 = self.read_u8()
-        let b1 = self.read_u8()
-        let b2 = self.read_u8()
-        let b3 = self.read_u8()
-        return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
-    }
-
-    // Read u32 big-endian (file count, positions, sizes)
-    fn read_u32_be(&self): i32 {
-        let b0 = self.read_u8()
-        let b1 = self.read_u8()
-        let b2 = self.read_u8()
-        let b3 = self.read_u8()
-        return (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
-    }
-
-    // Read null-terminated string
-    fn read_string_null_terminated(&self, max_len: i32): string {
-        let result = ""
-        let count = 0
-        while count < max_len {
-            let byte = self.read_u8()
-            if byte == 0 {
-                break
-            }
-            result = result + String::from_char(byte)
-            count = count + 1
-        }
-        return result
-    }
-
-    // Read fixed-length byte array
-    fn read_bytes(&self, count: i32): Vec<i32> {
-        let bytes = Vec::init()
-        for i in 0..count {
-            bytes.add(self.read_u8())
-        }
-        return bytes
-    }
-
-    fn seek(&self, position: i32) {
-        self.position = position
-    }
-
-    fn get_position(&self): i32 {
-        return self.position
-    }
-
-    fn remaining(&self): i32 {
-        return self.data.len() - self.position
-    }
 }
 
 // A single BIG archive file
@@ -144,215 +54,6 @@ struct BigArchive {
     raw_data: Vec<i32>,             // Entire archive in memory
     is_open: bool,
     last_error: BigError,
-
-    fn init(): BigArchive {
-        let archive = BigArchive {
-            file_path: "",
-            archive_size: 0,
-            file_count: 0,
-            files: HashMap::init(),
-            raw_data: Vec::init(),
-            is_open: false,
-            last_error: BigError::None,
-        }
-        return archive
-    }
-
-    // Open and parse a BIG archive file
-    fn open(&self, path: string): bool {
-        self.file_path = path
-
-        // Read entire file into memory
-        let file_data = File::read_bytes(path)
-        if file_data == null {
-            self.last_error = BigError::ReadError
-            return false
-        }
-
-        self.raw_data = file_data
-
-        // Parse the header
-        if !self.parse_header() {
-            return false
-        }
-
-        self.is_open = true
-        return true
-    }
-
-    // Parse the BIG file header and build file index
-    fn parse_header(&self): bool {
-        if self.raw_data.len() < 16 {
-            self.last_error = BigError::InvalidHeader
-            return false
-        }
-
-        let reader = BigReader::init(self.raw_data)
-
-        // Read and verify magic (4 bytes)
-        let magic = reader.read_u32_le()
-        if magic != BIG_MAGIC_BIGF and magic != BIG_MAGIC_BIG4 {
-            self.last_error = BigError::InvalidMagic
-            return false
-        }
-
-        // Read archive size (little-endian)
-        self.archive_size = reader.read_u32_le()
-
-        // Read file count (big-endian)
-        self.file_count = reader.read_u32_be()
-
-        // Skip 4 reserved bytes, seek to offset 16 for file entries
-        reader.seek(16)
-
-        // Parse file entries
-        for i in 0..self.file_count {
-            // Read position and size (big-endian)
-            let position = reader.read_u32_be()
-            let size = reader.read_u32_be()
-
-            // Read null-terminated filename
-            let name = reader.read_string_null_terminated(BIG_PATH_MAX)
-
-            if name.len() >= BIG_PATH_MAX {
-                self.last_error = BigError::PathTooLong
-                return false
-            }
-
-            // Normalize path: replace backslash with forward slash, lowercase
-            let normalized = self.normalize_path(name)
-
-            // Create file info and add to map
-            let info = ArchivedFileInfo::init(normalized, position, size)
-            self.files.set(normalized, info)
-        }
-
-        return true
-    }
-
-    // Normalize a path: replace \ with /, convert to lowercase
-    fn normalize_path(&self, path: string): string {
-        let result = ""
-        for i in 0..path.len() {
-            let c = path.char_at(i)
-            if c == '\\' {
-                result = result + "/"
-            } else if c >= "A" and c <= "Z" {
-                // Convert to lowercase
-                result = result + String::from_char(c + 32)
-            } else {
-                result = result + String::from_char(c)
-            }
-        }
-        return result
-    }
-
-    // Check if a file exists in the archive
-    fn file_exists(&self, path: string): bool {
-        let normalized = self.normalize_path(path)
-        return self.files.contains(normalized)
-    }
-
-    // Get file info for a path
-    fn get_file_info(&self, path: string): ArchivedFileInfo? {
-        let normalized = self.normalize_path(path)
-        return self.files.get(normalized)
-    }
-
-    // Read a file from the archive into memory
-    fn read_file(&self, path: string): Vec<i32>? {
-        let info = self.get_file_info(path)
-        if info == null {
-            self.last_error = BigError::FileNotFound
-            return null
-        }
-        return self.read_file_by_info(info)
-    }
-
-    // Read a file using its info struct
-    fn read_file_by_info(&self, info: ArchivedFileInfo): Vec<i32>? {
-        if !self.is_open {
-            self.last_error = BigError::ArchiveNotOpen
-            return null
-        }
-
-        let buffer = Vec::init()
-        let start = info.position
-        let end = start + info.size
-
-        // Bounds check
-        if end > self.raw_data.len() {
-            self.last_error = BigError::ReadError
-            return null
-        }
-
-        // Copy file data
-        for i in start..end {
-            buffer.add(self.raw_data.get(i))
-        }
-
-        return buffer
-    }
-
-    // Read file as string (for text files like INI)
-    fn read_file_as_string(&self, path: string): string? {
-        let data = self.read_file(path)
-        if data == null {
-            return null
-        }
-
-        let result = ""
-        for i in 0..data.len() {
-            result = result + String::from_char(data.get(i))
-        }
-        return result
-    }
-
-    // Get a list of all files in the archive
-    fn list_files(&self): Vec<string> {
-        let list = Vec::init()
-        for entry in self.files.entries() {
-            list.add(entry.key)
-        }
-        return list
-    }
-
-    // Get files matching a pattern (e.g., "*.ini", "data/art/*.tga")
-    fn find_files(&self, pattern: string): Vec<string> {
-        let list = Vec::init()
-        for entry in self.files.entries() {
-            if match_pattern(entry.key, pattern) {
-                list.add(entry.key)
-            }
-        }
-        return list
-    }
-
-    // Get files by extension
-    fn find_files_by_extension(&self, ext: string): Vec<string> {
-        let pattern = "*." + ext
-        return self.find_files(pattern)
-    }
-
-    // Get number of files in archive
-    fn get_file_count(&self): i32 {
-        return self.file_count
-    }
-
-    // Get total archive size
-    fn get_archive_size(&self): i32 {
-        return self.archive_size
-    }
-
-    // Close the archive
-    fn close(&self) {
-        self.raw_data.clear()
-        self.files.clear()
-        self.is_open = false
-        self.file_path = ""
-        self.archive_size = 0
-        self.file_count = 0
-    }
 }
 
 // Simple wildcard pattern matching (* and ?)
@@ -362,18 +63,18 @@ fn match_pattern(str: string, pattern: string): bool {
     let star_idx: i32? = null
     let match_idx = 0
 
-    while s < str.len() {
-        if p < pattern.len() {
+    while (s < str.len()) {
+        if (p < pattern.len()) {
             let pc = pattern.char_at(p)
             let sc = str.char_at(s)
 
-            if pc == "?" or to_lower(pc) == to_lower(sc) {
+            if (pc == "?" or to_lower(pc) == to_lower(sc)) {
                 s = s + 1
                 p = p + 1
                 continue
             }
 
-            if pc == "*" {
+            if (pc == "*") {
                 star_idx = p
                 match_idx = s
                 p = p + 1
@@ -381,7 +82,7 @@ fn match_pattern(str: string, pattern: string): bool {
             }
         }
 
-        if star_idx != null {
+        if (star_idx != null) {
             p = star_idx + 1
             match_idx = match_idx + 1
             s = match_idx
@@ -391,7 +92,7 @@ fn match_pattern(str: string, pattern: string): bool {
     }
 
     // Skip trailing wildcards
-    while p < pattern.len() and pattern.char_at(p) == "*" {
+    while (p < pattern.len() and pattern.char_at(p) == "*") {
         p = p + 1
     }
 
@@ -399,7 +100,7 @@ fn match_pattern(str: string, pattern: string): bool {
 }
 
 fn to_lower(c: i32): i32 {
-    if c >= 65 and c <= 90 {  // "A" to "Z"
+    if (c >= 65 and c <= 90) {  // "A" to "Z"
         return c + 32
     }
     return c
@@ -409,129 +110,6 @@ fn to_lower(c: i32): i32 {
 struct BigFileSystem {
     archives: Vec<BigArchive>,
     search_paths: Vec<string>,
-
-    fn init(): BigFileSystem {
-        let fs = BigFileSystem {
-            archives: Vec::init(),
-            search_paths: Vec::init(),
-        }
-        return fs
-    }
-
-    // Add a search path for finding BIG files
-    fn add_search_path(&self, path: string) {
-        self.search_paths.add(path)
-    }
-
-    // Load all .big files from a directory
-    fn load_directory(&self, dir_path: string): i32 {
-        let count = 0
-        let entries = Directory::list(dir_path)
-
-        if entries == null {
-            return 0
-        }
-
-        for entry in entries {
-            if entry.is_file and entry.name.ends_with(".big") {
-                let full_path = dir_path + "/" + entry.name
-                if self.load_archive(full_path) {
-                    count = count + 1
-                }
-            }
-        }
-
-        return count
-    }
-
-    // Load a single archive
-    fn load_archive(&self, path: string): bool {
-        let archive = BigArchive::init()
-        if archive.open(path) {
-            self.archives.add(archive)
-            return true
-        }
-        return false
-    }
-
-    // Check if a file exists in any loaded archive
-    fn file_exists(&self, path: string): bool {
-        for archive in self.archives {
-            if archive.file_exists(path) {
-                return true
-            }
-        }
-        return false
-    }
-
-    // Read a file from any loaded archive (first match wins)
-    fn read_file(&self, path: string): Vec<i32>? {
-        for archive in self.archives {
-            let info = archive.get_file_info(path)
-            if info != null {
-                return archive.read_file_by_info(info)
-            }
-        }
-        return null
-    }
-
-    // Read a file as string
-    fn read_file_as_string(&self, path: string): string? {
-        for archive in self.archives {
-            let info = archive.get_file_info(path)
-            if info != null {
-                let data = archive.read_file_by_info(info)
-                if data != null {
-                    let result = ""
-                    for i in 0..data.len() {
-                        result = result + String::from_char(data.get(i))
-                    }
-                    return result
-                }
-            }
-        }
-        return null
-    }
-
-    // Find files matching pattern across all archives
-    fn find_files(&self, pattern: string): Vec<string> {
-        let results = Vec::init()
-        let seen = HashMap::init()  // Avoid duplicates
-
-        for archive in self.archives {
-            let matches = archive.find_files(pattern)
-            for file in matches {
-                if !seen.contains(file) {
-                    seen.set(file, true)
-                    results.add(file)
-                }
-            }
-        }
-
-        return results
-    }
-
-    // Get total number of files across all archives
-    fn get_total_file_count(&self): i32 {
-        let count = 0
-        for archive in self.archives {
-            count = count + archive.get_file_count()
-        }
-        return count
-    }
-
-    // Get number of loaded archives
-    fn get_archive_count(&self): i32 {
-        return self.archives.len()
-    }
-
-    // Close all archives
-    fn close_all(&self) {
-        for archive in self.archives {
-            archive.close()
-        }
-        self.archives.clear()
-    }
 }
 
 // ============================================================================

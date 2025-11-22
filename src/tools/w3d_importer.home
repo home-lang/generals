@@ -69,25 +69,6 @@ enum W3DChunkType {
 struct W3DChunkHeader {
     chunk_type: u32       // W3DChunkType
     chunk_size: u32       // Size of chunk data (excluding header)
-
-    fn read(file: *File): ?W3DChunkHeader {
-        let mut header = W3DChunkHeader {
-            chunk_type: 0
-            chunk_size: 0
-        }
-
-        // Read chunk type (4 bytes)
-        if !file.read_u32(&header.chunk_type) {
-            return null
-        }
-
-        // Read chunk size (4 bytes)
-        if !file.read_u32(&header.chunk_size) {
-            return null
-        }
-
-        return header
-    }
 }
 
 // W3D mesh header (from EA's W3DMeshHeader3)
@@ -109,55 +90,6 @@ struct W3DMeshHeader {
     max_corner: Vec3         // AABB max
     sphere_center: Vec3      // Bounding sphere center
     sphere_radius: f32       // Bounding sphere radius
-
-    fn read(file: *File, chunk_size: u32): ?W3DMeshHeader {
-        let mut header = W3DMeshHeader {
-            version: 0
-            attributes: 0
-            mesh_name: ""
-            container_name: ""
-            num_triangles: 0
-            num_vertices: 0
-            num_materials: 0
-            num_damage_stages: 0
-            sort_level: 0
-            prelighting_type: 0
-            future_count: 0
-            vertex_channels: 0
-            face_channels: 0
-            min_corner: Vec3.init(0.0, 0.0, 0.0)
-            max_corner: Vec3.init(0.0, 0.0, 0.0)
-            sphere_center: Vec3.init(0.0, 0.0, 0.0)
-            sphere_radius: 0.0
-        }
-
-        file.read_u32(&header.version)
-        file.read_u32(&header.attributes)
-
-        // Read mesh name (null-terminated, max 32 chars)
-        header.mesh_name = file.read_fixed_string(32)
-        header.container_name = file.read_fixed_string(32)
-
-        file.read_u32(&header.num_triangles)
-        file.read_u32(&header.num_vertices)
-        file.read_u32(&header.num_materials)
-        file.read_u32(&header.num_damage_stages)
-        file.read_i32(&header.sort_level)
-        file.read_i32(&header.prelighting_type)
-        file.read_i32(&header.future_count)
-        file.read_u32(&header.vertex_channels)
-        file.read_u32(&header.face_channels)
-
-        // Read bounding box
-        file.read_vec3(&header.min_corner)
-        file.read_vec3(&header.max_corner)
-
-        // Read bounding sphere
-        file.read_vec3(&header.sphere_center)
-        file.read_f32(&header.sphere_radius)
-
-        return header
-    }
 }
 
 // Vertex data
@@ -171,7 +103,6 @@ struct W3DVertex {
 
 // Triangle (3 vertex indices)
 struct W3DTriangle {
-    vertex_indices: [3]u32
     attributes: u32
     normal: Vec3
 }
@@ -182,8 +113,6 @@ struct W3DMaterial {
     vertex_material_count: u32
     shader_count: u32
     texture_count: u32
-
-    // Material properties
     ambient: Vec3       // RGB ambient color
     diffuse: Vec3       // RGB diffuse color
     specular: Vec3      // RGB specular color
@@ -191,43 +120,7 @@ struct W3DMaterial {
     shininess: f32
     opacity: f32
     translucency: f32
-
-    // Texture info
     texture_name: string
-
-    fn read(file: *File): ?W3DMaterial {
-        let mut mat = W3DMaterial {
-            pass_count: 0
-            vertex_material_count: 0
-            shader_count: 0
-            texture_count: 0
-            ambient: Vec3.init(1.0, 1.0, 1.0)
-            diffuse: Vec3.init(1.0, 1.0, 1.0)
-            specular: Vec3.init(1.0, 1.0, 1.0)
-            emissive: Vec3.init(0.0, 0.0, 0.0)
-            shininess: 1.0
-            opacity: 1.0
-            translucency: 0.0
-            texture_name: ""
-        }
-
-        file.read_u32(&mat.pass_count)
-        file.read_u32(&mat.vertex_material_count)
-        file.read_u32(&mat.shader_count)
-        file.read_u32(&mat.texture_count)
-
-        // Read material colors
-        file.read_vec3(&mat.ambient)
-        file.read_vec3(&mat.diffuse)
-        file.read_vec3(&mat.specular)
-        file.read_vec3(&mat.emissive)
-
-        file.read_f32(&mat.shininess)
-        file.read_f32(&mat.opacity)
-        file.read_f32(&mat.translucency)
-
-        return mat
-    }
 }
 
 // Bone/pivot data (from EA's W3DPivot)
@@ -243,8 +136,6 @@ struct W3DPivot {
 struct W3DHierarchy {
     name: string
     num_pivots: u32
-    pivots: []W3DPivot
-
     center_pos: Vec3        // Center of hierarchy
 }
 
@@ -255,8 +146,6 @@ struct W3DAnimationChannel {
     vector_len: u32         // Position keyframes
     type_flags: u32
     pivot_index: u32        // Which bone this animates
-
-    data: []f32             // Keyframe data (positions/rotations)
 }
 
 struct W3DAnimation {
@@ -264,15 +153,11 @@ struct W3DAnimation {
     hierarchy_name: string  // Which skeleton this animates
     num_frames: u32
     frame_rate: u32         // FPS
-    channels: []W3DAnimationChannel
 }
 
 // Imported mesh (converted to Home format)
 struct ImportedMesh {
     name: string
-    vertices: []W3DVertex
-    indices: []u32          // Triangle indices (3 per triangle)
-    materials: []W3DMaterial
     bounding_box_min: Vec3
     bounding_box_max: Vec3
     bounding_sphere_center: Vec3
@@ -282,177 +167,6 @@ struct ImportedMesh {
 // W3D Importer
 struct W3DImporter {
     allocator: Allocator
-
-    fn init(allocator: Allocator): W3DImporter {
-        return W3DImporter {
-            allocator: allocator
-        }
-    }
-
-    fn import_mesh(mut self, filepath: string): ?ImportedMesh {
-        let file = File.open(filepath, FileMode.Read)
-        if !file {
-            println("Failed to open W3D file: {filepath}")
-            return null
-        }
-        defer file.close()
-
-        let mut mesh = ImportedMesh {
-            name: ""
-            vertices: []
-            indices: []
-            materials: []
-            bounding_box_min: Vec3.init(0.0, 0.0, 0.0)
-            bounding_box_max: Vec3.init(0.0, 0.0, 0.0)
-            bounding_sphere_center: Vec3.init(0.0, 0.0, 0.0)
-            bounding_sphere_radius: 0.0
-        }
-
-        // Read chunks until EOF
-        while !file.is_eof() {
-            let header = W3DChunkHeader.read(file)
-            if !header {
-                break
-            }
-
-            let chunk_type = @intToEnum(W3DChunkType, header.?.chunk_type)
-
-            match chunk_type {
-                W3DChunkType.MeshHeader3 => {
-                    self.read_mesh_header(file, header.?.chunk_size, &mesh)
-                }
-                W3DChunkType.Vertices => {
-                    self.read_vertices(file, header.?.chunk_size, &mesh)
-                }
-                W3DChunkType.VertexNormals => {
-                    self.read_normals(file, header.?.chunk_size, &mesh)
-                }
-                W3DChunkType.Triangles => {
-                    self.read_triangles(file, header.?.chunk_size, &mesh)
-                }
-                W3DChunkType.MaterialInfo => {
-                    self.read_material(file, header.?.chunk_size, &mesh)
-                }
-                _ => {
-                    // Skip unknown chunk
-                    file.seek_relative(@intCast(i64, header.?.chunk_size))
-                }
-            }
-        }
-
-        return mesh
-    }
-
-    fn read_mesh_header(mut self, file: *File, chunk_size: u32, mesh: *ImportedMesh) {
-        let header = W3DMeshHeader.read(file, chunk_size)
-        if !header {
-            return
-        }
-
-        mesh.name = header.?.mesh_name
-        mesh.bounding_box_min = header.?.min_corner
-        mesh.bounding_box_max = header.?.max_corner
-        mesh.bounding_sphere_center = header.?.sphere_center
-        mesh.bounding_sphere_radius = header.?.sphere_radius
-
-        // Allocate vertex and index arrays
-        mesh.vertices = self.allocator.alloc(W3DVertex, @intCast(usize, header.?.num_vertices))
-        mesh.indices = self.allocator.alloc(u32, @intCast(usize, header.?.num_triangles * 3))
-    }
-
-    fn read_vertices(mut self, file: *File, chunk_size: u32, mesh: *ImportedMesh) {
-        let num_vertices = chunk_size / 12  // 3 floats per vertex (x, y, z)
-
-        for i in 0..num_vertices {
-            let mut pos = Vec3.init(0.0, 0.0, 0.0)
-            file.read_vec3(&pos)
-            mesh.vertices[i].position = pos
-        }
-    }
-
-    fn read_normals(mut self, file: *File, chunk_size: u32, mesh: *ImportedMesh) {
-        let num_normals = chunk_size / 12  // 3 floats per normal
-
-        for i in 0..num_normals {
-            let mut normal = Vec3.init(0.0, 0.0, 1.0)
-            file.read_vec3(&normal)
-            mesh.vertices[i].normal = normal
-        }
-    }
-
-    fn read_triangles(mut self, file: *File, chunk_size: u32, mesh: *ImportedMesh) {
-        let num_triangles = chunk_size / 32  // W3DTriangle struct size
-
-        for i in 0..num_triangles {
-            let base_index = i * 3
-
-            // Read 3 vertex indices
-            file.read_u32(&mesh.indices[base_index])
-            file.read_u32(&mesh.indices[base_index + 1])
-            file.read_u32(&mesh.indices[base_index + 2])
-
-            // Read attributes and normal (skip for now)
-            let mut dummy_u32: u32 = 0
-            let mut dummy_vec3 = Vec3.init(0.0, 0.0, 0.0)
-            file.read_u32(&dummy_u32)
-            file.read_vec3(&dummy_vec3)
-        }
-    }
-
-    fn read_material(mut self, file: *File, chunk_size: u32, mesh: *ImportedMesh) {
-        let material = W3DMaterial.read(file)
-        if material {
-            // Allocate and append material
-            let new_materials = self.allocator.alloc(W3DMaterial, mesh.materials.len + 1)
-
-            for i in 0..mesh.materials.len {
-                new_materials[i] = mesh.materials[i]
-            }
-
-            new_materials[mesh.materials.len] = material.?
-
-            self.allocator.free(mesh.materials)
-            mesh.materials = new_materials
-        }
-    }
-
-    fn export_to_binary(&self, mesh: *ImportedMesh, output_path: string): bool {
-        // Export to custom Home binary format
-        let file = File.create(output_path, FileMode.Write)
-        if !file {
-            return false
-        }
-        defer file.close()
-
-        // Write header
-        file.write_string("HOMEMESH")  // Magic number
-        file.write_u32(1)              // Format version
-
-        // Write mesh data
-        file.write_string(mesh.name)
-        file.write_u32(@intCast(u32, mesh.vertices.len))
-        file.write_u32(@intCast(u32, mesh.indices.len))
-
-        // Write vertices
-        for vertex in mesh.vertices {
-            file.write_vec3(&vertex.position)
-            file.write_vec3(&vertex.normal)
-            file.write_vec2(&vertex.uv)
-        }
-
-        // Write indices
-        for index in mesh.indices {
-            file.write_u32(index)
-        }
-
-        // Write bounding volumes
-        file.write_vec3(&mesh.bounding_box_min)
-        file.write_vec3(&mesh.bounding_box_max)
-        file.write_vec3(&mesh.bounding_sphere_center)
-        file.write_f32(mesh.bounding_sphere_radius)
-
-        return true
-    }
 }
 
 // Example usage
@@ -461,7 +175,7 @@ export fn convert_w3d_model(input_path: string, output_path: string): bool {
     let mut importer = W3DImporter.init(allocator)
 
     let mesh = importer.import_mesh(input_path)
-    if !mesh {
+    if (!mesh) {
         println("Failed to import W3D mesh: {input_path}")
         return false
     }
@@ -471,7 +185,7 @@ export fn convert_w3d_model(input_path: string, output_path: string): bool {
     println("  Triangles: {mesh.?.indices.len / 3}")
     println("  Materials: {mesh.?.materials.len}")
 
-    if !importer.export_to_binary(&mesh.?, output_path) {
+    if (!importer.export_to_binary(&mesh.?, output_path)) {
         println("Failed to export mesh to: {output_path}")
         return false
     }

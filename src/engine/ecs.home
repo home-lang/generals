@@ -12,14 +12,6 @@ import graphics/mesh
 struct Entity {
     id: u32
     generation: u32  // For detecting stale references
-
-    fn is_valid(&self): bool {
-        return self.id != 0
-    }
-
-    fn equals(&self, other: Entity): bool {
-        return self.id == other.id and self.generation == other.generation
-    }
 }
 
 // Component type IDs
@@ -39,15 +31,12 @@ enum ComponentType {
 struct TransformComponent {
     entity: Entity
     transform: Transform
-    parent: ?Entity
-    children: []Entity
     child_count: usize
 }
 
 // Component: Renderable (visual representation)
 struct RenderableComponent {
     entity: Entity
-    model: ?*Model
     visible: bool
     cast_shadow: bool
     receive_shadow: bool
@@ -141,11 +130,11 @@ struct ComponentArray<T> {
     }
 
     fn add(mut self, entity: Entity, component: T): bool {
-        if self.count >= self.capacity {
+        if (self.count >= self.capacity) {
             return false
         }
 
-        if entity.id >= 4096 {
+        if (entity.id >= 4096) {
             return false
         }
 
@@ -160,18 +149,18 @@ struct ComponentArray<T> {
     }
 
     fn remove(mut self, entity: Entity): bool {
-        if entity.id >= 4096 {
+        if (entity.id >= 4096) {
             return false
         }
 
         let index = self.entity_to_index[entity.id]
-        if index == 0xFFFFFFFF {
+        if (index == 0xFFFFFFFF) {
             return false  // Entity doesn't have this component
         }
 
         // Swap with last element
         let last_index = self.count - 1
-        if index < last_index {
+        if (index < last_index) {
             self.components[index] = self.components[last_index]
 
             let moved_entity_id = self.index_to_entity[last_index]
@@ -187,12 +176,12 @@ struct ComponentArray<T> {
     }
 
     fn get(&self, entity: Entity): ?*T {
-        if entity.id >= 4096 {
+        if (entity.id >= 4096) {
             return null
         }
 
         let index = self.entity_to_index[entity.id]
-        if index == 0xFFFFFFFF or index >= self.count {
+        if (index == 0xFFFFFFFF or index >= self.count) {
             return null
         }
 
@@ -200,7 +189,7 @@ struct ComponentArray<T> {
     }
 
     fn has(&self, entity: Entity): bool {
-        if entity.id >= 4096 {
+        if (entity.id >= 4096) {
             return false
         }
 
@@ -215,15 +204,10 @@ struct ComponentArray<T> {
 
 // ECS World (manages all entities and components)
 struct World {
-    // Entity management
-    entities: []Entity
     entity_count: usize
-    free_entities: []u32
     free_count: usize
     next_entity_id: u32
     max_entities: usize
-
-    // Component arrays
     transforms: ComponentArray<TransformComponent>
     renderables: ComponentArray<RenderableComponent>
     velocities: ComponentArray<VelocityComponent>
@@ -233,251 +217,14 @@ struct World {
     weapons: ComponentArray<WeaponComponent>
     selectables: ComponentArray<SelectableComponent>
     teams: ComponentArray<TeamComponent>
-
     allocator: Allocator
-
-    fn init(allocator: Allocator): World {
-        const max_entities: usize = 4096
-
-        return World {
-            entities: allocator.alloc(Entity, max_entities)
-            entity_count: 0
-            free_entities: allocator.alloc(u32, max_entities)
-            free_count: 0
-            next_entity_id: 1  // 0 is reserved for invalid
-            max_entities: max_entities
-            transforms: ComponentArray.init(allocator, max_entities)
-            renderables: ComponentArray.init(allocator, max_entities)
-            velocities: ComponentArray.init(allocator, max_entities)
-            healths: ComponentArray.init(allocator, max_entities)
-            units: ComponentArray.init(allocator, max_entities)
-            buildings: ComponentArray.init(allocator, max_entities)
-            weapons: ComponentArray.init(allocator, max_entities)
-            selectables: ComponentArray.init(allocator, max_entities)
-            teams: ComponentArray.init(allocator, max_entities)
-            allocator: allocator
-        }
-    }
-
-    fn create_entity(mut self): Entity {
-        let mut id: u32 = 0
-        let mut generation: u32 = 0
-
-        if self.free_count > 0 {
-            // Reuse free entity
-            self.free_count -= 1
-            id = self.free_entities[self.free_count]
-            generation = self.entities[id].generation + 1
-        } else {
-            // Create new entity
-            if self.entity_count >= self.max_entities {
-                return Entity { id: 0, generation: 0 }  // Invalid
-            }
-
-            id = self.next_entity_id
-            self.next_entity_id += 1
-            generation = 0
-        }
-
-        let entity = Entity { id: id, generation: generation }
-        self.entities[id] = entity
-        self.entity_count += 1
-
-        return entity
-    }
-
-    fn destroy_entity(mut self, entity: Entity) {
-        if !self.is_entity_valid(entity) {
-            return
-        }
-
-        // Remove all components
-        self.transforms.remove(entity)
-        self.renderables.remove(entity)
-        self.velocities.remove(entity)
-        self.healths.remove(entity)
-        self.units.remove(entity)
-        self.buildings.remove(entity)
-        self.weapons.remove(entity)
-        self.selectables.remove(entity)
-        self.teams.remove(entity)
-
-        // Add to free list
-        if self.free_count < self.free_entities.len {
-            self.free_entities[self.free_count] = entity.id
-            self.free_count += 1
-        }
-
-        self.entity_count -= 1
-    }
-
-    fn is_entity_valid(&self, entity: Entity): bool {
-        if entity.id == 0 or entity.id >= self.next_entity_id {
-            return false
-        }
-
-        return self.entities[entity.id].generation == entity.generation
-    }
-
-    // Component accessors
-    fn add_transform(mut self, entity: Entity, transform: Transform): bool {
-        return self.transforms.add(entity, TransformComponent {
-            entity: entity
-            transform: transform
-            parent: null
-            children: []
-            child_count: 0
-        })
-    }
-
-    fn add_renderable(mut self, entity: Entity, model: ?*Model): bool {
-        return self.renderables.add(entity, RenderableComponent {
-            entity: entity
-            model: model
-            visible: true
-            cast_shadow: true
-            receive_shadow: true
-        })
-    }
-
-    fn add_velocity(mut self, entity: Entity, linear: Vec3, max_speed: f32): bool {
-        return self.velocities.add(entity, VelocityComponent {
-            entity: entity
-            linear: linear
-            angular: Vec3.init(0.0, 0.0, 0.0)
-            max_speed: max_speed
-        })
-    }
-
-    fn add_health(mut self, entity: Entity, max_health: f32): bool {
-        return self.healths.add(entity, HealthComponent {
-            entity: entity
-            current: max_health
-            maximum: max_health
-            regeneration_rate: 0.0
-            armor: 0.0
-        })
-    }
-
-    fn add_unit(mut self, entity: Entity, unit_type: string): bool {
-        return self.units.add(entity, UnitComponent {
-            entity: entity
-            unit_type: unit_type
-            move_speed: 10.0
-            turn_speed: 2.0
-            attack_range: 5.0
-            vision_range: 15.0
-            experience: 0
-            veterancy_level: 0
-        })
-    }
-
-    fn add_selectable(mut self, entity: Entity): bool {
-        return self.selectables.add(entity, SelectableComponent {
-            entity: entity
-            is_selected: false
-            selection_priority: 0
-            selection_radius: 1.0
-        })
-    }
-
-    fn add_team(mut self, entity: Entity, team_id: u32): bool {
-        return self.teams.add(entity, TeamComponent {
-            entity: entity
-            team_id: team_id
-            is_friendly: false
-        })
-    }
-
-    // Get components
-    fn get_transform(&self, entity: Entity): ?*TransformComponent {
-        return self.transforms.get(entity)
-    }
-
-    fn get_renderable(&self, entity: Entity): ?*RenderableComponent {
-        return self.renderables.get(entity)
-    }
-
-    fn get_velocity(&self, entity: Entity): ?*VelocityComponent {
-        return self.velocities.get(entity)
-    }
-
-    fn get_health(&self, entity: Entity): ?*HealthComponent {
-        return self.healths.get(entity)
-    }
-
-    fn get_unit(&self, entity: Entity): ?*UnitComponent {
-        return self.units.get(entity)
-    }
-
-    fn get_selectable(&self, entity: Entity): ?*SelectableComponent {
-        return self.selectables.get(entity)
-    }
-
-    fn get_team(&self, entity: Entity): ?*TeamComponent {
-        return self.teams.get(entity)
-    }
-
-    // Cleanup
-    fn deinit(mut self) {
-        self.transforms.deinit()
-        self.renderables.deinit()
-        self.velocities.deinit()
-        self.healths.deinit()
-        self.units.deinit()
-        self.buildings.deinit()
-        self.weapons.deinit()
-        self.selectables.deinit()
-        self.teams.deinit()
-
-        self.allocator.free(self.entities)
-        self.allocator.free(self.free_entities)
-    }
 }
 
 // Systems operate on components
 struct MovementSystem {
-    fn update(world: *World, delta_time: f32) {
-        // Update all entities with transform + velocity
-        for i in 0..world.velocities.count {
-            let velocity_comp = &world.velocities.components[i]
-            let entity = world.entities[velocity_comp.entity.id]
-
-            if world.transforms.has(entity) {
-                let transform = world.get_transform(entity)
-                if transform {
-                    // Update position based on velocity
-                    transform.?.transform.position = vec3_add(
-                        transform.?.transform.position,
-                        vec3_mul(velocity_comp.linear, delta_time)
-                    )
-                }
-            }
-        }
-    }
 }
 
 struct RenderSystem {
-    fn update(world: *World) {
-        // Render all entities with transform + renderable
-        for i in 0..world.renderables.count {
-            let renderable = &world.renderables.components[i]
-            let entity = world.entities[renderable.entity.id]
-
-            if !renderable.visible {
-                continue
-            }
-
-            if world.transforms.has(entity) {
-                let transform = world.get_transform(entity)
-                if transform and renderable.model {
-                    // TODO: Submit to renderer with transform matrix
-                    // let matrix = transform.?.transform.to_matrix()
-                    // render_model(renderable.model.?, matrix)
-                }
-            }
-        }
-    }
 }
 
 // Global ECS world
@@ -488,39 +235,39 @@ export fn init_ecs(allocator: Allocator) {
 }
 
 export fn shutdown_ecs() {
-    if g_world {
+    if (g_world) {
         g_world.?.deinit()
         g_world = null
     }
 }
 
 export fn create_entity(): Entity {
-    if g_world {
+    if (g_world) {
         return g_world.?.create_entity()
     }
     return Entity { id: 0, generation: 0 }
 }
 
 export fn destroy_entity(entity: Entity) {
-    if g_world {
+    if (g_world) {
         g_world.?.destroy_entity(entity)
     }
 }
 
 export fn update_movement_system(delta_time: f32) {
-    if g_world {
+    if (g_world) {
         MovementSystem.update(&g_world.?, delta_time)
     }
 }
 
 export fn update_render_system() {
-    if g_world {
+    if (g_world) {
         RenderSystem.update(&g_world.?)
     }
 }
 
 export fn get_world(): ?*World {
-    if g_world {
+    if (g_world) {
         return &g_world.?
     }
     return null

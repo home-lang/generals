@@ -26,76 +26,6 @@ enum VisibilityState {
 
 // Fog of war tile
 struct FogTile {
-    visibility: [8]VisibilityState  // One per player
-    explored: [8]bool               // Has player ever seen this tile?
-    visible_unit_count: [8]u32      // Number of units providing vision
-
-    fn init(): FogTile {
-        return FogTile {
-            visibility: [VisibilityState.Shroud; 8]
-            explored: [false; 8]
-            visible_unit_count: [0; 8]
-        }
-    }
-
-    fn add_visibility(mut self, player_id: u32) {
-        if player_id >= 8 {
-            return
-        }
-
-        self.visible_unit_count[player_id] += 1
-        self.visibility[player_id] = VisibilityState.Visible
-        self.explored[player_id] = true
-    }
-
-    fn remove_visibility(mut self, player_id: u32) {
-        if player_id >= 8 {
-            return
-        }
-
-        if self.visible_unit_count[player_id] > 0 {
-            self.visible_unit_count[player_id] -= 1
-        }
-
-        if self.visible_unit_count[player_id] == 0 {
-            if self.explored[player_id] {
-                self.visibility[player_id] = VisibilityState.Fog
-            } else {
-                self.visibility[player_id] = VisibilityState.Shroud
-            }
-        }
-    }
-
-    fn is_visible(&self, player_id: u32): bool {
-        if player_id >= 8 {
-            return false
-        }
-        return self.visibility[player_id] == VisibilityState.Visible
-    }
-
-    fn is_explored(&self, player_id: u32): bool {
-        if player_id >= 8 {
-            return false
-        }
-        return self.explored[player_id]
-    }
-
-    fn reveal(mut self, player_id: u32) {
-        if player_id >= 8 {
-            return
-        }
-        self.explored[player_id] = true
-        self.visibility[player_id] = VisibilityState.Visible
-    }
-
-    fn shroud(mut self, player_id: u32) {
-        if player_id >= 8 {
-            return
-        }
-        self.explored[player_id] = false
-        self.visibility[player_id] = VisibilityState.Shroud
-        self.visible_unit_count[player_id] = 0
-    }
 }
 
 // Vision provider (unit or building that provides sight)
@@ -105,293 +35,18 @@ struct VisionProvider {
     sight_range: f32
     player_id: u32
     is_active: bool
-
-    // Special vision types
     has_radar: bool        // Can see through fog
     reveals_stealth: bool  // Can see stealth units
-
-    fn init(id: u32, position: Vec3, sight_range: f32, player_id: u32): VisionProvider {
-        return VisionProvider {
-            id: id
-            position: position
-            sight_range: sight_range
-            player_id: player_id
-            is_active: true
-            has_radar: false
-            reveals_stealth: false
-        }
-    }
 }
 
 // Radar system
 struct RadarSystem {
-    // Fog of war map
-    fog_map: [[FogTile; FOG_MAP_SIZE]; FOG_MAP_SIZE]
-
-    // Vision providers (units and buildings)
-    vision_providers: [4096]VisionProvider
     vision_provider_count: u32
     next_provider_id: u32
-
-    // Map bounds
     map_min: Vec3
     map_max: Vec3
     tile_size: f32
-
     allocator: Allocator
-
-    fn init(allocator: Allocator, map_size: f32): RadarSystem {
-        return RadarSystem {
-            fog_map: [[FogTile.init(); FOG_MAP_SIZE]; FOG_MAP_SIZE]
-            vision_providers: [VisionProvider.init(0, Vec3.init(0.0, 0.0, 0.0), 0.0, 0); 4096]
-            vision_provider_count: 0
-            next_provider_id: 1
-            map_min: Vec3.init(0.0, 0.0, 0.0)
-            map_max: Vec3.init(map_size, map_size, 0.0)
-            tile_size: @intToFloat(f32, FOG_TILE_SIZE)
-            allocator: allocator
-        }
-    }
-
-    fn world_to_fog_coords(&self, world_pos: Vec3): (u32, u32) {
-        let x = @floatToInt(u32, world_pos.x / self.tile_size)
-        let y = @floatToInt(u32, world_pos.z / self.tile_size)
-
-        // Clamp to map bounds
-        let clamped_x = if x >= FOG_MAP_SIZE { FOG_MAP_SIZE - 1 } else { x }
-        let clamped_y = if y >= FOG_MAP_SIZE { FOG_MAP_SIZE - 1 } else { y }
-
-        return (clamped_x, clamped_y)
-    }
-
-    fn register_vision_provider(mut self, position: Vec3, sight_range: f32, player_id: u32): u32 {
-        if self.vision_provider_count >= 4096 {
-            return 0
-        }
-
-        let provider_id = self.next_provider_id
-        self.next_provider_id += 1
-
-        self.vision_providers[self.vision_provider_count] = VisionProvider.init(
-            provider_id,
-            position,
-            sight_range,
-            player_id
-        )
-        self.vision_provider_count += 1
-
-        // Add initial vision
-        self.add_vision_circle(position, sight_range, player_id)
-
-        return provider_id
-    }
-
-    fn unregister_vision_provider(mut self, provider_id: u32) {
-        for i in 0..self.vision_provider_count {
-            if self.vision_providers[i].id == provider_id {
-                // Remove vision before removing provider
-                self.remove_vision_circle(
-                    self.vision_providers[i].position,
-                    self.vision_providers[i].sight_range,
-                    self.vision_providers[i].player_id
-                )
-
-                // Shift remaining providers
-                for j in i..(self.vision_provider_count - 1) {
-                    self.vision_providers[j] = self.vision_providers[j + 1]
-                }
-                self.vision_provider_count -= 1
-                return
-            }
-        }
-    }
-
-    fn update_vision_provider(mut self, provider_id: u32, new_position: Vec3) {
-        for i in 0..self.vision_provider_count {
-            if self.vision_providers[i].id == provider_id {
-                let old_pos = self.vision_providers[i].position
-                let range = self.vision_providers[i].sight_range
-                let player_id = self.vision_providers[i].player_id
-
-                // Remove old vision
-                self.remove_vision_circle(old_pos, range, player_id)
-
-                // Update position
-                self.vision_providers[i].position = new_position
-
-                // Add new vision
-                self.add_vision_circle(new_position, range, player_id)
-                return
-            }
-        }
-    }
-
-    fn add_vision_circle(mut self, center: Vec3, radius: f32, player_id: u32) {
-        let radius_tiles = @floatToInt(u32, radius / self.tile_size) + 1
-
-        let (center_x, center_y) = self.world_to_fog_coords(center)
-
-        for dy in 0..(radius_tiles * 2) {
-            let y = if dy < radius_tiles {
-                if center_y < dy { 0 } else { center_y - dy }
-            } else {
-                center_y + (dy - radius_tiles)
-            }
-
-            if y >= FOG_MAP_SIZE {
-                continue
-            }
-
-            for dx in 0..(radius_tiles * 2) {
-                let x = if dx < radius_tiles {
-                    if center_x < dx { 0 } else { center_x - dx }
-                } else {
-                    center_x + (dx - radius_tiles)
-                }
-
-                if x >= FOG_MAP_SIZE {
-                    continue
-                }
-
-                // Check if within circle
-                let tile_center_x = (@intToFloat(f32, x) + 0.5) * self.tile_size
-                let tile_center_y = (@intToFloat(f32, y) + 0.5) * self.tile_size
-                let tile_center = Vec3.init(tile_center_x, 0.0, tile_center_y)
-
-                let distance = Vec3.distance(center, tile_center)
-                if distance <= radius {
-                    self.fog_map[y][x].add_visibility(player_id)
-                }
-            }
-        }
-    }
-
-    fn remove_vision_circle(mut self, center: Vec3, radius: f32, player_id: u32) {
-        let radius_tiles = @floatToInt(u32, radius / self.tile_size) + 1
-
-        let (center_x, center_y) = self.world_to_fog_coords(center)
-
-        for dy in 0..(radius_tiles * 2) {
-            let y = if dy < radius_tiles {
-                if center_y < dy { 0 } else { center_y - dy }
-            } else {
-                center_y + (dy - radius_tiles)
-            }
-
-            if y >= FOG_MAP_SIZE {
-                continue
-            }
-
-            for dx in 0..(radius_tiles * 2) {
-                let x = if dx < radius_tiles {
-                    if center_x < dx { 0 } else { center_x - dx }
-                } else {
-                    center_x + (dx - radius_tiles)
-                }
-
-                if x >= FOG_MAP_SIZE {
-                    continue
-                }
-
-                // Check if within circle
-                let tile_center_x = (@intToFloat(f32, x) + 0.5) * self.tile_size
-                let tile_center_y = (@intToFloat(f32, y) + 0.5) * self.tile_size
-                let tile_center = Vec3.init(tile_center_x, 0.0, tile_center_y)
-
-                let distance = Vec3.distance(center, tile_center)
-                if distance <= radius {
-                    self.fog_map[y][x].remove_visibility(player_id)
-                }
-            }
-        }
-    }
-
-    fn is_position_visible(&self, position: Vec3, player_id: u32): bool {
-        let (x, y) = self.world_to_fog_coords(position)
-        return self.fog_map[y][x].is_visible(player_id)
-    }
-
-    fn is_position_explored(&self, position: Vec3, player_id: u32): bool {
-        let (x, y) = self.world_to_fog_coords(position)
-        return self.fog_map[y][x].is_explored(player_id)
-    }
-
-    fn get_visibility_state(&self, position: Vec3, player_id: u32): VisibilityState {
-        let (x, y) = self.world_to_fog_coords(position)
-        if player_id >= 8 {
-            return VisibilityState.Shroud
-        }
-        return self.fog_map[y][x].visibility[player_id]
-    }
-
-    fn reveal_area(mut self, center: Vec3, radius: f32, player_id: u32) {
-        let radius_tiles = @floatToInt(u32, radius / self.tile_size) + 1
-        let (center_x, center_y) = self.world_to_fog_coords(center)
-
-        for dy in 0..(radius_tiles * 2) {
-            let y = if dy < radius_tiles {
-                if center_y < dy { 0 } else { center_y - dy }
-            } else {
-                center_y + (dy - radius_tiles)
-            }
-
-            if y >= FOG_MAP_SIZE {
-                continue
-            }
-
-            for dx in 0..(radius_tiles * 2) {
-                let x = if dx < radius_tiles {
-                    if center_x < dx { 0 } else { center_x - dx }
-                } else {
-                    center_x + (dx - radius_tiles)
-                }
-
-                if x >= FOG_MAP_SIZE {
-                    continue
-                }
-
-                let tile_center_x = (@intToFloat(f32, x) + 0.5) * self.tile_size
-                let tile_center_y = (@intToFloat(f32, y) + 0.5) * self.tile_size
-                let tile_center = Vec3.init(tile_center_x, 0.0, tile_center_y)
-
-                let distance = Vec3.distance(center, tile_center)
-                if distance <= radius {
-                    self.fog_map[y][x].reveal(player_id)
-                }
-            }
-        }
-    }
-
-    fn reveal_all(mut self, player_id: u32) {
-        for y in 0..FOG_MAP_SIZE {
-            for x in 0..FOG_MAP_SIZE {
-                self.fog_map[y][x].reveal(player_id)
-            }
-        }
-    }
-
-    fn shroud_all(mut self, player_id: u32) {
-        for y in 0..FOG_MAP_SIZE {
-            for x in 0..FOG_MAP_SIZE {
-                self.fog_map[y][x].shroud(player_id)
-            }
-        }
-    }
-
-    fn get_exploration_percentage(&self, player_id: u32): f32 {
-        let mut explored_count: u32 = 0
-        let total_tiles = FOG_MAP_SIZE * FOG_MAP_SIZE
-
-        for y in 0..FOG_MAP_SIZE {
-            for x in 0..FOG_MAP_SIZE {
-                if self.fog_map[y][x].is_explored(player_id) {
-                    explored_count += 1
-                }
-            }
-        }
-
-        return @intToFloat(f32, explored_count) / @intToFloat(f32, total_tiles)
-    }
 }
 
 // Global radar system
@@ -408,33 +63,33 @@ export fn shutdown_radar_system() {
 }
 
 export fn register_vision_provider(position: Vec3, sight_range: f32, player_id: u32): u32 {
-    if g_radar_system {
+    if (g_radar_system) {
         return g_radar_system.?.register_vision_provider(position, sight_range, player_id)
     }
     return 0
 }
 
 export fn unregister_vision_provider(provider_id: u32) {
-    if g_radar_system {
+    if (g_radar_system) {
         g_radar_system.?.unregister_vision_provider(provider_id)
     }
 }
 
 export fn update_vision_provider(provider_id: u32, new_position: Vec3) {
-    if g_radar_system {
+    if (g_radar_system) {
         g_radar_system.?.update_vision_provider(provider_id, new_position)
     }
 }
 
 export fn is_position_visible(position: Vec3, player_id: u32): bool {
-    if g_radar_system {
+    if (g_radar_system) {
         return g_radar_system.?.is_position_visible(position, player_id)
     }
     return false
 }
 
 export fn reveal_map_area(center: Vec3, radius: f32, player_id: u32) {
-    if g_radar_system {
+    if (g_radar_system) {
         g_radar_system.?.reveal_area(center, radius, player_id)
     }
 }

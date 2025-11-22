@@ -13,29 +13,6 @@ struct Cluster {
     max_x: i32,
     max_y: i32,
     entrances: Vec<Entrance>,
-
-    fn init(id: i32, min_x: i32, min_y: i32, max_x: i32, max_y: i32): Cluster {
-        return Cluster {
-            id: id,
-            min_x: min_x,
-            min_y: min_y,
-            max_x: max_x,
-            max_y: max_y,
-            entrances: Vec::new(),
-        }
-    }
-
-    fn contains(&self, x: i32, y: i32): bool {
-        return x >= self.min_x && x < self.max_x &&
-               y >= self.min_y && y < self.max_y
-    }
-
-    fn get_center(&self): (Int, Int) {
-        return (
-            (self.min_x + self.max_x) / 2,
-            (self.min_y + self.max_y) / 2
-        )
-    }
 }
 
 // Entrance - Connection between two clusters
@@ -44,45 +21,6 @@ struct Entrance {
     cluster1_id: i32,
     cluster2_id: i32,
     positions: Vec<(Int, Int)>,  // Cells in the entrance
-    center: (Int, Int),
-
-    fn init(id: i32, cluster1_id: i32, cluster2_id: i32): Entrance {
-        return Entrance {
-            id: id,
-            cluster1_id: cluster1_id,
-            cluster2_id: cluster2_id,
-            positions: Vec::new(),
-            center: (0, 0),
-        }
-    }
-
-    fn add_position(&self, x: i32, y: i32) {
-        self.positions.add((x, y))
-        self.recalculate_center()
-    }
-
-    fn recalculate_center(&self) {
-        if self.positions.count() == 0 {
-            return
-        }
-
-        let sum_x = 0
-        let sum_y = 0
-
-        for pos in self.positions {
-            sum_x = sum_x + pos.0
-            sum_y = sum_y + pos.1
-        }
-
-        self.center = (
-            sum_x / self.positions.count(),
-            sum_y / self.positions.count()
-        )
-    }
-
-    fn get_width(&self): i32 {
-        return self.positions.count()
-    }
 }
 
 // Abstract node - Represents an entrance in the abstract graph
@@ -90,22 +28,7 @@ struct AbstractNode {
     id: i32,
     entrance_id: i32,
     cluster_id: i32,
-    position: (Int, Int),
     connections: Vec<AbstractEdge>,
-
-    fn init(id: i32, entrance_id: i32, cluster_id: i32, pos: (Int, Int)): AbstractNode {
-        return AbstractNode {
-            id: id,
-            entrance_id: entrance_id,
-            cluster_id: cluster_id,
-            position: pos,
-            connections: Vec::new(),
-        }
-    }
-
-    fn add_connection(&self, edge: AbstractEdge) {
-        self.connections.add(edge)
-    }
 }
 
 // Abstract edge - Connection between abstract nodes
@@ -113,14 +36,6 @@ struct AbstractEdge {
     to_node_id: i32,
     cost: f64,
     level: i32,  // Hierarchy level (0 = lowest, intra-cluster)
-
-    fn init(to_node_id: i32, cost: f64, level: i32): AbstractEdge {
-        return AbstractEdge {
-            to_node_id: to_node_id,
-            cost: cost,
-            level: level,
-        }
-    }
 }
 
 // HPA* Grid
@@ -133,298 +48,15 @@ struct HPAGrid {
     abstract_nodes: Vec<AbstractNode>,
     next_entrance_id: i32,
     next_node_id: i32,
-
-    fn init(width: i32, height: i32, cluster_size: i32): HPAGrid {
-        let grid = HPAGrid {
-            width: width,
-            height: height,
-            cluster_size: cluster_size,
-            clusters: Vec::new(),
-            entrances: Vec::new(),
-            abstract_nodes: Vec::new(),
-            next_entrance_id: 0,
-            next_node_id: 0,
-        }
-
-        grid.build_clusters()
-        return grid
-    }
-
-    fn build_clusters(&self) {
-        let cluster_id = 0
-
-        let clusters_x = (self.width + self.cluster_size - 1) / self.cluster_size
-        let clusters_y = (self.height + self.cluster_size - 1) / self.cluster_size
-
-        for cy in 0..clusters_y {
-            for cx in 0..clusters_x {
-                let min_x = cx * self.cluster_size
-                let min_y = cy * self.cluster_size
-                let max_x = min(min_x + self.cluster_size, self.width)
-                let max_y = min(min_y + self.cluster_size, self.height)
-
-                let cluster = Cluster::init(cluster_id, min_x, min_y, max_x, max_y)
-                self.clusters.add(cluster)
-
-                cluster_id = cluster_id + 1
-            }
-        }
-    }
-
-    fn find_cluster(&self, x: i32, y: i32): Cluster? {
-        for cluster in self.clusters {
-            if cluster.contains(x, y) {
-                return cluster
-            }
-        }
-        return null
-    }
-
-    fn build_entrances(&self, walkable: Vec<Vec<bool>>) {
-        let clusters_x = (self.width + self.cluster_size - 1) / self.cluster_size
-
-        // Horizontal entrances
-        for cy in 0..(self.height / self.cluster_size) {
-            for cx in 0..(clusters_x - 1) {
-                self.find_horizontal_entrance(cx, cy, walkable)
-            }
-        }
-
-        // Vertical entrances
-        for cy in 0..((self.height / self.cluster_size) - 1) {
-            for cx in 0..clusters_x {
-                self.find_vertical_entrance(cx, cy, walkable)
-            }
-        }
-    }
-
-    fn find_horizontal_entrance(&self, cx: i32, cy: i32, walkable: Vec<Vec<bool>>) {
-        let border_x = (cx + 1) * self.cluster_size
-        let start_y = cy * self.cluster_size
-        let end_y = min(start_y + self.cluster_size, self.height)
-
-        let entrance: Entrance? = null
-        let entrance_started = false
-
-        for y in start_y..end_y {
-            if border_x < self.width {
-                let left_walkable = walkable.get(border_x - 1).get(y)
-                let right_walkable = walkable.get(border_x).get(y)
-
-                if left_walkable && right_walkable {
-                    if !entrance_started {
-                        let cluster1 = self.find_cluster(border_x - 1, y)?
-                        let cluster2 = self.find_cluster(border_x, y)?
-
-                        entrance = Entrance::init(self.next_entrance_id, cluster1.id, cluster2.id)
-                        self.next_entrance_id = self.next_entrance_id + 1
-                        entrance_started = true
-                    }
-
-                    if let Some(e) = entrance {
-                        e.add_position(border_x, y)
-                    }
-                } else if entrance_started {
-                    if let Some(e) = entrance {
-                        self.entrances.add(e)
-                        self.create_abstract_nodes_for_entrance(e)
-                    }
-                    entrance = null
-                    entrance_started = false
-                }
-            }
-        }
-
-        if entrance_started {
-            if let Some(e) = entrance {
-                self.entrances.add(e)
-                self.create_abstract_nodes_for_entrance(e)
-            }
-        }
-    }
-
-    fn find_vertical_entrance(&self, cx: i32, cy: i32, walkable: Vec<Vec<bool>>) {
-        let border_y = (cy + 1) * self.cluster_size
-        let start_x = cx * self.cluster_size
-        let end_x = min(start_x + self.cluster_size, self.width)
-
-        let entrance: Entrance? = null
-        let entrance_started = false
-
-        for x in start_x..end_x {
-            if border_y < self.height {
-                let top_walkable = walkable.get(x).get(border_y - 1)
-                let bottom_walkable = walkable.get(x).get(border_y)
-
-                if top_walkable && bottom_walkable {
-                    if !entrance_started {
-                        let cluster1 = self.find_cluster(x, border_y - 1)?
-                        let cluster2 = self.find_cluster(x, border_y)?
-
-                        entrance = Entrance::init(self.next_entrance_id, cluster1.id, cluster2.id)
-                        self.next_entrance_id = self.next_entrance_id + 1
-                        entrance_started = true
-                    }
-
-                    if let Some(e) = entrance {
-                        e.add_position(x, border_y)
-                    }
-                } else if entrance_started {
-                    if let Some(e) = entrance {
-                        self.entrances.add(e)
-                        self.create_abstract_nodes_for_entrance(e)
-                    }
-                    entrance = null
-                    entrance_started = false
-                }
-            }
-        }
-
-        if entrance_started {
-            if let Some(e) = entrance {
-                self.entrances.add(e)
-                self.create_abstract_nodes_for_entrance(e)
-            }
-        }
-    }
-
-    fn create_abstract_nodes_for_entrance(&self, entrance: Entrance) {
-        // Create two nodes, one for each cluster
-        let node1 = AbstractNode::init(
-            self.next_node_id,
-            entrance.id,
-            entrance.cluster1_id,
-            entrance.center
-        )
-        self.next_node_id = self.next_node_id + 1
-
-        let node2 = AbstractNode::init(
-            self.next_node_id,
-            entrance.id,
-            entrance.cluster2_id,
-            entrance.center
-        )
-        self.next_node_id = self.next_node_id + 1
-
-        // Connect the two nodes (inter-cluster edge)
-        let cost = entrance.get_width() as Float
-        node1.add_connection(AbstractEdge::init(node2.id, cost, 1))
-        node2.add_connection(AbstractEdge::init(node1.id, cost, 1))
-
-        self.abstract_nodes.add(node1)
-        self.abstract_nodes.add(node2)
-    }
-
-    fn find_abstract_path(&self, start_cluster: i32, goal_cluster: i32): Vec<i32>? {
-        // A* search on abstract graph
-        let open_set = Vec::new()
-        let came_from = Vec::new()
-        let g_score = Vec::new()
-        let f_score = Vec::new()
-
-        // Initialize scores
-        for node in self.abstract_nodes {
-            g_score.add(999999.0)
-            f_score.add(999999.0)
-        }
-
-        // Find start nodes in start cluster
-        for node in self.abstract_nodes {
-            if node.cluster_id == start_cluster {
-                open_set.add(node.id)
-                g_score.set(node.id, 0.0)
-                f_score.set(node.id, self.heuristic(node.cluster_id, goal_cluster))
-            }
-        }
-
-        while open_set.count() > 0 {
-            // Find node with lowest f_score
-            let current_id = self.find_lowest_f_score(open_set, f_score)
-            let current = self.get_abstract_node(current_id)?
-
-            if current.cluster_id == goal_cluster {
-                return self.reconstruct_abstract_path(came_from, current_id)
-            }
-
-            open_set.remove(current_id)
-
-            for edge in current.connections {
-                let neighbor = self.get_abstract_node(edge.to_node_id)?
-                let tentative_g = g_score.get(current_id) + edge.cost
-
-                if tentative_g < g_score.get(neighbor.id) {
-                    came_from.set(neighbor.id, current_id)
-                    g_score.set(neighbor.id, tentative_g)
-                    f_score.set(neighbor.id, tentative_g + self.heuristic(neighbor.cluster_id, goal_cluster))
-
-                    if !open_set.contains(neighbor.id) {
-                        open_set.add(neighbor.id)
-                    }
-                }
-            }
-        }
-
-        return null
-    }
-
-    fn heuristic(&self, cluster1: i32, cluster2: i32): f64 {
-        let c1 = self.clusters.get(cluster1)
-        let c2 = self.clusters.get(cluster2)
-
-        let (c1x, c1y) = c1.get_center()
-        let (c2x, c2y) = c2.get_center()
-
-        let dx = abs(c2x - c1x) as Float
-        let dy = abs(c2y - c1y) as Float
-
-        return sqrt(dx * dx + dy * dy)
-    }
-
-    fn find_lowest_f_score(&self, open_set: Vec<i32>, f_score: Vec<f64>): i32 {
-        let min_id = open_set.get(0)
-        let min_score = f_score.get(min_id)
-
-        for id in open_set {
-            let score = f_score.get(id)
-            if score < min_score {
-                min_score = score
-                min_id = id
-            }
-        }
-
-        return min_id
-    }
-
-    fn get_abstract_node(&self, id: i32): AbstractNode? {
-        for node in self.abstract_nodes {
-            if node.id == id {
-                return node
-            }
-        }
-        return null
-    }
-
-    fn reconstruct_abstract_path(&self, came_from: Vec<i32>, current: i32): Vec<i32> {
-        let path = Vec::new()
-        path.add(current)
-
-        let mut node = current
-        while came_from.contains(node) {
-            node = came_from.get(node)
-            path.insert(0, node)
-        }
-
-        return path
-    }
 }
 
 // Helper functions
 fn min(a: i32, b: i32): i32 {
-    if a < b { return a } else { return b }
+    if (a < b) { return a } else { return b }
 }
 
 fn abs(x: i32): i32 {
-    if x < 0 { return -x } else { return x }
+    if (x < 0) { return -x } else { return x }
 }
 
 fn sqrt(x: f64): f64 {

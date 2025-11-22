@@ -24,350 +24,42 @@ struct FrameLimiter {
     target_frame_time: f64  // In seconds
     min_frame_time: f64
     max_frame_time: f64
-
-    fn init(target_fps: u32): FrameLimiter {
-        let target_time = 1.0 / @intToFloat(f64, target_fps)
-
-        return FrameLimiter {
-            target_fps: target_fps
-            target_frame_time: target_time
-            min_frame_time: target_time * 0.5  // Allow up to 2x target
-            max_frame_time: target_time * 2.0  // Clamp to half target
-        }
-    }
-
-    fn should_limit(&self, elapsed: f64): bool {
-        return elapsed < self.target_frame_time
-    }
-
-    fn get_sleep_time(&self, elapsed: f64): f64 {
-        if elapsed < self.target_frame_time {
-            return self.target_frame_time - elapsed
-        }
-        return 0.0
-    }
-
-    fn set_target_fps(mut self, fps: u32) {
-        self.target_fps = fps
-        self.target_frame_time = 1.0 / @intToFloat(f64, fps)
-        self.min_frame_time = self.target_frame_time * 0.5
-        self.max_frame_time = self.target_frame_time * 2.0
-    }
 }
 
 // High-resolution timer
 struct Timer {
     start_time: u64  // In nanoseconds
     is_running: bool
-
-    fn init(): Timer {
-        return Timer {
-            start_time: 0
-            is_running: false
-        }
-    }
-
-    fn start(mut self) {
-        self.start_time = get_nanoseconds()
-        self.is_running = true
-    }
-
-    fn stop(mut self): f64 {
-        if !self.is_running {
-            return 0.0
-        }
-
-        let end_time = get_nanoseconds()
-        let elapsed = end_time - self.start_time
-        self.is_running = false
-
-        return nanoseconds_to_seconds(elapsed)
-    }
-
-    fn elapsed(&self): f64 {
-        if !self.is_running {
-            return 0.0
-        }
-
-        let current = get_nanoseconds()
-        let elapsed = current - self.start_time
-        return nanoseconds_to_seconds(elapsed)
-    }
-
-    fn reset(mut self) {
-        self.start_time = get_nanoseconds()
-    }
 }
 
 // Frame timing tracker
 struct FrameTimer {
     mode: TimingMode
     limiter: FrameLimiter
-
-    // Time tracking
     current_time: u64
     last_time: u64
     delta_time: f64
     unscaled_delta_time: f64
     time_scale: f64
-
-    // Fixed timestep
     fixed_timestep: f64
     accumulator: f64
     max_accumulator: f64
-
-    // Frame counting
     frame_count: u64
     fps_update_interval: f64
     fps_update_timer: f64
     fps_frame_count: u32
     current_fps: f32
-
-    // Delta time smoothing
-    delta_history: [60]f64
     delta_history_index: usize
     smooth_delta: bool
-
-    fn init(mode: TimingMode, target_fps: u32): FrameTimer {
-        let fixed_dt = 1.0 / 60.0  // 60 Hz physics
-
-        return FrameTimer {
-            mode: mode
-            limiter: FrameLimiter.init(target_fps)
-            current_time: get_nanoseconds()
-            last_time: get_nanoseconds()
-            delta_time: 0.0
-            unscaled_delta_time: 0.0
-            time_scale: 1.0
-            fixed_timestep: fixed_dt
-            accumulator: 0.0
-            max_accumulator: fixed_dt * 5.0
-            frame_count: 0
-            fps_update_interval: 1.0
-            fps_update_timer: 0.0
-            fps_frame_count: 0
-            current_fps: 0.0
-            delta_history: [60]f64{ 0.0 }
-            delta_history_index: 0
-            smooth_delta: true
-        }
-    }
-
-    fn tick(mut self) {
-        // Update time
-        self.last_time = self.current_time
-        self.current_time = get_nanoseconds()
-
-        // Calculate raw delta time
-        let elapsed_ns = self.current_time - self.last_time
-        let raw_delta = nanoseconds_to_seconds(elapsed_ns)
-
-        // Clamp delta time to prevent huge jumps
-        self.unscaled_delta_time = clamp_f64(
-            raw_delta,
-            self.limiter.min_frame_time,
-            self.limiter.max_frame_time
-        )
-
-        // Apply time scale
-        self.delta_time = self.unscaled_delta_time * self.time_scale
-
-        // Smooth delta time
-        if self.smooth_delta {
-            self.delta_history[self.delta_history_index] = self.delta_time
-            self.delta_history_index = (self.delta_history_index + 1) % 60
-
-            // Calculate average delta
-            let mut sum: f64 = 0.0
-            for i in 0..60 {
-                sum += self.delta_history[i]
-            }
-            self.delta_time = sum / 60.0
-        }
-
-        // Update accumulator for fixed timestep
-        match self.mode {
-            TimingMode.Fixed => {
-                self.delta_time = self.fixed_timestep
-            }
-            TimingMode.SemiFixed => {
-                self.accumulator += self.delta_time
-
-                // Clamp accumulator to prevent spiral of death
-                if self.accumulator > self.max_accumulator {
-                    self.accumulator = self.max_accumulator
-                }
-            }
-            _ => {}
-        }
-
-        // Update frame counter
-        self.frame_count += 1
-
-        // Update FPS counter
-        self.fps_update_timer += self.unscaled_delta_time
-        self.fps_frame_count += 1
-
-        if self.fps_update_timer >= self.fps_update_interval {
-            self.current_fps = @intToFloat(f32, self.fps_frame_count) /
-                               @floatCast(f32, self.fps_update_timer)
-            self.fps_update_timer = 0.0
-            self.fps_frame_count = 0
-        }
-    }
-
-    fn should_update_fixed(&self): bool {
-        // Check if we should run a fixed timestep update
-        match self.mode {
-            TimingMode.SemiFixed => {
-                return self.accumulator >= self.fixed_timestep
-            }
-            _ => {
-                return true
-            }
-        }
-    }
-
-    fn consume_fixed_update(mut self) {
-        // Consume one fixed timestep from accumulator
-        if self.mode == TimingMode.SemiFixed {
-            self.accumulator -= self.fixed_timestep
-        }
-    }
-
-    fn get_delta_time(&self): f32 {
-        return @floatCast(f32, self.delta_time)
-    }
-
-    fn get_fixed_delta_time(&self): f32 {
-        return @floatCast(f32, self.fixed_timestep)
-    }
-
-    fn get_unscaled_delta_time(&self): f32 {
-        return @floatCast(f32, self.unscaled_delta_time)
-    }
-
-    fn get_fps(&self): f32 {
-        return self.current_fps
-    }
-
-    fn get_frame_count(&self): u64 {
-        return self.frame_count
-    }
-
-    fn set_time_scale(mut self, scale: f64) {
-        self.time_scale = scale
-    }
-
-    fn pause(mut self) {
-        self.time_scale = 0.0
-    }
-
-    fn resume(mut self) {
-        self.time_scale = 1.0
-    }
-
-    fn set_target_fps(mut self, fps: u32) {
-        self.limiter.set_target_fps(fps)
-    }
-
-    fn wait_for_next_frame(&self) {
-        let sleep_time = self.limiter.get_sleep_time(self.unscaled_delta_time)
-        if sleep_time > 0.0 {
-            sleep_seconds(sleep_time)
-        }
-    }
 }
 
 // Stopwatch for profiling
 struct Stopwatch {
     name: string
-    samples: []f64
     sample_count: usize
     capacity: usize
     current_sample: Timer
     allocator: Allocator
-
-    fn init(allocator: Allocator, name: string, capacity: usize): Stopwatch {
-        return Stopwatch {
-            name: name
-            samples: allocator.alloc(f64, capacity)
-            sample_count: 0
-            capacity: capacity
-            current_sample: Timer.init()
-            allocator: allocator
-        }
-    }
-
-    fn start(mut self) {
-        self.current_sample.start()
-    }
-
-    fn stop(mut self) {
-        let elapsed = self.current_sample.stop()
-
-        if self.sample_count < self.capacity {
-            self.samples[self.sample_count] = elapsed
-            self.sample_count += 1
-        } else {
-            // Shift samples and add new one
-            for i in 1..self.capacity {
-                self.samples[i - 1] = self.samples[i]
-            }
-            self.samples[self.capacity - 1] = elapsed
-        }
-    }
-
-    fn get_average(&self): f64 {
-        if self.sample_count == 0 {
-            return 0.0
-        }
-
-        let mut sum: f64 = 0.0
-        for i in 0..self.sample_count {
-            sum += self.samples[i]
-        }
-
-        return sum / @intToFloat(f64, self.sample_count)
-    }
-
-    fn get_min(&self): f64 {
-        if self.sample_count == 0 {
-            return 0.0
-        }
-
-        let mut min = self.samples[0]
-        for i in 1..self.sample_count {
-            if self.samples[i] < min {
-                min = self.samples[i]
-            }
-        }
-
-        return min
-    }
-
-    fn get_max(&self): f64 {
-        if self.sample_count == 0 {
-            return 0.0
-        }
-
-        let mut max = self.samples[0]
-        for i in 1..self.sample_count {
-            if self.samples[i] > max {
-                max = self.samples[i]
-            }
-        }
-
-        return max
-    }
-
-    fn reset(mut self) {
-        self.sample_count = 0
-    }
-
-    fn deinit(mut self) {
-        self.allocator.free(self.samples)
-    }
 }
 
 // Platform-specific time functions
@@ -409,10 +101,10 @@ fn seconds_to_milliseconds(seconds: f64): u64 {
 }
 
 fn clamp_f64(value: f64, min: f64, max: f64): f64 {
-    if value < min {
+    if (value < min) {
         return min
     }
-    if value > max {
+    if (value > max) {
         return max
     }
     return value
@@ -426,72 +118,72 @@ export fn init_timing(mode: TimingMode, target_fps: u32) {
 }
 
 export fn tick_timing() {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.tick()
     }
 }
 
 export fn get_delta_time(): f32 {
-    if g_frame_timer {
+    if (g_frame_timer) {
         return g_frame_timer.?.get_delta_time()
     }
     return 0.0
 }
 
 export fn get_fixed_delta_time(): f32 {
-    if g_frame_timer {
+    if (g_frame_timer) {
         return g_frame_timer.?.get_fixed_delta_time()
     }
     return 0.016667  // 60 FPS
 }
 
 export fn should_update_fixed(): bool {
-    if g_frame_timer {
+    if (g_frame_timer) {
         return g_frame_timer.?.should_update_fixed()
     }
     return true
 }
 
 export fn consume_fixed_update() {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.consume_fixed_update()
     }
 }
 
 export fn get_fps(): f32 {
-    if g_frame_timer {
+    if (g_frame_timer) {
         return g_frame_timer.?.get_fps()
     }
     return 0.0
 }
 
 export fn get_frame_count(): u64 {
-    if g_frame_timer {
+    if (g_frame_timer) {
         return g_frame_timer.?.get_frame_count()
     }
     return 0
 }
 
 export fn set_time_scale(scale: f32) {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.set_time_scale(@floatCast(f64, scale))
     }
 }
 
 export fn pause_time() {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.pause()
     }
 }
 
 export fn resume_time() {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.resume()
     }
 }
 
 export fn wait_for_next_frame() {
-    if g_frame_timer {
+    if (g_frame_timer) {
         g_frame_timer.?.wait_for_next_frame()
     }
 }

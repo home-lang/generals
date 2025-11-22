@@ -49,365 +49,28 @@ struct Objective {
     id: string                      // Unique identifier
     objective_type: ObjectiveType
     status: ObjectiveStatus
-
-    // Display
     description: string             // Text shown to player (or localization key)
     short_description: string       // Brief version for HUD
     is_hidden: bool                 // Hidden until revealed
-
-    // Triggers
     trigger_script: string          // Script that activates this objective
     complete_condition: string      // Condition to check for completion
     fail_condition: string          // Condition that fails objective
-
-    // Progression
     current_count: i32              // For "kill 10 tanks" style objectives
     target_count: i32               // Target to reach
-
-    // Rewards
     rank_points: i32                // Points awarded on completion
     bonus_money: i32                // Money bonus on completion
-
-    // Time tracking
     start_time: i32                 // Mission time when activated (seconds)
     complete_time: i32              // Mission time when completed (seconds)
     time_limit: i32                 // Time limit in seconds (0 = no limit)
-
-    fn init(id: string): Objective {
-        return Objective {
-            id: id
-            objective_type: ObjectiveType.Primary
-            status: ObjectiveStatus.Pending
-            description: ""
-            short_description: ""
-            is_hidden: false
-            trigger_script: ""
-            complete_condition: ""
-            fail_condition: ""
-            current_count: 0
-            target_count: 1
-            rank_points: 100
-            bonus_money: 0
-            start_time: 0
-            complete_time: 0
-            time_limit: 0
-        }
-    }
-
-    fn activate(mut self, mission_time: i32) {
-        if self.status == ObjectiveStatus.Pending {
-            self.status = ObjectiveStatus.Active
-            self.start_time = mission_time
-
-            println("Objective activated: {self.short_description}")
-            // TODO: Show UI notification
-        }
-    }
-
-    fn complete(mut self, mission_time: i32) {
-        if self.status == ObjectiveStatus.Active {
-            self.status = ObjectiveStatus.Completed
-            self.complete_time = mission_time
-
-            let time_taken = mission_time - self.start_time
-            println("Objective completed: {self.short_description} (+{self.rank_points} points)")
-            println("  Time: {time_taken}s")
-
-            // TODO: Show UI notification
-            // TODO: Award rank points and money
-        }
-    }
-
-    fn fail(mut self, mission_time: i32) {
-        if self.status == ObjectiveStatus.Active {
-            self.status = ObjectiveStatus.Failed
-            self.complete_time = mission_time
-
-            println("Objective failed: {self.short_description}")
-
-            // TODO: Show UI notification
-
-            // Primary objective failure = mission failure
-            if self.objective_type == ObjectiveType.Primary {
-                println("MISSION FAILED - Primary objective failed!")
-            }
-        }
-    }
-
-    fn update_progress(mut self, current: i32) {
-        self.current_count = current
-
-        // Auto-complete if target reached
-        if self.current_count >= self.target_count {
-            // Will be completed by ObjectiveManager
-        }
-    }
-
-    fn get_progress_percentage(&self): f32 {
-        if self.target_count == 0 {
-            return 0.0
-        }
-
-        let progress = @intToFloat(f32, self.current_count) / @intToFloat(f32, self.target_count) * 100.0
-
-        if progress > 100.0 {
-            return 100.0
-        }
-
-        return progress
-    }
-
-    fn is_time_expired(&self, mission_time: i32): bool {
-        if self.time_limit == 0 or self.status != ObjectiveStatus.Active {
-            return false
-        }
-
-        let elapsed = mission_time - self.start_time
-        return elapsed >= self.time_limit
-    }
-
-    fn get_time_remaining(&self, mission_time: i32): i32 {
-        if self.time_limit == 0 or self.status != ObjectiveStatus.Active {
-            return 0
-        }
-
-        let elapsed = mission_time - self.start_time
-        let remaining = self.time_limit - elapsed
-
-        if remaining < 0 {
-            return 0
-        }
-
-        return remaining
-    }
 }
 
 // Objective manager
 struct ObjectiveManager {
-    objectives: [MAX_OBJECTIVES]Objective
     objective_count: u32
-
     mission_time_seconds: i32
     all_primary_complete: bool
     any_primary_failed: bool
-
     allocator: Allocator
-
-    fn init(allocator: Allocator): ObjectiveManager {
-        return ObjectiveManager {
-            objectives: [Objective.init(""); MAX_OBJECTIVES]
-            objective_count: 0
-            mission_time_seconds: 0
-            all_primary_complete: false
-            any_primary_failed: false
-            allocator: allocator
-        }
-    }
-
-    fn add_objective(mut self, objective: Objective): bool {
-        if self.objective_count >= MAX_OBJECTIVES {
-            println("Cannot add objective - max limit reached!")
-            return false
-        }
-
-        self.objectives[self.objective_count] = objective
-        self.objective_count += 1
-
-        return true
-    }
-
-    fn get_objective(mut self, id: string): ?*Objective {
-        for i in 0..self.objective_count {
-            if self.objectives[i].id == id {
-                return &self.objectives[i]
-            }
-        }
-        return null
-    }
-
-    fn activate_objective(mut self, id: string) {
-        let obj = self.get_objective(id)
-        if obj {
-            obj.?.activate(self.mission_time_seconds)
-        }
-    }
-
-    fn complete_objective(mut self, id: string) {
-        let obj = self.get_objective(id)
-        if obj {
-            obj.?.complete(self.mission_time_seconds)
-        }
-    }
-
-    fn fail_objective(mut self, id: string) {
-        let obj = self.get_objective(id)
-        if obj {
-            obj.?.fail(self.mission_time_seconds)
-        }
-    }
-
-    fn update_objective_progress(mut self, id: string, current: i32) {
-        let obj = self.get_objective(id)
-        if obj {
-            obj.?.update_progress(current)
-
-            // Auto-complete if target reached
-            if obj.?.current_count >= obj.?.target_count and obj.?.status == ObjectiveStatus.Active {
-                self.complete_objective(id)
-            }
-        }
-    }
-
-    fn update(mut self, delta_time: f32) {
-        self.mission_time_seconds += @floatToInt(i32, delta_time)
-
-        // Check for time-limited objectives
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.status == ObjectiveStatus.Active and obj.time_limit > 0 {
-                if obj.is_time_expired(self.mission_time_seconds) {
-                    println("Objective timed out: {obj.short_description}")
-                    self.objectives[i].fail(self.mission_time_seconds)
-                }
-            }
-        }
-
-        // Check overall mission state
-        self.check_mission_state()
-    }
-
-    fn check_mission_state(mut self) {
-        let mut primary_count: u32 = 0
-        let mut primary_complete: u32 = 0
-        let mut primary_failed: u32 = 0
-
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.objective_type == ObjectiveType.Primary and !obj.is_hidden {
-                primary_count += 1
-
-                if obj.status == ObjectiveStatus.Completed {
-                    primary_complete += 1
-                }
-
-                if obj.status == ObjectiveStatus.Failed {
-                    primary_failed += 1
-                }
-            }
-        }
-
-        // Mission victory if all primary objectives complete
-        if primary_count > 0 and primary_complete == primary_count {
-            self.all_primary_complete = true
-        }
-
-        // Mission failure if any primary objective failed
-        if primary_failed > 0 {
-            self.any_primary_failed = true
-        }
-    }
-
-    fn get_active_objectives(&self): []Objective {
-        let mut active: []Objective = []
-
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.status == ObjectiveStatus.Active and !obj.is_hidden {
-                active = active.append(obj.*)
-            }
-        }
-
-        return active
-    }
-
-    fn get_completed_objectives(&self): []Objective {
-        let mut completed: []Objective = []
-
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.status == ObjectiveStatus.Completed {
-                completed = completed.append(obj.*)
-            }
-        }
-
-        return completed
-    }
-
-    fn get_total_rank_points(&self): i32 {
-        let mut total: i32 = 0
-
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.status == ObjectiveStatus.Completed {
-                total += obj.rank_points
-            }
-        }
-
-        return total
-    }
-
-    fn print_objectives_status(&self) {
-        println("\n=== Mission Objectives ===")
-        println("Mission Time: {self.mission_time_seconds}s")
-
-        println("\nPrimary Objectives:")
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.objective_type == ObjectiveType.Primary and !obj.is_hidden {
-                let status_str = match obj.status {
-                    ObjectiveStatus.Pending => "[ ]"
-                    ObjectiveStatus.Active => "[>]"
-                    ObjectiveStatus.Completed => "[✓]"
-                    ObjectiveStatus.Failed => "[✗]"
-                    ObjectiveStatus.Cancelled => "[-]"
-                }
-
-                println("  {status_str} {obj.short_description}")
-
-                if obj.target_count > 1 and obj.status == ObjectiveStatus.Active {
-                    println("      Progress: {obj.current_count}/{obj.target_count} ({obj.get_progress_percentage():.0}%)")
-                }
-
-                if obj.time_limit > 0 and obj.status == ObjectiveStatus.Active {
-                    let remaining = obj.get_time_remaining(self.mission_time_seconds)
-                    println("      Time Remaining: {remaining}s")
-                }
-            }
-        }
-
-        println("\nSecondary Objectives:")
-        for i in 0..self.objective_count {
-            let obj = &self.objectives[i]
-
-            if obj.objective_type == ObjectiveType.Secondary and !obj.is_hidden {
-                let status_str = match obj.status {
-                    ObjectiveStatus.Pending => "[ ]"
-                    ObjectiveStatus.Active => "[>]"
-                    ObjectiveStatus.Completed => "[✓]"
-                    ObjectiveStatus.Failed => "[✗]"
-                    ObjectiveStatus.Cancelled => "[-]"
-                }
-
-                println("  {status_str} {obj.short_description} (+{obj.rank_points} points)")
-            }
-        }
-
-        println("\nTotal Rank Points: {self.get_total_rank_points()}")
-
-        if self.all_primary_complete {
-            println("\n*** ALL PRIMARY OBJECTIVES COMPLETE - VICTORY! ***")
-        }
-
-        if self.any_primary_failed {
-            println("\n*** PRIMARY OBJECTIVE FAILED - MISSION FAILED! ***")
-        }
-    }
 }
 
 // Global objective manager
@@ -418,7 +81,7 @@ export fn init_objective_manager(allocator: Allocator) {
 }
 
 export fn add_objective(objective: Objective): bool {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return false
     }
 
@@ -426,7 +89,7 @@ export fn add_objective(objective: Objective): bool {
 }
 
 export fn activate_objective(id: string) {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return
     }
 
@@ -434,7 +97,7 @@ export fn activate_objective(id: string) {
 }
 
 export fn complete_objective(id: string) {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return
     }
 
@@ -442,7 +105,7 @@ export fn complete_objective(id: string) {
 }
 
 export fn fail_objective(id: string) {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return
     }
 
@@ -450,7 +113,7 @@ export fn fail_objective(id: string) {
 }
 
 export fn update_objective_progress(id: string, current: i32) {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return
     }
 
@@ -458,7 +121,7 @@ export fn update_objective_progress(id: string, current: i32) {
 }
 
 export fn update_objectives(delta_time: f32) {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return
     }
 
@@ -466,7 +129,7 @@ export fn update_objectives(delta_time: f32) {
 }
 
 export fn is_mission_victory(): bool {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return false
     }
 
@@ -474,7 +137,7 @@ export fn is_mission_victory(): bool {
 }
 
 export fn is_mission_defeat(): bool {
-    if !g_objective_manager {
+    if (!g_objective_manager) {
         return false
     }
 

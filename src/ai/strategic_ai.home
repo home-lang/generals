@@ -49,7 +49,6 @@ struct AttackComposition {
     light_vehicle_count: u32
     heavy_vehicle_count: u32
     aircraft_count: u32
-
     total_strength: f32
     is_ready: bool
 }
@@ -73,618 +72,36 @@ enum TechStage {
 // Strategic AI manager
 struct StrategicAI {
     player_id: u32
-
-    // Base management
-    bases: []BaseLocation
     base_count: usize
     main_base: Vec3
-
-    // Building placement
     placement_grid: PathfindingGrid  // Reuse pathfinding grid for placement
-    building_placements: []BuildingPlacement
     placement_count: usize
-
-    // Strategic priorities
     current_priority: StrategicPriority
     tech_stage: TechStage
-
-    // Economy targets
     target_supply_centers: u32
     target_power_plants: u32
     supply_centers_built: u32
     power_plants_built: u32
-
-    // Military targets
     target_barracks_count: u32
     target_factory_count: u32
     target_airfield_count: u32
-
-    // Defense
-    defensive_positions: []DefensivePosition
     defensive_position_count: usize
     perimeter_defense_count: u32
-
-    // Attack coordination
     min_attack_strength: f32
     preferred_attack_composition: AttackComposition
-
-    // Expansion
     expansion_interval: f64  // Seconds between expansion attempts
     time_since_last_expansion: f64
     max_expansions: u32
-
     allocator: Allocator
-
-    fn init(allocator: Allocator, player_id: u32, main_base_pos: Vec3): StrategicAI {
-        return StrategicAI {
-            player_id: player_id
-            bases: allocator.alloc(BaseLocation, 8)
-            base_count: 0
-            main_base: main_base_pos
-            placement_grid: PathfindingGrid.init(allocator)
-            building_placements: allocator.alloc(BuildingPlacement, 64)
-            placement_count: 0
-            current_priority: StrategicPriority.Economy
-            tech_stage: TechStage.Early
-            target_supply_centers: 3
-            target_power_plants: 2
-            supply_centers_built: 0
-            power_plants_built: 0
-            target_barracks_count: 2
-            target_factory_count: 1
-            target_airfield_count: 1
-            defensive_positions: allocator.alloc(DefensivePosition, 32)
-            defensive_position_count: 0
-            perimeter_defense_count: 0
-            min_attack_strength: 100.0
-            preferred_attack_composition: AttackComposition.init()
-            expansion_interval: 300.0  // 5 minutes
-            time_since_last_expansion: 0.0
-            max_expansions: 3
-            allocator: allocator
-        }
-    }
-
-    fn update(mut self, delta_time: f32) {
-        self.time_since_last_expansion += delta_time
-
-        // Update strategic priority based on game state
-        self.update_strategic_priority()
-
-        // Update tech stage
-        self.update_tech_stage()
-
-        // Process building placements
-        self.process_building_placements()
-
-        // Manage base expansion
-        if self.should_expand() {
-            self.plan_expansion()
-        }
-
-        // Update defensive positions
-        self.update_defensive_positions()
-    }
-
-    fn update_strategic_priority(mut self) {
-        // Get economy state
-        let economy = get_player_economy(self.player_id)
-        if !economy {
-            return
-        }
-
-        let supplies = economy.?.supplies
-        let income_rate = economy.?.income_rate
-
-        // Determine priority based on game state
-        if supplies < 1000 {
-            // Low on money, focus on economy
-            self.current_priority = StrategicPriority.Economy
-        } else if income_rate < 5.0 {
-            // Low income, need more supply centers
-            self.current_priority = StrategicPriority.Economy
-        } else if self.tech_stage == TechStage.Early {
-            // Early game, focus on military
-            self.current_priority = StrategicPriority.Military
-        } else if self.perimeter_defense_count < 4 {
-            // Need defenses
-            self.current_priority = StrategicPriority.Defense
-        } else {
-            // Balanced approach
-            self.current_priority = StrategicPriority.Military
-        }
-    }
-
-    fn update_tech_stage(mut self) {
-        // Check what buildings we have to determine tech stage
-        let has_war_factory = self.has_building(BuildingType.War_Factory)
-        let has_airfield = self.has_building(BuildingType.Airfield)
-        let has_strategy_center = self.has_building(BuildingType.Strategy_Center)
-
-        if has_strategy_center {
-            self.tech_stage = TechStage.Late
-        } else if has_airfield {
-            self.tech_stage = TechStage.Mid
-        } else {
-            self.tech_stage = TechStage.Early
-        }
-    }
-
-    // ============================================================
-    // BASE BUILDING LOGIC
-    // ============================================================
-
-    fn find_building_placement(mut self, building_type: BuildingType, near: Vec3, radius: f32): ?Vec3 {
-        // Get building size
-        let building_size = self.get_building_size(building_type)
-        let grid_size = @floatToInt(usize, building_size / self.placement_grid.cell_size)
-
-        // Spiral search outward from preferred position
-        let max_distance = @floatToInt(usize, radius / self.placement_grid.cell_size)
-        let center_coords = self.placement_grid.world_to_grid(near)
-        let center_x = center_coords[0]
-        let center_y = center_coords[1]
-
-        for distance in 1..max_distance {
-            // Check cells in a square ring at this distance
-            for dx in 0..(distance * 2) {
-                for dy in 0..(distance * 2) {
-                    // Calculate grid position
-                    let test_x = center_x + dx - distance
-                    let test_y = center_y + dy - distance
-
-                    // Only check perimeter of square
-                    if dx != 0 and dx != distance * 2 - 1 and
-                       dy != 0 and dy != distance * 2 - 1 {
-                        continue
-                    }
-
-                    // Check if this position is valid
-                    if self.is_valid_building_position(test_x, test_y, grid_size) {
-                        return self.placement_grid.grid_to_world(test_x, test_y)
-                    }
-                }
-            }
-        }
-
-        return null
-    }
-
-    fn is_valid_building_position(&self, grid_x: usize, grid_y: usize, size: usize): bool {
-        // Check if all cells in the building footprint are walkable
-        for x in grid_x..(grid_x + size) {
-            for y in grid_y..(grid_y + size) {
-                if x >= self.placement_grid.width or y >= self.placement_grid.height {
-                    return false
-                }
-
-                let cell = self.placement_grid.get_cell(x, y)
-                if cell.type != CellType.Walkable {
-                    return false
-                }
-
-                // Check if cell is already occupied by a building
-                if cell.is_occupied {
-                    return false
-                }
-            }
-        }
-
-        return true
-    }
-
-    fn get_building_size(&self, building_type: BuildingType): f32 {
-        // Return building footprint size in world units
-        match building_type {
-            BuildingType.Command_Center => 8.0
-            BuildingType.Supply_Center => 6.0
-            BuildingType.Barracks => 4.0
-            BuildingType.War_Factory => 6.0
-            BuildingType.Airfield => 8.0
-            BuildingType.Patriot_Missile => 2.0
-            BuildingType.Gattling_Cannon => 2.0
-            _ => 4.0
-        }
-    }
-
-    fn plan_building_placement(mut self, building_type: BuildingType, priority: u32, is_defensive: bool) {
-        if self.placement_count >= self.building_placements.len {
-            return
-        }
-
-        // Determine preferred location based on building type
-        let preferred_pos = if is_defensive {
-            // Defensive buildings go at perimeter
-            self.find_perimeter_position()
-        } else {
-            // Economic/production buildings go near base center
-            self.main_base
-        }
-
-        self.building_placements[self.placement_count] = BuildingPlacement {
-            building_type: building_type
-            priority: priority
-            preferred_position: preferred_pos
-            min_distance_from_base: if is_defensive { 15.0 } else { 5.0 }
-            max_distance_from_base: if is_defensive { 40.0 } else { 25.0 }
-            requires_power: self.building_requires_power(building_type)
-            is_defensive: is_defensive
-        }
-
-        self.placement_count += 1
-    }
-
-    fn process_building_placements(mut self) {
-        if self.placement_count == 0 {
-            return
-        }
-
-        // Sort placements by priority (bubble sort for simplicity)
-        for i in 0..self.placement_count {
-            for j in (i + 1)..self.placement_count {
-                if self.building_placements[j].priority > self.building_placements[i].priority {
-                    let temp = self.building_placements[i]
-                    self.building_placements[i] = self.building_placements[j]
-                    self.building_placements[j] = temp
-                }
-            }
-        }
-
-        // Try to place highest priority building
-        if self.placement_count > 0 {
-            let placement = self.building_placements[0]
-
-            // Check if we can afford it
-            if self.can_afford_building(placement.building_type) {
-                // Find valid placement position
-                let radius = placement.max_distance_from_base
-                let position = self.find_building_placement(
-                    placement.building_type,
-                    placement.preferred_position,
-                    radius
-                )
-
-                if position {
-                    // Issue build command
-                    self.build_structure(placement.building_type, position.?)
-
-                    // Remove from queue
-                    self.remove_placement(0)
-                }
-            }
-        }
-    }
-
-    fn remove_placement(mut self, index: usize) {
-        if index >= self.placement_count {
-            return
-        }
-
-        // Shift queue down
-        for i in index..(self.placement_count - 1) {
-            self.building_placements[i] = self.building_placements[i + 1]
-        }
-
-        self.placement_count -= 1
-    }
-
-    fn find_perimeter_position(&self): Vec3 {
-        // Find position at edge of base (for defensive structures)
-        let angle = random_float(0.0, 6.28318)  // Random angle in radians
-        let distance = 25.0  // Distance from base center
-
-        let offset = Vec3 {
-            x: @cos(angle) * distance
-            y: 0.0
-            z: @sin(angle) * distance
-        }
-
-        return vec3_add(self.main_base, offset)
-    }
-
-    fn should_expand(&self): bool {
-        if self.base_count >= self.max_expansions {
-            return false
-        }
-
-        if self.time_since_last_expansion < self.expansion_interval {
-            return false
-        }
-
-        // Check if we have enough resources to expand
-        let economy = get_player_economy(self.player_id)
-        if !economy {
-            return false
-        }
-
-        if economy.?.supplies < 5000 {
-            return false
-        }
-
-        return true
-    }
-
-    fn plan_expansion(mut self) {
-        // Find expansion location (near supply docks)
-        // TODO: Scan map for supply docks
-        let expansion_pos = vec3_add(self.main_base, Vec3.init(50.0, 0.0, 50.0))
-
-        if self.base_count < self.bases.len {
-            self.bases[self.base_count] = BaseLocation {
-                center: expansion_pos
-                radius: 30.0
-                is_main_base: false
-                is_expansion: true
-                supply_dock_position: expansion_pos
-                has_supply_dock: true
-                threat_level: 0.0
-            }
-
-            self.base_count += 1
-            self.time_since_last_expansion = 0.0
-
-            // Queue command center at expansion
-            self.plan_building_placement(BuildingType.Command_Center, 10, false)
-        }
-    }
-
-    // ============================================================
-    // ATTACK COORDINATION
-    // ============================================================
-
-    fn calculate_attack_composition(mut self, target_strength: f32): AttackComposition {
-        // Determine optimal unit mix based on tech stage and enemy composition
-        let mut composition = AttackComposition.init()
-
-        match self.tech_stage {
-            TechStage.Early => {
-                // Early game: mostly infantry with some light vehicles
-                composition.infantry_count = 15
-                composition.light_vehicle_count = 3
-                composition.heavy_vehicle_count = 0
-                composition.aircraft_count = 0
-                composition.total_strength = 50.0
-            }
-            TechStage.Mid => {
-                // Mid game: balanced mix
-                composition.infantry_count = 10
-                composition.light_vehicle_count = 5
-                composition.heavy_vehicle_count = 3
-                composition.aircraft_count = 2
-                composition.total_strength = 120.0
-            }
-            TechStage.Late => {
-                // Late game: heavy vehicles and air support
-                composition.infantry_count = 5
-                composition.light_vehicle_count = 3
-                composition.heavy_vehicle_count = 8
-                composition.aircraft_count = 4
-                composition.total_strength = 250.0
-            }
-        }
-
-        composition.is_ready = composition.total_strength >= self.min_attack_strength
-        return composition
-    }
-
-    fn prioritize_attack_targets(&self, enemy_buildings: []Entity): []Entity {
-        // Prioritize targets: superweapons > production > defenses > economy
-        // TODO: Scan and sort enemy buildings by priority
-
-        // Priority order:
-        // 1. Superweapons (Particle Cannon, SCUD Storm, Nuke)
-        // 2. Production (War Factory, Airfield)
-        // 3. Tech (Strategy Center)
-        // 4. Defenses (Patriot, Gattling)
-        // 5. Economy (Supply Centers, Command Center)
-
-        return enemy_buildings
-    }
-
-    fn should_retreat(&self, friendly_strength: f32, enemy_strength: f32): bool {
-        // Retreat if outnumbered 2:1 or more
-        if enemy_strength > friendly_strength * 2.0 {
-            return true
-        }
-
-        // Retreat if low on forces
-        if friendly_strength < 20.0 {
-            return true
-        }
-
-        return false
-    }
-
-    fn coordinate_combined_arms(mut self, infantry: []Entity, vehicles: []Entity, aircraft: []Entity): AttackPlan {
-        // Create coordinated attack with multiple unit types
-        let mut plan = AttackPlan.init()
-
-        // Infantry lead (cheaper, scout)
-        plan.wave_1_units = infantry
-        plan.wave_1_delay = 0.0
-
-        // Vehicles follow (main force)
-        plan.wave_2_units = vehicles
-        plan.wave_2_delay = 5.0  // 5 seconds after infantry
-
-        // Aircraft support (hit high-value targets)
-        plan.wave_3_units = aircraft
-        plan.wave_3_delay = 10.0  // 10 seconds after infantry
-
-        return plan
-    }
-
-    // ============================================================
-    // DEFENSIVE POSITIONING
-    // ============================================================
-
-    fn identify_defensive_positions(mut self) {
-        // Find key defensive positions around base
-        self.defensive_position_count = 0
-
-        // Create defensive ring at 8 cardinal/ordinal directions
-        let angles = [0.0, 0.785, 1.571, 2.356, 3.142, 3.927, 4.712, 5.498]  // 0°, 45°, 90°, etc.
-        let defense_radius = 20.0
-
-        for i in 0..8 {
-            let angle = angles[i]
-            let position = Vec3 {
-                x: self.main_base.x + @cos(angle) * defense_radius
-                y: self.main_base.y
-                z: self.main_base.z + @sin(angle) * defense_radius
-            }
-
-            if self.defensive_position_count < self.defensive_positions.len {
-                self.defensive_positions[self.defensive_position_count] = DefensivePosition {
-                    position: position
-                    importance: 0.8  // High importance
-                    has_defense: false
-                    defense_type: BuildingType.Patriot_Missile
-                    threat_direction: self.calculate_threat_direction(position)
-                }
-
-                self.defensive_position_count += 1
-            }
-        }
-    }
-
-    fn calculate_threat_direction(&self, position: Vec3): Vec3 {
-        // Direction enemies most likely to come from (toward base center)
-        let to_base = vec3_sub(self.main_base, position)
-        return vec3_normalize(to_base)
-    }
-
-    fn place_defensive_structures(mut self) {
-        // Place defensive structures at identified positions
-        for i in 0..self.defensive_position_count {
-            let pos = &self.defensive_positions[i]
-
-            if !pos.has_defense and pos.importance > 0.5 {
-                // Queue defensive building
-                self.plan_building_placement(pos.defense_type, 7, true)
-                pos.has_defense = true
-                self.perimeter_defense_count += 1
-            }
-        }
-    }
-
-    fn should_garrison_units(&self, building: Entity, nearby_threat: bool): bool {
-        // Garrison infantry in buildings when under attack
-        if nearby_threat {
-            return true
-        }
-
-        // Garrison if building has garrison capacity and we have spare infantry
-        // TODO: Check building garrison capacity
-
-        return false
-    }
-
-    fn find_retreat_position(&self, current_position: Vec3): Vec3 {
-        // Find safe position closer to base
-        let to_base = vec3_sub(self.main_base, current_position)
-        let direction = vec3_normalize(to_base)
-        let retreat_distance = 15.0
-
-        return vec3_add(current_position, vec3_mul_scalar(direction, retreat_distance))
-    }
-
-    // ============================================================
-    // HELPER FUNCTIONS
-    // ============================================================
-
-    fn has_building(&self, building_type: BuildingType): bool {
-        // TODO: Query building manager for this building type
-        return false
-    }
-
-    fn can_afford_building(&self, building_type: BuildingType): bool {
-        let cost = self.get_building_cost(building_type)
-
-        let economy = get_player_economy(self.player_id)
-        if !economy {
-            return false
-        }
-
-        return economy.?.supplies >= cost
-    }
-
-    fn get_building_cost(&self, building_type: BuildingType): i32 {
-        match building_type {
-            BuildingType.Command_Center => 2000
-            BuildingType.Supply_Center => 800
-            BuildingType.Barracks => 500
-            BuildingType.War_Factory => 2000
-            BuildingType.Airfield => 3000
-            BuildingType.Patriot_Missile => 1000
-            BuildingType.Strategy_Center => 2500
-            _ => 1000
-        }
-    }
-
-    fn building_requires_power(&self, building_type: BuildingType): bool {
-        match building_type {
-            BuildingType.Command_Center => false  // Produces power
-            BuildingType.Supply_Center => false
-            BuildingType.Barracks => true
-            BuildingType.War_Factory => true
-            BuildingType.Airfield => true
-            BuildingType.Patriot_Missile => true
-            BuildingType.Strategy_Center => true
-            _ => false
-        }
-    }
-
-    fn build_structure(mut self, building_type: BuildingType, position: Vec3) {
-        // Issue build command to construction system
-        create_building(building_type, position, self.player_id)
-
-        // Update counts
-        match building_type {
-            BuildingType.Supply_Center => {
-                self.supply_centers_built += 1
-            }
-            BuildingType.Command_Center => {
-                self.power_plants_built += 1
-            }
-            _ => {}
-        }
-    }
-
-    fn deinit(mut self) {
-        self.allocator.free(self.bases)
-        self.allocator.free(self.building_placements)
-        self.allocator.free(self.defensive_positions)
-        self.placement_grid.deinit()
-    }
 }
 
 // Attack plan for coordinated strikes
 struct AttackPlan {
-    wave_1_units: []Entity
     wave_1_delay: f32
-
-    wave_2_units: []Entity
     wave_2_delay: f32
-
-    wave_3_units: []Entity
     wave_3_delay: f32
-
     target_position: Vec3
     retreat_threshold: f32
-
-    fn init(): AttackPlan {
-        return AttackPlan {
-            wave_1_units: []
-            wave_1_delay: 0.0
-            wave_2_units: []
-            wave_2_delay: 0.0
-            wave_3_units: []
-            wave_3_delay: 0.0
-            target_position: Vec3.init(0.0, 0.0, 0.0)
-            retreat_threshold: 20.0
-        }
-    }
 }
 
 // Attack composition helper
@@ -751,26 +168,26 @@ export fn init_strategic_ai(allocator: Allocator, player_id: u32, main_base: Vec
 }
 
 export fn shutdown_strategic_ai() {
-    if g_strategic_ai {
+    if (g_strategic_ai) {
         g_strategic_ai.?.deinit()
         g_strategic_ai = null
     }
 }
 
 export fn update_strategic_ai(delta_time: f32) {
-    if g_strategic_ai {
+    if (g_strategic_ai) {
         g_strategic_ai.?.update(delta_time)
     }
 }
 
 export fn request_building_placement(building_type: BuildingType, priority: u32, is_defensive: bool) {
-    if g_strategic_ai {
+    if (g_strategic_ai) {
         g_strategic_ai.?.plan_building_placement(building_type, priority, is_defensive)
     }
 }
 
 export fn get_attack_composition(target_strength: f32): AttackComposition {
-    if g_strategic_ai {
+    if (g_strategic_ai) {
         return g_strategic_ai.?.calculate_attack_composition(target_strength)
     }
 

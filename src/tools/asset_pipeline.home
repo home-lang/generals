@@ -55,17 +55,6 @@ struct ConversionStats {
     total_bytes_processed: u64
     start_time: f64
     end_time: f64
-
-    fn get_progress(&self): f32 {
-        if self.total_tasks == 0 {
-            return 0.0
-        }
-        return @intToFloat(f32, self.completed_tasks) / @intToFloat(f32, self.total_tasks)
-    }
-
-    fn get_elapsed_time(&self): f64 {
-        return self.end_time - self.start_time
-    }
 }
 
 // Asset pipeline configuration
@@ -77,324 +66,18 @@ struct PipelineConfig {
     generate_mipmaps: bool          // Generate texture mipmaps
     optimize_meshes: bool           // Optimize mesh data
     validate_assets: bool           // Validate after conversion
-
-    fn default(): PipelineConfig {
-        return PipelineConfig {
-            source_data_dir: "Data/"
-            output_dir: "ProcessedAssets/"
-            num_worker_threads: 4
-            compress_textures: true
-            generate_mipmaps: true
-            optimize_meshes: true
-            validate_assets: true
-        }
-    }
 }
 
 // Asset pipeline
 struct AssetPipeline {
     config: PipelineConfig
-    tasks: []AssetConversionTask
     task_count: usize
     stats: ConversionStats
     allocator: Allocator
-
-    fn init(allocator: Allocator, config: PipelineConfig): AssetPipeline {
-        return AssetPipeline {
-            config: config
-            tasks: []
-            task_count: 0
-            stats: ConversionStats {
-                total_tasks: 0
-                completed_tasks: 0
-                failed_tasks: 0
-                total_bytes_processed: 0
-                start_time: 0.0
-                end_time: 0.0
-            }
-            allocator: allocator
-        }
-    }
-
-    fn scan_assets(mut self) {
-        println("Scanning asset directories...")
-
-        // Scan for W3D models
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "W3D/",
-            "*.w3d",
-            AssetType.Model,
-            self.config.output_dir + "Models/"
-        )
-
-        // Scan for textures
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "Textures/",
-            "*.dds",
-            AssetType.Texture,
-            self.config.output_dir + "Textures/"
-        )
-
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "Textures/",
-            "*.tga",
-            AssetType.Texture,
-            self.config.output_dir + "Textures/"
-        )
-
-        // Scan for audio
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "Audio/Sounds/",
-            "*.wav",
-            AssetType.Audio,
-            self.config.output_dir + "Audio/Sounds/"
-        )
-
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "Audio/Music/",
-            "*.mp3",
-            AssetType.Audio,
-            self.config.output_dir + "Audio/Music/"
-        )
-
-        // Scan for INI data files
-        self.scan_directory_for_type(
-            self.config.source_data_dir + "INI/",
-            "*.ini",
-            AssetType.Data,
-            self.config.output_dir + "Data/"
-        )
-
-        println("Found {self.task_count} assets to convert")
-    }
-
-    fn scan_directory_for_type(
-        mut self,
         source_dir: string,
         pattern: string,
         asset_type: AssetType,
         output_dir: string
-    ) {
-        let files = filesystem_scan_directory(source_dir, pattern)
-
-        for file_path in files {
-            let filename = filesystem_get_filename(file_path)
-            let output_path = output_dir + filename
-
-            // Change extension based on asset type
-            match asset_type {
-                AssetType.Model => {
-                    output_path = output_path.replace(".w3d", ".mesh")
-                }
-                AssetType.Texture => {
-                    output_path = output_path.replace(".dds", ".tex")
-                    output_path = output_path.replace(".tga", ".tex")
-                }
-                AssetType.Audio => {
-                    // Keep original format for now
-                }
-                AssetType.Data => {
-                    output_path = output_path.replace(".ini", ".dat")
-                }
-                _ => {}
-            }
-
-            self.add_task(AssetConversionTask {
-                asset_type: asset_type
-                source_path: file_path
-                output_path: output_path
-                priority: self.get_asset_priority(asset_type)
-                completed: false
-            })
-        }
-    }
-
-    fn get_asset_priority(&self, asset_type: AssetType): i32 {
-        // Convert critical assets first
-        return match asset_type {
-            AssetType.Data => 100      // INI data is critical for loading
-            AssetType.Model => 80      // Models needed for rendering
-            AssetType.Texture => 70    // Textures needed for models
-            AssetType.Audio => 50      // Audio can load later
-            AssetType.Shader => 90     // Shaders needed early
-            _ => 0
-        }
-    }
-
-    fn add_task(mut self, task: AssetConversionTask) {
-        let new_tasks = self.allocator.alloc(AssetConversionTask, self.task_count + 1)
-
-        for i in 0..self.task_count {
-            new_tasks[i] = self.tasks[i]
-        }
-
-        new_tasks[self.task_count] = task
-
-        if self.task_count > 0 {
-            self.allocator.free(self.tasks)
-        }
-
-        self.tasks = new_tasks
-        self.task_count += 1
-    }
-
-    fn sort_tasks_by_priority(mut self) {
-        // Simple bubble sort by priority (descending)
-        for i in 0..self.task_count {
-            for j in 0..(self.task_count - i - 1) {
-                if self.tasks[j].priority < self.tasks[j + 1].priority {
-                    let temp = self.tasks[j]
-                    self.tasks[j] = self.tasks[j + 1]
-                    self.tasks[j + 1] = temp
-                }
-            }
-        }
-    }
-
-    fn process_all_assets(mut self) {
-        println("=== Starting Asset Pipeline ===")
-
-        self.stats.total_tasks = @intCast(u32, self.task_count)
-        self.stats.start_time = get_current_time()
-
-        // Sort by priority
-        self.sort_tasks_by_priority()
-
-        // Create output directories
-        self.create_output_directories()
-
-        // Process each task
-        for i in 0..self.task_count {
-            let success = self.process_task(&self.tasks[i])
-
-            if success {
-                self.tasks[i].completed = true
-                self.stats.completed_tasks += 1
-            } else {
-                self.stats.failed_tasks += 1
-            }
-
-            // Print progress
-            if (i + 1) % 100 == 0 {
-                self.print_progress()
-            }
-        }
-
-        self.stats.end_time = get_current_time()
-
-        self.print_final_report()
-    }
-
-    fn create_output_directories(&self) {
-        filesystem_create_directory(self.config.output_dir)
-        filesystem_create_directory(self.config.output_dir + "Models/")
-        filesystem_create_directory(self.config.output_dir + "Textures/")
-        filesystem_create_directory(self.config.output_dir + "Audio/")
-        filesystem_create_directory(self.config.output_dir + "Audio/Sounds/")
-        filesystem_create_directory(self.config.output_dir + "Audio/Music/")
-        filesystem_create_directory(self.config.output_dir + "Data/")
-    }
-
-    fn process_task(mut self, task: *AssetConversionTask): bool {
-        println("Converting: {task.source_path}")
-
-        match task.asset_type {
-            AssetType.Model => {
-                return self.convert_model(task)
-            }
-            AssetType.Texture => {
-                return self.convert_texture(task)
-            }
-            AssetType.Audio => {
-                return self.convert_audio(task)
-            }
-            AssetType.Data => {
-                return self.convert_data_file(task)
-            }
-            _ => {
-                println("  Skipped: Unknown asset type")
-                return false
-            }
-        }
-    }
-
-    fn convert_model(mut self, task: *AssetConversionTask): bool {
-        // Use W3D importer
-        let result = convert_w3d_model(task.source_path, task.output_path)
-
-        if result {
-            println("  ✓ Model converted successfully")
-        } else {
-            println("  ✗ Model conversion failed")
-        }
-
-        return result
-    }
-
-    fn convert_texture(mut self, task: *AssetConversionTask): bool {
-        // Texture conversion would use a DDS/TGA loader
-        // For now, just copy the file
-        let success = filesystem_copy_file(task.source_path, task.output_path)
-
-        if success {
-            println("  ✓ Texture copied")
-        } else {
-            println("  ✗ Texture copy failed")
-        }
-
-        return success
-    }
-
-    fn convert_audio(mut self, task: *AssetConversionTask): bool {
-        // Audio files can be copied directly
-        // Future: Could convert to platform-optimized formats
-        let success = filesystem_copy_file(task.source_path, task.output_path)
-
-        if success {
-            println("  ✓ Audio copied")
-        } else {
-            println("  ✗ Audio copy failed")
-        }
-
-        return success
-    }
-
-    fn convert_data_file(mut self, task: *AssetConversionTask): bool {
-        // Parse INI file and convert to binary format
-        let mut parser = INIParser.init(self.allocator)
-        let doc = parser.parse_file(task.source_path)
-
-        if !doc {
-            println("  ✗ Failed to parse INI file")
-            return false
-        }
-
-        // For now, just validate that it parsed correctly
-        println("  ✓ INI file parsed ({doc.?.sections.len} sections)")
-
-        // TODO: Serialize to binary format
-        return true
-    }
-
-    fn print_progress(&self) {
-        let progress = self.stats.get_progress() * 100.0
-        println("Progress: {self.stats.completed_tasks}/{self.stats.total_tasks} ({progress:.1}%)")
-    }
-
-    fn print_final_report(&self) {
-        println("\n=== Asset Pipeline Complete ===")
-        println("Total Assets: {self.stats.total_tasks}")
-        println("Converted: {self.stats.completed_tasks}")
-        println("Failed: {self.stats.failed_tasks}")
-        println("Time Elapsed: {self.stats.get_elapsed_time():.2}s")
-        println("Success Rate: {self.stats.get_progress() * 100.0:.1}%")
-    }
-
-    fn deinit(mut self) {
-        if self.task_count > 0 {
-            self.allocator.free(self.tasks)
-        }
-    }
 }
 
 // Global asset pipeline instance
@@ -406,7 +89,7 @@ export fn init_asset_pipeline(config: PipelineConfig) {
 }
 
 export fn run_asset_pipeline() {
-    if !g_asset_pipeline {
+    if (!g_asset_pipeline) {
         println("Error: Asset pipeline not initialized")
         return
     }
@@ -416,7 +99,7 @@ export fn run_asset_pipeline() {
 }
 
 export fn shutdown_asset_pipeline() {
-    if g_asset_pipeline {
+    if (g_asset_pipeline) {
         g_asset_pipeline.?.deinit()
         g_asset_pipeline = null
     }

@@ -35,389 +35,28 @@ struct MinimapIcon {
     size: u8
     team: u8
     is_visible: bool
-
-    fn init(icon_type: MinimapIconType, x: f32, y: f32, color: Color): MinimapIcon {
-        return MinimapIcon {
-            icon_type: icon_type
-            position: Vec2 { x: x, y: y }
-            color: color
-            size: 2
-            team: 0
-            is_visible: true
-        }
-    }
 }
 
 // Minimap display
 struct Minimap {
-    window: *Window
-
-    // Map dimensions
     map_width: f32
     map_height: f32
     pixels_per_world_unit: f32
-
-    // Pixel buffer (RGBA)
-    pixel_buffer: []u32
     buffer_width: usize
     buffer_height: usize
-
-    // Terrain data
     terrain_texture_id: u32
     needs_terrain_update: bool
-
-    // Icons to draw
-    icons: []MinimapIcon
     icon_count: usize
-
-    // Camera viewport
     camera_rect: Rect
     camera_position: Vec3
     camera_zoom: f32
-
-    // Interaction
     is_dragging: bool
     last_click_pos: Vec2
-
-    // Rendering mode
     show_terrain: bool
     show_shroud: bool  // Fog of war
     show_units: bool
     show_buildings: bool
-
     allocator: Allocator
-
-    fn init(allocator: Allocator, window: *Window, map_width: f32, map_height: f32): Minimap {
-        let pixels_per_unit = @intToFloat(f32, MINIMAP_WIDTH) / map_width
-
-        let mut minimap = Minimap {
-            window: window
-            map_width: map_width
-            map_height: map_height
-            pixels_per_world_unit: pixels_per_unit
-            pixel_buffer: allocator.alloc(u32, MINIMAP_WIDTH * MINIMAP_HEIGHT)
-            buffer_width: MINIMAP_WIDTH
-            buffer_height: MINIMAP_HEIGHT
-            terrain_texture_id: 0
-            needs_terrain_update: true
-            icons: allocator.alloc(MinimapIcon, 1024)
-            icon_count: 0
-            camera_rect: Rect.init(0, 0, 100, 100)
-            camera_position: Vec3.init(0.0, 0.0, 0.0)
-            camera_zoom: 1.0
-            is_dragging: false
-            last_click_pos: Vec2 { x: 0.0, y: 0.0 }
-            show_terrain: true
-            show_shroud: true
-            show_units: true
-            show_buildings: true
-            allocator: allocator
-        }
-
-        // Clear buffer to black
-        for i in 0..(MINIMAP_WIDTH * MINIMAP_HEIGHT) {
-            minimap.pixel_buffer[i] = 0xFF000000
-        }
-
-        // Set up input handler
-        window.on_input = minimap_input_handler
-        window.on_draw = minimap_draw_handler
-        window.user_data = &minimap
-
-        return minimap
-    }
-
-    fn update(mut self, delta_time: f32, camera_pos: Vec3, camera_zoom: f32) {
-        // Update camera tracking
-        self.camera_position = camera_pos
-        self.camera_zoom = camera_zoom
-
-        // Update camera rectangle on minimap
-        self.update_camera_rect()
-
-        // Rebuild icon list
-        self.rebuild_icons()
-
-        // Update terrain if needed
-        if self.needs_terrain_update {
-            self.update_terrain()
-            self.needs_terrain_update = false
-        }
-    }
-
-    fn update_camera_rect(mut self) {
-        // Convert camera world position to minimap coordinates
-        let center_x = self.world_to_minimap_x(self.camera_position.x)
-        let center_y = self.world_to_minimap_y(self.camera_position.z)
-
-        // Calculate viewport size on minimap
-        let viewport_width = @floatToInt(i32, 100.0 / self.camera_zoom * self.pixels_per_world_unit)
-        let viewport_height = @floatToInt(i32, 80.0 / self.camera_zoom * self.pixels_per_world_unit)
-
-        self.camera_rect.x = center_x - viewport_width / 2
-        self.camera_rect.y = center_y - viewport_height / 2
-        self.camera_rect.width = viewport_width
-        self.camera_rect.height = viewport_height
-    }
-
-    fn rebuild_icons(mut self) {
-        self.icon_count = 0
-
-        // TODO: Get all visible entities from world
-        // For each entity, add minimap icon
-
-        // Example: Add units
-        // for unit in all_units {
-        //     self.add_unit_icon(unit)
-        // }
-
-        // Example: Add buildings
-        // for building in all_buildings {
-        //     self.add_building_icon(building)
-        // }
-    }
-
-    fn add_unit_icon(mut self, unit: *Unit, position: Vec3, team: u8) {
-        if self.icon_count >= self.icons.len {
-            return
-        }
-
-        let color = get_team_color(team)
-        let icon_type = match unit.category {
-            UnitCategory.Infantry => MinimapIconType.Infantry
-            UnitCategory.Vehicle => MinimapIconType.Vehicle
-            UnitCategory.Aircraft => MinimapIconType.Aircraft
-        }
-
-        let x = self.world_to_minimap_x(position.x)
-        let y = self.world_to_minimap_y(position.z)
-
-        self.icons[self.icon_count] = MinimapIcon.init(
-            icon_type,
-            @intToFloat(f32, x),
-            @intToFloat(f32, y),
-            color
-        )
-        self.icons[self.icon_count].team = team
-        self.icon_count += 1
-    }
-
-    fn add_building_icon(mut self, building: *Building, position: Vec3, team: u8) {
-        if self.icon_count >= self.icons.len {
-            return
-        }
-
-        let color = get_team_color(team)
-        let x = self.world_to_minimap_x(position.x)
-        let y = self.world_to_minimap_y(position.z)
-
-        self.icons[self.icon_count] = MinimapIcon.init(
-            MinimapIconType.Building,
-            @intToFloat(f32, x),
-            @intToFloat(f32, y),
-            color
-        )
-        self.icons[self.icon_count].size = 4  // Buildings larger
-        self.icons[self.icon_count].team = team
-        self.icon_count += 1
-    }
-
-    fn add_ping(mut self, world_x: f32, world_z: f32) {
-        if self.icon_count >= self.icons.len {
-            return
-        }
-
-        let x = self.world_to_minimap_x(world_x)
-        let y = self.world_to_minimap_y(world_z)
-
-        self.icons[self.icon_count] = MinimapIcon.init(
-            MinimapIconType.Ping,
-            @intToFloat(f32, x),
-            @intToFloat(f32, y),
-            Color.init(1.0, 1.0, 0.0, 1.0)  // Yellow
-        )
-        self.icons[self.icon_count].size = 8
-        self.icon_count += 1
-    }
-
-    fn update_terrain(mut self) {
-        // Render terrain to pixel buffer
-        // This would sample the heightmap and generate terrain colors
-
-        for y in 0..MINIMAP_HEIGHT {
-            for x in 0..MINIMAP_WIDTH {
-                // Convert minimap pixel to world position
-                let world_x = self.minimap_to_world_x(@intCast(i32, x))
-                let world_z = self.minimap_to_world_y(@intCast(i32, y))
-
-                // Sample terrain at this position
-                let terrain_color = self.sample_terrain(world_x, world_z)
-
-                // Write to buffer
-                let index = y * MINIMAP_WIDTH + x
-                self.pixel_buffer[index] = terrain_color.to_u32()
-            }
-        }
-    }
-
-    fn sample_terrain(&self, world_x: f32, world_z: f32): Color {
-        // TODO: Sample actual terrain heightmap/texture
-        // For now, return simple color based on height
-
-        // Example: green for low, brown for high
-        let height = 0.5  // TODO: Get actual height
-        return Color.init(0.2, 0.5, 0.2, 1.0)  // Green
-    }
-
-    fn render(mut self) {
-        // Clear buffer if terrain not showing
-        if !self.show_terrain {
-            for i in 0..(MINIMAP_WIDTH * MINIMAP_HEIGHT) {
-                self.pixel_buffer[i] = 0xFF000000
-            }
-        }
-
-        // Draw shroud (fog of war)
-        if self.show_shroud {
-            self.render_shroud()
-        }
-
-        // Draw icons
-        if self.show_units or self.show_buildings {
-            for i in 0..self.icon_count {
-                let icon = &self.icons[i]
-
-                if !icon.is_visible {
-                    continue
-                }
-
-                // Skip based on filter
-                if !self.show_units and (icon.icon_type == MinimapIconType.Infantry or
-                                         icon.icon_type == MinimapIconType.Vehicle or
-                                         icon.icon_type == MinimapIconType.Aircraft) {
-                    continue
-                }
-
-                if !self.show_buildings and icon.icon_type == MinimapIconType.Building {
-                    continue
-                }
-
-                self.draw_icon(icon)
-            }
-        }
-
-        // Draw camera viewport rectangle
-        self.draw_camera_rect()
-
-        // TODO: Upload pixel_buffer to GPU texture
-    }
-
-    fn render_shroud(mut self) {
-        // Draw fog of war overlay
-        // TODO: Sample visibility data and darken unexplored areas
-    }
-
-    fn draw_icon(mut self, icon: *MinimapIcon) {
-        let x = @floatToInt(i32, icon.position.x)
-        let y = @floatToInt(i32, icon.position.y)
-        let size = @intCast(i32, icon.size)
-
-        // Draw filled rectangle for icon
-        for dy in -size..size {
-            for dx in -size..size {
-                let px = x + dx
-                let py = y + dy
-
-                if px >= 0 and px < MINIMAP_WIDTH and py >= 0 and py < MINIMAP_HEIGHT {
-                    let index = @intCast(usize, py) * MINIMAP_WIDTH + @intCast(usize, px)
-                    self.pixel_buffer[index] = icon.color.to_u32()
-                }
-            }
-        }
-    }
-
-    fn draw_camera_rect(mut self) {
-        // Draw white rectangle outline for camera viewport
-        let color = Color.init(1.0, 1.0, 1.0, 1.0).to_u32()
-
-        // Top and bottom edges
-        for x in self.camera_rect.x..(self.camera_rect.x + self.camera_rect.width) {
-            if x >= 0 and x < MINIMAP_WIDTH {
-                // Top
-                let y1 = self.camera_rect.y
-                if y1 >= 0 and y1 < MINIMAP_HEIGHT {
-                    let index1 = @intCast(usize, y1) * MINIMAP_WIDTH + @intCast(usize, x)
-                    self.pixel_buffer[index1] = color
-                }
-
-                // Bottom
-                let y2 = self.camera_rect.y + self.camera_rect.height
-                if y2 >= 0 and y2 < MINIMAP_HEIGHT {
-                    let index2 = @intCast(usize, y2) * MINIMAP_WIDTH + @intCast(usize, x)
-                    self.pixel_buffer[index2] = color
-                }
-            }
-        }
-
-        // Left and right edges
-        for y in self.camera_rect.y..(self.camera_rect.y + self.camera_rect.height) {
-            if y >= 0 and y < MINIMAP_HEIGHT {
-                // Left
-                let x1 = self.camera_rect.x
-                if x1 >= 0 and x1 < MINIMAP_WIDTH {
-                    let index1 = @intCast(usize, y) * MINIMAP_WIDTH + @intCast(usize, x1)
-                    self.pixel_buffer[index1] = color
-                }
-
-                // Right
-                let x2 = self.camera_rect.x + self.camera_rect.width
-                if x2 >= 0 and x2 < MINIMAP_WIDTH {
-                    let index2 = @intCast(usize, y) * MINIMAP_WIDTH + @intCast(usize, x2)
-                    self.pixel_buffer[index2] = color
-                }
-            }
-        }
-    }
-
-    fn world_to_minimap_x(&self, world_x: f32): i32 {
-        return @floatToInt(i32, world_x * self.pixels_per_world_unit)
-    }
-
-    fn world_to_minimap_y(&self, world_z: f32): i32 {
-        return @floatToInt(i32, world_z * self.pixels_per_world_unit)
-    }
-
-    fn minimap_to_world_x(&self, minimap_x: i32): f32 {
-        return @intToFloat(f32, minimap_x) / self.pixels_per_world_unit
-    }
-
-    fn minimap_to_world_y(&self, minimap_y: i32): f32 {
-        return @intToFloat(f32, minimap_y) / self.pixels_per_world_unit
-    }
-
-    fn handle_click(mut self, minimap_x: i32, minimap_y: i32) {
-        // Convert minimap click to world position
-        let world_x = self.minimap_to_world_x(minimap_x)
-        let world_z = self.minimap_to_world_y(minimap_y)
-
-        // Move camera to clicked position
-        move_camera_to(world_x, world_z)
-    }
-
-    fn handle_right_click(mut self, minimap_x: i32, minimap_y: i32) {
-        // Right click on minimap = ping
-        let world_x = self.minimap_to_world_x(minimap_x)
-        let world_z = self.minimap_to_world_y(minimap_y)
-
-        self.add_ping(world_x, world_z)
-
-        // TODO: Broadcast ping to other players in multiplayer
-    }
-
-    fn deinit(mut self) {
-        self.allocator.free(self.pixel_buffer)
-        self.allocator.free(self.icons)
-    }
 }
 
 // Input handler for minimap
@@ -439,7 +78,7 @@ fn minimap_input_handler(window: *Window, msg: WindowMessage, data1: u32, data2:
             return true
         }
         WindowMessage.MousePos => {
-            if minimap.is_dragging {
+            if (minimap.is_dragging) {
                 let mouse_x = @intCast(i32, data1) - window.screen_rect.x
                 let mouse_y = @intCast(i32, data2) - window.screen_rect.y
                 minimap.handle_click(mouse_x, mouse_y)
@@ -500,19 +139,19 @@ export fn init_minimap(allocator: Allocator, window: *Window, map_width: f32, ma
 }
 
 export fn update_minimap(delta_time: f32, camera_pos: Vec3, camera_zoom: f32) {
-    if g_minimap {
+    if (g_minimap) {
         g_minimap.?.update(delta_time, camera_pos, camera_zoom)
     }
 }
 
 export fn minimap_add_ping(world_x: f32, world_z: f32) {
-    if g_minimap {
+    if (g_minimap) {
         g_minimap.?.add_ping(world_x, world_z)
     }
 }
 
 export fn shutdown_minimap() {
-    if g_minimap {
+    if (g_minimap) {
         g_minimap.?.deinit()
         g_minimap = null
     }

@@ -63,206 +63,39 @@ const INVALID_AUDIO_HANDLE: AudioHandle = 0
 struct AudioEventInfo {
     audio_name: string  // Event name (e.g., "ButtonClick", "TankFire")
     filename: string    // For music tracks
-
-    // Volume & pitch
     volume: f32
     volume_shift: f32   // Random volume variation
     min_volume: f32
     pitch_shift_min: f32
     pitch_shift_max: f32
-
-    // Timing
     delay_min: i32      // Milliseconds
     delay_max: i32
     loop_count: i32     // 0 = infinite loop
-
-    // Limits
     limit: i32          // Max simultaneous instances
-
-    // Properties
     priority: AudioPriority
     sound_type: u32     // Bitmask of SoundType flags
     control: u32        // Bitmask of AudioControl flags
     audio_type: AudioType
-
-    // Time-of-day variants
-    sounds_morning: []string
-    sounds_default: []string
-    sounds_evening: []string
-    sounds_night: []string
-
-    // Attack/decay envelopes
-    attack_sounds: []string
-    decay_sounds: []string
-
-    // 3D audio
     low_pass_freq: f32  // Low-pass filter frequency
     min_distance: f32   // Minimum 3D distance
     max_distance: f32   // Maximum 3D distance (attenuation)
-
-    fn init(name: string): AudioEventInfo {
-        return AudioEventInfo {
-            audio_name: name
-            filename: ""
-            volume: 1.0
-            volume_shift: 0.0
-            min_volume: 0.0
-            pitch_shift_min: 1.0
-            pitch_shift_max: 1.0
-            delay_min: 0
-            delay_max: 0
-            loop_count: 1
-            limit: 8
-            priority: AudioPriority.Normal
-            sound_type: 0
-            control: 0
-            audio_type: AudioType.SoundEffect
-            sounds_morning: []
-            sounds_default: []
-            sounds_evening: []
-            sounds_night: []
-            attack_sounds: []
-            decay_sounds: []
-            low_pass_freq: 1.0
-            min_distance: 10.0
-            max_distance: 100.0
-        }
-    }
-
-    fn is_looping(&self): bool {
-        return (self.control & @enumToInt(AudioControl.Loop)) != 0 and self.loop_count == 0
-    }
 }
 
 // Audio event instance (from EA's AudioEventRTS)
 struct AudioEvent {
     event_name: string
-    event_info: ?*AudioEventInfo
-
-    // Playback state
     handle: AudioHandle
     is_playing: bool
     is_paused: bool
-
-    // Positioning
     position: Vec3
     is_positional: bool
     object_id: u32      // If attached to game object
-
-    // Playback parameters
     volume: f32
     pitch: f32
     delay: f32
     loop_count: i32
-
-    // Time-of-day
     time_of_day: TimeOfDay
-
-    // Priority
     priority: AudioPriority
-
-    fn init(name: string): AudioEvent {
-        return AudioEvent {
-            event_name: name
-            event_info: null
-            handle: INVALID_AUDIO_HANDLE
-            is_playing: false
-            is_paused: false
-            position: Vec3.init(0.0, 0.0, 0.0)
-            is_positional: false
-            object_id: 0
-            volume: 1.0
-            pitch: 1.0
-            delay: 0.0
-            loop_count: 1
-            time_of_day: TimeOfDay.Midday
-            priority: AudioPriority.Normal
-        }
-    }
-
-    fn generate_filename(mut self): string {
-        if !self.event_info {
-            return ""
-        }
-
-        let info = self.event_info.?
-
-        // Select sound list based on time of day
-        let sound_list = match self.time_of_day {
-            TimeOfDay.Morning => if info.sounds_morning.len > 0 { info.sounds_morning } else { info.sounds_default }
-            TimeOfDay.Evening => if info.sounds_evening.len > 0 { info.sounds_evening } else { info.sounds_default }
-            TimeOfDay.Night => if info.sounds_night.len > 0 { info.sounds_night } else { info.sounds_default }
-            _ => info.sounds_default
-        }
-
-        if sound_list.len == 0 {
-            return info.filename
-        }
-
-        // Select sound from list
-        let index: usize = 0
-        if (info.control & @enumToInt(AudioControl.Random)) != 0 {
-            // Random selection
-            index = random_range(0, sound_list.len)
-        } else {
-            // Sequential
-            index = 0  // TODO: Track playback index
-        }
-
-        return sound_list[index]
-    }
-
-    fn calculate_pitch_shift(&self): f32 {
-        if !self.event_info {
-            return 1.0
-        }
-
-        let info = self.event_info.?
-        if info.pitch_shift_min == info.pitch_shift_max {
-            return info.pitch_shift_min
-        }
-
-        // Random pitch variation
-        return random_range_f32(info.pitch_shift_min, info.pitch_shift_max)
-    }
-
-    fn calculate_volume_shift(&self): f32 {
-        if !self.event_info {
-            return self.volume
-        }
-
-        let info = self.event_info.?
-        let shifted = self.volume + random_range_f32(-info.volume_shift, info.volume_shift)
-
-        // Clamp to min volume
-        if shifted < info.min_volume {
-            return info.min_volume
-        }
-
-        return shifted
-    }
-
-    fn calculate_3d_volume(&self, listener_pos: Vec3): f32 {
-        if !self.is_positional or !self.event_info {
-            return self.volume
-        }
-
-        let info = self.event_info.?
-        let distance = vec3_distance(self.position, listener_pos)
-
-        // Clamp to min/max distance
-        if distance < info.min_distance {
-            distance = info.min_distance
-        }
-
-        if distance > info.max_distance {
-            return 0.0  // Silent beyond max distance
-        }
-
-        // Linear falloff
-        let attenuation = 1.0 - (distance - info.min_distance) / (info.max_distance - info.min_distance)
-        return self.volume * attenuation
-    }
 }
 
 // Time of day enum
@@ -276,245 +109,24 @@ enum TimeOfDay {
 // Audio channel (mixer channel)
 struct AudioChannel {
     channel_id: u32
-    current_event: ?AudioEvent
     volume: f32
     is_active: bool
-
-    fn init(channel_id: u32): AudioChannel {
-        return AudioChannel {
-            channel_id: channel_id
-            current_event: null
-            volume: 1.0
-            is_active: false
-        }
-    }
-
-    fn play(mut self, event: AudioEvent) {
-        self.current_event = event
-        self.is_active = true
-
-        // TODO: Start actual audio playback via platform audio API
-    }
-
-    fn stop(mut self) {
-        self.current_event = null
-        self.is_active = false
-
-        // TODO: Stop platform audio
-    }
-
-    fn pause(mut self) {
-        if self.current_event {
-            self.current_event.?.is_paused = true
-        }
-
-        // TODO: Pause platform audio
-    }
-
-    fn resume(mut self) {
-        if self.current_event {
-            self.current_event.?.is_paused = false
-        }
-
-        // TODO: Resume platform audio
-    }
 }
 
 // Audio engine
 struct AudioEngine {
-    // Event registry
-    audio_events: []AudioEventInfo
     event_count: usize
-
-    // Active channels
-    channels: []AudioChannel
     channel_count: usize
     max_channels: usize
-
-    // Master volume controls
     master_volume: f32
     music_volume: f32
     sfx_volume: f32
     voice_volume: f32
-
-    // Listener (camera) position for 3D audio
     listener_position: Vec3
     listener_forward: Vec3
-
-    // Current time of day
     current_time_of_day: TimeOfDay
-
-    // Next handle ID
     next_handle: AudioHandle
-
     allocator: Allocator
-
-    fn init(allocator: Allocator, max_channels: usize): AudioEngine {
-        return AudioEngine {
-            audio_events: allocator.alloc(AudioEventInfo, 512)
-            event_count: 0
-            channels: allocator.alloc(AudioChannel, max_channels)
-            channel_count: 0
-            max_channels: max_channels
-            master_volume: 1.0
-            music_volume: 0.8
-            sfx_volume: 1.0
-            voice_volume: 1.0
-            listener_position: Vec3.init(0.0, 0.0, 0.0)
-            listener_forward: Vec3.init(0.0, 0.0, 1.0)
-            current_time_of_day: TimeOfDay.Midday
-            next_handle: 1
-            allocator: allocator
-        }
-    }
-
-    fn register_event(mut self, event_info: AudioEventInfo) {
-        if self.event_count >= self.audio_events.len {
-            return
-        }
-
-        self.audio_events[self.event_count] = event_info
-        self.event_count += 1
-    }
-
-    fn find_event_info(&self, event_name: string): ?*AudioEventInfo {
-        for i in 0..self.event_count {
-            if self.audio_events[i].audio_name == event_name {
-                return &self.audio_events[i]
-            }
-        }
-        return null
-    }
-
-    fn play_audio_event(mut self, event_name: string): AudioHandle {
-        let info = self.find_event_info(event_name)
-        if !info {
-            return INVALID_AUDIO_HANDLE
-        }
-
-        let mut event = AudioEvent.init(event_name)
-        event.event_info = info
-        event.time_of_day = self.current_time_of_day
-        event.priority = info.?.priority
-
-        // Calculate random variations
-        event.pitch = event.calculate_pitch_shift()
-        event.volume = event.calculate_volume_shift()
-
-        // Assign handle
-        event.handle = self.next_handle
-        self.next_handle += 1
-
-        // Find free channel
-        let channel = self.find_free_channel(event.priority)
-        if channel {
-            channel.?.play(event)
-        }
-
-        return event.handle
-    }
-
-    fn play_audio_event_3d(mut self, event_name: string, position: Vec3): AudioHandle {
-        let handle = self.play_audio_event(event_name)
-
-        // Update to positional
-        for i in 0..self.channel_count {
-            if self.channels[i].current_event {
-                if self.channels[i].current_event.?.handle == handle {
-                    self.channels[i].current_event.?.is_positional = true
-                    self.channels[i].current_event.?.position = position
-                }
-            }
-        }
-
-        return handle
-    }
-
-    fn find_free_channel(mut self, priority: AudioPriority): ?*AudioChannel {
-        // First, look for inactive channel
-        for i in 0..self.channel_count {
-            if !self.channels[i].is_active {
-                return &self.channels[i]
-            }
-        }
-
-        // No free channels, try to steal one with lower priority
-        for i in 0..self.channel_count {
-            if self.channels[i].current_event {
-                if @enumToInt(self.channels[i].current_event.?.priority) < @enumToInt(priority) {
-                    self.channels[i].stop()
-                    return &self.channels[i]
-                }
-            }
-        }
-
-        // All channels busy with higher priority
-        return null
-    }
-
-    fn stop_audio(mut self, handle: AudioHandle) {
-        for i in 0..self.channel_count {
-            if self.channels[i].current_event {
-                if self.channels[i].current_event.?.handle == handle {
-                    self.channels[i].stop()
-                    return
-                }
-            }
-        }
-    }
-
-    fn stop_all_audio(mut self) {
-        for i in 0..self.channel_count {
-            self.channels[i].stop()
-        }
-    }
-
-    fn update(mut self, delta_time: f32) {
-        // Update 3D audio volumes based on listener position
-        for i in 0..self.channel_count {
-            if self.channels[i].is_active and self.channels[i].current_event {
-                let event = &self.channels[i].current_event.?
-
-                if event.is_positional {
-                    let volume_3d = event.calculate_3d_volume(self.listener_position)
-                    self.channels[i].volume = volume_3d
-                }
-            }
-        }
-
-        // TODO: Update platform audio system
-    }
-
-    fn set_listener_position(mut self, position: Vec3, forward: Vec3) {
-        self.listener_position = position
-        self.listener_forward = vec3_normalize(forward)
-    }
-
-    fn set_time_of_day(mut self, tod: TimeOfDay) {
-        self.current_time_of_day = tod
-    }
-
-    fn set_master_volume(mut self, volume: f32) {
-        self.master_volume = clamp(volume, 0.0, 1.0)
-    }
-
-    fn set_music_volume(mut self, volume: f32) {
-        self.music_volume = clamp(volume, 0.0, 1.0)
-    }
-
-    fn set_sfx_volume(mut self, volume: f32) {
-        self.sfx_volume = clamp(volume, 0.0, 1.0)
-    }
-
-    fn set_voice_volume(mut self, volume: f32) {
-        self.voice_volume = clamp(volume, 0.0, 1.0)
-    }
-
-    fn deinit(mut self) {
-        self.stop_all_audio()
-        self.allocator.free(self.audio_events)
-        self.allocator.free(self.channels)
-    }
 }
 
 // Helper functions
@@ -530,8 +142,8 @@ fn random_range_f32(min: f32, max: f32): f32 {
 }
 
 fn clamp(value: f32, min: f32, max: f32): f32 {
-    if value < min { return min }
-    if value > max { return max }
+    if (value < min) { return min }
+    if (value > max) { return max }
     return value
 }
 
@@ -549,46 +161,46 @@ export fn init_audio_engine(allocator: Allocator) {
 }
 
 export fn shutdown_audio_engine() {
-    if g_audio_engine {
+    if (g_audio_engine) {
         g_audio_engine.?.deinit()
         g_audio_engine = null
     }
 }
 
 export fn update_audio(delta_time: f32) {
-    if g_audio_engine {
+    if (g_audio_engine) {
         g_audio_engine.?.update(delta_time)
     }
 }
 
 export fn play_sound(event_name: string): AudioHandle {
-    if g_audio_engine {
+    if (g_audio_engine) {
         return g_audio_engine.?.play_audio_event(event_name)
     }
     return INVALID_AUDIO_HANDLE
 }
 
 export fn play_sound_3d(event_name: string, position: Vec3): AudioHandle {
-    if g_audio_engine {
+    if (g_audio_engine) {
         return g_audio_engine.?.play_audio_event_3d(event_name, position)
     }
     return INVALID_AUDIO_HANDLE
 }
 
 export fn stop_sound(handle: AudioHandle) {
-    if g_audio_engine {
+    if (g_audio_engine) {
         g_audio_engine.?.stop_audio(handle)
     }
 }
 
 export fn audio_set_listener(position: Vec3, forward: Vec3) {
-    if g_audio_engine {
+    if (g_audio_engine) {
         g_audio_engine.?.set_listener_position(position, forward)
     }
 }
 
 export fn audio_register_event(event_info: AudioEventInfo) {
-    if g_audio_engine {
+    if (g_audio_engine) {
         g_audio_engine.?.register_event(event_info)
     }
 }
