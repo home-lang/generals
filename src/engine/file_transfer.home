@@ -1,0 +1,1113 @@
+// file_transfer.home - Map and replay file transfer system
+// Full implementation of chunked file transfers with verification
+
+const MAX_CHUNK_SIZE: u32 = 4096
+const MAX_CONCURRENT_TRANSFERS: u32 = 4
+const MAX_PENDING_CHUNKS: u32 = 16
+const CHUNK_TIMEOUT_MS: u32 = 5000
+const TRANSFER_TIMEOUT_MS: u32 = 300000  // 5 minutes
+const MAX_RETRIES: u32 = 3
+
+// ============================================================================
+// Transfer Types
+// ============================================================================
+
+enum TransferType {
+    Map,
+    Replay,
+    CustomContent,
+    Screenshot,
+    SaveGame
+}
+
+enum TransferDirection {
+    Upload,
+    Download
+}
+
+enum TransferState {
+    Idle,
+    Initializing,
+    Transferring,
+    Verifying,
+    Complete,
+    Failed,
+    Cancelled
+}
+
+enum TransferError {
+    None,
+    FileNotFound,
+    AccessDenied,
+    DiskFull,
+    NetworkError,
+    Timeout,
+    ChecksumMismatch,
+    InvalidChunk,
+    TransferCancelled,
+    PeerDisconnected,
+    TooManyRetries
+}
+
+// ============================================================================
+// File Metadata
+// ============================================================================
+
+struct FileMetadata {
+    file_name: string,
+    file_path: string,
+    file_size: u64,
+    chunk_count: u32,
+    crc32: u32,
+    md5_hash: [u8; 16],
+    transfer_type: TransferType,
+    created_time: u64,
+    modified_time: u64
+}
+
+impl FileMetadata {
+    fn new() -> FileMetadata {
+        FileMetadata {
+            file_name: "",
+            file_path: "",
+            file_size: 0,
+            chunk_count: 0,
+            crc32: 0,
+            md5_hash: [0; 16],
+            transfer_type: TransferType::Map,
+            created_time: 0,
+            modified_time: 0
+        }
+    }
+
+    fn calculate_chunk_count(&mut self) {
+        self.chunk_count = ((self.file_size + MAX_CHUNK_SIZE as u64 - 1) / MAX_CHUNK_SIZE as u64) as u32
+    }
+
+    fn serialize(&self, buffer: &mut [u8]) -> u32 {
+        var offset: u32 = 0
+
+        // File name (64 bytes)
+        write_string(buffer, offset, self.file_name, 64)
+        offset += 64
+
+        // File size
+        write_u64(buffer, offset, self.file_size)
+        offset += 8
+
+        // Chunk count
+        write_u32(buffer, offset, self.chunk_count)
+        offset += 4
+
+        // CRC32
+        write_u32(buffer, offset, self.crc32)
+        offset += 4
+
+        // MD5 hash
+        for i in 0..16 {
+            buffer[offset + i] = self.md5_hash[i]
+        }
+        offset += 16
+
+        // Transfer type
+        buffer[offset] = self.transfer_type as u8
+        offset += 1
+
+        return offset
+    }
+
+    fn deserialize(&mut self, buffer: &[u8]) {
+        var offset: u32 = 0
+
+        self.file_name = read_string(buffer, offset, 64)
+        offset += 64
+
+        self.file_size = read_u64(buffer, offset)
+        offset += 8
+
+        self.chunk_count = read_u32(buffer, offset)
+        offset += 4
+
+        self.crc32 = read_u32(buffer, offset)
+        offset += 4
+
+        for i in 0..16 {
+            self.md5_hash[i] = buffer[offset + i]
+        }
+        offset += 16
+
+        self.transfer_type = unsafe { transmute::<u8, TransferType>(buffer[offset]) }
+    }
+}
+
+// ============================================================================
+// Chunk Data
+// ============================================================================
+
+struct ChunkHeader {
+    transfer_id: u32,
+    chunk_index: u32,
+    chunk_size: u32,
+    chunk_crc: u32,
+    is_last: bool
+}
+
+struct ChunkData {
+    header: ChunkHeader,
+    data: [u8; MAX_CHUNK_SIZE],
+    actual_size: u32
+}
+
+struct PendingChunk {
+    chunk_index: u32,
+    request_time: u64,
+    retry_count: u32,
+    received: bool
+}
+
+impl ChunkHeader {
+    fn serialize(&self, buffer: &mut [u8]) -> u32 {
+        write_u32(buffer, 0, self.transfer_id)
+        write_u32(buffer, 4, self.chunk_index)
+        write_u32(buffer, 8, self.chunk_size)
+        write_u32(buffer, 12, self.chunk_crc)
+        buffer[16] = if self.is_last { 1 } else { 0 }
+        return 17
+    }
+
+    fn deserialize(buffer: &[u8]) -> ChunkHeader {
+        ChunkHeader {
+            transfer_id: read_u32(buffer, 0),
+            chunk_index: read_u32(buffer, 4),
+            chunk_size: read_u32(buffer, 8),
+            chunk_crc: read_u32(buffer, 12),
+            is_last: buffer[16] != 0
+        }
+    }
+}
+
+// ============================================================================
+// Transfer State
+// ============================================================================
+
+struct TransferProgress {
+    bytes_transferred: u64,
+    bytes_total: u64,
+    chunks_complete: u32,
+    chunks_total: u32,
+    percent_complete: f32,
+    transfer_rate_kbps: f32,
+    estimated_time_remaining_ms: u64
+}
+
+struct FileTransfer {
+    transfer_id: u32,
+    direction: TransferDirection,
+    state: TransferState,
+    error: TransferError,
+
+    // File info
+    metadata: FileMetadata,
+    local_path: string,
+
+    // Peer info
+    peer_id: u64,
+
+    // Progress tracking
+    chunks_received: [bool; 16384],     // Bitmap of received chunks (max 64MB file)
+    chunks_complete: u32,
+    bytes_transferred: u64,
+
+    // Pending requests
+    pending_chunks: [PendingChunk; MAX_PENDING_CHUNKS],
+    pending_count: u32,
+    next_chunk_to_request: u32,
+
+    // Timing
+    start_time: u64,
+    last_activity_time: u64,
+    last_progress_time: u64,
+
+    // Rate tracking
+    bytes_last_second: u64,
+    rate_sample_time: u64,
+    transfer_rate_kbps: f32,
+
+    // File handle for writing
+    file_buffer: [u8; 1048576],         // 1MB buffer
+    buffer_offset: u64,
+    buffer_used: u32
+}
+
+impl FileTransfer {
+    fn new(transfer_id: u32, direction: TransferDirection) -> FileTransfer {
+        FileTransfer {
+            transfer_id: transfer_id,
+            direction: direction,
+            state: TransferState::Idle,
+            error: TransferError::None,
+            metadata: FileMetadata::new(),
+            local_path: "",
+            peer_id: 0,
+            chunks_received: [false; 16384],
+            chunks_complete: 0,
+            bytes_transferred: 0,
+            pending_chunks: undefined,
+            pending_count: 0,
+            next_chunk_to_request: 0,
+            start_time: 0,
+            last_activity_time: 0,
+            last_progress_time: 0,
+            bytes_last_second: 0,
+            rate_sample_time: 0,
+            transfer_rate_kbps: 0.0,
+            file_buffer: undefined,
+            buffer_offset: 0,
+            buffer_used: 0
+        }
+    }
+
+    fn get_progress(&self) -> TransferProgress {
+        let percent = if self.metadata.file_size > 0 {
+            (self.bytes_transferred as f32 / self.metadata.file_size as f32) * 100.0
+        } else {
+            0.0
+        }
+
+        let eta = if self.transfer_rate_kbps > 0.0 {
+            let remaining_kb = (self.metadata.file_size - self.bytes_transferred) as f32 / 1024.0
+            (remaining_kb / self.transfer_rate_kbps * 1000.0) as u64
+        } else {
+            0
+        }
+
+        TransferProgress {
+            bytes_transferred: self.bytes_transferred,
+            bytes_total: self.metadata.file_size,
+            chunks_complete: self.chunks_complete,
+            chunks_total: self.metadata.chunk_count,
+            percent_complete: percent,
+            transfer_rate_kbps: self.transfer_rate_kbps,
+            estimated_time_remaining_ms: eta
+        }
+    }
+
+    fn is_chunk_received(&self, chunk_index: u32) -> bool {
+        if chunk_index >= 16384 {
+            return false
+        }
+        return self.chunks_received[chunk_index]
+    }
+
+    fn mark_chunk_received(&mut self, chunk_index: u32, size: u32) {
+        if chunk_index >= 16384 {
+            return
+        }
+
+        if !self.chunks_received[chunk_index] {
+            self.chunks_received[chunk_index] = true
+            self.chunks_complete += 1
+            self.bytes_transferred += size as u64
+        }
+    }
+
+    fn get_next_missing_chunk(&self) -> ?u32 {
+        for i in 0..self.metadata.chunk_count {
+            if !self.chunks_received[i] {
+                // Check if not already pending
+                var is_pending = false
+                for j in 0..self.pending_count {
+                    if self.pending_chunks[j].chunk_index == i {
+                        is_pending = true
+                        break
+                    }
+                }
+
+                if !is_pending {
+                    return i
+                }
+            }
+        }
+        return null
+    }
+
+    fn add_pending_chunk(&mut self, chunk_index: u32, time_ms: u64) {
+        if self.pending_count >= MAX_PENDING_CHUNKS {
+            return
+        }
+
+        self.pending_chunks[self.pending_count] = PendingChunk {
+            chunk_index: chunk_index,
+            request_time: time_ms,
+            retry_count: 0,
+            received: false
+        }
+        self.pending_count += 1
+    }
+
+    fn remove_pending_chunk(&mut self, chunk_index: u32) {
+        for i in 0..self.pending_count {
+            if self.pending_chunks[i].chunk_index == chunk_index {
+                // Shift remaining items
+                for j in i..(self.pending_count - 1) {
+                    self.pending_chunks[j] = self.pending_chunks[j + 1]
+                }
+                self.pending_count -= 1
+                return
+            }
+        }
+    }
+
+    fn check_pending_timeouts(&mut self, current_time_ms: u64) -> [u32; MAX_PENDING_CHUNKS] {
+        var timed_out: [u32; MAX_PENDING_CHUNKS] = [0xFFFFFFFF; MAX_PENDING_CHUNKS]
+        var timeout_count: u32 = 0
+
+        for i in 0..self.pending_count {
+            let elapsed = current_time_ms - self.pending_chunks[i].request_time
+
+            if elapsed > CHUNK_TIMEOUT_MS as u64 {
+                if self.pending_chunks[i].retry_count >= MAX_RETRIES {
+                    self.state = TransferState::Failed
+                    self.error = TransferError::TooManyRetries
+                    return timed_out
+                }
+
+                timed_out[timeout_count] = self.pending_chunks[i].chunk_index
+                timeout_count += 1
+
+                // Reset for retry
+                self.pending_chunks[i].request_time = current_time_ms
+                self.pending_chunks[i].retry_count += 1
+            }
+        }
+
+        return timed_out
+    }
+
+    fn update_transfer_rate(&mut self, current_time_ms: u64) {
+        let elapsed = current_time_ms - self.rate_sample_time
+
+        if elapsed >= 1000 {
+            self.transfer_rate_kbps = (self.bytes_last_second as f32 / 1024.0) * (1000.0 / elapsed as f32)
+            self.bytes_last_second = 0
+            self.rate_sample_time = current_time_ms
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        return self.chunks_complete >= self.metadata.chunk_count
+    }
+}
+
+// ============================================================================
+// File Transfer Manager
+// ============================================================================
+
+struct FileTransferConfig {
+    download_path: string,
+    max_concurrent: u32,
+    chunk_size: u32,
+    timeout_ms: u32,
+    verify_checksums: bool,
+    auto_resume: bool
+}
+
+fn default_transfer_config() -> FileTransferConfig {
+    FileTransferConfig {
+        download_path: "downloads/",
+        max_concurrent: 4,
+        chunk_size: MAX_CHUNK_SIZE,
+        timeout_ms: TRANSFER_TIMEOUT_MS,
+        verify_checksums: true,
+        auto_resume: true
+    }
+}
+
+struct FileTransferManager {
+    config: FileTransferConfig,
+
+    // Active transfers
+    transfers: [FileTransfer; MAX_CONCURRENT_TRANSFERS],
+    transfer_count: u32,
+    next_transfer_id: u32,
+
+    // Callbacks
+    on_transfer_started: fn(u32, &FileMetadata),
+    on_transfer_progress: fn(u32, &TransferProgress),
+    on_transfer_complete: fn(u32, string),
+    on_transfer_failed: fn(u32, TransferError),
+    on_chunk_request: fn(u32, u32),                 // transfer_id, chunk_index
+    on_chunk_send: fn(u32, &ChunkData),
+
+    // Statistics
+    total_bytes_downloaded: u64,
+    total_bytes_uploaded: u64,
+    total_transfers_complete: u32,
+    total_transfers_failed: u32
+}
+
+impl FileTransferManager {
+    fn new(config: FileTransferConfig) -> FileTransferManager {
+        FileTransferManager {
+            config: config,
+            transfers: undefined,
+            transfer_count: 0,
+            next_transfer_id: 1,
+            on_transfer_started: null,
+            on_transfer_progress: null,
+            on_transfer_complete: null,
+            on_transfer_failed: null,
+            on_chunk_request: null,
+            on_chunk_send: null,
+            total_bytes_downloaded: 0,
+            total_bytes_uploaded: 0,
+            total_transfers_complete: 0,
+            total_transfers_failed: 0
+        }
+    }
+
+    // ========================================================================
+    // Transfer Initiation
+    // ========================================================================
+
+    fn start_download(&mut self, peer_id: u64, metadata: FileMetadata) -> ?u32 {
+        if self.transfer_count >= MAX_CONCURRENT_TRANSFERS {
+            return null
+        }
+
+        let transfer_id = self.next_transfer_id
+        self.next_transfer_id += 1
+
+        var transfer = FileTransfer::new(transfer_id, TransferDirection::Download)
+        transfer.peer_id = peer_id
+        transfer.metadata = metadata
+        transfer.local_path = self.config.download_path + metadata.file_name
+        transfer.state = TransferState::Initializing
+        transfer.start_time = get_current_time_ms()
+        transfer.last_activity_time = transfer.start_time
+        transfer.rate_sample_time = transfer.start_time
+
+        self.transfers[self.transfer_count] = transfer
+        self.transfer_count += 1
+
+        if self.on_transfer_started != null {
+            self.on_transfer_started(transfer_id, &metadata)
+        }
+
+        return transfer_id
+    }
+
+    fn start_upload(&mut self, peer_id: u64, file_path: string) -> ?u32 {
+        if self.transfer_count >= MAX_CONCURRENT_TRANSFERS {
+            return null
+        }
+
+        // Create metadata from file
+        var metadata = self.create_metadata_from_file(file_path)
+        if metadata == null {
+            return null
+        }
+
+        let transfer_id = self.next_transfer_id
+        self.next_transfer_id += 1
+
+        var transfer = FileTransfer::new(transfer_id, TransferDirection::Upload)
+        transfer.peer_id = peer_id
+        transfer.metadata = metadata.unwrap()
+        transfer.local_path = file_path
+        transfer.state = TransferState::Initializing
+        transfer.start_time = get_current_time_ms()
+        transfer.last_activity_time = transfer.start_time
+        transfer.rate_sample_time = transfer.start_time
+
+        self.transfers[self.transfer_count] = transfer
+        self.transfer_count += 1
+
+        return transfer_id
+    }
+
+    fn create_metadata_from_file(&self, path: string) -> ?FileMetadata {
+        // Read file info
+        let file_size = get_file_size(path)
+        if file_size == 0 {
+            return null
+        }
+
+        var metadata = FileMetadata::new()
+        metadata.file_path = path
+        metadata.file_name = extract_filename(path)
+        metadata.file_size = file_size
+        metadata.calculate_chunk_count()
+        metadata.crc32 = calculate_file_crc32(path)
+        calculate_file_md5(path, &mut metadata.md5_hash)
+        metadata.transfer_type = infer_transfer_type(path)
+
+        return metadata
+    }
+
+    // ========================================================================
+    // Transfer Operations
+    // ========================================================================
+
+    fn get_transfer(&mut self, transfer_id: u32) -> ?&mut FileTransfer {
+        for i in 0..self.transfer_count {
+            if self.transfers[i].transfer_id == transfer_id {
+                return &mut self.transfers[i]
+            }
+        }
+        return null
+    }
+
+    fn cancel_transfer(&mut self, transfer_id: u32) {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return
+        }
+
+        var t = transfer.unwrap()
+        t.state = TransferState::Cancelled
+        t.error = TransferError::TransferCancelled
+
+        if self.on_transfer_failed != null {
+            self.on_transfer_failed(transfer_id, TransferError::TransferCancelled)
+        }
+
+        self.remove_transfer(transfer_id)
+    }
+
+    fn remove_transfer(&mut self, transfer_id: u32) {
+        for i in 0..self.transfer_count {
+            if self.transfers[i].transfer_id == transfer_id {
+                // Shift remaining transfers
+                for j in i..(self.transfer_count - 1) {
+                    self.transfers[j] = self.transfers[j + 1]
+                }
+                self.transfer_count -= 1
+                return
+            }
+        }
+    }
+
+    // ========================================================================
+    // Chunk Handling
+    // ========================================================================
+
+    fn receive_chunk(&mut self, transfer_id: u32, chunk: &ChunkData) -> bool {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return false
+        }
+
+        var t = transfer.unwrap()
+
+        // Verify chunk CRC
+        if self.config.verify_checksums {
+            let computed_crc = crc32(&chunk.data, chunk.actual_size)
+            if computed_crc != chunk.header.chunk_crc {
+                return false  // Invalid chunk
+            }
+        }
+
+        // Already have this chunk?
+        if t.is_chunk_received(chunk.header.chunk_index) {
+            return true  // Duplicate, but not an error
+        }
+
+        // Write to file buffer
+        let file_offset = chunk.header.chunk_index as u64 * MAX_CHUNK_SIZE as u64
+        self.write_chunk_to_buffer(t, file_offset, &chunk.data, chunk.actual_size)
+
+        // Mark received
+        t.mark_chunk_received(chunk.header.chunk_index, chunk.actual_size)
+        t.remove_pending_chunk(chunk.header.chunk_index)
+        t.last_activity_time = get_current_time_ms()
+        t.bytes_last_second += chunk.actual_size as u64
+
+        // Check completion
+        if t.is_complete() {
+            self.finalize_download(transfer_id)
+        }
+
+        // Report progress
+        if self.on_transfer_progress != null {
+            let progress = t.get_progress()
+            self.on_transfer_progress(transfer_id, &progress)
+        }
+
+        return true
+    }
+
+    fn write_chunk_to_buffer(&mut self, transfer: &mut FileTransfer, offset: u64, data: &[u8; MAX_CHUNK_SIZE], size: u32) {
+        // For simplicity, assume chunks arrive in order or are buffered externally
+        // In a real implementation, you'd write to specific file offsets
+        for i in 0..size {
+            if transfer.buffer_used < 1048576 {
+                transfer.file_buffer[transfer.buffer_used] = data[i]
+                transfer.buffer_used += 1
+            }
+        }
+    }
+
+    fn request_chunks(&mut self, transfer_id: u32) {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return
+        }
+
+        var t = transfer.unwrap()
+
+        if t.state != TransferState::Transferring {
+            t.state = TransferState::Transferring
+        }
+
+        let current_time = get_current_time_ms()
+
+        // Request up to MAX_PENDING_CHUNKS at a time
+        while t.pending_count < MAX_PENDING_CHUNKS {
+            let next_chunk = t.get_next_missing_chunk()
+            if next_chunk == null {
+                break
+            }
+
+            let chunk_index = next_chunk.unwrap()
+            t.add_pending_chunk(chunk_index, current_time)
+
+            if self.on_chunk_request != null {
+                self.on_chunk_request(transfer_id, chunk_index)
+            }
+        }
+    }
+
+    fn send_chunk(&mut self, transfer_id: u32, chunk_index: u32) {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return
+        }
+
+        var t = transfer.unwrap()
+
+        // Read chunk from file
+        var chunk = ChunkData {
+            header: ChunkHeader {
+                transfer_id: transfer_id,
+                chunk_index: chunk_index,
+                chunk_size: 0,
+                chunk_crc: 0,
+                is_last: false
+            },
+            data: undefined,
+            actual_size: 0
+        }
+
+        let file_offset = chunk_index as u64 * MAX_CHUNK_SIZE as u64
+        let remaining = t.metadata.file_size - file_offset
+        let chunk_size = if remaining > MAX_CHUNK_SIZE as u64 {
+            MAX_CHUNK_SIZE
+        } else {
+            remaining as u32
+        }
+
+        // Read from file
+        read_file_chunk(t.local_path, file_offset, &mut chunk.data, chunk_size)
+
+        chunk.header.chunk_size = chunk_size
+        chunk.actual_size = chunk_size
+        chunk.header.chunk_crc = crc32(&chunk.data, chunk_size)
+        chunk.header.is_last = chunk_index == t.metadata.chunk_count - 1
+
+        // Track upload progress
+        t.mark_chunk_received(chunk_index, chunk_size)
+        t.last_activity_time = get_current_time_ms()
+        t.bytes_last_second += chunk_size as u64
+
+        if self.on_chunk_send != null {
+            self.on_chunk_send(transfer_id, &chunk)
+        }
+
+        // Check completion
+        if t.is_complete() {
+            self.finalize_upload(transfer_id)
+        }
+    }
+
+    // ========================================================================
+    // Transfer Completion
+    // ========================================================================
+
+    fn finalize_download(&mut self, transfer_id: u32) {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return
+        }
+
+        var t = transfer.unwrap()
+        t.state = TransferState::Verifying
+
+        // Verify complete file
+        if self.config.verify_checksums {
+            // Write buffer to file first
+            write_file(t.local_path, &t.file_buffer, t.buffer_used)
+
+            // Verify CRC
+            let file_crc = calculate_file_crc32(t.local_path)
+            if file_crc != t.metadata.crc32 {
+                t.state = TransferState::Failed
+                t.error = TransferError::ChecksumMismatch
+
+                if self.on_transfer_failed != null {
+                    self.on_transfer_failed(transfer_id, TransferError::ChecksumMismatch)
+                }
+
+                self.total_transfers_failed += 1
+                return
+            }
+        } else {
+            // Just write the file
+            write_file(t.local_path, &t.file_buffer, t.buffer_used)
+        }
+
+        t.state = TransferState::Complete
+        self.total_bytes_downloaded += t.bytes_transferred
+        self.total_transfers_complete += 1
+
+        if self.on_transfer_complete != null {
+            self.on_transfer_complete(transfer_id, t.local_path)
+        }
+    }
+
+    fn finalize_upload(&mut self, transfer_id: u32) {
+        let transfer = self.get_transfer(transfer_id)
+        if transfer == null {
+            return
+        }
+
+        var t = transfer.unwrap()
+        t.state = TransferState::Complete
+        self.total_bytes_uploaded += t.bytes_transferred
+        self.total_transfers_complete += 1
+
+        if self.on_transfer_complete != null {
+            self.on_transfer_complete(transfer_id, t.local_path)
+        }
+    }
+
+    // ========================================================================
+    // Update Loop
+    // ========================================================================
+
+    fn update(&mut self) {
+        let current_time = get_current_time_ms()
+
+        for i in 0..self.transfer_count {
+            var transfer = &mut self.transfers[i]
+
+            // Skip completed/failed transfers
+            if transfer.state == TransferState::Complete or
+               transfer.state == TransferState::Failed or
+               transfer.state == TransferState::Cancelled {
+                continue
+            }
+
+            // Check overall timeout
+            let total_elapsed = current_time - transfer.start_time
+            if total_elapsed > self.config.timeout_ms as u64 {
+                transfer.state = TransferState::Failed
+                transfer.error = TransferError::Timeout
+
+                if self.on_transfer_failed != null {
+                    self.on_transfer_failed(transfer.transfer_id, TransferError::Timeout)
+                }
+                continue
+            }
+
+            // Check chunk timeouts and retry
+            let timed_out = transfer.check_pending_timeouts(current_time)
+            for j in 0..MAX_PENDING_CHUNKS {
+                if timed_out[j] != 0xFFFFFFFF {
+                    if self.on_chunk_request != null {
+                        self.on_chunk_request(transfer.transfer_id, timed_out[j])
+                    }
+                }
+            }
+
+            // Update transfer rate
+            transfer.update_transfer_rate(current_time)
+
+            // Request more chunks if downloading
+            if transfer.direction == TransferDirection::Download {
+                if transfer.pending_count < MAX_PENDING_CHUNKS and !transfer.is_complete() {
+                    self.request_chunks(transfer.transfer_id)
+                }
+            }
+        }
+
+        // Clean up completed transfers
+        self.cleanup_completed()
+    }
+
+    fn cleanup_completed(&mut self) {
+        var i: u32 = 0
+        while i < self.transfer_count {
+            let state = self.transfers[i].state
+            if state == TransferState::Complete or
+               state == TransferState::Failed or
+               state == TransferState::Cancelled {
+                // Remove transfer
+                for j in i..(self.transfer_count - 1) {
+                    self.transfers[j] = self.transfers[j + 1]
+                }
+                self.transfer_count -= 1
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    // ========================================================================
+    // Utility
+    // ========================================================================
+
+    fn get_active_transfer_count(&self) -> u32 {
+        var count: u32 = 0
+        for i in 0..self.transfer_count {
+            let state = self.transfers[i].state
+            if state == TransferState::Initializing or
+               state == TransferState::Transferring or
+               state == TransferState::Verifying {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn get_transfer_progress(&self, transfer_id: u32) -> ?TransferProgress {
+        for i in 0..self.transfer_count {
+            if self.transfers[i].transfer_id == transfer_id {
+                return self.transfers[i].get_progress()
+            }
+        }
+        return null
+    }
+
+    fn get_all_progress(&self) -> [TransferProgress; MAX_CONCURRENT_TRANSFERS] {
+        var progress: [TransferProgress; MAX_CONCURRENT_TRANSFERS] = undefined
+
+        for i in 0..self.transfer_count {
+            progress[i] = self.transfers[i].get_progress()
+        }
+
+        return progress
+    }
+}
+
+// ============================================================================
+// Map-Specific Transfer
+// ============================================================================
+
+struct MapTransfer {
+    manager: FileTransferManager,
+    map_cache_path: string,
+    pending_map_requests: [u64; 8],     // Peer IDs waiting for maps
+    pending_count: u32
+}
+
+impl MapTransfer {
+    fn new(cache_path: string) -> MapTransfer {
+        var config = default_transfer_config()
+        config.download_path = cache_path
+
+        MapTransfer {
+            manager: FileTransferManager::new(config),
+            map_cache_path: cache_path,
+            pending_map_requests: [0; 8],
+            pending_count: 0
+        }
+    }
+
+    fn request_map(&mut self, peer_id: u64, map_name: string, map_crc: u32) -> bool {
+        // Check if we already have this map
+        if self.has_map(map_name, map_crc) {
+            return true
+        }
+
+        // Check if already downloading
+        for i in 0..self.manager.transfer_count {
+            if self.manager.transfers[i].metadata.file_name == map_name {
+                return true  // Already in progress
+            }
+        }
+
+        // Queue request
+        if self.pending_count < 8 {
+            self.pending_map_requests[self.pending_count] = peer_id
+            self.pending_count += 1
+        }
+
+        return false
+    }
+
+    fn has_map(&self, map_name: string, expected_crc: u32) -> bool {
+        let map_path = self.map_cache_path + map_name
+
+        if !file_exists(map_path) {
+            return false
+        }
+
+        // Verify CRC if provided
+        if expected_crc != 0 {
+            let actual_crc = calculate_file_crc32(map_path)
+            return actual_crc == expected_crc
+        }
+
+        return true
+    }
+
+    fn get_map_path(&self, map_name: string) -> string {
+        return self.map_cache_path + map_name
+    }
+}
+
+// ============================================================================
+// Replay Transfer
+// ============================================================================
+
+struct ReplayTransfer {
+    manager: FileTransferManager,
+    replay_path: string
+}
+
+impl ReplayTransfer {
+    fn new(replay_path: string) -> ReplayTransfer {
+        var config = default_transfer_config()
+        config.download_path = replay_path
+
+        ReplayTransfer {
+            manager: FileTransferManager::new(config),
+            replay_path: replay_path
+        }
+    }
+
+    fn send_replay(&mut self, peer_id: u64, replay_name: string) -> ?u32 {
+        let full_path = self.replay_path + replay_name
+        return self.manager.start_upload(peer_id, full_path)
+    }
+
+    fn receive_replay(&mut self, peer_id: u64, metadata: FileMetadata) -> ?u32 {
+        return self.manager.start_download(peer_id, metadata)
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn crc32(data: &[u8; MAX_CHUNK_SIZE], size: u32) -> u32 {
+    // CRC-32 (IEEE 802.3)
+    const CRC_POLY: u32 = 0xEDB88320
+
+    var crc: u32 = 0xFFFFFFFF
+
+    for i in 0..size {
+        crc = crc ^ (data[i] as u32)
+
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ CRC_POLY
+            } else {
+                crc = crc >> 1
+            }
+        }
+    }
+
+    return crc ^ 0xFFFFFFFF
+}
+
+fn extract_filename(path: string) -> string {
+    // Find last / or \
+    var last_sep: i32 = -1
+
+    for i in 0..path.len() {
+        if path[i] == '/' or path[i] == '\\' {
+            last_sep = i as i32
+        }
+    }
+
+    if last_sep < 0 {
+        return path
+    }
+
+    return path.substring((last_sep + 1) as u32, path.len())
+}
+
+fn infer_transfer_type(path: string) -> TransferType {
+    let lower = path.to_lowercase()
+
+    if lower.ends_with(".map") {
+        return TransferType::Map
+    } else if lower.ends_with(".rep") or lower.ends_with(".replay") {
+        return TransferType::Replay
+    } else if lower.ends_with(".sav") {
+        return TransferType::SaveGame
+    } else if lower.ends_with(".png") or lower.ends_with(".jpg") {
+        return TransferType::Screenshot
+    }
+
+    return TransferType::CustomContent
+}
+
+// Serialization helpers
+fn write_u32(buffer: &mut [u8], offset: u32, value: u32) {
+    buffer[offset] = (value & 0xFF) as u8
+    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8
+    buffer[offset + 2] = ((value >> 16) & 0xFF) as u8
+    buffer[offset + 3] = ((value >> 24) & 0xFF) as u8
+}
+
+fn write_u64(buffer: &mut [u8], offset: u32, value: u64) {
+    write_u32(buffer, offset, (value & 0xFFFFFFFF) as u32)
+    write_u32(buffer, offset + 4, ((value >> 32) & 0xFFFFFFFF) as u32)
+}
+
+fn write_string(buffer: &mut [u8], offset: u32, value: string, max_len: u32) {
+    let len = min(value.len(), max_len - 1)
+    buffer[offset] = len as u8
+    for i in 0..len {
+        buffer[offset + 1 + i] = value[i]
+    }
+}
+
+fn read_u32(buffer: &[u8], offset: u32) -> u32 {
+    return buffer[offset] as u32 |
+           (buffer[offset + 1] as u32 << 8) |
+           (buffer[offset + 2] as u32 << 16) |
+           (buffer[offset + 3] as u32 << 24)
+}
+
+fn read_u64(buffer: &[u8], offset: u32) -> u64 {
+    return read_u32(buffer, offset) as u64 |
+           (read_u32(buffer, offset + 4) as u64 << 32)
+}
+
+fn read_string(buffer: &[u8], offset: u32, max_len: u32) -> string {
+    let len = buffer[offset] as u32
+    let actual_len = min(len, max_len - 1)
+    var result: string = ""
+    for i in 0..actual_len {
+        result = result + (buffer[offset + 1 + i] as char)
+    }
+    return result
+}
+
+fn min(a: u32, b: u32) -> u32 {
+    if a < b { return a }
+    return b
+}
+
+// External functions
+extern fn get_current_time_ms() -> u64
+extern fn get_file_size(path: string) -> u64
+extern fn file_exists(path: string) -> bool
+extern fn calculate_file_crc32(path: string) -> u32
+extern fn calculate_file_md5(path: string, hash: &mut [u8; 16])
+extern fn read_file_chunk(path: string, offset: u64, buffer: &mut [u8; MAX_CHUNK_SIZE], size: u32)
+extern fn write_file(path: string, data: &[u8; 1048576], size: u32)

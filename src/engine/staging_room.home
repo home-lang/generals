@@ -1,0 +1,1470 @@
+// staging_room.home - Pre-game lobby and staging room system
+// Full implementation of multiplayer game setup lobby
+
+const MAX_SLOTS: u32 = 8
+const MAX_OBSERVERS: u32 = 4
+const MAX_CHAT_MESSAGES: u32 = 100
+const READY_COUNTDOWN_MS: u32 = 5000
+const MAP_PREVIEW_SIZE: u32 = 256
+
+// ============================================================================
+// Slot Configuration
+// ============================================================================
+
+enum SlotState {
+    Empty,
+    Open,
+    Closed,
+    Human,
+    AI,
+    Observer
+}
+
+enum SlotColor {
+    Random,
+    Gold,
+    Red,
+    Blue,
+    Green,
+    Orange,
+    Cyan,
+    Purple,
+    Pink
+}
+
+enum AIPersonality {
+    Easy,
+    Medium,
+    Hard,
+    Brutal,
+    Custom
+}
+
+enum TeamId {
+    NoTeam,
+    Team1,
+    Team2,
+    Team3,
+    Team4
+}
+
+enum Faction {
+    Random,
+    USA,
+    USAAirForce,
+    USALaser,
+    USASuperWeapon,
+    China,
+    ChinaTank,
+    ChinaInfantry,
+    ChinaNuke,
+    GLA,
+    GLAToxin,
+    GLAStealth,
+    GLADemo
+}
+
+struct SlotSettings {
+    state: SlotState,
+    color: SlotColor,
+    team: TeamId,
+    faction: Faction,
+    handicap: u32,              // 0-100, multiplier percentage
+    start_position: i32,        // -1 for random, 0-7 for specific
+    ai_personality: AIPersonality,
+    ai_difficulty_override: f32 // 0.0-1.0 for custom AI
+}
+
+struct PlayerSlot {
+    slot_id: u32,
+    settings: SlotSettings,
+    player_id: u64,             // 0 if AI or empty
+    player_name: string,
+    ping_ms: u32,
+    is_ready: bool,
+    is_host: bool,
+    is_loading: bool,
+    load_progress: f32          // 0.0-1.0 during map load
+}
+
+// ============================================================================
+// Game Settings
+// ============================================================================
+
+enum GameSpeed {
+    Slowest,
+    Slower,
+    Normal,
+    Faster,
+    Fastest
+}
+
+enum StartingCash {
+    Low,        // 5000
+    Medium,     // 10000
+    High,       // 20000
+    Mega        // 50000
+}
+
+enum SuperweaponSetting {
+    Disabled,
+    Enabled
+}
+
+struct GameSettings {
+    map_name: string,
+    map_path: string,
+    map_crc: u32,
+    map_size: u32,                      // Number of players supported
+    game_speed: GameSpeed,
+    starting_cash: StartingCash,
+    superweapons: SuperweaponSetting,
+    limit_superweapons: bool,           // One per player
+    allow_observers: bool,
+    lock_teams: bool,
+    lock_colors: bool,
+    lock_factions: bool,
+    fog_of_war: bool,
+    shroud: bool,
+    crates: bool,
+    random_crates: bool,
+    build_time: f32,                    // 1.0 = normal
+    income_multiplier: f32,             // 1.0 = normal
+    tech_level: u32,                    // 1-3
+    replay_enabled: bool,
+    ranked_match: bool,
+    tournament_mode: bool
+}
+
+fn default_game_settings() -> GameSettings {
+    GameSettings {
+        map_name: "Tournament Desert",
+        map_path: "maps/official/tournament_desert.map",
+        map_crc: 0,
+        map_size: 4,
+        game_speed: GameSpeed::Normal,
+        starting_cash: StartingCash::Medium,
+        superweapons: SuperweaponSetting::Enabled,
+        limit_superweapons: false,
+        allow_observers: true,
+        lock_teams: false,
+        lock_colors: false,
+        lock_factions: false,
+        fog_of_war: true,
+        shroud: true,
+        crates: false,
+        random_crates: false,
+        build_time: 1.0,
+        income_multiplier: 1.0,
+        tech_level: 3,
+        replay_enabled: true,
+        ranked_match: false,
+        tournament_mode: false
+    }
+}
+
+// ============================================================================
+// Map Information
+// ============================================================================
+
+struct MapStartPosition {
+    x: f32,
+    y: f32,
+    angle: f32,
+    is_valid: bool
+}
+
+struct MapInfo {
+    name: string,
+    path: string,
+    description: string,
+    author: string,
+    num_players: u32,
+    file_size: u64,
+    crc: u32,
+    is_official: bool,
+    is_multiplayer: bool,
+    supports_teams: bool,
+    terrain_type: string,
+    start_positions: [MapStartPosition; 8],
+    preview_width: u32,
+    preview_height: u32,
+    preview_data: [u8; 65536]           // Map preview image
+}
+
+struct MapBrowser {
+    available_maps: [MapInfo; 256],
+    map_count: u32,
+    filter_text: string,
+    filter_players: u32,                // 0 = any
+    filter_official_only: bool,
+    selected_index: u32
+}
+
+impl MapBrowser {
+    fn new() -> MapBrowser {
+        MapBrowser {
+            available_maps: undefined,
+            map_count: 0,
+            filter_text: "",
+            filter_players: 0,
+            filter_official_only: false,
+            selected_index: 0
+        }
+    }
+
+    fn scan_maps(&mut self, base_path: string) {
+        self.map_count = 0
+        // Scan directory for .map files
+        // Parse map headers for info
+        // Build preview thumbnails
+    }
+
+    fn filter_maps(&self) -> [&MapInfo; 256] {
+        var results: [&MapInfo; 256] = undefined
+        var count: u32 = 0
+
+        for i in 0..self.map_count {
+            let map = &self.available_maps[i]
+
+            // Apply filters
+            if self.filter_players > 0 and map.num_players != self.filter_players {
+                continue
+            }
+
+            if self.filter_official_only and !map.is_official {
+                continue
+            }
+
+            if self.filter_text.len() > 0 {
+                if !map.name.contains_ignore_case(self.filter_text) {
+                    continue
+                }
+            }
+
+            results[count] = map
+            count += 1
+        }
+
+        return results
+    }
+
+    fn get_selected_map(&self) -> ?&MapInfo {
+        if self.selected_index < self.map_count {
+            return &self.available_maps[self.selected_index]
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// Chat System
+// ============================================================================
+
+struct LobbyChatMessage {
+    sender_id: u64,
+    sender_name: string,
+    message: string,
+    timestamp: u64,
+    is_system: bool,
+    is_team_only: bool
+}
+
+struct LobbyChat {
+    messages: [LobbyChatMessage; MAX_CHAT_MESSAGES],
+    message_count: u32,
+    unread_count: u32
+}
+
+impl LobbyChat {
+    fn new() -> LobbyChat {
+        LobbyChat {
+            messages: undefined,
+            message_count: 0,
+            unread_count: 0
+        }
+    }
+
+    fn add_message(&mut self, sender_id: u64, sender_name: string, message: string, is_team: bool) {
+        let idx = self.message_count % MAX_CHAT_MESSAGES
+
+        self.messages[idx] = LobbyChatMessage {
+            sender_id: sender_id,
+            sender_name: sender_name,
+            message: message,
+            timestamp: get_current_time_ms(),
+            is_system: false,
+            is_team_only: is_team
+        }
+
+        self.message_count += 1
+        self.unread_count += 1
+    }
+
+    fn add_system_message(&mut self, message: string) {
+        let idx = self.message_count % MAX_CHAT_MESSAGES
+
+        self.messages[idx] = LobbyChatMessage {
+            sender_id: 0,
+            sender_name: "System",
+            message: message,
+            timestamp: get_current_time_ms(),
+            is_system: true,
+            is_team_only: false
+        }
+
+        self.message_count += 1
+        self.unread_count += 1
+    }
+
+    fn mark_read(&mut self) {
+        self.unread_count = 0
+    }
+}
+
+// ============================================================================
+// Staging Room State
+// ============================================================================
+
+enum StagingRoomState {
+    Initializing,
+    WaitingForPlayers,
+    CountingDown,
+    Loading,
+    Launching,
+    Cancelled,
+    Error
+}
+
+enum ReadyCheckResult {
+    AllReady,
+    NotAllReady,
+    MissingPlayers,
+    InvalidSettings,
+    MapMismatch
+}
+
+struct StagingRoomConfig {
+    max_players: u32,
+    max_observers: u32,
+    countdown_time_ms: u32,
+    auto_start: bool,
+    allow_late_join: bool,
+    min_players: u32,
+    host_only_settings: bool
+}
+
+fn default_staging_config() -> StagingRoomConfig {
+    StagingRoomConfig {
+        max_players: 8,
+        max_observers: 4,
+        countdown_time_ms: 5000,
+        auto_start: false,
+        allow_late_join: false,
+        min_players: 2,
+        host_only_settings: true
+    }
+}
+
+// ============================================================================
+// Staging Room Manager
+// ============================================================================
+
+struct StagingRoom {
+    config: StagingRoomConfig,
+    state: StagingRoomState,
+    room_id: u64,
+    room_name: string,
+    room_password: string,
+    is_private: bool,
+    host_id: u64,
+
+    // Slots
+    slots: [PlayerSlot; MAX_SLOTS],
+    observer_slots: [PlayerSlot; MAX_OBSERVERS],
+
+    // Settings
+    game_settings: GameSettings,
+    map_browser: MapBrowser,
+
+    // Chat
+    chat: LobbyChat,
+
+    // Countdown
+    countdown_start_time: u64,
+    countdown_remaining_ms: u32,
+
+    // Callbacks
+    on_player_joined: fn(u64, string),
+    on_player_left: fn(u64, string),
+    on_settings_changed: fn(&GameSettings),
+    on_slot_changed: fn(u32, &PlayerSlot),
+    on_countdown_tick: fn(u32),
+    on_game_starting: fn(),
+    on_chat_message: fn(&LobbyChatMessage),
+
+    // Network sync
+    last_sync_frame: u32,
+    pending_changes: bool
+}
+
+impl StagingRoom {
+    fn new(config: StagingRoomConfig) -> StagingRoom {
+        var room = StagingRoom {
+            config: config,
+            state: StagingRoomState::Initializing,
+            room_id: 0,
+            room_name: "New Game",
+            room_password: "",
+            is_private: false,
+            host_id: 0,
+            slots: undefined,
+            observer_slots: undefined,
+            game_settings: default_game_settings(),
+            map_browser: MapBrowser::new(),
+            chat: LobbyChat::new(),
+            countdown_start_time: 0,
+            countdown_remaining_ms: 0,
+            on_player_joined: null,
+            on_player_left: null,
+            on_settings_changed: null,
+            on_slot_changed: null,
+            on_countdown_tick: null,
+            on_game_starting: null,
+            on_chat_message: null,
+            last_sync_frame: 0,
+            pending_changes: false
+        }
+
+        // Initialize all slots
+        for i in 0..MAX_SLOTS {
+            room.slots[i] = PlayerSlot {
+                slot_id: i,
+                settings: SlotSettings {
+                    state: if i < 2 { SlotState::Open } else { SlotState::Closed },
+                    color: SlotColor::Random,
+                    team: TeamId::NoTeam,
+                    faction: Faction::Random,
+                    handicap: 100,
+                    start_position: -1,
+                    ai_personality: AIPersonality::Medium,
+                    ai_difficulty_override: 0.5
+                },
+                player_id: 0,
+                player_name: "",
+                ping_ms: 0,
+                is_ready: false,
+                is_host: false,
+                is_loading: false,
+                load_progress: 0.0
+            }
+        }
+
+        for i in 0..MAX_OBSERVERS {
+            room.observer_slots[i] = PlayerSlot {
+                slot_id: i + MAX_SLOTS,
+                settings: SlotSettings {
+                    state: SlotState::Empty,
+                    color: SlotColor::Random,
+                    team: TeamId::NoTeam,
+                    faction: Faction::Random,
+                    handicap: 100,
+                    start_position: -1,
+                    ai_personality: AIPersonality::Medium,
+                    ai_difficulty_override: 0.5
+                },
+                player_id: 0,
+                player_name: "",
+                ping_ms: 0,
+                is_ready: false,
+                is_host: false,
+                is_loading: false,
+                load_progress: 0.0
+            }
+        }
+
+        return room
+    }
+
+    // ========================================================================
+    // Room Setup
+    // ========================================================================
+
+    fn create_room(&mut self, name: string, host_player_id: u64, host_name: string) {
+        self.room_id = generate_room_id()
+        self.room_name = name
+        self.host_id = host_player_id
+
+        // Add host to first slot
+        self.slots[0].settings.state = SlotState::Human
+        self.slots[0].player_id = host_player_id
+        self.slots[0].player_name = host_name
+        self.slots[0].is_host = true
+        self.slots[0].is_ready = true  // Host is always ready
+
+        self.state = StagingRoomState::WaitingForPlayers
+        self.chat.add_system_message("Game room created")
+    }
+
+    fn set_password(&mut self, password: string) {
+        self.room_password = password
+        self.is_private = password.len() > 0
+    }
+
+    // ========================================================================
+    // Player Management
+    // ========================================================================
+
+    fn find_open_slot(&self) -> ?u32 {
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Open {
+                return i
+            }
+        }
+        return null
+    }
+
+    fn find_observer_slot(&self) -> ?u32 {
+        if !self.game_settings.allow_observers {
+            return null
+        }
+
+        for i in 0..MAX_OBSERVERS {
+            if self.observer_slots[i].settings.state == SlotState::Empty {
+                return i
+            }
+        }
+        return null
+    }
+
+    fn add_player(&mut self, player_id: u64, player_name: string, as_observer: bool) -> bool {
+        if as_observer {
+            let slot_idx = self.find_observer_slot()
+            if slot_idx == null {
+                return false
+            }
+
+            let idx = slot_idx.unwrap()
+            self.observer_slots[idx].settings.state = SlotState::Observer
+            self.observer_slots[idx].player_id = player_id
+            self.observer_slots[idx].player_name = player_name
+            self.observer_slots[idx].is_ready = false
+
+            self.chat.add_system_message(player_name + " joined as observer")
+        } else {
+            let slot_idx = self.find_open_slot()
+            if slot_idx == null {
+                return false
+            }
+
+            let idx = slot_idx.unwrap()
+            self.slots[idx].settings.state = SlotState::Human
+            self.slots[idx].player_id = player_id
+            self.slots[idx].player_name = player_name
+            self.slots[idx].is_ready = false
+
+            self.chat.add_system_message(player_name + " joined the game")
+
+            if self.on_slot_changed != null {
+                self.on_slot_changed(idx, &self.slots[idx])
+            }
+        }
+
+        if self.on_player_joined != null {
+            self.on_player_joined(player_id, player_name)
+        }
+
+        // Cancel countdown if in progress
+        if self.state == StagingRoomState::CountingDown {
+            self.cancel_countdown()
+        }
+
+        self.pending_changes = true
+        return true
+    }
+
+    fn remove_player(&mut self, player_id: u64) {
+        var player_name = ""
+        var was_host = false
+
+        // Check player slots
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].player_id == player_id {
+                player_name = self.slots[i].player_name
+                was_host = self.slots[i].is_host
+
+                // Clear slot
+                self.slots[i].settings.state = SlotState::Open
+                self.slots[i].player_id = 0
+                self.slots[i].player_name = ""
+                self.slots[i].is_ready = false
+                self.slots[i].is_host = false
+
+                if self.on_slot_changed != null {
+                    self.on_slot_changed(i, &self.slots[i])
+                }
+                break
+            }
+        }
+
+        // Check observer slots
+        for i in 0..MAX_OBSERVERS {
+            if self.observer_slots[i].player_id == player_id {
+                player_name = self.observer_slots[i].player_name
+
+                self.observer_slots[i].settings.state = SlotState::Empty
+                self.observer_slots[i].player_id = 0
+                self.observer_slots[i].player_name = ""
+                self.observer_slots[i].is_ready = false
+                break
+            }
+        }
+
+        if player_name.len() > 0 {
+            self.chat.add_system_message(player_name + " left the game")
+
+            if self.on_player_left != null {
+                self.on_player_left(player_id, player_name)
+            }
+        }
+
+        // Handle host migration
+        if was_host {
+            self.migrate_host()
+        }
+
+        // Cancel countdown if in progress
+        if self.state == StagingRoomState::CountingDown {
+            self.cancel_countdown()
+        }
+
+        self.pending_changes = true
+    }
+
+    fn kick_player(&mut self, player_id: u64, reason: string) {
+        // Only host can kick
+        self.chat.add_system_message("Player kicked: " + reason)
+        self.remove_player(player_id)
+    }
+
+    fn migrate_host(&mut self) {
+        // Find first human player to become new host
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human and self.slots[i].player_id != 0 {
+                self.slots[i].is_host = true
+                self.host_id = self.slots[i].player_id
+                self.chat.add_system_message(self.slots[i].player_name + " is now the host")
+                return
+            }
+        }
+
+        // No players left, room is empty
+        self.state = StagingRoomState::Cancelled
+    }
+
+    // ========================================================================
+    // Slot Management
+    // ========================================================================
+
+    fn set_slot_state(&mut self, slot_id: u32, state: SlotState) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        // Can't change occupied human slots
+        if self.slots[slot_id].settings.state == SlotState::Human and
+           self.slots[slot_id].player_id != 0 {
+            return
+        }
+
+        self.slots[slot_id].settings.state = state
+
+        // If adding AI, set default name
+        if state == SlotState::AI {
+            self.slots[slot_id].player_name = "AI " + (slot_id + 1).to_string()
+            self.slots[slot_id].is_ready = true  // AI is always ready
+        }
+
+        if self.on_slot_changed != null {
+            self.on_slot_changed(slot_id, &self.slots[slot_id])
+        }
+
+        self.pending_changes = true
+    }
+
+    fn set_slot_color(&mut self, slot_id: u32, color: SlotColor) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        if self.game_settings.lock_colors and !self.is_host_slot(slot_id) {
+            return
+        }
+
+        // Check if color is taken
+        if color != SlotColor::Random {
+            for i in 0..MAX_SLOTS {
+                if i != slot_id and self.slots[i].settings.color == color {
+                    return  // Color already taken
+                }
+            }
+        }
+
+        self.slots[slot_id].settings.color = color
+        self.pending_changes = true
+    }
+
+    fn set_slot_team(&mut self, slot_id: u32, team: TeamId) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        if self.game_settings.lock_teams and !self.is_host_slot(slot_id) {
+            return
+        }
+
+        self.slots[slot_id].settings.team = team
+        self.pending_changes = true
+    }
+
+    fn set_slot_faction(&mut self, slot_id: u32, faction: Faction) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        if self.game_settings.lock_factions and !self.is_host_slot(slot_id) {
+            return
+        }
+
+        self.slots[slot_id].settings.faction = faction
+        self.pending_changes = true
+    }
+
+    fn set_slot_handicap(&mut self, slot_id: u32, handicap: u32) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        self.slots[slot_id].settings.handicap = clamp(handicap, 50, 100)
+        self.pending_changes = true
+    }
+
+    fn set_slot_start_position(&mut self, slot_id: u32, position: i32) {
+        if slot_id >= MAX_SLOTS {
+            return
+        }
+
+        // Check if position is taken
+        if position >= 0 {
+            for i in 0..MAX_SLOTS {
+                if i != slot_id and self.slots[i].settings.start_position == position {
+                    return  // Position already taken
+                }
+            }
+        }
+
+        self.slots[slot_id].settings.start_position = position
+        self.pending_changes = true
+    }
+
+    fn swap_slots(&mut self, slot_a: u32, slot_b: u32) {
+        if slot_a >= MAX_SLOTS or slot_b >= MAX_SLOTS {
+            return
+        }
+
+        // Swap all slot data
+        let temp = self.slots[slot_a]
+        self.slots[slot_a] = self.slots[slot_b]
+        self.slots[slot_b] = temp
+
+        // Update slot IDs
+        self.slots[slot_a].slot_id = slot_a
+        self.slots[slot_b].slot_id = slot_b
+
+        self.pending_changes = true
+    }
+
+    fn move_to_observer(&mut self, player_id: u64) -> bool {
+        let obs_slot = self.find_observer_slot()
+        if obs_slot == null {
+            return false
+        }
+
+        // Find player's current slot
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].player_id == player_id {
+                let obs_idx = obs_slot.unwrap()
+
+                // Copy to observer
+                self.observer_slots[obs_idx].settings.state = SlotState::Observer
+                self.observer_slots[obs_idx].player_id = player_id
+                self.observer_slots[obs_idx].player_name = self.slots[i].player_name
+                self.observer_slots[obs_idx].is_ready = false
+
+                // Clear player slot
+                self.slots[i].settings.state = SlotState::Open
+                self.slots[i].player_id = 0
+                self.slots[i].player_name = ""
+                self.slots[i].is_ready = false
+
+                self.pending_changes = true
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn is_host_slot(&self, slot_id: u32) -> bool {
+        if slot_id >= MAX_SLOTS {
+            return false
+        }
+        return self.slots[slot_id].is_host
+    }
+
+    // ========================================================================
+    // Game Settings
+    // ========================================================================
+
+    fn set_map(&mut self, map_info: &MapInfo) {
+        self.game_settings.map_name = map_info.name
+        self.game_settings.map_path = map_info.path
+        self.game_settings.map_crc = map_info.crc
+        self.game_settings.map_size = map_info.num_players
+
+        // Adjust open slots based on map size
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Open or
+               self.slots[i].settings.state == SlotState::Closed {
+                if i < map_info.num_players {
+                    self.slots[i].settings.state = SlotState::Open
+                } else {
+                    self.slots[i].settings.state = SlotState::Closed
+                }
+            }
+        }
+
+        // Reset start positions
+        for i in 0..MAX_SLOTS {
+            self.slots[i].settings.start_position = -1
+        }
+
+        self.chat.add_system_message("Map changed to: " + map_info.name)
+
+        if self.on_settings_changed != null {
+            self.on_settings_changed(&self.game_settings)
+        }
+
+        self.pending_changes = true
+    }
+
+    fn set_game_speed(&mut self, speed: GameSpeed) {
+        self.game_settings.game_speed = speed
+        self.pending_changes = true
+    }
+
+    fn set_starting_cash(&mut self, cash: StartingCash) {
+        self.game_settings.starting_cash = cash
+        self.pending_changes = true
+    }
+
+    fn set_superweapons(&mut self, enabled: bool, limit: bool) {
+        self.game_settings.superweapons = if enabled {
+            SuperweaponSetting::Enabled
+        } else {
+            SuperweaponSetting::Disabled
+        }
+        self.game_settings.limit_superweapons = limit
+        self.pending_changes = true
+    }
+
+    fn update_settings(&mut self, settings: GameSettings) {
+        self.game_settings = settings
+
+        if self.on_settings_changed != null {
+            self.on_settings_changed(&self.game_settings)
+        }
+
+        self.pending_changes = true
+    }
+
+    // ========================================================================
+    // Ready System
+    // ========================================================================
+
+    fn set_ready(&mut self, player_id: u64, ready: bool) {
+        // Find player's slot
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].player_id == player_id {
+                self.slots[i].is_ready = ready
+
+                let status = if ready { "ready" } else { "not ready" }
+                self.chat.add_system_message(self.slots[i].player_name + " is " + status)
+
+                if self.on_slot_changed != null {
+                    self.on_slot_changed(i, &self.slots[i])
+                }
+                break
+            }
+        }
+
+        // Check for observers
+        for i in 0..MAX_OBSERVERS {
+            if self.observer_slots[i].player_id == player_id {
+                self.observer_slots[i].is_ready = ready
+                break
+            }
+        }
+
+        // Auto-start countdown if all ready
+        if self.config.auto_start and self.check_all_ready() == ReadyCheckResult::AllReady {
+            self.start_countdown()
+        }
+
+        self.pending_changes = true
+    }
+
+    fn check_all_ready(&self) -> ReadyCheckResult {
+        var human_count: u32 = 0
+        var ready_count: u32 = 0
+
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human {
+                human_count += 1
+                if self.slots[i].is_ready {
+                    ready_count += 1
+                }
+            }
+        }
+
+        // Check observers
+        for i in 0..MAX_OBSERVERS {
+            if self.observer_slots[i].settings.state == SlotState::Observer {
+                if !self.observer_slots[i].is_ready {
+                    return ReadyCheckResult::NotAllReady
+                }
+            }
+        }
+
+        if human_count < self.config.min_players {
+            return ReadyCheckResult::MissingPlayers
+        }
+
+        if ready_count != human_count {
+            return ReadyCheckResult::NotAllReady
+        }
+
+        return ReadyCheckResult::AllReady
+    }
+
+    fn get_player_count(&self) -> u32 {
+        var count: u32 = 0
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human or
+               self.slots[i].settings.state == SlotState::AI {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn get_human_count(&self) -> u32 {
+        var count: u32 = 0
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    // ========================================================================
+    // Countdown & Launch
+    // ========================================================================
+
+    fn start_countdown(&mut self) {
+        let ready_check = self.check_all_ready()
+
+        if ready_check != ReadyCheckResult::AllReady {
+            return
+        }
+
+        self.state = StagingRoomState::CountingDown
+        self.countdown_start_time = get_current_time_ms()
+        self.countdown_remaining_ms = self.config.countdown_time_ms
+
+        self.chat.add_system_message("Game starting in " + (self.config.countdown_time_ms / 1000).to_string() + " seconds...")
+    }
+
+    fn cancel_countdown(&mut self) {
+        if self.state == StagingRoomState::CountingDown {
+            self.state = StagingRoomState::WaitingForPlayers
+            self.countdown_remaining_ms = 0
+            self.chat.add_system_message("Countdown cancelled")
+        }
+    }
+
+    fn update_countdown(&mut self, delta_ms: u32) {
+        if self.state != StagingRoomState::CountingDown {
+            return
+        }
+
+        let elapsed = get_current_time_ms() - self.countdown_start_time
+
+        if elapsed >= self.config.countdown_time_ms as u64 {
+            self.countdown_remaining_ms = 0
+            self.launch_game()
+        } else {
+            let remaining = self.config.countdown_time_ms - elapsed as u32
+
+            // Notify on second changes
+            if remaining / 1000 != self.countdown_remaining_ms / 1000 {
+                if self.on_countdown_tick != null {
+                    self.on_countdown_tick(remaining / 1000)
+                }
+            }
+
+            self.countdown_remaining_ms = remaining
+        }
+    }
+
+    fn launch_game(&mut self) {
+        // Final ready check
+        let ready_check = self.check_all_ready()
+        if ready_check != ReadyCheckResult::AllReady {
+            self.cancel_countdown()
+            return
+        }
+
+        self.state = StagingRoomState::Loading
+        self.chat.add_system_message("Loading game...")
+
+        // Set all players to loading state
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human {
+                self.slots[i].is_loading = true
+                self.slots[i].load_progress = 0.0
+            }
+        }
+
+        if self.on_game_starting != null {
+            self.on_game_starting()
+        }
+    }
+
+    fn update_load_progress(&mut self, player_id: u64, progress: f32) {
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].player_id == player_id {
+                self.slots[i].load_progress = progress
+                break
+            }
+        }
+
+        // Check if all loaded
+        if self.is_all_loaded() {
+            self.finalize_launch()
+        }
+    }
+
+    fn is_all_loaded(&self) -> bool {
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].settings.state == SlotState::Human {
+                if self.slots[i].load_progress < 1.0 {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    fn finalize_launch(&mut self) {
+        self.state = StagingRoomState::Launching
+        // Transition to game state happens externally
+    }
+
+    // ========================================================================
+    // Chat
+    // ========================================================================
+
+    fn send_chat(&mut self, player_id: u64, message: string, team_only: bool) {
+        var sender_name = ""
+
+        // Find sender name
+        for i in 0..MAX_SLOTS {
+            if self.slots[i].player_id == player_id {
+                sender_name = self.slots[i].player_name
+                break
+            }
+        }
+
+        for i in 0..MAX_OBSERVERS {
+            if self.observer_slots[i].player_id == player_id {
+                sender_name = self.observer_slots[i].player_name
+                break
+            }
+        }
+
+        if sender_name.len() == 0 {
+            return
+        }
+
+        self.chat.add_message(player_id, sender_name, message, team_only)
+
+        if self.on_chat_message != null {
+            let idx = (self.chat.message_count - 1) % MAX_CHAT_MESSAGES
+            self.on_chat_message(&self.chat.messages[idx])
+        }
+    }
+
+    // ========================================================================
+    // Network Sync
+    // ========================================================================
+
+    fn serialize(&self, buffer: &mut [u8]) -> u32 {
+        var offset: u32 = 0
+
+        // Room info
+        write_u64(buffer, offset, self.room_id)
+        offset += 8
+        write_string(buffer, offset, self.room_name)
+        offset += 64
+        write_u8(buffer, offset, self.state as u8)
+        offset += 1
+
+        // Game settings
+        write_string(buffer, offset, self.game_settings.map_name)
+        offset += 64
+        write_u32(buffer, offset, self.game_settings.map_crc)
+        offset += 4
+        write_u8(buffer, offset, self.game_settings.game_speed as u8)
+        offset += 1
+        write_u8(buffer, offset, self.game_settings.starting_cash as u8)
+        offset += 1
+        write_u8(buffer, offset, self.game_settings.superweapons as u8)
+        offset += 1
+
+        // Slots
+        for i in 0..MAX_SLOTS {
+            write_u8(buffer, offset, self.slots[i].settings.state as u8)
+            offset += 1
+            write_u64(buffer, offset, self.slots[i].player_id)
+            offset += 8
+            write_string(buffer, offset, self.slots[i].player_name)
+            offset += 32
+            write_u8(buffer, offset, self.slots[i].settings.color as u8)
+            offset += 1
+            write_u8(buffer, offset, self.slots[i].settings.team as u8)
+            offset += 1
+            write_u8(buffer, offset, self.slots[i].settings.faction as u8)
+            offset += 1
+            write_u8(buffer, offset, if self.slots[i].is_ready { 1 } else { 0 })
+            offset += 1
+        }
+
+        return offset
+    }
+
+    fn deserialize(&mut self, buffer: &[u8]) {
+        var offset: u32 = 0
+
+        // Room info
+        self.room_id = read_u64(buffer, offset)
+        offset += 8
+        self.room_name = read_string(buffer, offset, 64)
+        offset += 64
+        self.state = unsafe { transmute::<u8, StagingRoomState>(read_u8(buffer, offset)) }
+        offset += 1
+
+        // Game settings
+        self.game_settings.map_name = read_string(buffer, offset, 64)
+        offset += 64
+        self.game_settings.map_crc = read_u32(buffer, offset)
+        offset += 4
+        self.game_settings.game_speed = unsafe { transmute::<u8, GameSpeed>(read_u8(buffer, offset)) }
+        offset += 1
+        self.game_settings.starting_cash = unsafe { transmute::<u8, StartingCash>(read_u8(buffer, offset)) }
+        offset += 1
+        self.game_settings.superweapons = unsafe { transmute::<u8, SuperweaponSetting>(read_u8(buffer, offset)) }
+        offset += 1
+
+        // Slots
+        for i in 0..MAX_SLOTS {
+            self.slots[i].settings.state = unsafe { transmute::<u8, SlotState>(read_u8(buffer, offset)) }
+            offset += 1
+            self.slots[i].player_id = read_u64(buffer, offset)
+            offset += 8
+            self.slots[i].player_name = read_string(buffer, offset, 32)
+            offset += 32
+            self.slots[i].settings.color = unsafe { transmute::<u8, SlotColor>(read_u8(buffer, offset)) }
+            offset += 1
+            self.slots[i].settings.team = unsafe { transmute::<u8, TeamId>(read_u8(buffer, offset)) }
+            offset += 1
+            self.slots[i].settings.faction = unsafe { transmute::<u8, Faction>(read_u8(buffer, offset)) }
+            offset += 1
+            self.slots[i].is_ready = read_u8(buffer, offset) != 0
+            offset += 1
+        }
+    }
+
+    // ========================================================================
+    // Validation
+    // ========================================================================
+
+    fn validate_settings(&self) -> bool {
+        // Check map is valid
+        if self.game_settings.map_path.len() == 0 {
+            return false
+        }
+
+        // Check we have enough players
+        if self.get_player_count() < self.config.min_players {
+            return false
+        }
+
+        // Check for duplicate colors (excluding Random)
+        var used_colors: [bool; 9] = [false; 9]
+        for i in 0..MAX_SLOTS {
+            let color = self.slots[i].settings.color
+            if color != SlotColor::Random {
+                let idx = color as u32
+                if used_colors[idx] {
+                    return false
+                }
+                used_colors[idx] = true
+            }
+        }
+
+        // Check for duplicate start positions (excluding Random)
+        var used_positions: [bool; 8] = [false; 8]
+        for i in 0..MAX_SLOTS {
+            let pos = self.slots[i].settings.start_position
+            if pos >= 0 and pos < 8 {
+                if used_positions[pos as u32] {
+                    return false
+                }
+                used_positions[pos as u32] = true
+            }
+        }
+
+        return true
+    }
+
+    // ========================================================================
+    // Update Loop
+    // ========================================================================
+
+    fn update(&mut self, delta_ms: u32) {
+        match self.state {
+            StagingRoomState::CountingDown => {
+                self.update_countdown(delta_ms)
+            },
+            StagingRoomState::Loading => {
+                // Check for timeout
+            },
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
+// Game Launch Info
+// ============================================================================
+
+struct GameLaunchInfo {
+    map_path: string,
+    map_crc: u32,
+    random_seed: u32,
+
+    players: [GameLaunchPlayer; 8],
+    player_count: u32,
+
+    settings: GameSettings,
+
+    is_multiplayer: bool,
+    is_replay: bool,
+    replay_path: string
+}
+
+struct GameLaunchPlayer {
+    slot_id: u32,
+    player_id: u64,
+    player_name: string,
+    color: SlotColor,
+    team: TeamId,
+    faction: Faction,
+    start_position: u32,
+    handicap: u32,
+    is_human: bool,
+    is_local: bool,
+    ai_personality: AIPersonality
+}
+
+fn create_launch_info(room: &StagingRoom, local_player_id: u64) -> GameLaunchInfo {
+    var info = GameLaunchInfo {
+        map_path: room.game_settings.map_path,
+        map_crc: room.game_settings.map_crc,
+        random_seed: generate_random_seed(),
+        players: undefined,
+        player_count: 0,
+        settings: room.game_settings,
+        is_multiplayer: true,
+        is_replay: false,
+        replay_path: ""
+    }
+
+    // Assign random colors/positions if needed
+    var available_colors: [SlotColor; 8] = [
+        SlotColor::Gold, SlotColor::Red, SlotColor::Blue, SlotColor::Green,
+        SlotColor::Orange, SlotColor::Cyan, SlotColor::Purple, SlotColor::Pink
+    ]
+    var available_positions: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    shuffle_array(&mut available_colors)
+    shuffle_array(&mut available_positions)
+
+    var color_idx: u32 = 0
+    var pos_idx: u32 = 0
+
+    for i in 0..MAX_SLOTS {
+        let slot = &room.slots[i]
+
+        if slot.settings.state != SlotState::Human and slot.settings.state != SlotState::AI {
+            continue
+        }
+
+        var player = GameLaunchPlayer {
+            slot_id: i,
+            player_id: slot.player_id,
+            player_name: slot.player_name,
+            color: slot.settings.color,
+            team: slot.settings.team,
+            faction: slot.settings.faction,
+            start_position: 0,
+            handicap: slot.settings.handicap,
+            is_human: slot.settings.state == SlotState::Human,
+            is_local: slot.player_id == local_player_id,
+            ai_personality: slot.settings.ai_personality
+        }
+
+        // Assign random color if needed
+        if player.color == SlotColor::Random {
+            player.color = available_colors[color_idx]
+            color_idx += 1
+        }
+
+        // Assign random position if needed
+        if slot.settings.start_position < 0 {
+            player.start_position = available_positions[pos_idx]
+            pos_idx += 1
+        } else {
+            player.start_position = slot.settings.start_position as u32
+        }
+
+        // Assign random faction if needed
+        if player.faction == Faction::Random {
+            player.faction = get_random_faction()
+        }
+
+        info.players[info.player_count] = player
+        info.player_count += 1
+    }
+
+    return info
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn generate_room_id() -> u64 {
+    return get_current_time_ms() ^ (get_random_u32() as u64 << 32)
+}
+
+fn generate_random_seed() -> u32 {
+    return get_random_u32()
+}
+
+fn get_random_faction() -> Faction {
+    let factions = [
+        Faction::USA, Faction::USAAirForce, Faction::USALaser, Faction::USASuperWeapon,
+        Faction::China, Faction::ChinaTank, Faction::ChinaInfantry, Faction::ChinaNuke,
+        Faction::GLA, Faction::GLAToxin, Faction::GLAStealth, Faction::GLADemo
+    ]
+
+    return factions[get_random_u32() % 12]
+}
+
+fn shuffle_array<T>(arr: &mut [T; 8]) {
+    for i in 0..8 {
+        let j = get_random_u32() % 8
+        let temp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = temp
+    }
+}
+
+fn clamp(value: u32, min: u32, max: u32) -> u32 {
+    if value < min { return min }
+    if value > max { return max }
+    return value
+}
+
+// External time function
+extern fn get_current_time_ms() -> u64
+extern fn get_random_u32() -> u32
+
+// Serialization helpers
+fn write_u8(buffer: &mut [u8], offset: u32, value: u8) {
+    buffer[offset] = value
+}
+
+fn write_u32(buffer: &mut [u8], offset: u32, value: u32) {
+    buffer[offset] = (value & 0xFF) as u8
+    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8
+    buffer[offset + 2] = ((value >> 16) & 0xFF) as u8
+    buffer[offset + 3] = ((value >> 24) & 0xFF) as u8
+}
+
+fn write_u64(buffer: &mut [u8], offset: u32, value: u64) {
+    write_u32(buffer, offset, (value & 0xFFFFFFFF) as u32)
+    write_u32(buffer, offset + 4, ((value >> 32) & 0xFFFFFFFF) as u32)
+}
+
+fn write_string(buffer: &mut [u8], offset: u32, value: string) {
+    let len = min(value.len(), 63)
+    buffer[offset] = len as u8
+    for i in 0..len {
+        buffer[offset + 1 + i] = value[i]
+    }
+}
+
+fn read_u8(buffer: &[u8], offset: u32) -> u8 {
+    return buffer[offset]
+}
+
+fn read_u32(buffer: &[u8], offset: u32) -> u32 {
+    return buffer[offset] as u32 |
+           (buffer[offset + 1] as u32 << 8) |
+           (buffer[offset + 2] as u32 << 16) |
+           (buffer[offset + 3] as u32 << 24)
+}
+
+fn read_u64(buffer: &[u8], offset: u32) -> u64 {
+    return read_u32(buffer, offset) as u64 |
+           (read_u32(buffer, offset + 4) as u64 << 32)
+}
+
+fn read_string(buffer: &[u8], offset: u32, max_len: u32) -> string {
+    let len = buffer[offset] as u32
+    let actual_len = min(len, max_len - 1)
+    var result: string = ""
+    for i in 0..actual_len {
+        result = result + (buffer[offset + 1 + i] as char)
+    }
+    return result
+}
+
+fn min(a: u32, b: u32) -> u32 {
+    if a < b { return a }
+    return b
+}

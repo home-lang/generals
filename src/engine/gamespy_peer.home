@@ -1,0 +1,1130 @@
+// GameSpy Peer - Peer-to-peer connections for multiplayer
+// Handles NAT traversal, peer state, and direct connections
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct GameSpyPeerConfig {
+    stun_server: string = "stun.gamespy.com",
+    stun_port: u16 = 3478,
+    relay_server: string = "relay.gamespy.com",
+    relay_port: u16 = 6500,
+    connection_timeout: f32 = 30.0,
+    keepalive_interval: f32 = 10.0,
+    nat_punch_attempts: i32 = 10,
+    nat_punch_interval: f32 = 0.5,
+    max_peers: i32 = 8,
+    enable_upnp: bool = true,
+    enable_nat_pmp: bool = true,
+    enable_relay_fallback: bool = true,
+    direct_connect_timeout: f32 = 5.0,
+}
+
+// ============================================================================
+// NAT Types
+// ============================================================================
+
+enum NATType {
+    Unknown,
+    Open,                                     // No NAT
+    FullCone,                                 // Easy to traverse
+    RestrictedCone,                           // Moderate difficulty
+    PortRestrictedCone,                       // Harder
+    Symmetric,                                // Hardest, may need relay
+}
+
+enum ConnectionMethod {
+    Direct,                                   // Direct P2P connection
+    NATPunch,                                 // NAT hole punching
+    UPnP,                                     // UPnP port mapping
+    NATPMP,                                   // NAT-PMP port mapping
+    Relay,                                    // Relay server fallback
+}
+
+// ============================================================================
+// Peer State
+// ============================================================================
+
+enum PeerState {
+    Disconnected,
+    Discovering,                              // Discovering NAT type
+    Connecting,                               // Attempting connection
+    NATTraversal,                             // NAT punch in progress
+    Connected,
+    Relayed,                                  // Connected via relay
+    Failed,
+}
+
+struct PeerEndpoint {
+    public_ip: string,
+    public_port: u16,
+    private_ip: string,
+    private_port: u16,
+    is_valid: bool,
+}
+
+fn create_peer_endpoint() -> PeerEndpoint {
+    return PeerEndpoint {
+        public_ip: "",
+        public_port: 0,
+        private_ip: "",
+        private_port: 0,
+        is_valid: false,
+    };
+}
+
+struct Peer {
+    peer_id: u64,
+    profile_id: u64,
+    nickname: string,
+    state: PeerState,
+    nat_type: NATType,
+    endpoint: PeerEndpoint,
+    connection_method: ConnectionMethod,
+
+    // Connection timing
+    connect_start_time: f32,
+    last_activity_time: f32,
+    round_trip_time: f32,
+    rtt_samples: [f32; 10],
+    rtt_sample_count: i32,
+
+    // NAT traversal
+    punch_attempts: i32,
+    punch_timer: f32,
+
+    // Relay
+    relay_session_id: u64,
+    is_relay_host: bool,
+
+    // Statistics
+    packets_sent: u64,
+    packets_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    packet_loss: f32,
+}
+
+fn create_peer(peer_id: u64, profile_id: u64, nickname: string) -> Peer {
+    return Peer {
+        peer_id: peer_id,
+        profile_id: profile_id,
+        nickname: nickname,
+        state: PeerState.Disconnected,
+        nat_type: NATType.Unknown,
+        endpoint: create_peer_endpoint(),
+        connection_method: ConnectionMethod.Direct,
+        connect_start_time: 0.0,
+        last_activity_time: 0.0,
+        round_trip_time: 0.0,
+        rtt_samples: [0.0; 10],
+        rtt_sample_count: 0,
+        punch_attempts: 0,
+        punch_timer: 0.0,
+        relay_session_id: 0,
+        is_relay_host: false,
+        packets_sent: 0,
+        packets_received: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        packet_loss: 0.0,
+    };
+}
+
+// ============================================================================
+// STUN Protocol
+// ============================================================================
+
+struct STUNRequest {
+    request_id: u64,
+    transaction_id: [u8; 12],
+    request_type: STUNRequestType,
+    send_time: f32,
+    response_received: bool,
+}
+
+enum STUNRequestType {
+    BindingRequest,
+    BindingResponse,
+    BindingError,
+}
+
+struct STUNResponse {
+    transaction_id: [u8; 12],
+    mapped_address: PeerEndpoint,
+    changed_address: PeerEndpoint,
+    source_address: PeerEndpoint,
+    is_valid: bool,
+}
+
+fn create_stun_request(request_id: u64) -> STUNRequest {
+    let mut request = STUNRequest {
+        request_id: request_id,
+        transaction_id: [0; 12],
+        request_type: STUNRequestType.BindingRequest,
+        send_time: 0.0,
+        response_received: false,
+    };
+
+    // Generate random transaction ID
+    for i in 0..12 {
+        request.transaction_id[i] = ((request_id * 1103515245 + i as u64 * 12345) & 0xFF) as u8;
+    }
+
+    return request;
+}
+
+fn serialize_stun_request(request: &STUNRequest) -> [u8; 20] {
+    let mut buffer: [u8; 20] = [0; 20];
+
+    // STUN header
+    // Message type: Binding Request (0x0001)
+    buffer[0] = 0x00;
+    buffer[1] = 0x01;
+
+    // Message length: 0 (no attributes for basic request)
+    buffer[2] = 0x00;
+    buffer[3] = 0x00;
+
+    // Magic cookie: 0x2112A442
+    buffer[4] = 0x21;
+    buffer[5] = 0x12;
+    buffer[6] = 0xA4;
+    buffer[7] = 0x42;
+
+    // Transaction ID (12 bytes)
+    for i in 0..12 {
+        buffer[8 + i] = request.transaction_id[i];
+    }
+
+    return buffer;
+}
+
+fn parse_stun_response(data: &[u8], size: i32) -> STUNResponse {
+    let mut response = STUNResponse {
+        transaction_id: [0; 12],
+        mapped_address: create_peer_endpoint(),
+        changed_address: create_peer_endpoint(),
+        source_address: create_peer_endpoint(),
+        is_valid: false,
+    };
+
+    if size < 20 {
+        return response;
+    }
+
+    // Check message type (Binding Response: 0x0101)
+    if data[0] != 0x01 || data[1] != 0x01 {
+        return response;
+    }
+
+    // Check magic cookie
+    if data[4] != 0x21 || data[5] != 0x12 || data[6] != 0xA4 || data[7] != 0x42 {
+        return response;
+    }
+
+    // Copy transaction ID
+    for i in 0..12 {
+        response.transaction_id[i] = data[8 + i];
+    }
+
+    // Parse attributes
+    let mut offset: i32 = 20;
+    let msg_length = ((data[2] as i32) << 8) | (data[3] as i32);
+
+    while offset < 20 + msg_length && offset + 4 <= size {
+        let attr_type = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
+        let attr_length = ((data[offset + 2] as i32) << 8) | (data[offset + 3] as i32);
+        offset += 4;
+
+        if attr_type == 0x0001 || attr_type == 0x0020 {
+            // MAPPED-ADDRESS or XOR-MAPPED-ADDRESS
+            if attr_length >= 8 && offset + 8 <= size {
+                let family = data[offset + 1];
+                if family == 0x01 {  // IPv4
+                    let port = ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
+                    let ip_a = data[offset + 4];
+                    let ip_b = data[offset + 5];
+                    let ip_c = data[offset + 6];
+                    let ip_d = data[offset + 7];
+
+                    // XOR with magic cookie if XOR-MAPPED-ADDRESS
+                    let (final_port, final_ip) = if attr_type == 0x0020 {
+                        (port ^ 0x2112,
+                         (ip_a ^ 0x21, ip_b ^ 0x12, ip_c ^ 0xA4, ip_d ^ 0x42))
+                    } else {
+                        (port, (ip_a, ip_b, ip_c, ip_d))
+                    };
+
+                    response.mapped_address.public_ip = final_ip.0 as string + "." +
+                                                        final_ip.1 as string + "." +
+                                                        final_ip.2 as string + "." +
+                                                        final_ip.3 as string;
+                    response.mapped_address.public_port = final_port;
+                    response.mapped_address.is_valid = true;
+                }
+            }
+        }
+
+        // Move to next attribute (with padding)
+        offset += (attr_length + 3) & !3;
+    }
+
+    response.is_valid = response.mapped_address.is_valid;
+    return response;
+}
+
+// ============================================================================
+// NAT Detection
+// ============================================================================
+
+struct NATDetector {
+    state: NATDetectionState,
+    detected_type: NATType,
+    public_endpoint: PeerEndpoint,
+    local_endpoint: PeerEndpoint,
+
+    // STUN requests
+    pending_requests: [STUNRequest; 4],
+    pending_count: i32,
+    next_request_id: u64,
+
+    // Detection phases
+    phase: i32,
+    phase_timer: f32,
+    responses: [STUNResponse; 4],
+    response_count: i32,
+}
+
+enum NATDetectionState {
+    Idle,
+    Detecting,
+    Complete,
+    Failed,
+}
+
+fn create_nat_detector() -> NATDetector {
+    return NATDetector {
+        state: NATDetectionState.Idle,
+        detected_type: NATType.Unknown,
+        public_endpoint: create_peer_endpoint(),
+        local_endpoint: create_peer_endpoint(),
+        pending_requests: [create_stun_request(0); 4],
+        pending_count: 0,
+        next_request_id: 1,
+        phase: 0,
+        phase_timer: 0.0,
+        responses: [STUNResponse {
+            transaction_id: [0; 12],
+            mapped_address: create_peer_endpoint(),
+            changed_address: create_peer_endpoint(),
+            source_address: create_peer_endpoint(),
+            is_valid: false,
+        }; 4],
+        response_count: 0,
+    };
+}
+
+fn start_nat_detection(detector: &mut NATDetector) {
+    detector.state = NATDetectionState.Detecting;
+    detector.phase = 1;
+    detector.phase_timer = 0.0;
+    detector.response_count = 0;
+    detector.pending_count = 0;
+}
+
+fn update_nat_detection(detector: &mut NATDetector, delta_time: f32) {
+    if detector.state != NATDetectionState.Detecting {
+        return;
+    }
+
+    detector.phase_timer += delta_time;
+
+    // Phase timeout
+    if detector.phase_timer > 3.0 {
+        advance_nat_detection_phase(detector);
+    }
+}
+
+fn advance_nat_detection_phase(detector: &mut NATDetector) {
+    match detector.phase {
+        1 => {
+            // Phase 1: Basic STUN request
+            if detector.response_count >= 1 {
+                detector.public_endpoint = detector.responses[0].mapped_address;
+                detector.phase = 2;
+                detector.phase_timer = 0.0;
+            } else {
+                // No response - might be behind strict firewall
+                detector.detected_type = NATType.Symmetric;
+                detector.state = NATDetectionState.Complete;
+            }
+        },
+        2 => {
+            // Phase 2: Request from different server
+            if detector.response_count >= 2 {
+                // Compare mapped addresses
+                if detector.responses[0].mapped_address.public_port ==
+                   detector.responses[1].mapped_address.public_port {
+                    // Same external port - likely cone NAT
+                    detector.phase = 3;
+                    detector.phase_timer = 0.0;
+                } else {
+                    // Different ports - symmetric NAT
+                    detector.detected_type = NATType.Symmetric;
+                    detector.state = NATDetectionState.Complete;
+                }
+            } else {
+                detector.detected_type = NATType.PortRestrictedCone;
+                detector.state = NATDetectionState.Complete;
+            }
+        },
+        3 => {
+            // Phase 3: Determine cone type
+            if detector.response_count >= 3 {
+                detector.detected_type = NATType.FullCone;
+            } else {
+                detector.detected_type = NATType.RestrictedCone;
+            }
+            detector.state = NATDetectionState.Complete;
+        },
+        _ => {
+            detector.state = NATDetectionState.Complete;
+        },
+    }
+}
+
+fn process_stun_response(detector: &mut NATDetector, response: STUNResponse) {
+    if !response.is_valid || detector.response_count >= 4 {
+        return;
+    }
+
+    // Verify transaction ID matches a pending request
+    for i in 0..detector.pending_count {
+        let mut matches = true;
+        for j in 0..12 {
+            if detector.pending_requests[i].transaction_id[j] != response.transaction_id[j] {
+                matches = false;
+                break;
+            }
+        }
+
+        if matches {
+            detector.pending_requests[i].response_received = true;
+            detector.responses[detector.response_count] = response;
+            detector.response_count += 1;
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// NAT Punch
+// ============================================================================
+
+struct NATPunchSession {
+    session_id: u64,
+    local_peer_id: u64,
+    remote_peer_id: u64,
+    state: NATPunchState,
+
+    // Endpoints
+    local_endpoint: PeerEndpoint,
+    remote_endpoint: PeerEndpoint,
+
+    // Timing
+    start_time: f32,
+    last_punch_time: f32,
+    punch_count: i32,
+    max_punches: i32,
+    punch_interval: f32,
+
+    // Results
+    success: bool,
+    established_endpoint: PeerEndpoint,
+}
+
+enum NATPunchState {
+    Idle,
+    Exchanging,                               // Exchanging endpoints via server
+    Punching,                                 // Sending punch packets
+    Confirming,                               // Confirming connection
+    Success,
+    Failed,
+}
+
+fn create_nat_punch_session(session_id: u64, local_peer_id: u64, remote_peer_id: u64) -> NATPunchSession {
+    return NATPunchSession {
+        session_id: session_id,
+        local_peer_id: local_peer_id,
+        remote_peer_id: remote_peer_id,
+        state: NATPunchState.Idle,
+        local_endpoint: create_peer_endpoint(),
+        remote_endpoint: create_peer_endpoint(),
+        start_time: 0.0,
+        last_punch_time: 0.0,
+        punch_count: 0,
+        max_punches: 10,
+        punch_interval: 0.5,
+        success: false,
+        established_endpoint: create_peer_endpoint(),
+    };
+}
+
+fn start_nat_punch(session: &mut NATPunchSession, local_ep: PeerEndpoint, remote_ep: PeerEndpoint, current_time: f32) {
+    session.local_endpoint = local_ep;
+    session.remote_endpoint = remote_ep;
+    session.state = NATPunchState.Punching;
+    session.start_time = current_time;
+    session.punch_count = 0;
+}
+
+fn update_nat_punch(session: &mut NATPunchSession, current_time: f32) -> bool {
+    if session.state != NATPunchState.Punching {
+        return false;
+    }
+
+    let elapsed = current_time - session.last_punch_time;
+    if elapsed >= session.punch_interval {
+        session.last_punch_time = current_time;
+        session.punch_count += 1;
+
+        if session.punch_count >= session.max_punches {
+            session.state = NATPunchState.Failed;
+            return false;
+        }
+
+        // Would send punch packet here
+        return true;  // Send punch
+    }
+
+    return false;
+}
+
+fn receive_punch_response(session: &mut NATPunchSession) {
+    if session.state == NATPunchState.Punching {
+        session.state = NATPunchState.Confirming;
+    } else if session.state == NATPunchState.Confirming {
+        session.state = NATPunchState.Success;
+        session.success = true;
+        session.established_endpoint = session.remote_endpoint;
+    }
+}
+
+// ============================================================================
+// UPnP Port Mapping
+// ============================================================================
+
+struct UPnPMapping {
+    internal_port: u16,
+    external_port: u16,
+    protocol: string,
+    description: string,
+    lease_duration: i32,
+    is_active: bool,
+}
+
+struct UPnPManager {
+    gateway_ip: string,
+    control_url: string,
+    is_available: bool,
+    mappings: [UPnPMapping; 8],
+    mapping_count: i32,
+}
+
+fn create_upnp_manager() -> UPnPManager {
+    return UPnPManager {
+        gateway_ip: "",
+        control_url: "",
+        is_available: false,
+        mappings: [UPnPMapping {
+            internal_port: 0,
+            external_port: 0,
+            protocol: "",
+            description: "",
+            lease_duration: 0,
+            is_active: false,
+        }; 8],
+        mapping_count: 0,
+    };
+}
+
+fn discover_upnp_gateway(upnp: &mut UPnPManager) -> bool {
+    // Would send SSDP discovery here
+    // M-SEARCH * HTTP/1.1
+    // HOST: 239.255.255.250:1900
+    // MAN: "ssdp:discover"
+    // MX: 3
+    // ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+    // Simulate discovery
+    upnp.is_available = true;
+    upnp.gateway_ip = "192.168.1.1";
+    upnp.control_url = "/ctl/IPConn";
+
+    return upnp.is_available;
+}
+
+fn add_upnp_port_mapping(upnp: &mut UPnPManager, internal_port: u16, external_port: u16, protocol: string, description: string) -> bool {
+    if !upnp.is_available || upnp.mapping_count >= 8 {
+        return false;
+    }
+
+    // Would send AddPortMapping SOAP request here
+
+    upnp.mappings[upnp.mapping_count] = UPnPMapping {
+        internal_port: internal_port,
+        external_port: external_port,
+        protocol: protocol,
+        description: description,
+        lease_duration: 3600,
+        is_active: true,
+    };
+    upnp.mapping_count += 1;
+
+    return true;
+}
+
+fn remove_upnp_port_mapping(upnp: &mut UPnPManager, external_port: u16, protocol: string) -> bool {
+    for i in 0..upnp.mapping_count {
+        if upnp.mappings[i].external_port == external_port && upnp.mappings[i].protocol == protocol {
+            upnp.mappings[i].is_active = false;
+
+            // Would send DeletePortMapping SOAP request here
+
+            // Compact array
+            for j in i..(upnp.mapping_count - 1) {
+                upnp.mappings[j] = upnp.mappings[j + 1];
+            }
+            upnp.mapping_count -= 1;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Relay Connection
+// ============================================================================
+
+struct RelaySession {
+    session_id: u64,
+    relay_server: string,
+    relay_port: u16,
+    is_connected: bool,
+    is_host: bool,
+    client_ids: [u64; 8],
+    client_count: i32,
+    bandwidth_limit: u32,
+    bytes_relayed: u64,
+}
+
+fn create_relay_session(session_id: u64, server: string, port: u16) -> RelaySession {
+    return RelaySession {
+        session_id: session_id,
+        relay_server: server,
+        relay_port: port,
+        is_connected: false,
+        is_host: false,
+        client_ids: [0; 8],
+        client_count: 0,
+        bandwidth_limit: 65536,  // 64 KB/s default
+        bytes_relayed: 0,
+    };
+}
+
+// ============================================================================
+// GameSpy Peer Manager
+// ============================================================================
+
+struct GameSpyPeerManager {
+    config: GameSpyPeerConfig,
+    local_peer_id: u64,
+    local_profile_id: u64,
+
+    // NAT detection
+    nat_detector: NATDetector,
+    local_nat_type: NATType,
+    local_endpoint: PeerEndpoint,
+
+    // UPnP
+    upnp: UPnPManager,
+
+    // Peers
+    peers: Map<u64, Peer>,
+    peer_count: i32,
+
+    // NAT punch sessions
+    punch_sessions: [NATPunchSession; 16],
+    punch_session_count: i32,
+    next_punch_session_id: u64,
+
+    // Relay
+    relay_session: RelaySession,
+
+    // Timing
+    current_time: f32,
+    keepalive_timer: f32,
+
+    // Callbacks
+    on_peer_connected: fn(u64) = null,
+    on_peer_disconnected: fn(u64, string) = null,
+    on_nat_detected: fn(NATType) = null,
+    on_connection_failed: fn(u64, string) = null,
+}
+
+fn create_gamespy_peer_manager(config: GameSpyPeerConfig) -> GameSpyPeerManager {
+    return GameSpyPeerManager {
+        config: config,
+        local_peer_id: 0,
+        local_profile_id: 0,
+        nat_detector: create_nat_detector(),
+        local_nat_type: NATType.Unknown,
+        local_endpoint: create_peer_endpoint(),
+        upnp: create_upnp_manager(),
+        peers: Map<u64, Peer>.new(),
+        peer_count: 0,
+        punch_sessions: [create_nat_punch_session(0, 0, 0); 16],
+        punch_session_count: 0,
+        next_punch_session_id: 1,
+        relay_session: create_relay_session(0, "", 0),
+        current_time: 0.0,
+        keepalive_timer: 0.0,
+    };
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+fn initialize_peer_manager(manager: &mut GameSpyPeerManager, local_peer_id: u64, profile_id: u64) {
+    manager.local_peer_id = local_peer_id;
+    manager.local_profile_id = profile_id;
+
+    // Start NAT detection
+    start_nat_detection(&mut manager.nat_detector);
+
+    // Discover UPnP gateway
+    if manager.config.enable_upnp {
+        discover_upnp_gateway(&mut manager.upnp);
+    }
+}
+
+fn shutdown_peer_manager(manager: &mut GameSpyPeerManager) {
+    // Disconnect all peers
+    let mut peer_ids: [u64; 8] = [0; 8];
+    let mut count: i32 = 0;
+
+    for entry in manager.peers.iter() {
+        if count < 8 {
+            peer_ids[count] = entry.key;
+            count += 1;
+        }
+    }
+
+    for i in 0..count {
+        disconnect_peer(manager, peer_ids[i], "Shutdown");
+    }
+
+    // Remove UPnP mappings
+    while manager.upnp.mapping_count > 0 {
+        let mapping = &manager.upnp.mappings[0];
+        remove_upnp_port_mapping(&mut manager.upnp, mapping.external_port, mapping.protocol);
+    }
+}
+
+// ============================================================================
+// Peer Connection
+// ============================================================================
+
+fn connect_to_peer(manager: &mut GameSpyPeerManager, remote_peer_id: u64, remote_profile_id: u64, nickname: string, remote_endpoint: PeerEndpoint) -> bool {
+    if manager.peer_count >= manager.config.max_peers {
+        return false;
+    }
+
+    // Create peer
+    let mut peer = create_peer(remote_peer_id, remote_profile_id, nickname);
+    peer.endpoint = remote_endpoint;
+    peer.state = PeerState.Connecting;
+    peer.connect_start_time = manager.current_time;
+
+    manager.peers.insert(remote_peer_id, peer);
+    manager.peer_count += 1;
+
+    // Determine connection method
+    let method = determine_connection_method(manager, remote_endpoint);
+
+    match method {
+        ConnectionMethod.Direct => {
+            attempt_direct_connection(manager, remote_peer_id);
+        },
+        ConnectionMethod.NATPunch => {
+            start_nat_punch_to_peer(manager, remote_peer_id, remote_endpoint);
+        },
+        ConnectionMethod.UPnP => {
+            // UPnP mapping should already be set up
+            attempt_direct_connection(manager, remote_peer_id);
+        },
+        ConnectionMethod.Relay => {
+            connect_via_relay(manager, remote_peer_id);
+        },
+        _ => {
+            attempt_direct_connection(manager, remote_peer_id);
+        },
+    }
+
+    return true;
+}
+
+fn disconnect_peer(manager: &mut GameSpyPeerManager, peer_id: u64, reason: string) {
+    let peer = manager.peers.get(peer_id);
+    if peer == null {
+        return;
+    }
+
+    // Cancel any active punch sessions
+    for i in 0..manager.punch_session_count {
+        if manager.punch_sessions[i].remote_peer_id == peer_id {
+            manager.punch_sessions[i].state = NATPunchState.Failed;
+        }
+    }
+
+    manager.peers.remove(peer_id);
+    manager.peer_count -= 1;
+
+    if manager.on_peer_disconnected != null {
+        manager.on_peer_disconnected(peer_id, reason);
+    }
+}
+
+fn determine_connection_method(manager: &GameSpyPeerManager, remote_endpoint: PeerEndpoint) -> ConnectionMethod {
+    // If we have open NAT or UPnP, try direct
+    if manager.local_nat_type == NATType.Open {
+        return ConnectionMethod.Direct;
+    }
+
+    if manager.upnp.is_available && manager.upnp.mapping_count > 0 {
+        return ConnectionMethod.UPnP;
+    }
+
+    // If both sides have cone NAT, try punch
+    if manager.local_nat_type != NATType.Symmetric {
+        return ConnectionMethod.NATPunch;
+    }
+
+    // Fallback to relay
+    if manager.config.enable_relay_fallback {
+        return ConnectionMethod.Relay;
+    }
+
+    return ConnectionMethod.NATPunch;
+}
+
+fn attempt_direct_connection(manager: &mut GameSpyPeerManager, peer_id: u64) {
+    let peer = manager.peers.get_mut(peer_id);
+    if peer == null {
+        return;
+    }
+
+    peer.state = PeerState.Connecting;
+    peer.connection_method = ConnectionMethod.Direct;
+
+    // Would send connection request packet here
+}
+
+fn start_nat_punch_to_peer(manager: &mut GameSpyPeerManager, peer_id: u64, remote_endpoint: PeerEndpoint) {
+    if manager.punch_session_count >= 16 {
+        return;
+    }
+
+    let session_id = manager.next_punch_session_id;
+    manager.next_punch_session_id += 1;
+
+    let mut session = create_nat_punch_session(session_id, manager.local_peer_id, peer_id);
+    start_nat_punch(&mut session, manager.local_endpoint, remote_endpoint, manager.current_time);
+
+    manager.punch_sessions[manager.punch_session_count] = session;
+    manager.punch_session_count += 1;
+
+    let peer = manager.peers.get_mut(peer_id);
+    if peer != null {
+        peer.state = PeerState.NATTraversal;
+        peer.connection_method = ConnectionMethod.NATPunch;
+    }
+}
+
+fn connect_via_relay(manager: &mut GameSpyPeerManager, peer_id: u64) {
+    let peer = manager.peers.get_mut(peer_id);
+    if peer == null {
+        return;
+    }
+
+    peer.state = PeerState.Connecting;
+    peer.connection_method = ConnectionMethod.Relay;
+
+    // Connect to relay server if not already
+    if !manager.relay_session.is_connected {
+        manager.relay_session = create_relay_session(
+            manager.next_punch_session_id,
+            manager.config.relay_server,
+            manager.config.relay_port
+        );
+        manager.next_punch_session_id += 1;
+        manager.relay_session.is_connected = true;
+    }
+}
+
+// ============================================================================
+// Update Loop
+// ============================================================================
+
+fn update_peer_manager(manager: &mut GameSpyPeerManager, delta_time: f32) {
+    manager.current_time += delta_time;
+
+    // Update NAT detection
+    update_nat_detection(&mut manager.nat_detector, delta_time);
+    if manager.nat_detector.state == NATDetectionState.Complete {
+        if manager.local_nat_type != manager.nat_detector.detected_type {
+            manager.local_nat_type = manager.nat_detector.detected_type;
+            manager.local_endpoint = manager.nat_detector.public_endpoint;
+
+            if manager.on_nat_detected != null {
+                manager.on_nat_detected(manager.local_nat_type);
+            }
+        }
+    }
+
+    // Update NAT punch sessions
+    update_punch_sessions(manager);
+
+    // Update peer connections
+    update_peer_connections(manager, delta_time);
+
+    // Keepalive
+    manager.keepalive_timer += delta_time;
+    if manager.keepalive_timer >= manager.config.keepalive_interval {
+        manager.keepalive_timer = 0.0;
+        send_keepalives(manager);
+    }
+}
+
+fn update_punch_sessions(manager: &mut GameSpyPeerManager) {
+    let mut i: i32 = 0;
+    while i < manager.punch_session_count {
+        let session = &mut manager.punch_sessions[i];
+
+        let should_punch = update_nat_punch(session, manager.current_time);
+
+        if should_punch {
+            // Would send punch packet here
+        }
+
+        if session.state == NATPunchState.Success {
+            // Connection established via punch
+            let peer = manager.peers.get_mut(session.remote_peer_id);
+            if peer != null {
+                peer.state = PeerState.Connected;
+                peer.endpoint = session.established_endpoint;
+
+                if manager.on_peer_connected != null {
+                    manager.on_peer_connected(session.remote_peer_id);
+                }
+            }
+
+            // Remove session
+            for j in i..(manager.punch_session_count - 1) {
+                manager.punch_sessions[j] = manager.punch_sessions[j + 1];
+            }
+            manager.punch_session_count -= 1;
+            continue;
+        }
+
+        if session.state == NATPunchState.Failed {
+            // Try relay fallback
+            if manager.config.enable_relay_fallback {
+                connect_via_relay(manager, session.remote_peer_id);
+            } else {
+                if manager.on_connection_failed != null {
+                    manager.on_connection_failed(session.remote_peer_id, "NAT traversal failed");
+                }
+            }
+
+            // Remove session
+            for j in i..(manager.punch_session_count - 1) {
+                manager.punch_sessions[j] = manager.punch_sessions[j + 1];
+            }
+            manager.punch_session_count -= 1;
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+fn update_peer_connections(manager: &mut GameSpyPeerManager, delta_time: f32) {
+    for entry in manager.peers.iter_mut() {
+        let peer = entry.value;
+
+        match peer.state {
+            PeerState.Connecting => {
+                let elapsed = manager.current_time - peer.connect_start_time;
+                if elapsed > manager.config.connection_timeout {
+                    peer.state = PeerState.Failed;
+                    if manager.on_connection_failed != null {
+                        manager.on_connection_failed(peer.peer_id, "Connection timeout");
+                    }
+                }
+            },
+            PeerState.Connected => {
+                // Check for timeout
+                let idle_time = manager.current_time - peer.last_activity_time;
+                if idle_time > manager.config.connection_timeout {
+                    peer.state = PeerState.Disconnected;
+                    if manager.on_peer_disconnected != null {
+                        manager.on_peer_disconnected(peer.peer_id, "Timeout");
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+fn send_keepalives(manager: &mut GameSpyPeerManager) {
+    for entry in manager.peers.iter_mut() {
+        let peer = entry.value;
+        if peer.state == PeerState.Connected || peer.state == PeerState.Relayed {
+            // Would send keepalive packet here
+            peer.packets_sent += 1;
+        }
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+fn update_peer_rtt(manager: &mut GameSpyPeerManager, peer_id: u64, rtt: f32) {
+    let peer = manager.peers.get_mut(peer_id);
+    if peer == null {
+        return;
+    }
+
+    // Add to samples
+    if peer.rtt_sample_count < 10 {
+        peer.rtt_samples[peer.rtt_sample_count] = rtt;
+        peer.rtt_sample_count += 1;
+    } else {
+        // Shift samples
+        for i in 0..9 {
+            peer.rtt_samples[i] = peer.rtt_samples[i + 1];
+        }
+        peer.rtt_samples[9] = rtt;
+    }
+
+    // Calculate average
+    let mut sum: f32 = 0.0;
+    for i in 0..peer.rtt_sample_count {
+        sum += peer.rtt_samples[i];
+    }
+    peer.round_trip_time = sum / peer.rtt_sample_count as f32;
+}
+
+fn get_peer_stats(manager: &GameSpyPeerManager, peer_id: u64) -> PeerStats {
+    let peer = manager.peers.get(peer_id);
+    if peer == null {
+        return PeerStats {
+            peer_id: peer_id,
+            state: PeerState.Disconnected,
+            connection_method: ConnectionMethod.Direct,
+            round_trip_time: 0.0,
+            packet_loss: 0.0,
+            bytes_sent: 0,
+            bytes_received: 0,
+        };
+    }
+
+    return PeerStats {
+        peer_id: peer.peer_id,
+        state: peer.state,
+        connection_method: peer.connection_method,
+        round_trip_time: peer.round_trip_time,
+        packet_loss: peer.packet_loss,
+        bytes_sent: peer.bytes_sent,
+        bytes_received: peer.bytes_received,
+    };
+}
+
+struct PeerStats {
+    peer_id: u64,
+    state: PeerState,
+    connection_method: ConnectionMethod,
+    round_trip_time: f32,
+    packet_loss: f32,
+    bytes_sent: u64,
+    bytes_received: u64,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_gamespy_peer() {
+    print("Testing GameSpy Peer...");
+
+    // Create manager
+    let config = GameSpyPeerConfig {};
+    let mut manager = create_gamespy_peer_manager(config);
+    print("  Created peer manager");
+
+    // Initialize
+    initialize_peer_manager(&mut manager, 1001, 12345);
+    print("  Initialized with peer ID 1001");
+
+    // Update to complete NAT detection
+    for _ in 0..10 {
+        update_peer_manager(&mut manager, 0.5);
+    }
+    print("  NAT type: " + manager.local_nat_type as i32 as string);
+
+    // Test STUN request
+    let stun_req = create_stun_request(1);
+    let stun_data = serialize_stun_request(&stun_req);
+    print("  Created STUN request, size: 20 bytes");
+
+    // Test UPnP
+    if manager.upnp.is_available {
+        add_upnp_port_mapping(&mut manager.upnp, 6112, 6112, "UDP", "Generals");
+        print("  Added UPnP mapping");
+    }
+
+    // Test peer connection
+    let remote_ep = PeerEndpoint {
+        public_ip: "192.168.1.100",
+        public_port: 6112,
+        private_ip: "192.168.1.100",
+        private_port: 6112,
+        is_valid: true,
+    };
+
+    connect_to_peer(&mut manager, 2001, 67890, "RemotePlayer", remote_ep);
+    print("  Started connection to peer 2001");
+
+    // Update
+    for _ in 0..5 {
+        update_peer_manager(&mut manager, 0.1);
+    }
+
+    // Get stats
+    let stats = get_peer_stats(&manager, 2001);
+    print("  Peer state: " + stats.state as i32 as string);
+
+    // Shutdown
+    shutdown_peer_manager(&mut manager);
+    print("  Shutdown complete");
+
+    print("GameSpy Peer tests complete!");
+}

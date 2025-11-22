@@ -1,0 +1,1050 @@
+// frame_metrics.home - Network frame timing and synchronization metrics
+// Full implementation of latency tracking and frame sync for multiplayer
+
+const MAX_PLAYERS: u32 = 8
+const HISTORY_SIZE: u32 = 128
+const PING_HISTORY_SIZE: u32 = 32
+const SYNC_WINDOW_FRAMES: u32 = 4
+const MAX_ALLOWED_AHEAD: u32 = 8
+const MAX_DESYNC_TOLERANCE: u32 = 16
+
+// ============================================================================
+// Time Tracking
+// ============================================================================
+
+struct TimePoint {
+    frame: u32,
+    timestamp_ms: u64
+}
+
+struct FrameClock {
+    start_time_ms: u64,
+    current_frame: u32,
+    frame_duration_ms: u32,     // Target ms per frame (e.g., 100 for 10 FPS sim)
+    accumulated_time_ms: u64,
+    time_scale: f32,            // 1.0 = normal speed
+
+    // Frame timing history
+    frame_times: [u64; HISTORY_SIZE],
+    frame_time_index: u32,
+
+    // Drift compensation
+    drift_accumulator: i64,
+    drift_correction_rate: f32
+}
+
+impl FrameClock {
+    fn new(frame_duration_ms: u32) -> FrameClock {
+        FrameClock {
+            start_time_ms: 0,
+            current_frame: 0,
+            frame_duration_ms: frame_duration_ms,
+            accumulated_time_ms: 0,
+            time_scale: 1.0,
+            frame_times: [0; HISTORY_SIZE],
+            frame_time_index: 0,
+            drift_accumulator: 0,
+            drift_correction_rate: 0.1
+        }
+    }
+
+    fn start(&mut self, time_ms: u64) {
+        self.start_time_ms = time_ms
+        self.current_frame = 0
+        self.accumulated_time_ms = 0
+    }
+
+    fn update(&mut self, current_time_ms: u64) -> u32 {
+        let elapsed = current_time_ms - self.start_time_ms
+        let scaled_elapsed = (elapsed as f32 * self.time_scale) as u64
+
+        // Apply drift correction
+        let corrected_elapsed = (scaled_elapsed as i64 + self.drift_accumulator) as u64
+
+        // Calculate how many frames should have passed
+        let target_frame = (corrected_elapsed / self.frame_duration_ms as u64) as u32
+
+        // Store frame time
+        self.frame_times[self.frame_time_index] = current_time_ms
+        self.frame_time_index = (self.frame_time_index + 1) % HISTORY_SIZE
+
+        let frames_to_advance = target_frame - self.current_frame
+        self.current_frame = target_frame
+        self.accumulated_time_ms = corrected_elapsed
+
+        return frames_to_advance
+    }
+
+    fn apply_drift_correction(&mut self, drift_ms: i64) {
+        // Gradually apply drift correction
+        self.drift_accumulator += (drift_ms as f32 * self.drift_correction_rate) as i64
+    }
+
+    fn get_frame_for_time(&self, time_ms: u64) -> u32 {
+        if time_ms < self.start_time_ms {
+            return 0
+        }
+        let elapsed = time_ms - self.start_time_ms
+        return (elapsed / self.frame_duration_ms as u64) as u32
+    }
+
+    fn get_time_for_frame(&self, frame: u32) -> u64 {
+        return self.start_time_ms + (frame as u64 * self.frame_duration_ms as u64)
+    }
+}
+
+// ============================================================================
+// Latency Tracking
+// ============================================================================
+
+struct PingStats {
+    samples: [u32; PING_HISTORY_SIZE],
+    sample_count: u32,
+    sample_index: u32,
+
+    min_ping: u32,
+    max_ping: u32,
+    avg_ping: u32,
+    jitter: u32,            // Standard deviation approximation
+
+    last_ping_sent: u64,
+    last_ping_received: u64,
+    ping_sequence: u32
+}
+
+impl PingStats {
+    fn new() -> PingStats {
+        PingStats {
+            samples: [0; PING_HISTORY_SIZE],
+            sample_count: 0,
+            sample_index: 0,
+            min_ping: 0xFFFFFFFF,
+            max_ping: 0,
+            avg_ping: 0,
+            jitter: 0,
+            last_ping_sent: 0,
+            last_ping_received: 0,
+            ping_sequence: 0
+        }
+    }
+
+    fn add_sample(&mut self, ping_ms: u32) {
+        self.samples[self.sample_index] = ping_ms
+        self.sample_index = (self.sample_index + 1) % PING_HISTORY_SIZE
+
+        if self.sample_count < PING_HISTORY_SIZE {
+            self.sample_count += 1
+        }
+
+        self.recalculate_stats()
+    }
+
+    fn recalculate_stats(&mut self) {
+        if self.sample_count == 0 {
+            return
+        }
+
+        var sum: u64 = 0
+        self.min_ping = 0xFFFFFFFF
+        self.max_ping = 0
+
+        for i in 0..self.sample_count {
+            let sample = self.samples[i]
+            sum += sample as u64
+
+            if sample < self.min_ping {
+                self.min_ping = sample
+            }
+            if sample > self.max_ping {
+                self.max_ping = sample
+            }
+        }
+
+        self.avg_ping = (sum / self.sample_count as u64) as u32
+
+        // Calculate jitter (variance approximation)
+        var variance_sum: u64 = 0
+        for i in 0..self.sample_count {
+            let diff = if self.samples[i] > self.avg_ping {
+                self.samples[i] - self.avg_ping
+            } else {
+                self.avg_ping - self.samples[i]
+            }
+            variance_sum += (diff * diff) as u64
+        }
+        self.jitter = sqrt_u32((variance_sum / self.sample_count as u64) as u32)
+    }
+
+    fn get_estimated_rtt(&self) -> u32 {
+        // Use 90th percentile for conservative estimate
+        if self.sample_count == 0 {
+            return 100  // Default
+        }
+
+        var sorted: [u32; PING_HISTORY_SIZE] = self.samples
+        sort_samples(&mut sorted, self.sample_count)
+
+        let percentile_idx = (self.sample_count * 90) / 100
+        return sorted[percentile_idx]
+    }
+}
+
+struct PlayerLatency {
+    player_id: u64,
+    ping: PingStats,
+
+    // One-way delay estimates
+    outbound_delay_ms: u32,
+    inbound_delay_ms: u32,
+
+    // Command lead time
+    command_lead_frames: u32,
+
+    // Connection quality
+    packet_loss_percent: f32,
+    out_of_order_count: u32,
+    duplicate_count: u32
+}
+
+impl PlayerLatency {
+    fn new(player_id: u64) -> PlayerLatency {
+        PlayerLatency {
+            player_id: player_id,
+            ping: PingStats::new(),
+            outbound_delay_ms: 0,
+            inbound_delay_ms: 0,
+            command_lead_frames: 2,
+            packet_loss_percent: 0.0,
+            out_of_order_count: 0,
+            duplicate_count: 0
+        }
+    }
+
+    fn update_delays(&mut self) {
+        // Estimate one-way delays (assume symmetric for now)
+        let half_rtt = self.ping.avg_ping / 2
+        self.outbound_delay_ms = half_rtt
+        self.inbound_delay_ms = half_rtt
+    }
+
+    fn calculate_command_lead(&mut self, frame_duration_ms: u32) {
+        // Command lead = ceil(RTT / frame_duration) + safety margin
+        let rtt = self.ping.get_estimated_rtt()
+        let frames_for_rtt = (rtt + frame_duration_ms - 1) / frame_duration_ms
+        self.command_lead_frames = frames_for_rtt + 1  // +1 safety margin
+
+        // Clamp to reasonable values
+        if self.command_lead_frames < 2 {
+            self.command_lead_frames = 2
+        }
+        if self.command_lead_frames > 10 {
+            self.command_lead_frames = 10
+        }
+    }
+}
+
+// ============================================================================
+// Frame Synchronization
+// ============================================================================
+
+struct PlayerFrameState {
+    player_id: u64,
+    current_frame: u32,
+    confirmed_frame: u32,
+    commands_pending: u32,
+    is_stalled: bool,
+    stall_duration_ms: u64
+}
+
+struct FrameSyncState {
+    local_frame: u32,
+    confirmed_frame: u32,           // All players have reached this frame
+    target_frame: u32,              // Frame we're trying to reach
+
+    player_states: [PlayerFrameState; MAX_PLAYERS],
+    player_count: u32,
+
+    // Sync window management
+    min_player_frame: u32,
+    max_player_frame: u32,
+    frame_spread: u32,
+
+    // Waiting state
+    is_waiting: bool,
+    wait_start_time: u64,
+    waiting_for_players: [u64; MAX_PLAYERS],
+    waiting_count: u32
+}
+
+impl FrameSyncState {
+    fn new() -> FrameSyncState {
+        FrameSyncState {
+            local_frame: 0,
+            confirmed_frame: 0,
+            target_frame: 0,
+            player_states: undefined,
+            player_count: 0,
+            min_player_frame: 0,
+            max_player_frame: 0,
+            frame_spread: 0,
+            is_waiting: false,
+            wait_start_time: 0,
+            waiting_for_players: [0; MAX_PLAYERS],
+            waiting_count: 0
+        }
+    }
+
+    fn add_player(&mut self, player_id: u64) {
+        if self.player_count >= MAX_PLAYERS {
+            return
+        }
+
+        self.player_states[self.player_count] = PlayerFrameState {
+            player_id: player_id,
+            current_frame: 0,
+            confirmed_frame: 0,
+            commands_pending: 0,
+            is_stalled: false,
+            stall_duration_ms: 0
+        }
+        self.player_count += 1
+    }
+
+    fn update_player_frame(&mut self, player_id: u64, frame: u32) {
+        for i in 0..self.player_count {
+            if self.player_states[i].player_id == player_id {
+                if frame > self.player_states[i].current_frame {
+                    self.player_states[i].current_frame = frame
+                    self.player_states[i].is_stalled = false
+                }
+                break
+            }
+        }
+
+        self.recalculate_sync()
+    }
+
+    fn confirm_frame(&mut self, player_id: u64, frame: u32) {
+        for i in 0..self.player_count {
+            if self.player_states[i].player_id == player_id {
+                if frame > self.player_states[i].confirmed_frame {
+                    self.player_states[i].confirmed_frame = frame
+                }
+                break
+            }
+        }
+
+        self.recalculate_confirmed()
+    }
+
+    fn recalculate_sync(&mut self) {
+        if self.player_count == 0 {
+            return
+        }
+
+        self.min_player_frame = 0xFFFFFFFF
+        self.max_player_frame = 0
+
+        for i in 0..self.player_count {
+            let frame = self.player_states[i].current_frame
+
+            if frame < self.min_player_frame {
+                self.min_player_frame = frame
+            }
+            if frame > self.max_player_frame {
+                self.max_player_frame = frame
+            }
+        }
+
+        self.frame_spread = self.max_player_frame - self.min_player_frame
+    }
+
+    fn recalculate_confirmed(&mut self) {
+        if self.player_count == 0 {
+            return
+        }
+
+        var min_confirmed: u32 = 0xFFFFFFFF
+        for i in 0..self.player_count {
+            if self.player_states[i].confirmed_frame < min_confirmed {
+                min_confirmed = self.player_states[i].confirmed_frame
+            }
+        }
+
+        self.confirmed_frame = min_confirmed
+    }
+
+    fn should_wait(&self) -> bool {
+        // Wait if any player is too far behind
+        return self.frame_spread > MAX_ALLOWED_AHEAD
+    }
+
+    fn get_slowest_player(&self) -> u64 {
+        var slowest_frame: u32 = 0xFFFFFFFF
+        var slowest_id: u64 = 0
+
+        for i in 0..self.player_count {
+            if self.player_states[i].current_frame < slowest_frame {
+                slowest_frame = self.player_states[i].current_frame
+                slowest_id = self.player_states[i].player_id
+            }
+        }
+
+        return slowest_id
+    }
+
+    fn begin_wait(&mut self, current_time_ms: u64) {
+        self.is_waiting = true
+        self.wait_start_time = current_time_ms
+        self.waiting_count = 0
+
+        // Find players we're waiting for
+        for i in 0..self.player_count {
+            if self.player_states[i].current_frame < self.local_frame {
+                self.waiting_for_players[self.waiting_count] = self.player_states[i].player_id
+                self.waiting_count += 1
+            }
+        }
+    }
+
+    fn end_wait(&mut self) {
+        self.is_waiting = false
+        self.waiting_count = 0
+    }
+}
+
+// ============================================================================
+// Desync Detection
+// ============================================================================
+
+struct FrameChecksum {
+    frame: u32,
+    checksum: u32,
+    timestamp: u64
+}
+
+struct DesyncDetector {
+    local_checksums: [FrameChecksum; HISTORY_SIZE],
+    checksum_count: u32,
+    checksum_index: u32,
+
+    // Per-player remote checksums
+    remote_checksums: [[FrameChecksum; HISTORY_SIZE]; MAX_PLAYERS],
+    remote_checksum_count: [u32; MAX_PLAYERS],
+
+    // Desync state
+    last_verified_frame: u32,
+    desync_detected: bool,
+    desync_frame: u32,
+    desync_players: [u64; MAX_PLAYERS],
+    desync_player_count: u32,
+
+    // Callbacks
+    on_desync: fn(u32, &[u64])
+}
+
+impl DesyncDetector {
+    fn new() -> DesyncDetector {
+        DesyncDetector {
+            local_checksums: undefined,
+            checksum_count: 0,
+            checksum_index: 0,
+            remote_checksums: undefined,
+            remote_checksum_count: [0; MAX_PLAYERS],
+            last_verified_frame: 0,
+            desync_detected: false,
+            desync_frame: 0,
+            desync_players: [0; MAX_PLAYERS],
+            desync_player_count: 0,
+            on_desync: null
+        }
+    }
+
+    fn add_local_checksum(&mut self, frame: u32, checksum: u32) {
+        self.local_checksums[self.checksum_index] = FrameChecksum {
+            frame: frame,
+            checksum: checksum,
+            timestamp: get_current_time_ms()
+        }
+        self.checksum_index = (self.checksum_index + 1) % HISTORY_SIZE
+
+        if self.checksum_count < HISTORY_SIZE {
+            self.checksum_count += 1
+        }
+    }
+
+    fn add_remote_checksum(&mut self, player_index: u32, frame: u32, checksum: u32) {
+        if player_index >= MAX_PLAYERS {
+            return
+        }
+
+        let idx = self.remote_checksum_count[player_index] % HISTORY_SIZE
+        self.remote_checksums[player_index][idx] = FrameChecksum {
+            frame: frame,
+            checksum: checksum,
+            timestamp: get_current_time_ms()
+        }
+        self.remote_checksum_count[player_index] += 1
+    }
+
+    fn verify_frame(&mut self, frame: u32, player_ids: &[u64; MAX_PLAYERS], player_count: u32) -> bool {
+        // Find local checksum for this frame
+        var local_sum: u32 = 0
+        var found_local = false
+
+        for i in 0..self.checksum_count {
+            if self.local_checksums[i].frame == frame {
+                local_sum = self.local_checksums[i].checksum
+                found_local = true
+                break
+            }
+        }
+
+        if !found_local {
+            return true  // Can't verify yet
+        }
+
+        // Check against all remote players
+        self.desync_player_count = 0
+
+        for p in 0..player_count {
+            for i in 0..self.remote_checksum_count[p] {
+                if self.remote_checksums[p][i].frame == frame {
+                    if self.remote_checksums[p][i].checksum != local_sum {
+                        // Desync detected!
+                        self.desync_players[self.desync_player_count] = player_ids[p]
+                        self.desync_player_count += 1
+                    }
+                    break
+                }
+            }
+        }
+
+        if self.desync_player_count > 0 {
+            self.desync_detected = true
+            self.desync_frame = frame
+
+            if self.on_desync != null {
+                self.on_desync(frame, &self.desync_players)
+            }
+            return false
+        }
+
+        self.last_verified_frame = frame
+        return true
+    }
+
+    fn reset(&mut self) {
+        self.checksum_count = 0
+        self.checksum_index = 0
+        self.desync_detected = false
+        self.desync_player_count = 0
+
+        for i in 0..MAX_PLAYERS {
+            self.remote_checksum_count[i] = 0
+        }
+    }
+}
+
+// ============================================================================
+// Frame Metrics Manager
+// ============================================================================
+
+enum NetworkQuality {
+    Excellent,  // <50ms, <1% loss
+    Good,       // <100ms, <2% loss
+    Fair,       // <200ms, <5% loss
+    Poor,       // <400ms, <10% loss
+    Critical    // >400ms or >10% loss
+}
+
+struct FrameMetricsConfig {
+    frame_duration_ms: u32,
+    checksum_interval: u32,         // Frames between checksum verification
+    ping_interval_ms: u32,
+    max_wait_time_ms: u32,
+    desync_tolerance_frames: u32
+}
+
+fn default_frame_metrics_config() -> FrameMetricsConfig {
+    FrameMetricsConfig {
+        frame_duration_ms: 100,     // 10 FPS simulation
+        checksum_interval: 10,
+        ping_interval_ms: 1000,
+        max_wait_time_ms: 5000,
+        desync_tolerance_frames: 16
+    }
+}
+
+struct FrameMetrics {
+    config: FrameMetricsConfig,
+
+    // Core timing
+    clock: FrameClock,
+    sync_state: FrameSyncState,
+    desync_detector: DesyncDetector,
+
+    // Per-player latency
+    player_latencies: [PlayerLatency; MAX_PLAYERS],
+    player_count: u32,
+    local_player_index: u32,
+
+    // Global metrics
+    average_latency_ms: u32,
+    worst_latency_ms: u32,
+    network_quality: NetworkQuality,
+
+    // Frame timing stats
+    frames_processed: u64,
+    frames_skipped: u64,
+    frames_waited: u64,
+    total_wait_time_ms: u64,
+
+    // Commands
+    commands_sent: u64,
+    commands_received: u64,
+    commands_dropped: u64,
+
+    // Bandwidth
+    bytes_sent: u64,
+    bytes_received: u64,
+    bandwidth_out_kbps: f32,
+    bandwidth_in_kbps: f32,
+
+    // Callbacks
+    on_quality_changed: fn(NetworkQuality),
+    on_player_stalled: fn(u64),
+    on_sync_restored: fn()
+}
+
+impl FrameMetrics {
+    fn new(config: FrameMetricsConfig) -> FrameMetrics {
+        FrameMetrics {
+            config: config,
+            clock: FrameClock::new(config.frame_duration_ms),
+            sync_state: FrameSyncState::new(),
+            desync_detector: DesyncDetector::new(),
+            player_latencies: undefined,
+            player_count: 0,
+            local_player_index: 0,
+            average_latency_ms: 0,
+            worst_latency_ms: 0,
+            network_quality: NetworkQuality::Good,
+            frames_processed: 0,
+            frames_skipped: 0,
+            frames_waited: 0,
+            total_wait_time_ms: 0,
+            commands_sent: 0,
+            commands_received: 0,
+            commands_dropped: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            bandwidth_out_kbps: 0.0,
+            bandwidth_in_kbps: 0.0,
+            on_quality_changed: null,
+            on_player_stalled: null,
+            on_sync_restored: null
+        }
+    }
+
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+
+    fn initialize(&mut self, start_time_ms: u64) {
+        self.clock.start(start_time_ms)
+        self.desync_detector.reset()
+    }
+
+    fn add_player(&mut self, player_id: u64, is_local: bool) {
+        if self.player_count >= MAX_PLAYERS {
+            return
+        }
+
+        self.player_latencies[self.player_count] = PlayerLatency::new(player_id)
+        self.sync_state.add_player(player_id)
+
+        if is_local {
+            self.local_player_index = self.player_count
+        }
+
+        self.player_count += 1
+    }
+
+    // ========================================================================
+    // Latency Tracking
+    // ========================================================================
+
+    fn record_ping_sent(&mut self, player_index: u32, sequence: u32, time_ms: u64) {
+        if player_index >= self.player_count {
+            return
+        }
+
+        self.player_latencies[player_index].ping.last_ping_sent = time_ms
+        self.player_latencies[player_index].ping.ping_sequence = sequence
+    }
+
+    fn record_ping_received(&mut self, player_index: u32, sequence: u32, time_ms: u64) {
+        if player_index >= self.player_count {
+            return
+        }
+
+        let sent_time = self.player_latencies[player_index].ping.last_ping_sent
+        if sent_time > 0 and time_ms > sent_time {
+            let rtt = (time_ms - sent_time) as u32
+            self.player_latencies[player_index].ping.add_sample(rtt)
+            self.player_latencies[player_index].ping.last_ping_received = time_ms
+
+            // Update delays and command lead
+            self.player_latencies[player_index].update_delays()
+            self.player_latencies[player_index].calculate_command_lead(self.config.frame_duration_ms)
+        }
+
+        self.recalculate_global_latency()
+    }
+
+    fn recalculate_global_latency(&mut self) {
+        if self.player_count == 0 {
+            return
+        }
+
+        var sum: u64 = 0
+        self.worst_latency_ms = 0
+
+        for i in 0..self.player_count {
+            let ping = self.player_latencies[i].ping.avg_ping
+            sum += ping as u64
+
+            if ping > self.worst_latency_ms {
+                self.worst_latency_ms = ping
+            }
+        }
+
+        self.average_latency_ms = (sum / self.player_count as u64) as u32
+        self.update_network_quality()
+    }
+
+    fn update_network_quality(&mut self) {
+        let old_quality = self.network_quality
+
+        // Calculate average packet loss
+        var total_loss: f32 = 0.0
+        for i in 0..self.player_count {
+            total_loss += self.player_latencies[i].packet_loss_percent
+        }
+        let avg_loss = total_loss / self.player_count as f32
+
+        // Determine quality based on latency and loss
+        if self.worst_latency_ms < 50 and avg_loss < 1.0 {
+            self.network_quality = NetworkQuality::Excellent
+        } else if self.worst_latency_ms < 100 and avg_loss < 2.0 {
+            self.network_quality = NetworkQuality::Good
+        } else if self.worst_latency_ms < 200 and avg_loss < 5.0 {
+            self.network_quality = NetworkQuality::Fair
+        } else if self.worst_latency_ms < 400 and avg_loss < 10.0 {
+            self.network_quality = NetworkQuality::Poor
+        } else {
+            self.network_quality = NetworkQuality::Critical
+        }
+
+        if self.network_quality != old_quality and self.on_quality_changed != null {
+            self.on_quality_changed(self.network_quality)
+        }
+    }
+
+    // ========================================================================
+    // Frame Synchronization
+    // ========================================================================
+
+    fn update(&mut self, current_time_ms: u64) -> FrameAdvanceResult {
+        let frames_elapsed = self.clock.update(current_time_ms)
+
+        // Check if we need to wait for other players
+        if self.sync_state.should_wait() {
+            if !self.sync_state.is_waiting {
+                self.sync_state.begin_wait(current_time_ms)
+            }
+
+            // Check for timeout
+            let wait_duration = current_time_ms - self.sync_state.wait_start_time
+            if wait_duration > self.config.max_wait_time_ms as u64 {
+                // Timeout - report stalled player
+                let stalled = self.sync_state.get_slowest_player()
+                if self.on_player_stalled != null {
+                    self.on_player_stalled(stalled)
+                }
+            }
+
+            self.frames_waited += 1
+            self.total_wait_time_ms += self.config.frame_duration_ms as u64
+
+            return FrameAdvanceResult {
+                can_advance: false,
+                frames_to_advance: 0,
+                should_wait: true,
+                waiting_for: self.sync_state.waiting_for_players,
+                waiting_count: self.sync_state.waiting_count
+            }
+        }
+
+        // No longer waiting
+        if self.sync_state.is_waiting {
+            self.sync_state.end_wait()
+            if self.on_sync_restored != null {
+                self.on_sync_restored()
+            }
+        }
+
+        // Can advance frames
+        self.frames_processed += frames_elapsed as u64
+
+        return FrameAdvanceResult {
+            can_advance: true,
+            frames_to_advance: frames_elapsed,
+            should_wait: false,
+            waiting_for: [0; MAX_PLAYERS],
+            waiting_count: 0
+        }
+    }
+
+    fn report_local_frame(&mut self, frame: u32) {
+        self.sync_state.local_frame = frame
+    }
+
+    fn report_remote_frame(&mut self, player_id: u64, frame: u32) {
+        self.sync_state.update_player_frame(player_id, frame)
+    }
+
+    fn confirm_remote_frame(&mut self, player_id: u64, frame: u32) {
+        self.sync_state.confirm_frame(player_id, frame)
+    }
+
+    // ========================================================================
+    // Checksum Verification
+    // ========================================================================
+
+    fn should_checksum(&self, frame: u32) -> bool {
+        return frame % self.config.checksum_interval == 0
+    }
+
+    fn add_local_checksum(&mut self, frame: u32, checksum: u32) {
+        self.desync_detector.add_local_checksum(frame, checksum)
+    }
+
+    fn add_remote_checksum(&mut self, player_index: u32, frame: u32, checksum: u32) {
+        self.desync_detector.add_remote_checksum(player_index, frame, checksum)
+    }
+
+    fn verify_checksums(&mut self, frame: u32) -> bool {
+        var player_ids: [u64; MAX_PLAYERS] = [0; MAX_PLAYERS]
+        for i in 0..self.player_count {
+            player_ids[i] = self.player_latencies[i].player_id
+        }
+
+        return self.desync_detector.verify_frame(frame, &player_ids, self.player_count)
+    }
+
+    fn is_desynced(&self) -> bool {
+        return self.desync_detector.desync_detected
+    }
+
+    fn get_desync_frame(&self) -> u32 {
+        return self.desync_detector.desync_frame
+    }
+
+    // ========================================================================
+    // Command Tracking
+    // ========================================================================
+
+    fn record_command_sent(&mut self, bytes: u32) {
+        self.commands_sent += 1
+        self.bytes_sent += bytes as u64
+    }
+
+    fn record_command_received(&mut self, bytes: u32) {
+        self.commands_received += 1
+        self.bytes_received += bytes as u64
+    }
+
+    fn record_command_dropped(&mut self) {
+        self.commands_dropped += 1
+    }
+
+    fn get_command_lead_for_player(&self, player_index: u32) -> u32 {
+        if player_index >= self.player_count {
+            return 2
+        }
+        return self.player_latencies[player_index].command_lead_frames
+    }
+
+    fn get_max_command_lead(&self) -> u32 {
+        var max_lead: u32 = 0
+        for i in 0..self.player_count {
+            if self.player_latencies[i].command_lead_frames > max_lead {
+                max_lead = self.player_latencies[i].command_lead_frames
+            }
+        }
+        return max_lead
+    }
+
+    // ========================================================================
+    // Bandwidth Tracking
+    // ========================================================================
+
+    fn update_bandwidth(&mut self, elapsed_seconds: f32) {
+        if elapsed_seconds <= 0.0 {
+            return
+        }
+
+        self.bandwidth_out_kbps = (self.bytes_sent as f32 / 1024.0) / elapsed_seconds
+        self.bandwidth_in_kbps = (self.bytes_received as f32 / 1024.0) / elapsed_seconds
+    }
+
+    fn reset_bandwidth_counters(&mut self) {
+        self.bytes_sent = 0
+        self.bytes_received = 0
+    }
+
+    // ========================================================================
+    // Time Synchronization
+    // ========================================================================
+
+    fn apply_time_sync(&mut self, server_time_ms: u64, local_time_ms: u64) {
+        let drift = server_time_ms as i64 - local_time_ms as i64
+        self.clock.apply_drift_correction(drift)
+    }
+
+    fn get_network_time(&self, local_time_ms: u64) -> u64 {
+        // Adjust local time by accumulated drift
+        return (local_time_ms as i64 + self.clock.drift_accumulator) as u64
+    }
+
+    // ========================================================================
+    // Statistics
+    // ========================================================================
+
+    fn get_stats(&self) -> FrameMetricsStats {
+        FrameMetricsStats {
+            current_frame: self.clock.current_frame,
+            confirmed_frame: self.sync_state.confirmed_frame,
+            frame_spread: self.sync_state.frame_spread,
+            average_latency_ms: self.average_latency_ms,
+            worst_latency_ms: self.worst_latency_ms,
+            network_quality: self.network_quality,
+            frames_processed: self.frames_processed,
+            frames_skipped: self.frames_skipped,
+            frames_waited: self.frames_waited,
+            commands_sent: self.commands_sent,
+            commands_received: self.commands_received,
+            commands_dropped: self.commands_dropped,
+            bandwidth_out_kbps: self.bandwidth_out_kbps,
+            bandwidth_in_kbps: self.bandwidth_in_kbps,
+            is_desynced: self.desync_detector.desync_detected,
+            is_waiting: self.sync_state.is_waiting
+        }
+    }
+
+    fn get_player_stats(&self, player_index: u32) -> ?PlayerLatencyStats {
+        if player_index >= self.player_count {
+            return null
+        }
+
+        let lat = &self.player_latencies[player_index]
+        return PlayerLatencyStats {
+            player_id: lat.player_id,
+            ping_avg: lat.ping.avg_ping,
+            ping_min: lat.ping.min_ping,
+            ping_max: lat.ping.max_ping,
+            jitter: lat.ping.jitter,
+            packet_loss: lat.packet_loss_percent,
+            command_lead: lat.command_lead_frames,
+            current_frame: self.get_player_frame(player_index)
+        }
+    }
+
+    fn get_player_frame(&self, player_index: u32) -> u32 {
+        if player_index >= self.sync_state.player_count {
+            return 0
+        }
+        return self.sync_state.player_states[player_index].current_frame
+    }
+}
+
+// ============================================================================
+// Result Types
+// ============================================================================
+
+struct FrameAdvanceResult {
+    can_advance: bool,
+    frames_to_advance: u32,
+    should_wait: bool,
+    waiting_for: [u64; MAX_PLAYERS],
+    waiting_count: u32
+}
+
+struct FrameMetricsStats {
+    current_frame: u32,
+    confirmed_frame: u32,
+    frame_spread: u32,
+    average_latency_ms: u32,
+    worst_latency_ms: u32,
+    network_quality: NetworkQuality,
+    frames_processed: u64,
+    frames_skipped: u64,
+    frames_waited: u64,
+    commands_sent: u64,
+    commands_received: u64,
+    commands_dropped: u64,
+    bandwidth_out_kbps: f32,
+    bandwidth_in_kbps: f32,
+    is_desynced: bool,
+    is_waiting: bool
+}
+
+struct PlayerLatencyStats {
+    player_id: u64,
+    ping_avg: u32,
+    ping_min: u32,
+    ping_max: u32,
+    jitter: u32,
+    packet_loss: f32,
+    command_lead: u32,
+    current_frame: u32
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn sqrt_u32(n: u32) -> u32 {
+    if n == 0 {
+        return 0
+    }
+
+    var x = n
+    var y = (x + 1) / 2
+
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+
+    return x
+}
+
+fn sort_samples(arr: &mut [u32; PING_HISTORY_SIZE], count: u32) {
+    // Simple insertion sort for small arrays
+    for i in 1..count {
+        let key = arr[i]
+        var j = i as i32 - 1
+
+        while j >= 0 and arr[j as u32] > key {
+            arr[(j + 1) as u32] = arr[j as u32]
+            j -= 1
+        }
+        arr[(j + 1) as u32] = key
+    }
+}
+
+// External time function
+extern fn get_current_time_ms() -> u64
