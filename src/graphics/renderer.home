@@ -1,0 +1,436 @@
+// C&C Generals Zero Hour - Home Port
+// Graphics Renderer Abstraction
+//
+// Original: DX8Wrapper.cpp, RenderDevice.cpp (Westwood Studios/EA)
+// Ported to Home with multi-API support (DirectX 12, Vulkan, Metal)
+
+import basics/allocator
+import graphics/mesh
+import core/memory
+
+// Graphics API backend types
+enum GraphicsAPI {
+    DirectX12
+    Vulkan
+    Metal
+    OpenGL  // Fallback
+}
+
+// Render states
+enum CullMode {
+    None
+    Front
+    Back
+}
+
+enum BlendMode {
+    Opaque
+    Alpha
+    Additive
+    Multiply
+}
+
+enum DepthFunc {
+    Never
+    Less
+    Equal
+    LessEqual
+    Greater
+    NotEqual
+    GreaterEqual
+    Always
+}
+
+// Shader stages
+enum ShaderStage {
+    Vertex
+    Fragment
+    Compute
+}
+
+// Texture formats
+enum TextureFormat {
+    RGBA8
+    RGB8
+    R8
+    RGBA16F
+    RGBA32F
+    Depth24Stencil8
+    BC1  // DXT1
+    BC3  // DXT5
+}
+
+// Texture filtering
+enum TextureFilter {
+    Nearest
+    Linear
+    Trilinear
+    Anisotropic
+}
+
+// Vertex buffer structure
+struct VertexBuffer {
+    handle: *u8  // API-specific handle
+    size: usize
+    vertex_count: usize
+    vertex_format: u32
+    is_dynamic: bool
+}
+
+// Index buffer structure
+struct IndexBuffer {
+    handle: *u8  // API-specific handle
+    size: usize
+    index_count: usize
+    is_32bit: bool
+}
+
+// Texture structure
+struct Texture {
+    handle: *u8  // API-specific handle
+    width: u32
+    height: u32
+    format: TextureFormat
+    mip_levels: u32
+    name: string
+}
+
+// Shader structure
+struct Shader {
+    handle: *u8  // API-specific handle
+    stage: ShaderStage
+    entry_point: string
+}
+
+// Render target structure
+struct RenderTarget {
+    color_texture: Texture
+    depth_texture: Texture
+    width: u32
+    height: u32
+}
+
+// Render command buffer
+struct CommandBuffer {
+    commands: []RenderCommand
+    command_count: usize
+    capacity: usize
+    allocator: Allocator
+
+    fn init(allocator: Allocator): CommandBuffer {
+        return CommandBuffer {
+            commands: allocator.alloc(RenderCommand, 4096)
+            command_count: 0
+            capacity: 4096
+            allocator: allocator
+        }
+    }
+
+    fn clear(mut self) {
+        self.command_count = 0
+    }
+
+    fn add(mut self, command: RenderCommand) {
+        if self.command_count < self.capacity {
+            self.commands[self.command_count] = command
+            self.command_count += 1
+        }
+    }
+
+    fn deinit(mut self) {
+        self.allocator.free(self.commands)
+    }
+}
+
+// Render command types
+enum RenderCommand {
+    DrawMesh {
+        vertex_buffer: *VertexBuffer
+        index_buffer: *IndexBuffer
+        index_count: u32
+        instance_count: u32
+    }
+    SetViewport {
+        x: i32
+        y: i32
+        width: u32
+        height: u32
+    }
+    SetScissor {
+        x: i32
+        y: i32
+        width: u32
+        height: u32
+    }
+    Clear {
+        color: [4]f32
+        depth: f32
+        stencil: u8
+    }
+    BindShader {
+        shader: *Shader
+    }
+    BindTexture {
+        slot: u32
+        texture: *Texture
+    }
+}
+
+// Main renderer interface
+struct Renderer {
+    api: GraphicsAPI
+    allocator: Allocator
+    device_handle: *u8  // API-specific device
+    context_handle: *u8  // API-specific context
+    command_buffer: CommandBuffer
+
+    // Render state
+    viewport_width: u32
+    viewport_height: u32
+    cull_mode: CullMode
+    blend_mode: BlendMode
+    depth_func: DepthFunc
+
+    // Statistics
+    frame_count: u64
+    triangle_count: u64
+    draw_call_count: u64
+
+    fn init(allocator: Allocator, api: GraphicsAPI, width: u32, height: u32): Renderer {
+        return Renderer {
+            api: api
+            allocator: allocator
+            device_handle: null
+            context_handle: null
+            command_buffer: CommandBuffer.init(allocator)
+            viewport_width: width
+            viewport_height: height
+            cull_mode: CullMode.Back
+            blend_mode: BlendMode.Opaque
+            depth_func: DepthFunc.Less
+            frame_count: 0
+            triangle_count: 0
+            draw_call_count: 0
+        }
+    }
+
+    fn initialize_api(mut self): bool {
+        match self.api {
+            GraphicsAPI.DirectX12 => {
+                return self.init_directx12()
+            }
+            GraphicsAPI.Vulkan => {
+                return self.init_vulkan()
+            }
+            GraphicsAPI.Metal => {
+                return self.init_metal()
+            }
+            GraphicsAPI.OpenGL => {
+                return self.init_opengl()
+            }
+        }
+        return false
+    }
+
+    fn begin_frame(mut self) {
+        self.command_buffer.clear()
+        self.triangle_count = 0
+        self.draw_call_count = 0
+    }
+
+    fn end_frame(mut self) {
+        // Submit command buffer to GPU
+        self.submit_commands()
+        self.frame_count += 1
+    }
+
+    fn clear(mut self, color: [4]f32, depth: f32, stencil: u8) {
+        self.command_buffer.add(RenderCommand.Clear {
+            color: color
+            depth: depth
+            stencil: stencil
+        })
+    }
+
+    fn set_viewport(mut self, x: i32, y: i32, width: u32, height: u32) {
+        self.viewport_width = width
+        self.viewport_height = height
+
+        self.command_buffer.add(RenderCommand.SetViewport {
+            x: x
+            y: y
+            width: width
+            height: height
+        })
+    }
+
+    fn create_vertex_buffer(mut self, vertices: []Vertex, is_dynamic: bool): ?VertexBuffer {
+        // TODO: Implement per-API vertex buffer creation
+        return null
+    }
+
+    fn create_index_buffer(mut self, indices: []u32): ?IndexBuffer {
+        // TODO: Implement per-API index buffer creation
+        return null
+    }
+
+    fn create_texture(mut self, width: u32, height: u32, format: TextureFormat, data: ?[]u8): ?Texture {
+        // TODO: Implement per-API texture creation
+        return null
+    }
+
+    fn create_shader(mut self, stage: ShaderStage, source: string): ?Shader {
+        // TODO: Implement per-API shader compilation
+        return null
+    }
+
+    fn draw_mesh(mut self, vertex_buffer: *VertexBuffer, index_buffer: *IndexBuffer) {
+        self.command_buffer.add(RenderCommand.DrawMesh {
+            vertex_buffer: vertex_buffer
+            index_buffer: index_buffer
+            index_count: @intCast(u32, index_buffer.index_count)
+            instance_count: 1
+        })
+
+        self.draw_call_count += 1
+        self.triangle_count += index_buffer.index_count / 3
+    }
+
+    fn draw_model(mut self, model: *Model) {
+        // Draw all meshes in the model
+        for i in 0..model.mesh_count {
+            // TODO: Create buffers and draw mesh
+            // This requires converting Mesh to GPU buffers
+        }
+    }
+
+    fn get_stats(self): RenderStats {
+        return RenderStats {
+            frame_count: self.frame_count
+            triangle_count: self.triangle_count
+            draw_call_count: self.draw_call_count
+            memory_used: 0  // TODO: Track GPU memory
+        }
+    }
+
+    // Private API-specific initialization methods
+
+    fn init_directx12(mut self): bool {
+        // TODO: Initialize DirectX 12
+        // - Create D3D12 device
+        // - Create command queue
+        // - Create swap chain
+        // - Create descriptor heaps
+        return false
+    }
+
+    fn init_vulkan(mut self): bool {
+        // TODO: Initialize Vulkan
+        // - Create VkInstance
+        // - Select physical device
+        // - Create logical device
+        // - Create swap chain
+        // - Create command pool
+        return false
+    }
+
+    fn init_metal(mut self): bool {
+        // TODO: Initialize Metal
+        // - Create MTLDevice
+        // - Create MTLCommandQueue
+        // - Create CAMetalLayer
+        // - Set up render pipeline
+        return false
+    }
+
+    fn init_opengl(mut self): bool {
+        // TODO: Initialize OpenGL
+        // - Create GL context
+        // - Load GL functions
+        // - Set up framebuffers
+        return false
+    }
+
+    fn submit_commands(mut self) {
+        // TODO: Submit command buffer to GPU based on API
+        match self.api {
+            GraphicsAPI.DirectX12 => {
+                // Execute D3D12 command list
+            }
+            GraphicsAPI.Vulkan => {
+                // Submit VkCommandBuffer
+            }
+            GraphicsAPI.Metal => {
+                // Commit MTLCommandBuffer
+            }
+            GraphicsAPI.OpenGL => {
+                // Execute GL commands immediately
+            }
+        }
+    }
+
+    fn deinit(mut self) {
+        self.command_buffer.deinit()
+
+        // TODO: Clean up API-specific resources
+    }
+}
+
+// Render statistics
+struct RenderStats {
+    frame_count: u64
+    triangle_count: u64
+    draw_call_count: u64
+    memory_used: usize
+}
+
+// Global renderer instance
+var g_renderer: ?Renderer = null
+
+export fn init_renderer(allocator: Allocator, api: GraphicsAPI, width: u32, height: u32): bool {
+    let mut renderer = Renderer.init(allocator, api, width, height)
+
+    if !renderer.initialize_api() {
+        return false
+    }
+
+    g_renderer = renderer
+    return true
+}
+
+export fn shutdown_renderer() {
+    if g_renderer {
+        g_renderer.?.deinit()
+        g_renderer = null
+    }
+}
+
+export fn begin_frame() {
+    if g_renderer {
+        g_renderer.?.begin_frame()
+    }
+}
+
+export fn end_frame() {
+    if g_renderer {
+        g_renderer.?.end_frame()
+    }
+}
+
+export fn render_model(model: *Model) {
+    if g_renderer {
+        g_renderer.?.draw_model(model)
+    }
+}
+
+export fn get_render_stats(): RenderStats {
+    if g_renderer {
+        return g_renderer.?.get_stats()
+    }
+    return RenderStats {
+        frame_count: 0
+        triangle_count: 0
+        draw_call_count: 0
+        memory_used: 0
+    }
+}
