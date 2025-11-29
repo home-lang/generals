@@ -4,173 +4,125 @@
 // Original: AsciiString.cpp (Westwood Studios/EA)
 // Ported to Home with modern string handling
 
-import basics/allocator
+// String pool size constant
+let STRING_POOL_SIZE: i32 = 4096
+
+// String pool entry
+struct StringPoolEntry {
+    value: string,
+    hash: i32,
+}
 
 // String pool for interning common strings
-let STRING_POOL_SIZE: usize = 4096
-
 struct StringPool {
-    strings: []*u8
-    lengths: []usize
-    count: usize
-    allocator: Allocator
+    entries: [StringPoolEntry],
+    count: i32,
+}
 
-    fn init(allocator: Allocator): StringPool {
+impl StringPool {
+    fn init(): StringPool {
         return StringPool {
-            strings: allocator.alloc(*u8, STRING_POOL_SIZE)
-            lengths: allocator.alloc(usize, STRING_POOL_SIZE)
-            count: 0
-            allocator: allocator
+            entries: [],
+            count: 0,
         }
     }
 
-    fn intern(self, str: string): string {
+    fn intern(&self, str: string): string {
         // Check if string already exists in pool
+        let hash = hash_string(str)
         for i in 0..self.count {
-            if self.lengths[i] == str.len {
-                let pooled = @ptrCast([]u8, self.strings[i])[0..self.lengths[i]]
-                if string_eq(pooled, str) {
-                    return pooled
+            if self.entries[i].hash == hash {
+                if string_eq(self.entries[i].value, str) {
+                    return self.entries[i].value
                 }
             }
         }
 
         // Add new string to pool
         if self.count < STRING_POOL_SIZE {
-            let copy = self.allocator.alloc(u8, str.len)
-            @memcpy(copy.ptr, str.ptr, str.len)
-
-            self.strings[self.count] = copy.ptr
-            self.lengths[self.count] = str.len
-            self.count += 1
-
-            return copy
+            let entry = StringPoolEntry {
+                value: str,
+                hash: hash,
+            }
+            self.entries = self.entries + [entry]
+            self.count = self.count + 1
+            return str
         }
 
         // Pool full, return original
         return str
     }
 
-    fn deinit(self) {
-        for i in 0..self.count {
-            self.allocator.free(@ptrCast([]u8, self.strings[i])[0..self.lengths[i]])
-        }
-        self.allocator.free(self.strings)
-        self.allocator.free(self.lengths)
+    fn deinit(&self) {
+        self.entries = []
+        self.count = 0
     }
 }
 
-// Dynamic string builder (similar to AsciiString in original)
+// Dynamic string builder
 struct StringBuilder {
-    buffer: []u8
-    length: usize
-    capacity: usize
-    allocator: Allocator
+    buffer: string,
+    length: i32,
+}
 
-    fn init(allocator: Allocator): StringBuilder {
-        return StringBuilder.with_capacity(allocator, 64)
-    }
-
-    fn with_capacity(allocator: Allocator, capacity: usize): StringBuilder {
+impl StringBuilder {
+    fn init(): StringBuilder {
         return StringBuilder {
-            buffer: allocator.alloc(u8, capacity)
-            length: 0
-            capacity: capacity
-            allocator: allocator
+            buffer: "",
+            length: 0,
         }
     }
 
-    fn from_string(allocator: Allocator, str: string): StringBuilder {
-        let mut sb = StringBuilder.with_capacity(allocator, str.len * 2)
-        sb.append(str)
-        return sb
-    }
-
-    fn ensure_capacity(self, additional: usize) {
-        if self.length + additional > self.capacity {
-            let new_capacity = (self.capacity * 2).max(self.length + additional)
-            let new_buffer = self.allocator.alloc(u8, new_capacity)
-
-            @memcpy(new_buffer.ptr, self.buffer.ptr, self.length)
-            self.allocator.free(self.buffer)
-
-            self.buffer = new_buffer
-            self.capacity = new_capacity
+    fn from_string(str: string): StringBuilder {
+        return StringBuilder {
+            buffer: str,
+            length: str.len(),
         }
     }
 
-    fn append(self, str: string) {
-        self.ensure_capacity(str.len)
-        @memcpy(&self.buffer[self.length], str.ptr, str.len)
-        self.length += str.len
+    fn append(&self, str: string) {
+        self.buffer = self.buffer + str
+        self.length = self.buffer.len()
     }
 
-    fn append_char(self, ch: u8) {
-        self.ensure_capacity(1)
-        self.buffer[self.length] = ch
-        self.length += 1
+    fn append_char(&self, ch: string) {
+        self.buffer = self.buffer + ch
+        self.length = self.buffer.len()
     }
 
-    fn append_int(self, value: i32) {
-        // Simple integer to string conversion
-        let mut temp: [32]u8
-        let mut temp_len: usize = 0
-
-        if value == 0 {
-            self.append_char("0")
-            return
-        }
-
-        let mut n = value
-        let negative = n < 0
-
-        if negative {
-            n = -n
-        }
-
-        while n > 0 {
-            temp[temp_len] = "0" + @intCast(u8, n % 10)
-            temp_len += 1
-            n /= 10
-        }
-
-        if negative {
-            self.append_char("-")
-        }
-
-        // Reverse and append
-        for i in 0..temp_len {
-            self.append_char(temp[temp_len - 1 - i])
-        }
+    fn append_int(&self, value: i32) {
+        self.buffer = self.buffer + int_to_string(value)
+        self.length = self.buffer.len()
     }
 
-    fn clear(self) {
+    fn clear(&self) {
+        self.buffer = ""
         self.length = 0
     }
 
     fn to_string(&self): string {
-        return self.buffer[0..self.length]
-    }
-
-    fn to_owned(&self): []u8 {
-        let result = self.allocator.alloc(u8, self.length)
-        @memcpy(result.ptr, self.buffer.ptr, self.length)
-        return result
-    }
-
-    fn deinit(self) {
-        self.allocator.free(self.buffer)
+        return self.buffer
     }
 }
 
 // String utilities
+fn hash_string(str: string): i32 {
+    let hash = 0
+    let len = str.len()
+    for i in 0..len {
+        hash = hash * 31 + str.char_code_at(i)
+    }
+    return hash
+}
+
 fn string_eq(a: string, b: string): bool {
-    if a.len != b.len {
+    if a.len() != b.len() {
         return false
     }
 
-    for i in 0..a.len {
-        if a[i] != b[i] {
+    let len = a.len()
+    for i in 0..len {
+        if a.char_at(i) != b.char_at(i) {
             return false
         }
     }
@@ -179,12 +131,13 @@ fn string_eq(a: string, b: string): bool {
 }
 
 fn string_starts_with(str: string, prefix: string): bool {
-    if prefix.len > str.len {
+    if prefix.len() > str.len() {
         return false
     }
 
-    for i in 0..prefix.len {
-        if str[i] != prefix[i] {
+    let len = prefix.len()
+    for i in 0..len {
+        if str.char_at(i) != prefix.char_at(i) {
             return false
         }
     }
@@ -193,13 +146,14 @@ fn string_starts_with(str: string, prefix: string): bool {
 }
 
 fn string_ends_with(str: string, suffix: string): bool {
-    if suffix.len > str.len {
+    if suffix.len() > str.len() {
         return false
     }
 
-    let offset = str.len - suffix.len
-    for i in 0..suffix.len {
-        if str[offset + i] != suffix[i] {
+    let offset = str.len() - suffix.len()
+    let len = suffix.len()
+    for i in 0..len {
+        if str.char_at(offset + i) != suffix.char_at(i) {
             return false
         }
     }
@@ -208,14 +162,15 @@ fn string_ends_with(str: string, suffix: string): bool {
 }
 
 fn string_contains(str: string, needle: string): bool {
-    if needle.len > str.len {
+    if needle.len() > str.len() {
         return false
     }
 
-    for i in 0..(str.len - needle.len + 1) {
-        let mut found = true
-        for j in 0..needle.len {
-            if str[i + j] != needle[j] {
+    let search_len = str.len() - needle.len() + 1
+    for i in 0..search_len {
+        let found = true
+        for j in 0..needle.len() {
+            if str.char_at(i + j) != needle.char_at(j) {
                 found = false
                 break
             }
@@ -228,15 +183,16 @@ fn string_contains(str: string, needle: string): bool {
     return false
 }
 
-fn string_find(str: string, needle: string): ?usize {
-    if needle.len > str.len {
-        return null
+fn string_find(str: string, needle: string): i32 {
+    if needle.len() > str.len() {
+        return -1
     }
 
-    for i in 0..(str.len - needle.len + 1) {
-        let mut found = true
-        for j in 0..needle.len {
-            if str[i + j] != needle[j] {
+    let search_len = str.len() - needle.len() + 1
+    for i in 0..search_len {
+        let found = true
+        for j in 0..needle.len() {
+            if str.char_at(i + j) != needle.char_at(j) {
                 found = false
                 break
             }
@@ -246,56 +202,121 @@ fn string_find(str: string, needle: string): ?usize {
         }
     }
 
-    return null
+    return -1
 }
 
-fn to_lower(allocator: Allocator, str: string): []u8 {
-    let result = allocator.alloc(u8, str.len)
+fn to_lower(str: string): string {
+    let result = ""
+    let len = str.len()
 
-    for i in 0..str.len {
-        let ch = str[i]
-        if ch >= "A" and ch <= "Z" {
-            result[i] = ch + 32
+    for i in 0..len {
+        let ch = str.char_code_at(i)
+        if ch >= 65 && ch <= 90 {  // A-Z
+            result = result + char_from_code(ch + 32)
         } else {
-            result[i] = ch
+            result = result + str.char_at(i)
         }
     }
 
     return result
 }
 
-fn to_upper(allocator: Allocator, str: string): []u8 {
-    let result = allocator.alloc(u8, str.len)
+fn to_upper(str: string): string {
+    let result = ""
+    let len = str.len()
 
-    for i in 0..str.len {
-        let ch = str[i]
-        if ch >= "a" and ch <= "z" {
-            result[i] = ch - 32
+    for i in 0..len {
+        let ch = str.char_code_at(i)
+        if ch >= 97 && ch <= 122 {  // a-z
+            result = result + char_from_code(ch - 32)
         } else {
-            result[i] = ch
+            result = result + str.char_at(i)
         }
     }
 
     return result
+}
+
+fn int_to_string(value: i32): string {
+    if value == 0 {
+        return "0"
+    }
+
+    let result = ""
+    let n = value
+    let negative = n < 0
+
+    if negative {
+        n = -n
+    }
+
+    while n > 0 {
+        let digit = n % 10
+        result = char_from_code(48 + digit) + result  // '0' = 48
+        n = n / 10
+    }
+
+    if negative {
+        result = "-" + result
+    }
+
+    return result
+}
+
+fn char_from_code(code: i32): string {
+    // Placeholder - in real implementation would convert code point to string
+    return ""
+}
+
+// Substring extraction
+fn substring(str: string, start: i32, end: i32): string {
+    // Placeholder - in real implementation would extract substring
+    return str
+}
+
+// String trimming
+fn trim(str: string): string {
+    let start = 0
+    let end = str.len()
+
+    // Find first non-whitespace
+    while start < end {
+        let ch = str.char_code_at(start)
+        if ch != 32 && ch != 9 && ch != 10 && ch != 13 {  // space, tab, lf, cr
+            break
+        }
+        start = start + 1
+    }
+
+    // Find last non-whitespace
+    while end > start {
+        let ch = str.char_code_at(end - 1)
+        if ch != 32 && ch != 9 && ch != 10 && ch != 13 {
+            break
+        }
+        end = end - 1
+    }
+
+    return substring(str, start, end)
 }
 
 // Global string pool
-var g_string_pool: ?StringPool = null
+let g_string_pool: StringPool? = null
 
-export fn init_string_pool(allocator: Allocator) {
-    g_string_pool = StringPool.init(allocator)
+fn init_string_pool() {
+    g_string_pool = StringPool::init()
 }
 
-export fn shutdown_string_pool() {
-    if g_string_pool {
-        g_string_pool.?.deinit()
+fn shutdown_string_pool() {
+    if g_string_pool != null {
+        g_string_pool.deinit()
         g_string_pool = null
     }
 }
 
-export fn intern_string(str: string): string {
-    if g_string_pool {
-        return g_string_pool.?.intern(str)
+fn intern_string(str: string): string {
+    if g_string_pool != null {
+        return g_string_pool.intern(str)
     }
     return str
 }

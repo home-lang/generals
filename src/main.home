@@ -44,7 +44,7 @@ import math/matrix4 {Mat4}
 import math/quaternion {Quaternion}
 
 // Assets (moved to engine/)
-import engine/ini_parser {INIParser, INIFile}
+import engine/ini_parser {INIParser, INIDocument}
 import engine/asset_manifest {AssetManifest}
 
 // Rendering
@@ -188,7 +188,7 @@ struct GeneralsGame {
 
     // AI systems
     pathfinder: HPAPathfinder,
-    ai_controllers: Vec<AIPlayer>,
+    ai_controllers: [AIPlayer],
 
     // Rendering systems
     terrain_renderer: TerrainRenderer,
@@ -226,6 +226,13 @@ struct GeneralsGame {
     video_player: VideoPlayer,
     cinematic_system: CinematicSystem,
 
+    // Camera and display
+    camera: RTSCamera,
+    shell_map: ShellMap,
+
+    // Command system
+    command_system: CommandSystem,
+
     // State
     is_running: bool,
     is_paused: bool,
@@ -248,7 +255,7 @@ impl GeneralsGame {
             damage_system: DamageSystem::init(),
             projectile_manager: ProjectileManager::init(),
             pathfinder: HPAPathfinder::init(),
-            ai_controllers: Vec::init(),
+            ai_controllers: [],
             terrain_renderer: TerrainRenderer::init(),
             particle_system: ParticleSystem::init(),
             shadow_renderer: ShadowRenderer::init(),
@@ -273,6 +280,9 @@ impl GeneralsGame {
             script_engine: ScriptEngine::init(),
             video_player: VideoPlayer::init(),
             cinematic_system: CinematicSystem::init(),
+            camera: RTSCamera::init(),
+            shell_map: ShellMap::init(),
+            command_system: CommandSystem::init(),
             is_running: false,
             is_paused: false,
             current_mode: GameMode::MainMenu,
@@ -363,38 +373,756 @@ fn load_localization(game: GeneralsGame): bool {
 }
 
 fn load_game_data(game: GeneralsGame): bool {
-    // Load all INI files from assets/ini/
-    let ini_files = game.file_system.find_files("assets/ini/*.ini")
+    // Load game data INI files in order matching Thyme's gameengine.cpp initialization
+    // This follows the authentic C&C Generals Zero Hour loading sequence
 
-    for file_path in ini_files {
-        let ini_data = game.file_system.read_file_as_string(file_path)
-        if ini_data != null {
-            let parser = INIParser::init()
-            let ini = parser.parse(ini_data)
-            process_ini_file(game, file_path, ini)
+    let parser = INIParser::init()
+
+    // =========================================================================
+    // CORE GAME DATA
+    // =========================================================================
+
+    // GameData.ini - Core game settings (frame rate, memory, debug options)
+    let gamedata_ini = game.file_system.read_file_as_string("Data/INI/Default/GameData.ini")
+    if gamedata_ini != null {
+        let doc = parser.parse(gamedata_ini)
+        if doc != null {
+            process_gamedata_ini(game, doc)
+        }
+    }
+    let gamedata_override = game.file_system.read_file_as_string("Data/INI/GameData.ini")
+    if gamedata_override != null {
+        let doc = parser.parse(gamedata_override)
+        if doc != null {
+            process_gamedata_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // ENVIRONMENT INI FILES
+    // =========================================================================
+
+    // Water.ini - Water rendering settings
+    let water_default = game.file_system.read_file_as_string("Data/INI/Default/Water.ini")
+    if water_default != null {
+        let doc = parser.parse(water_default)
+        if doc != null {
+            process_water_ini(game, doc)
+        }
+    }
+    let water_ini = game.file_system.read_file_as_string("Data/INI/Water.ini")
+    if water_ini != null {
+        let doc = parser.parse(water_ini)
+        if doc != null {
+            process_water_ini(game, doc)
+        }
+    }
+
+    // Weather.ini - Weather effects settings
+    let weather_default = game.file_system.read_file_as_string("Data/INI/Default/Weather.ini")
+    if weather_default != null {
+        let doc = parser.parse(weather_default)
+        if doc != null {
+            process_weather_ini(game, doc)
+        }
+    }
+    let weather_ini = game.file_system.read_file_as_string("Data/INI/Weather.ini")
+    if weather_ini != null {
+        let doc = parser.parse(weather_ini)
+        if doc != null {
+            process_weather_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // SCIENCE AND TECH TREE
+    // =========================================================================
+
+    // Science.ini - Technology research definitions
+    let science_default = game.file_system.read_file_as_string("Data/INI/Default/Science.ini")
+    if science_default != null {
+        let doc = parser.parse(science_default)
+        if doc != null {
+            process_science_ini(game, doc)
+        }
+    }
+    let science_ini = game.file_system.read_file_as_string("Data/INI/Science.ini")
+    if science_ini != null {
+        let doc = parser.parse(science_ini)
+        if doc != null {
+            process_science_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // MULTIPLAYER SETTINGS
+    // =========================================================================
+
+    // Multiplayer.ini - Multiplayer game settings
+    let mp_default = game.file_system.read_file_as_string("Data/INI/Default/Multiplayer.ini")
+    if mp_default != null {
+        let doc = parser.parse(mp_default)
+        if doc != null {
+            process_multiplayer_ini(game, doc)
+        }
+    }
+    let mp_ini = game.file_system.read_file_as_string("Data/INI/Multiplayer.ini")
+    if mp_ini != null {
+        let doc = parser.parse(mp_ini)
+        if doc != null {
+            process_multiplayer_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // TERRAIN DEFINITIONS
+    // =========================================================================
+
+    // Terrain.ini - Terrain types and properties
+    let terrain_default = game.file_system.read_file_as_string("Data/INI/Default/Terrain.ini")
+    if terrain_default != null {
+        let doc = parser.parse(terrain_default)
+        if doc != null {
+            process_terrain_ini(game, doc)
+        }
+    }
+    let terrain_ini = game.file_system.read_file_as_string("Data/INI/Terrain.ini")
+    if terrain_ini != null {
+        let doc = parser.parse(terrain_ini)
+        if doc != null {
+            process_terrain_ini(game, doc)
+        }
+    }
+
+    // Roads.ini - Road definitions
+    let roads_default = game.file_system.read_file_as_string("Data/INI/Default/Roads.ini")
+    if roads_default != null {
+        let doc = parser.parse(roads_default)
+        if doc != null {
+            process_roads_ini(game, doc)
+        }
+    }
+    let roads_ini = game.file_system.read_file_as_string("Data/INI/Roads.ini")
+    if roads_ini != null {
+        let doc = parser.parse(roads_ini)
+        if doc != null {
+            process_roads_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // PLAYER TEMPLATES
+    // =========================================================================
+
+    // PlayerTemplate.ini - Faction definitions
+    let player_default = game.file_system.read_file_as_string("Data/INI/Default/PlayerTemplate.ini")
+    if player_default != null {
+        let doc = parser.parse(player_default)
+        if doc != null {
+            process_player_template_ini(game, doc)
+        }
+    }
+    let player_ini = game.file_system.read_file_as_string("Data/INI/PlayerTemplate.ini")
+    if player_ini != null {
+        let doc = parser.parse(player_ini)
+        if doc != null {
+            process_player_template_ini(game, doc)
+        }
+    }
+
+    // Rank.ini - Player rank progression
+    let rank_ini = game.file_system.read_file_as_string("Data/INI/Rank.ini")
+    if rank_ini != null {
+        let doc = parser.parse(rank_ini)
+        if doc != null {
+            process_rank_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // EFFECTS DEFINITIONS
+    // =========================================================================
+
+    // FXList.ini - Visual and sound effects
+    let fx_default = game.file_system.read_file_as_string("Data/INI/Default/FXList.ini")
+    if fx_default != null {
+        let doc = parser.parse(fx_default)
+        if doc != null {
+            process_fxlist_ini(game, doc)
+        }
+    }
+    let fx_ini = game.file_system.read_file_as_string("Data/INI/FXList.ini")
+    if fx_ini != null {
+        let doc = parser.parse(fx_ini)
+        if doc != null {
+            process_fxlist_ini(game, doc)
+        }
+    }
+
+    // ParticleSystem.ini - Particle effects
+    let particle_ini = game.file_system.read_file_as_string("Data/INI/ParticleSystem.ini")
+    if particle_ini != null {
+        let doc = parser.parse(particle_ini)
+        if doc != null {
+            process_particle_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // COMBAT DEFINITIONS
+    // =========================================================================
+
+    // Weapon.ini - All weapon definitions
+    let weapon_ini = game.file_system.read_file_as_string("Data/INI/Weapon.ini")
+    if weapon_ini != null {
+        let doc = parser.parse(weapon_ini)
+        if doc != null {
+            process_weapon_ini(game, doc)
+        }
+    }
+
+    // Armor.ini - Armor types and damage modifiers
+    let armor_ini = game.file_system.read_file_as_string("Data/INI/Armor.ini")
+    if armor_ini != null {
+        let doc = parser.parse(armor_ini)
+        if doc != null {
+            process_armor_ini(game, doc)
+        }
+    }
+
+    // DamageFX.ini - Damage visual effects
+    let damagefx_ini = game.file_system.read_file_as_string("Data/INI/DamageFX.ini")
+    if damagefx_ini != null {
+        let doc = parser.parse(damagefx_ini)
+        if doc != null {
+            process_damagefx_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // LOCOMOTOR AND MOVEMENT
+    // =========================================================================
+
+    // Locomotor.ini - Movement types for units
+    let locomotor_ini = game.file_system.read_file_as_string("Data/INI/Locomotor.ini")
+    if locomotor_ini != null {
+        let doc = parser.parse(locomotor_ini)
+        if doc != null {
+            process_locomotor_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // SPECIAL POWERS
+    // =========================================================================
+
+    // SpecialPower.ini - General abilities and superweapons
+    let sp_default = game.file_system.read_file_as_string("Data/INI/Default/SpecialPower.ini")
+    if sp_default != null {
+        let doc = parser.parse(sp_default)
+        if doc != null {
+            process_specialpower_ini(game, doc)
+        }
+    }
+    let sp_ini = game.file_system.read_file_as_string("Data/INI/SpecialPower.ini")
+    if sp_ini != null {
+        let doc = parser.parse(sp_ini)
+        if doc != null {
+            process_specialpower_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // OBJECT CREATION LISTS
+    // =========================================================================
+
+    // ObjectCreationList.ini - Object spawning definitions
+    let ocl_default = game.file_system.read_file_as_string("Data/INI/Default/ObjectCreationList.ini")
+    if ocl_default != null {
+        let doc = parser.parse(ocl_default)
+        if doc != null {
+            process_objectcreationlist_ini(game, doc)
+        }
+    }
+    let ocl_ini = game.file_system.read_file_as_string("Data/INI/ObjectCreationList.ini")
+    if ocl_ini != null {
+        let doc = parser.parse(ocl_ini)
+        if doc != null {
+            process_objectcreationlist_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // OBJECT DEFINITIONS (Units, Buildings, Props)
+    // =========================================================================
+
+    // Default objects first
+    let object_default = game.file_system.read_file_as_string("Data/INI/Default/Object.ini")
+    if object_default != null {
+        let doc = parser.parse(object_default)
+        if doc != null {
+            process_object_ini(game, doc)
+        }
+    }
+
+    // Load all object INI files from the Object directory
+    let object_files = game.file_system.find_files("Data/INI/Object/*.ini")
+    let file_index = 0
+    while file_index < object_files.len() {
+        let object_file = object_files[file_index]
+        let object_data = game.file_system.read_file_as_string(object_file)
+        if object_data != null {
+            let doc = parser.parse(object_data)
+            if doc != null {
+                process_object_ini(game, doc)
+            }
+        }
+        file_index = file_index + 1
+    }
+
+    // =========================================================================
+    // UPGRADES
+    // =========================================================================
+
+    // Upgrade.ini - All upgrade definitions
+    let upgrade_default = game.file_system.read_file_as_string("Data/INI/Default/Upgrade.ini")
+    if upgrade_default != null {
+        let doc = parser.parse(upgrade_default)
+        if doc != null {
+            process_upgrade_ini(game, doc)
+        }
+    }
+    let upgrade_ini = game.file_system.read_file_as_string("Data/INI/Upgrade.ini")
+    if upgrade_ini != null {
+        let doc = parser.parse(upgrade_ini)
+        if doc != null {
+            process_upgrade_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // AI DEFINITIONS
+    // =========================================================================
+
+    // AIData.ini - AI behavior settings
+    let ai_default = game.file_system.read_file_as_string("Data/INI/Default/AIData.ini")
+    if ai_default != null {
+        let doc = parser.parse(ai_default)
+        if doc != null {
+            process_aidata_ini(game, doc)
+        }
+    }
+    let ai_ini = game.file_system.read_file_as_string("Data/INI/AIData.ini")
+    if ai_ini != null {
+        let doc = parser.parse(ai_ini)
+        if doc != null {
+            process_aidata_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // CRATE SYSTEM
+    // =========================================================================
+
+    // Crate.ini - Supply drop crate definitions
+    let crate_default = game.file_system.read_file_as_string("Data/INI/Default/Crate.ini")
+    if crate_default != null {
+        let doc = parser.parse(crate_default)
+        if doc != null {
+            process_crate_ini(game, doc)
+        }
+    }
+    let crate_ini = game.file_system.read_file_as_string("Data/INI/Crate.ini")
+    if crate_ini != null {
+        let doc = parser.parse(crate_ini)
+        if doc != null {
+            process_crate_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // UI DEFINITIONS
+    // =========================================================================
+
+    // CommandButton.ini - UI buttons for commands
+    let cmdbtn_default = game.file_system.read_file_as_string("Data/INI/Default/CommandButton.ini")
+    if cmdbtn_default != null {
+        let doc = parser.parse(cmdbtn_default)
+        if doc != null {
+            process_commandbutton_ini(game, doc)
+        }
+    }
+    let cmdbtn_ini = game.file_system.read_file_as_string("Data/INI/CommandButton.ini")
+    if cmdbtn_ini != null {
+        let doc = parser.parse(cmdbtn_ini)
+        if doc != null {
+            process_commandbutton_ini(game, doc)
+        }
+    }
+
+    // CommandSet.ini - Command groupings for units/buildings
+    let cmdset_ini = game.file_system.read_file_as_string("Data/INI/CommandSet.ini")
+    if cmdset_ini != null {
+        let doc = parser.parse(cmdset_ini)
+        if doc != null {
+            process_commandset_ini(game, doc)
+        }
+    }
+
+    // ControlBarScheme.ini - Control bar layouts
+    let ctrlbar_default = game.file_system.read_file_as_string("Data/INI/Default/ControlBarScheme.ini")
+    if ctrlbar_default != null {
+        let doc = parser.parse(ctrlbar_default)
+        if doc != null {
+            process_controlbar_ini(game, doc)
+        }
+    }
+    let ctrlbar_ini = game.file_system.read_file_as_string("Data/INI/ControlBarScheme.ini")
+    if ctrlbar_ini != null {
+        let doc = parser.parse(ctrlbar_ini)
+        if doc != null {
+            process_controlbar_ini(game, doc)
+        }
+    }
+
+    // InGameUI.ini - In-game UI settings
+    let ingameui_ini = game.file_system.read_file_as_string("Data/INI/InGameUI.ini")
+    if ingameui_ini != null {
+        let doc = parser.parse(ingameui_ini)
+        if doc != null {
+            process_ingameui_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // SHELL AND MENUS
+    // =========================================================================
+
+    // ShellMenuScheme.ini - Main menu layout
+    let shell_default = game.file_system.read_file_as_string("Data/INI/Default/ShellMenuScheme.ini")
+    if shell_default != null {
+        let doc = parser.parse(shell_default)
+        if doc != null {
+            process_shell_ini(game, doc)
+        }
+    }
+    let shell_ini = game.file_system.read_file_as_string("Data/INI/ShellMenuScheme.ini")
+    if shell_ini != null {
+        let doc = parser.parse(shell_ini)
+        if doc != null {
+            process_shell_ini(game, doc)
+        }
+    }
+
+    // WindowTransitions.ini - UI transition animations
+    let wndtrans_ini = game.file_system.read_file_as_string("Data/INI/WindowTransitions.ini")
+    if wndtrans_ini != null {
+        let doc = parser.parse(wndtrans_ini)
+        if doc != null {
+            process_windowtransitions_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // CAMPAIGN AND CHALLENGE
+    // =========================================================================
+
+    // Campaign.ini - Campaign mission definitions
+    let campaign_ini = game.file_system.read_file_as_string("Data/INI/Campaign.ini")
+    if campaign_ini != null {
+        let doc = parser.parse(campaign_ini)
+        if doc != null {
+            process_campaign_ini(game, doc)
+        }
+    }
+
+    // ChallengeMode.ini - Generals Challenge definitions
+    let challenge_ini = game.file_system.read_file_as_string("Data/INI/ChallengeMode.ini")
+    if challenge_ini != null {
+        let doc = parser.parse(challenge_ini)
+        if doc != null {
+            process_challenge_ini(game, doc)
+        }
+    }
+
+    // =========================================================================
+    // MISCELLANEOUS
+    // =========================================================================
+
+    // GameLOD.ini - Level of detail settings
+    let gamelod_ini = game.file_system.read_file_as_string("Data/INI/GameLOD.ini")
+    if gamelod_ini != null {
+        let doc = parser.parse(gamelod_ini)
+        if doc != null {
+            process_gamelod_ini(game, doc)
+        }
+    }
+
+    // GameLODPresets.ini - LOD presets
+    let gamelodpresets_ini = game.file_system.read_file_as_string("Data/INI/GameLODPresets.ini")
+    if gamelodpresets_ini != null {
+        let doc = parser.parse(gamelodpresets_ini)
+        if doc != null {
+            process_gamelod_ini(game, doc)
+        }
+    }
+
+    // Mouse.ini - Mouse cursor settings
+    let mouse_ini = game.file_system.read_file_as_string("Data/INI/Mouse.ini")
+    if mouse_ini != null {
+        let doc = parser.parse(mouse_ini)
+        if doc != null {
+            process_mouse_ini(game, doc)
+        }
+    }
+
+    // Video.ini - Video definitions
+    let video_default = game.file_system.read_file_as_string("Data/INI/Default/Video.ini")
+    if video_default != null {
+        let doc = parser.parse(video_default)
+        if doc != null {
+            process_video_ini(game, doc)
+        }
+    }
+    let video_ini = game.file_system.read_file_as_string("Data/INI/Video.ini")
+    if video_ini != null {
+        let doc = parser.parse(video_ini)
+        if doc != null {
+            process_video_ini(game, doc)
+        }
+    }
+
+    // Eva.ini - EVA voice announcements
+    let eva_ini = game.file_system.read_file_as_string("Data/INI/Eva.ini")
+    if eva_ini != null {
+        let doc = parser.parse(eva_ini)
+        if doc != null {
+            process_eva_ini(game, doc)
+        }
+    }
+
+    // Credits.ini - Credits screen data
+    let credits_ini = game.file_system.read_file_as_string("Data/INI/Credits.ini")
+    if credits_ini != null {
+        let doc = parser.parse(credits_ini)
+        if doc != null {
+            process_credits_ini(game, doc)
+        }
+    }
+
+    // Animation2D.ini - 2D animation definitions
+    let anim2d_ini = game.file_system.read_file_as_string("Data/INI/Animation2D.ini")
+    if anim2d_ini != null {
+        let doc = parser.parse(anim2d_ini)
+        if doc != null {
+            process_animation2d_ini(game, doc)
+        }
+    }
+
+    // DrawGroupInfo.ini - Draw group settings
+    let drawgroup_ini = game.file_system.read_file_as_string("Data/INI/DrawGroupInfo.ini")
+    if drawgroup_ini != null {
+        let doc = parser.parse(drawgroup_ini)
+        if doc != null {
+            process_drawgroup_ini(game, doc)
         }
     }
 
     return true
 }
 
-fn process_ini_file(game: GeneralsGame, path: string, ini: INIFile) {
-    // Process different INI file types
-    if path.contains("object") {
-        // Unit/building definitions
-    } else if path.contains("weapon") {
-        // Weapon definitions
-    } else if path.contains("upgrade") {
-        // Upgrade definitions
-    } else if path.contains("science") {
-        // Tech tree / science definitions
-    } else if path.contains("commandbutton") {
-        // UI command buttons
-    } else if path.contains("fxlist") {
-        // Visual effects
-    } else if path.contains("audio") {
-        // Audio definitions
-    }
+// ============================================================================
+// INI PROCESSING FUNCTIONS
+// ============================================================================
+
+fn process_gamedata_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process GameData block - global game settings
+    // Settings like MaxCameraHeight, MaxFrameRate, MaxShellScreens, etc.
+}
+
+fn process_water_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Water block - water rendering settings
+    // Transparency, reflection, wave parameters
+}
+
+fn process_weather_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Weather block - weather effects
+    // Snow, rain, fog, sandstorms
+}
+
+fn process_science_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Science definitions - tech tree nodes
+    // Prerequisites, costs, granted abilities
+}
+
+fn process_multiplayer_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Multiplayer settings
+    // Starting money, handicaps, team settings
+}
+
+fn process_terrain_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Terrain definitions
+    // Terrain types, passability, texture mappings
+}
+
+fn process_roads_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Road definitions
+    // Road types, textures, bridge settings
+}
+
+fn process_player_template_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process PlayerTemplate definitions
+    // Factions: USA, China, GLA, and Zero Hour generals
+}
+
+fn process_rank_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Rank definitions
+    // General experience ranks and unlock levels
+}
+
+fn process_fxlist_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process FXList definitions
+    // Visual and sound effect combinations
+}
+
+fn process_particle_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process ParticleSystem definitions
+    // Explosion, smoke, fire, debris particles
+}
+
+fn process_weapon_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Weapon definitions
+    // Damage, range, rate of fire, projectile type
+}
+
+fn process_armor_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Armor definitions
+    // Damage type modifiers for unit types
+}
+
+fn process_damagefx_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process DamageFX definitions
+    // Visual effects for damage states
+}
+
+fn process_locomotor_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Locomotor definitions
+    // Movement types: treads, wheels, legs, hover, aircraft
+}
+
+fn process_specialpower_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process SpecialPower definitions
+    // Superweapons and general abilities
+}
+
+fn process_objectcreationlist_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process ObjectCreationList definitions
+    // Spawning configurations for units and debris
+}
+
+fn process_object_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Object definitions
+    // Full unit/building/prop definitions with all modules
+    // This is the main object definition parser
+
+    // Each Object block defines:
+    // - Draw modules (W3DModelDraw, etc.)
+    // - Body modules (health, armor type)
+    // - Behavior modules (AI, weapons, abilities)
+    // - Locomotor sets
+    // - Command buttons
+    // - Prerequisites
+    // - Cost and build time
+}
+
+fn process_upgrade_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Upgrade definitions
+    // Unit and building upgrades
+}
+
+fn process_aidata_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process AIData definitions
+    // AI difficulty settings, build orders, strategies
+}
+
+fn process_crate_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Crate definitions
+    // Supply drop and veteran crate contents
+}
+
+fn process_commandbutton_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process CommandButton definitions
+    // UI buttons for unit/building commands
+}
+
+fn process_commandset_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process CommandSet definitions
+    // Button layouts for different unit/building types
+}
+
+fn process_controlbar_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process ControlBarScheme definitions
+    // Control bar layout per faction
+}
+
+fn process_ingameui_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process InGameUI settings
+    // Health bar colors, selection highlighting, tooltips
+}
+
+fn process_shell_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process ShellMenuScheme definitions
+    // Main menu layout and animations
+}
+
+fn process_windowtransitions_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process WindowTransitions definitions
+    // UI window transition animations
+}
+
+fn process_campaign_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Campaign definitions
+    // Mission list, prerequisites, cinematics
+}
+
+fn process_challenge_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process ChallengeMode definitions
+    // Generals Challenge generals and their bases
+}
+
+fn process_gamelod_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process GameLOD definitions
+    // Level of detail settings for different quality levels
+}
+
+fn process_mouse_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Mouse definitions
+    // Cursor images and hotspots
+}
+
+fn process_video_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Video definitions
+    // Video file paths for cutscenes
+}
+
+fn process_eva_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Eva definitions
+    // EVA voice announcement triggers and files
+}
+
+fn process_credits_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Credits definitions
+    // Credits screen text and styling
+}
+
+fn process_animation2d_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process Animation2D definitions
+    // 2D UI animations
+}
+
+fn process_drawgroup_ini(game: GeneralsGame, doc: INIDocument) {
+    // Process DrawGroupInfo definitions
+    // Rendering groups and priorities
 }
 
 fn init_audio(game: GeneralsGame): bool {
@@ -475,12 +1203,16 @@ fn process_input(game: GeneralsGame) {
 }
 
 fn update_logic(game: GeneralsGame, dt: f64) {
-    match game.current_mode {
-        GameMode::MainMenu => update_main_menu(game, dt),
-        GameMode::Skirmish => update_skirmish(game, dt),
-        GameMode::Campaign => update_campaign(game, dt),
-        GameMode::GeneralsChallenge => update_challenge(game, dt),
-        GameMode::Multiplayer => update_multiplayer(game, dt),
+    if game.current_mode == GameMode::MainMenu {
+        update_main_menu(game, dt)
+    } else if game.current_mode == GameMode::Skirmish {
+        update_skirmish(game, dt)
+    } else if game.current_mode == GameMode::Campaign {
+        update_campaign(game, dt)
+    } else if game.current_mode == GameMode::GeneralsChallenge {
+        update_challenge(game, dt)
+    } else if game.current_mode == GameMode::Multiplayer {
+        update_multiplayer(game, dt)
     }
 }
 
@@ -581,9 +1313,10 @@ fn render(game: GeneralsGame, alpha: f64) {
         1.0 / TARGET_RENDER_FPS
     )
 
-    match game.current_mode {
-        GameMode::MainMenu => render_main_menu(game, alpha),
-        _ => render_game(game, alpha),
+    if game.current_mode == GameMode::MainMenu {
+        render_main_menu(game, alpha)
+    } else {
+        render_game(game, alpha)
     }
 
     // End frame

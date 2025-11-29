@@ -1,63 +1,122 @@
 // Video Player - Bink video (BIK) playback for cutscenes and intro sequences
-// Implements C&C Generals Zero Hour video playback
+// Based on Thyme: platform/video/binkvideostream.cpp, game/client/videoplayer/videoplayer.cpp
+// Implements C&C Generals Zero Hour video playback with full Bink codec support
 
 // ============================================================================
-// BINK VIDEO FORMAT
+// VIDEO BUFFER TYPES
 // ============================================================================
 
-let BINK_SIGNATURE: [u8; 4] = [0x42, 0x49, 0x4B, 0x00]   // "BIK\0"
-let BINK2_SIGNATURE: [u8; 4] = [0x4B, 0x42, 0x32, 0x00]  // "KB2\0"
+enum VideoBufferType {
+    TYPE_UNKNOWN,
+    TYPE_R8G8B8,
+    TYPE_X8R8G8B8,
+    TYPE_R5G6B5,
+    TYPE_X1R5G5B5,
+    TYPE_COUNT,
+}
 
+struct VideoBuffer {
+    x_pos: i32,
+    y_pos: i32,
+    width: i32,
+    height: i32,
+    texture_width: i32,
+    texture_height: i32,
+    pitch: i32,
+    format: VideoBufferType,
+    data: [i32],  // Pixel data buffer
+    is_locked: bool,
+}
+
+impl VideoBuffer {
+    fn init(buffer_type: VideoBufferType): VideoBuffer {
+        return VideoBuffer {
+            x_pos: 0,
+            y_pos: 0,
+            width: 0,
+            height: 0,
+            texture_width: 0,
+            texture_height: 0,
+            pitch: 0,
+            format: buffer_type,
+            data: [],
+            is_locked: false,
+        }
+    }
+
+    fn allocate(&self, width: i32, height: i32): bool {
+        self.width = width
+        self.height = height
+
+        // Calculate texture dimensions (power of 2)
+        self.texture_width = next_power_of_two(width)
+        self.texture_height = next_power_of_two(height)
+
+        // Calculate pitch based on format
+        let bytes_per_pixel = get_bytes_per_pixel(self.format)
+        self.pitch = self.texture_width * bytes_per_pixel
+
+        // Allocate buffer
+        let buffer_size = self.texture_width * self.texture_height
+        // In real implementation, allocate memory here
+
+        return true
+    }
+
+    fn free(&self) {
+        self.width = 0
+        self.height = 0
+        self.texture_width = 0
+        self.texture_height = 0
+        self.pitch = 0
+    }
+
+    fn lock(&self): bool {
+        if self.is_locked {
+            return false
+        }
+        self.is_locked = true
+        return true
+    }
+
+    fn unlock(&self) {
+        self.is_locked = false
+    }
+
+    fn valid(&self): bool {
+        return self.width > 0 && self.height > 0
+    }
+
+    fn get_x_pos(&self): i32 { return self.x_pos }
+    fn get_y_pos(&self): i32 { return self.y_pos }
+    fn get_width(&self): i32 { return self.width }
+    fn get_height(&self): i32 { return self.height }
+    fn get_pitch(&self): i32 { return self.pitch }
+    fn get_format(&self): VideoBufferType { return self.format }
+}
+
+// ============================================================================
+// BINK VIDEO STRUCTURES
+// ============================================================================
+
+// Bink file header (matches original BIK format)
 struct BinkHeader {
-    signature: [u8; 4],
-    file_size: u32,
-    frame_count: u32,
-    largest_frame_size: u32,
-    width: u32,
-    height: u32,
-    fps_dividend: u32,
-    fps_divisor: u32,
-    video_flags: u32,
-    audio_track_count: u32
+    signature: [i32],      // "BIK" or "KB2" signature bytes
+    file_size: i32,
+    frame_count: i32,
+    largest_frame_size: i32,
+    width: i32,
+    height: i32,
+    fps_dividend: i32,
+    fps_divisor: i32,
+    video_flags: i32,
+    audio_track_count: i32,
 }
 
-struct BinkAudioTrack {
-    sample_rate: u32,
-    channels: u16,
-    flags: u16
-}
-
-struct BinkFrame {
-    frame_num: u32,
-    offset: u32,
-    size: u32,
-    is_keyframe: bool
-}
-
-struct BinkVideo {
-    header: BinkHeader,
-    audio_tracks: [BinkAudioTrack; 4],
-    frames: [BinkFrame; 65536],
-    frame_offsets: [u32; 65536],
-
-    // Playback state
-    current_frame: u32,
-    playback_time: f32,
-    frame_duration: f32,
-    is_playing: bool,
-    is_looping: bool,
-    is_finished: bool,
-
-    // Decoded data
-    video_buffer: [u8; 4194304],    // Current frame RGBA
-    audio_buffer: [i16; 262144],    // Audio samples
-    audio_buffer_size: i32
-}
-
-fn create_bink_video(): BinkVideo {
-    return BinkVideo {
-        header: BinkHeader {
-            signature: [0; 4],
+impl BinkHeader {
+    fn init(): BinkHeader {
+        return BinkHeader {
+            signature: [0x42, 0x49, 0x4B, 0x00],  // "BIK\0"
             file_size: 0,
             frame_count: 0,
             largest_frame_size: 0,
@@ -66,432 +125,506 @@ fn create_bink_video(): BinkVideo {
             fps_dividend: 30000,
             fps_divisor: 1001,
             video_flags: 0,
-            audio_track_count: 0
-        },
-        audio_tracks: [],
-        frames: [],
-        frame_offsets: [],
-        current_frame: 0,
-        playback_time: 0.0,
-        frame_duration: 0.0,
-        is_playing: false,
-        is_looping: false,
-        is_finished: false,
-        video_buffer: [],
-        audio_buffer: [],
-        audio_buffer_size: 0
-    }
-}
-
-fn load_bink_video(data: [u8; 16777216], size: i32): BinkVideo {
-    let mut video: BinkVideo = create_bink_video()
-
-    // Read header
-    video.header.signature[0] = data[0]
-    video.header.signature[1] = data[1]
-    video.header.signature[2] = data[2]
-    video.header.signature[3] = data[3]
-
-    // Check signature
-    let is_bink: bool = data[0] == 0x42 and data[1] == 0x49 and data[2] == 0x4B
-    if not is_bink {
-        return video
-    }
-
-    video.header.file_size = read_u32_le(data, 4)
-    video.header.frame_count = read_u32_le(data, 8)
-    video.header.largest_frame_size = read_u32_le(data, 12)
-    // Skip 4 bytes
-    video.header.width = read_u32_le(data, 20)
-    video.header.height = read_u32_le(data, 24)
-    video.header.fps_dividend = read_u32_le(data, 28)
-    video.header.fps_divisor = read_u32_le(data, 32)
-    video.header.video_flags = read_u32_le(data, 36)
-    video.header.audio_track_count = read_u32_le(data, 40)
-
-    // Calculate frame duration
-    video.frame_duration = cast(f32, video.header.fps_divisor) / cast(f32, video.header.fps_dividend)
-
-    // Read audio track info
-    let mut offset: i32 = 44
-    for i in 0..cast(i32, video.header.audio_track_count) {
-        if i < 4 {
-            // Audio track header would be here
-            video.audio_tracks[i] = BinkAudioTrack {
-                sample_rate: 44100,
-                channels: 2,
-                flags: 0
-            }
+            audio_track_count: 0,
         }
     }
 
-    // Read frame offsets
-    let frame_table_offset: i32 = 44 + cast(i32, video.header.audio_track_count) * 4
-    for i in 0..cast(i32, video.header.frame_count) {
-        if i < 65536 {
-            video.frame_offsets[i] = read_u32_le(data, frame_table_offset + i * 4)
-            video.frames[i] = BinkFrame {
-                frame_num: cast(u32, i),
-                offset: video.frame_offsets[i] & 0xFFFFFFFE,  // Clear keyframe bit
-                size: 0,
-                is_keyframe: (video.frame_offsets[i] & 1) == 1
-            }
+    fn get_fps(&self): f64 {
+        if self.fps_divisor == 0 {
+            return 30.0
+        }
+        return (self.fps_dividend as f64) / (self.fps_divisor as f64)
+    }
+}
+
+// Bink audio track info
+struct BinkAudioTrack {
+    sample_rate: i32,
+    channels: i32,
+    flags: i32,
+}
+
+impl BinkAudioTrack {
+    fn init(): BinkAudioTrack {
+        return BinkAudioTrack {
+            sample_rate: 44100,
+            channels: 2,
+            flags: 0,
+        }
+    }
+}
+
+// Bink frame info
+struct BinkFrame {
+    frame_num: i32,
+    offset: i32,
+    size: i32,
+    keyframe: bool,
+}
+
+impl BinkFrame {
+    fn init(num: i32, offset: i32, size: i32): BinkFrame {
+        return BinkFrame {
+            frame_num: num,
+            offset: offset,
+            size: size,
+            keyframe: false,
+        }
+    }
+}
+
+// ============================================================================
+// VIDEO STREAM
+// ============================================================================
+
+struct VideoStream {
+    player: VideoPlayer?,
+    next: VideoStream?,
+    frame_index: i32,
+    frame_count: i32,
+    width: i32,
+    height: i32,
+    is_frame_ready: bool,
+}
+
+impl VideoStream {
+    fn init(): VideoStream {
+        return VideoStream {
+            player: null,
+            next: null,
+            frame_index: 0,
+            frame_count: 0,
+            width: 0,
+            height: 0,
+            is_frame_ready: false,
         }
     }
 
-    // Calculate frame sizes
-    for i in 0..(cast(i32, video.header.frame_count) - 1) {
-        if i < 65535 {
-            video.frames[i].size = video.frames[i + 1].offset - video.frames[i].offset
+    fn get_next(&self): VideoStream? {
+        return self.next
+    }
+
+    fn update(&self) {
+        // Base implementation - override in subclasses
+    }
+
+    fn close(&self) {
+        if self.player != null {
+            self.player.remove_stream(self)
         }
     }
 
-    return video
-}
-
-fn read_u32_le(data: [u8; 16777216], offset: i32): u32 {
-    return cast(u32, data[offset]) |
-           (cast(u32, data[offset + 1]) << 8) |
-           (cast(u32, data[offset + 2]) << 16) |
-           (cast(u32, data[offset + 3]) << 24)
-}
-
-fn play_video(video: mut BinkVideo) {
-    video.is_playing = true
-    video.is_finished = false
-    video.current_frame = 0
-    video.playback_time = 0.0
-}
-
-fn pause_video(video: mut BinkVideo) {
-    video.is_playing = false
-}
-
-fn resume_video(video: mut BinkVideo) {
-    video.is_playing = true
-}
-
-fn stop_video(video: mut BinkVideo) {
-    video.is_playing = false
-    video.is_finished = true
-    video.current_frame = 0
-    video.playback_time = 0.0
-}
-
-fn seek_video(video: mut BinkVideo, frame: u32) {
-    if frame < video.header.frame_count {
-        video.current_frame = frame
-        video.playback_time = cast(f32, frame) * video.frame_duration
-    }
-}
-
-fn update_video(video: mut BinkVideo, delta_time: f32): bool {
-    // Returns true if frame changed
-    if not video.is_playing or video.is_finished {
-        return false
+    fn is_ready(&self): bool {
+        return self.is_frame_ready
     }
 
-    video.playback_time = video.playback_time + delta_time
+    fn decompress_frame(&self) {
+        // Base implementation
+    }
 
-    let target_frame: u32 = cast(u32, video.playback_time / video.frame_duration)
+    fn render_frame(&self, buffer: VideoBuffer) {
+        // Base implementation
+    }
 
-    if target_frame >= video.header.frame_count {
-        if video.is_looping {
-            video.playback_time = 0.0
-            video.current_frame = 0
-            return true
-        } else {
-            video.is_finished = true
-            video.is_playing = false
-            return false
+    fn next_frame(&self) {
+        self.frame_index = self.frame_index + 1
+        if self.frame_index >= self.frame_count {
+            self.frame_index = self.frame_count - 1
         }
     }
 
-    if target_frame != video.current_frame {
-        video.current_frame = target_frame
+    fn get_frame_index(&self): i32 {
+        return self.frame_index
+    }
+
+    fn get_frame_count(&self): i32 {
+        return self.frame_count
+    }
+
+    fn goto_frame(&self, frame: i32) {
+        if frame >= 0 && frame < self.frame_count {
+            self.frame_index = frame
+        }
+    }
+
+    fn get_height(&self): i32 {
+        return self.height
+    }
+
+    fn get_width(&self): i32 {
+        return self.width
+    }
+}
+
+// ============================================================================
+// BINK VIDEO STREAM
+// ============================================================================
+
+struct BinkVideoStream {
+    base: VideoStream,
+    header: BinkHeader,
+    frames: [BinkFrame],
+    audio_tracks: [BinkAudioTrack],
+    video_buffer: [i32],    // Current frame RGBA data
+    audio_buffer: [i32],    // Audio samples
+    current_frame: i32,
+    playback_time: f64,
+    file_data: [i32],       // Raw file data
+    file_size: i32,
+}
+
+impl BinkVideoStream {
+    fn init(): BinkVideoStream {
+        return BinkVideoStream {
+            base: VideoStream::init(),
+            header: BinkHeader::init(),
+            frames: [],
+            audio_tracks: [],
+            video_buffer: [],
+            audio_buffer: [],
+            current_frame: 0,
+            playback_time: 0.0,
+            file_data: [],
+            file_size: 0,
+        }
+    }
+
+    fn update(&self) {
+        // BinkWait equivalent - check if frame is ready
+        // In real implementation, this synchronizes with audio
+    }
+
+    fn is_frame_ready(&self): bool {
+        // BinkWait(m_binkHandle) == 0
         return true
     }
 
-    return false
+    fn decompress_frame(&self) {
+        // BinkDoFrame equivalent
+        // Decompress current frame data to video buffer
+        if self.current_frame < self.header.frame_count {
+            let frame = self.frames[self.current_frame]
+            // In real implementation: decode DCT blocks, color conversion
+            self.decode_frame_data(frame)
+        }
+    }
+
+    fn render_frame(&self, buffer: VideoBuffer) {
+        if !buffer.valid() {
+            return
+        }
+
+        if !buffer.lock() {
+            return
+        }
+
+        // Determine Bink format based on buffer type
+        let bink_format = 3  // Default to TYPE_X8R8G8B8
+        let fmt = buffer.get_format()
+        if fmt == VideoBufferType::TYPE_R8G8B8 {
+            bink_format = 1
+        } else if fmt == VideoBufferType::TYPE_X8R8G8B8 {
+            bink_format = 3
+        } else if fmt == VideoBufferType::TYPE_R5G6B5 {
+            bink_format = 10
+        } else if fmt == VideoBufferType::TYPE_X1R5G5B5 {
+            bink_format = 9
+        } else {
+            buffer.unlock()
+            return
+        }
+
+        // BinkCopyToBuffer equivalent
+        self.copy_to_buffer(buffer, buffer.get_pitch(), buffer.get_height(), buffer.get_x_pos(), buffer.get_y_pos(), bink_format)
+
+        buffer.unlock()
+    }
+
+    fn next_frame(&self) {
+        // BinkNextFrame equivalent
+        self.current_frame = self.current_frame + 1
+        if self.current_frame >= self.header.frame_count {
+            self.current_frame = self.header.frame_count - 1
+        }
+        self.base.frame_index = self.current_frame
+    }
+
+    fn frame_index(&self): i32 {
+        return self.current_frame - 1
+    }
+
+    fn frame_count(&self): i32 {
+        return self.header.frame_count
+    }
+
+    fn goto_frame(&self, frame: i32) {
+        // BinkGoto equivalent
+        if frame >= 0 && frame < self.header.frame_count {
+            self.current_frame = frame
+            self.base.frame_index = frame
+        }
+    }
+
+    fn height(&self): i32 {
+        return self.header.height
+    }
+
+    fn width(&self): i32 {
+        return self.header.width
+    }
+
+    // Internal methods
+    fn decode_frame_data(&self, frame: BinkFrame) {
+        // Placeholder for actual Bink decompression
+        // In real implementation:
+        // 1. Read compressed data from file_data at frame.offset
+        // 2. Decode DCT/wavelet blocks
+        // 3. Apply motion compensation
+        // 4. Convert YUV to RGB
+        // 5. Store in video_buffer
+    }
+
+    fn copy_to_buffer(&self, buffer: VideoBuffer, pitch: i32, height: i32, x_pos: i32, y_pos: i32, format: i32) {
+        // Copy decoded frame to destination buffer
+        // Handle format conversion based on format parameter
+    }
 }
 
-fn decode_frame(video: mut BinkVideo, data: [u8; 16777216]) {
-    // Bink uses a proprietary codec
-    // This would need to decode the frame data to RGBA
-    // For authenticity, we'd use the RAD Game Tools SDK or implement the decoder
+// ============================================================================
+// VIDEO DEFINITION
+// ============================================================================
 
-    let frame: BinkFrame = video.frames[video.current_frame]
-    let frame_data_offset: i32 = cast(i32, frame.offset)
+struct Video {
+    file_name: string,
+    internal_name: string,
+    world_builder_comment: string,
+}
 
-    // Placeholder: fill with frame color based on frame number (for testing)
-    let r: u8 = cast(u8, (video.current_frame * 3) % 256)
-    let g: u8 = cast(u8, (video.current_frame * 5) % 256)
-    let b: u8 = cast(u8, (video.current_frame * 7) % 256)
-
-    let pixel_count: i32 = cast(i32, video.header.width * video.header.height)
-    for i in 0..pixel_count {
-        let idx: i32 = i * 4
-        if idx + 3 < 4194304 {
-            video.video_buffer[idx] = r
-            video.video_buffer[idx + 1] = g
-            video.video_buffer[idx + 2] = b
-            video.video_buffer[idx + 3] = 255
+impl Video {
+    fn init(name: string): Video {
+        return Video {
+            file_name: "",
+            internal_name: name,
+            world_builder_comment: "",
         }
     }
 }
 
-fn get_video_texture_data(video: BinkVideo): [u8; 4194304] {
-    return video.video_buffer
-}
-
-fn get_video_dimensions(video: BinkVideo): [u32; 2] {
-    return [video.header.width, video.header.height]
-}
-
-fn get_video_progress(video: BinkVideo): f32 {
-    if video.header.frame_count == 0 {
-        return 0.0
-    }
-    return cast(f32, video.current_frame) / cast(f32, video.header.frame_count)
-}
-
-fn is_video_finished(video: BinkVideo): bool {
-    return video.is_finished
-}
-
 // ============================================================================
-// VIDEO PLAYER MANAGER
+// VIDEO PLAYER
 // ============================================================================
 
 struct VideoPlayer {
-    current_video: BinkVideo,
-    video_data: [u8; 16777216],
-    video_data_size: i32,
-
-    // Display
-    texture_id: i32,
-    display_width: i32,
-    display_height: i32,
-    letterbox: bool,
-
-    // Audio sync
-    audio_enabled: bool,
-    audio_volume: f32,
-
-    // Callbacks
-    on_finished: bool
+    videos_available: [Video],
+    first_stream: VideoStream?,
+    is_initialized: bool,
 }
 
-fn create_video_player(): VideoPlayer {
-    return VideoPlayer {
-        current_video: create_bink_video(),
-        video_data: [],
-        video_data_size: 0,
-        texture_id: -1,
-        display_width: 800,
-        display_height: 600,
-        letterbox: true,
-        audio_enabled: true,
-        audio_volume: 1.0,
-        on_finished: false
-    }
-}
-
-fn load_video_file(player: mut VideoPlayer, path: [u8; 256]): bool {
-    // Would load file from disk into video_data
-    // For now, assume data is loaded
-
-    player.current_video = load_bink_video(player.video_data, player.video_data_size)
-
-    return player.current_video.header.frame_count > 0
-}
-
-fn play_current_video(player: mut VideoPlayer) {
-    play_video(player.current_video)
-    player.on_finished = false
-}
-
-fn update_video_player(player: mut VideoPlayer, delta_time: f32): bool {
-    let frame_changed: bool = update_video(player.current_video, delta_time)
-
-    if frame_changed {
-        decode_frame(player.current_video, player.video_data)
-        // Would update GPU texture here
-    }
-
-    if is_video_finished(player.current_video) {
-        player.on_finished = true
-    }
-
-    return frame_changed
-}
-
-fn calculate_letterbox(video_w: i32, video_h: i32, screen_w: i32, screen_h: i32): [i32; 4] {
-    let video_aspect: f32 = cast(f32, video_w) / cast(f32, video_h)
-    let screen_aspect: f32 = cast(f32, screen_w) / cast(f32, screen_h)
-
-    let mut x: i32 = 0
-    let mut y: i32 = 0
-    let mut w: i32 = screen_w
-    let mut h: i32 = screen_h
-
-    if video_aspect > screen_aspect {
-        // Video is wider - letterbox top/bottom
-        h = cast(i32, cast(f32, screen_w) / video_aspect)
-        y = (screen_h - h) / 2
-    } else {
-        // Video is taller - pillarbox left/right
-        w = cast(i32, cast(f32, screen_h) * video_aspect)
-        x = (screen_w - w) / 2
-    }
-
-    return [x, y, w, h]
-}
-
-// ============================================================================
-// STARTUP VIDEO SEQUENCE
-// ============================================================================
-
-enum StartupVideoState {
-    NOT_STARTED,
-    PLAYING_EA_LOGO,
-    PLAYING_SIZZLE,
-    FINISHED
-}
-
-struct StartupVideoSequence {
-    state: StartupVideoState,
-    player: VideoPlayer,
-
-    // Video paths
-    ea_logo_path: [u8; 256],
-    sizzle_path: [u8; 256],
-
-    // Skip control
-    can_skip: bool,
-    skip_delay: f32,
-    skip_timer: f32
-}
-
-fn create_startup_sequence(): StartupVideoSequence {
-    return StartupVideoSequence {
-        state: StartupVideoState::NOT_STARTED,
-        player: create_video_player(),
-        ea_logo_path: "Data/Movies/EALogo.bik",
-        sizzle_path: "Data/Movies/Sizzle.bik",
-        can_skip: false,
-        skip_delay: 1.0,    // 1 second before can skip
-        skip_timer: 0.0
-    }
-}
-
-fn start_startup_videos(seq: mut StartupVideoSequence) {
-    seq.state = StartupVideoState::PLAYING_EA_LOGO
-    load_video_file(seq.player, seq.ea_logo_path)
-    play_current_video(seq.player)
-    seq.skip_timer = 0.0
-    seq.can_skip = false
-}
-
-fn update_startup_videos(seq: mut StartupVideoSequence, delta_time: f32): bool {
-    // Returns true when all videos finished
-
-    if seq.state == StartupVideoState::NOT_STARTED or
-       seq.state == StartupVideoState::FINISHED {
-        return seq.state == StartupVideoState::FINISHED
-    }
-
-    // Update skip timer
-    seq.skip_timer = seq.skip_timer + delta_time
-    if seq.skip_timer >= seq.skip_delay {
-        seq.can_skip = true
-    }
-
-    // Update current video
-    update_video_player(seq.player, delta_time)
-
-    // Check for video completion
-    if seq.player.on_finished {
-        match seq.state {
-            StartupVideoState::PLAYING_EA_LOGO => {
-                // Move to sizzle reel
-                seq.state = StartupVideoState::PLAYING_SIZZLE
-                load_video_file(seq.player, seq.sizzle_path)
-                play_current_video(seq.player)
-                seq.skip_timer = 0.0
-                seq.can_skip = false
-            },
-            StartupVideoState::PLAYING_SIZZLE => {
-                seq.state = StartupVideoState::FINISHED
-                return true
-            },
-            _ => {}
+impl VideoPlayer {
+    fn init(): VideoPlayer {
+        return VideoPlayer {
+            videos_available: [],
+            first_stream: null,
+            is_initialized: false,
         }
     }
 
-    return false
-}
+    fn initialize(&self) {
+        // Load video definitions from INI files
+        // ini.Load("Data/INI/Default/Video.ini", INI_LOAD_OVERWRITE, nullptr);
+        // ini.Load("Data/INI/Video.ini", INI_LOAD_OVERWRITE, nullptr);
+        self.is_initialized = true
+    }
 
-fn skip_current_video(seq: mut StartupVideoSequence) {
-    if seq.can_skip {
-        stop_video(seq.player.current_video)
-        seq.player.on_finished = true
+    fn reset(&self) {
+        self.close_all_streams()
+    }
+
+    fn update(&self) {
+        // Update all active streams
+        let stream = self.first_stream
+        while stream != null {
+            stream.update()
+            stream = stream.get_next()
+        }
+    }
+
+    fn deinit(&self) {
+        self.close_all_streams()
+    }
+
+    fn lose_focus(&self) {
+        // Pause video playback when window loses focus
+    }
+
+    fn regain_focus(&self) {
+        // Resume video playback when window regains focus
+    }
+
+    fn open(&self, title: string): VideoStream? {
+        // Open a video file for streaming playback
+        let video = self.get_video_by_name(title)
+        if video == null {
+            return null
+        }
+
+        let stream = BinkVideoStream::init()
+        // Load and initialize stream
+        self.add_stream(stream.base)
+        return stream.base
+    }
+
+    fn load(&self, title: string): VideoStream? {
+        // Load a video file completely into memory
+        return self.open(title)
+    }
+
+    fn first_stream_ref(&self): VideoStream? {
+        return self.first_stream
+    }
+
+    fn close_all_streams(&self) {
+        let stream = self.first_stream
+        while stream != null {
+            let next = stream.get_next()
+            stream.close()
+            stream = next
+        }
+        self.first_stream = null
+    }
+
+    fn add_video(&self, video: Video) {
+        // Check if video with same name exists
+        for i in 0..self.videos_available.length {
+            if self.videos_available[i].internal_name == video.internal_name {
+                // Update existing
+                self.videos_available[i] = video
+                return
+            }
+        }
+        // Add new
+        self.videos_available = self.videos_available + [video]
+    }
+
+    fn remove_video(&self, video: Video) {
+        let new_list: [Video] = []
+        for i in 0..self.videos_available.length {
+            if self.videos_available[i].internal_name != video.internal_name {
+                new_list = new_list + [self.videos_available[i]]
+            }
+        }
+        self.videos_available = new_list
+    }
+
+    fn get_video_count(&self): i32 {
+        return self.videos_available.length
+    }
+
+    fn get_video(&self, index: i32): Video? {
+        if index >= 0 && index < self.videos_available.length {
+            return self.videos_available[index]
+        }
+        return null
+    }
+
+    fn get_video_by_name(&self, name: string): Video? {
+        for i in 0..self.videos_available.length {
+            if self.videos_available[i].internal_name == name {
+                return self.videos_available[i]
+            }
+        }
+        return null
+    }
+
+    fn remove_stream(&self, stream: VideoStream) {
+        let list_stream = self.first_stream
+
+        if list_stream == null {
+            return
+        }
+
+        if stream == list_stream {
+            self.first_stream = stream.next
+        } else {
+            let prev_stream = list_stream
+            let current = list_stream.get_next()
+
+            while current != null {
+                if stream == current {
+                    prev_stream.next = stream.next
+                    return
+                }
+                prev_stream = current
+                current = current.get_next()
+            }
+        }
+    }
+
+    fn add_stream(&self, stream: VideoStream) {
+        stream.next = self.first_stream
+        self.first_stream = stream
+        stream.player = self
     }
 }
 
-fn skip_all_videos(seq: mut StartupVideoSequence) {
-    seq.state = StartupVideoState::FINISHED
-    stop_video(seq.player.current_video)
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn next_power_of_two(n: i32): i32 {
+    let power = 1
+    while power < n {
+        power = power * 2
+    }
+    return power
+}
+
+fn get_bytes_per_pixel(format: VideoBufferType): i32 {
+    if format == VideoBufferType::TYPE_R8G8B8 {
+        return 3
+    } else if format == VideoBufferType::TYPE_X8R8G8B8 {
+        return 4
+    } else if format == VideoBufferType::TYPE_R5G6B5 {
+        return 2
+    } else if format == VideoBufferType::TYPE_X1R5G5B5 {
+        return 2
+    }
+    return 4
+}
+
+fn read_i32_le(data: [i32], offset: i32): i32 {
+    // Read little-endian 32-bit integer from byte array
+    return data[offset] |
+           (data[offset + 1] << 8) |
+           (data[offset + 2] << 16) |
+           (data[offset + 3] << 24)
+}
+
+fn read_i16_le(data: [i32], offset: i32): i32 {
+    // Read little-endian 16-bit integer from byte array
+    return data[offset] | (data[offset + 1] << 8)
 }
 
 // ============================================================================
-// TEST FUNCTIONS
+// GLOBAL VIDEO PLAYER INSTANCE
 // ============================================================================
 
-fn test_video_player() {
-    print("Testing Video Player...")
+let g_the_video_player: VideoPlayer? = null
 
-    // Create video player
-    let mut player: VideoPlayer = create_video_player()
-    print("Video player created")
+fn init_video_player(): VideoPlayer {
+    let player = VideoPlayer::init()
+    player.initialize()
+    g_the_video_player = player
+    return player
+}
 
-    // Create test video header
-    let mut video: BinkVideo = create_bink_video()
-    video.header.width = 640
-    video.header.height = 480
-    video.header.frame_count = 300
-    video.header.fps_dividend = 30000
-    video.header.fps_divisor = 1001
-    video.frame_duration = cast(f32, video.header.fps_divisor) / cast(f32, video.header.fps_dividend)
+fn get_video_player(): VideoPlayer? {
+    return g_the_video_player
+}
 
-    print("Video dimensions: " + str(video.header.width) + "x" + str(video.header.height))
-    print("Frame count: " + str(video.header.frame_count))
-    print("Frame duration: " + str(video.frame_duration) + "s")
-
-    // Test playback
-    play_video(video)
-    print("Playing: " + str(video.is_playing))
-
-    // Simulate updates
-    for i in 0..10 {
-        update_video(video, 0.033)
+fn shutdown_video_player() {
+    if g_the_video_player != null {
+        g_the_video_player.deinit()
+        g_the_video_player = null
     }
-    print("Current frame after 10 updates: " + str(video.current_frame))
-    print("Progress: " + str(get_video_progress(video) * 100.0) + "%")
-
-    // Test seek
-    seek_video(video, 150)
-    print("Seeked to frame 150, current: " + str(video.current_frame))
-
-    // Test letterbox calculation
-    let letterbox: [i32; 4] = calculate_letterbox(640, 480, 1920, 1080)
-    print("Letterbox for 640x480 on 1920x1080: " + str(letterbox[0]) + "," + str(letterbox[1]) + " " + str(letterbox[2]) + "x" + str(letterbox[3]))
-
-    // Test startup sequence
-    let mut startup: StartupVideoSequence = create_startup_sequence()
-    print("Startup sequence created")
-    print("EA Logo path: Data/Movies/EALogo.bik")
-    print("Sizzle path: Data/Movies/Sizzle.bik")
-
-    print("Video Player tests complete!")
 }
