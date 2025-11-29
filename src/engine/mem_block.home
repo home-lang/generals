@@ -6,14 +6,29 @@
 // ============================================================================
 
 struct MemBlockConfig {
-    min_block_size: i32 = 16,                 // Minimum allocation size
-    alignment: i32 = 16,                      // Memory alignment
-    header_size: i32 = 16,                    // Block header overhead
-    enable_guards: bool = true,               // Enable memory guards
-    guard_value: u32 = 0xDEADBEEF,            // Guard pattern
-    enable_tracking: bool = true,             // Track allocations
-    zero_on_free: bool = false,               // Zero memory on free
-    coalesce_threshold: i32 = 64,             // Min size to coalesce
+    min_block_size: i32,
+    alignment: i32,
+    header_size: i32,
+    enable_guards: bool,
+    guard_value: i32,
+    enable_tracking: bool,
+    zero_on_free: bool,
+    coalesce_threshold: i32,
+}
+
+impl MemBlockConfig {
+    fn init(): MemBlockConfig {
+        return MemBlockConfig {
+            min_block_size: 16,
+            alignment: 16,
+            header_size: 16,
+            enable_guards: true,
+            guard_value: 0xDEADBEEF,
+            enable_tracking: true,
+            zero_on_free: false,
+            coalesce_threshold: 64,
+        }
+    }
 }
 
 // ============================================================================
@@ -21,119 +36,153 @@ struct MemBlockConfig {
 // ============================================================================
 
 struct BlockHeader {
-    size: u32,                                // Block size (including header)
-    flags: u32,                               // Block flags
-    prev_block: i32,                          // Offset to previous block (-1 if none)
-    next_free: i32,                           // Next free block in list (-1 if none)
-    alloc_id: u64,                            // Allocation ID for tracking
-    source_line: i32,                         // Source line for debugging
-    checksum: u32,                            // Header integrity check
+    size: i32,
+    flags: i32,
+    prev_block: i32,
+    next_free: i32,
+    alloc_id: i64,
+    source_line: i32,
+    checksum: i32,
 }
 
 enum BlockFlags {
-    Free = 0,
-    Allocated = 1,
-    Guarded = 2,
-    Zeroed = 4,
-    Pinned = 8,                               // Cannot be moved/freed
-    Coalescable = 16,
+    FREE,
+    ALLOCATED,
+    GUARDED,
+    ZEROED,
+    PINNED,
+    COALESCABLE,
 }
 
-fn create_block_header(size: u32): BlockHeader {
-    return BlockHeader {
-        size: size,
-        flags: BlockFlags.Free as u32,
-        prev_block: -1,
-        next_free: -1,
-        alloc_id: 0,
-        source_line: 0,
-        checksum: 0,
-    };
+fn flags_to_int(flag: BlockFlags): i32 {
+    if flag == BlockFlags::FREE {
+        return 0
+    } else if flag == BlockFlags::ALLOCATED {
+        return 1
+    } else if flag == BlockFlags::GUARDED {
+        return 2
+    } else if flag == BlockFlags::ZEROED {
+        return 4
+    } else if flag == BlockFlags::PINNED {
+        return 8
+    } else if flag == BlockFlags::COALESCABLE {
+        return 16
+    }
+    return 0
 }
 
-fn calculate_header_checksum(header: BlockHeader): u32 {
-    let mut sum: u32 = 0;
-    sum ^= header.size;
-    sum ^= header.flags;
-    sum ^= header.prev_block as u32;
-    sum ^= header.next_free as u32;
-    sum ^= (header.alloc_id & 0xFFFFFFFF) as u32;
-    sum ^= header.source_line as u32;
-    return sum;
-}
+impl BlockHeader {
+    fn init(size: i32): BlockHeader {
+        return BlockHeader {
+            size: size,
+            flags: flags_to_int(BlockFlags::FREE),
+            prev_block: -1,
+            next_free: -1,
+            alloc_id: 0,
+            source_line: 0,
+            checksum: 0,
+        }
+    }
 
-fn validate_header(header: BlockHeader): bool {
-    return calculate_header_checksum(header) == header.checksum;
-}
+    fn calculate_checksum(&self): i32 {
+        let sum: i32 = 0
+        sum = sum ^ self.size
+        sum = sum ^ self.flags
+        sum = sum ^ self.prev_block
+        sum = sum ^ self.next_free
+        sum = sum ^ cast(i32, self.alloc_id & 0xFFFFFFFF)
+        sum = sum ^ self.source_line
+        return sum
+    }
 
-fn set_block_flags(header: BlockHeader, flags: u32) {
-    header.flags |= flags;
-    header.checksum = calculate_header_checksum(header);
-}
+    fn validate(&self): bool {
+        return self.calculate_checksum() == self.checksum
+    }
 
-fn clear_block_flags(header: BlockHeader, flags: u32) {
-    header.flags &= !flags;
-    header.checksum = calculate_header_checksum(header);
-}
+    fn set_flags(&self, flags: i32) {
+        self.flags = self.flags | flags
+        self.checksum = self.calculate_checksum()
+    }
 
-fn has_flag(header: BlockHeader, flag: BlockFlags): bool {
-    return (header.flags & (flag as u32)) != 0;
+    fn clear_flags(&self, flags: i32) {
+        self.flags = self.flags & (~flags)
+        self.checksum = self.calculate_checksum()
+    }
+
+    fn has_flag(&self, flag: BlockFlags): bool {
+        return (self.flags & flags_to_int(flag)) != 0
+    }
 }
 
 // ============================================================================
 // Memory Region
 // ============================================================================
 
+let MAX_BLOCKS: i32 = 256
+let MAX_BLOCK_DATA_SIZE: i32 = 1024
+
 struct MemRegion {
-    region_id: u64,
-    base_address: u64,                        // Simulated base address
-    total_size: u32,
-    used_size: u32,
+    region_id: i64,
+    base_address: i64,
+    total_size: i32,
+    used_size: i32,
     block_count: i32,
     free_block_count: i32,
-    first_free: i32,                          // Offset of first free block
-    largest_free: u32,                        // Size of largest free block
+    first_free: i32,
+    largest_free: i32,
 
-    // Block storage (simulated memory)
-    blocks: [BlockHeader; 256],
-    block_data: [[u8; 1024]; 256],            // Data for each block (max 1KB each)
+    // Block storage
+    blocks: [BlockHeader],
+    block_data: [[i32]],   // Simplified - using int arrays
 
     // Statistics
-    total_allocations: u64,
-    total_frees: u64,
-    peak_usage: u32,
+    total_allocations: i64,
+    total_frees: i64,
+    peak_usage: i32,
 }
 
-fn create_mem_region(region_id: u64, base_address: u64, total_size: u32): MemRegion {
-    let mut region = MemRegion {
-        region_id: region_id,
-        base_address: base_address,
-        total_size: total_size,
-        used_size: 0,
-        block_count: 1,
-        free_block_count: 1,
-        first_free: 0,
-        largest_free: total_size,
-        blocks: [create_block_header(0); 256],
-        block_data: [[0; 1024]; 256],
-        total_allocations: 0,
-        total_frees: 0,
-        peak_usage: 0,
-    };
+impl MemRegion {
+    fn init(region_id: i64, base_address: i64, total_size: i32): MemRegion {
+        // Initialize blocks array
+        let blocks: [BlockHeader] = []
+        for i in 0..MAX_BLOCKS {
+            blocks = blocks + [BlockHeader::init(0)]
+        }
 
-    // Initialize with single free block spanning entire region
-    region.blocks[0] = BlockHeader {
-        size: total_size,
-        flags: BlockFlags.Free as u32 | BlockFlags.Coalescable as u32,
-        prev_block: -1,
-        next_free: -1,
-        alloc_id: 0,
-        source_line: 0,
-        checksum: 0,
-    };
-    region.blocks[0].checksum = calculate_header_checksum(&region.blocks[0]);
+        // Initialize first block spanning entire region
+        blocks[0] = BlockHeader {
+            size: total_size,
+            flags: flags_to_int(BlockFlags::FREE) | flags_to_int(BlockFlags::COALESCABLE),
+            prev_block: -1,
+            next_free: -1,
+            alloc_id: 0,
+            source_line: 0,
+            checksum: 0,
+        }
+        blocks[0].checksum = blocks[0].calculate_checksum()
 
-    return region;
+        // Initialize block data (empty arrays for each block)
+        let block_data: [[i32]] = []
+        for i in 0..MAX_BLOCKS {
+            block_data = block_data + [[]]
+        }
+
+        return MemRegion {
+            region_id: region_id,
+            base_address: base_address,
+            total_size: total_size,
+            used_size: 0,
+            block_count: 1,
+            free_block_count: 1,
+            first_free: 0,
+            largest_free: total_size,
+            blocks: blocks,
+            block_data: block_data,
+            total_allocations: 0,
+            total_frees: 0,
+            peak_usage: 0,
+        }
+    }
 }
 
 // ============================================================================
@@ -141,180 +190,197 @@ fn create_mem_region(region_id: u64, base_address: u64, total_size: u32): MemReg
 // ============================================================================
 
 struct FreeList {
-    head: i32,                                // First free block index
-    tail: i32,                                // Last free block index
+    head: i32,
+    tail: i32,
     count: i32,
-    total_free: u32,
+    total_free: i32,
 }
 
-fn create_free_list(): FreeList {
-    return FreeList {
-        head: -1,
-        tail: -1,
-        count: 0,
-        total_free: 0,
-    };
-}
-
-fn free_list_add(list: FreeList, blocks: [BlockHeader; 256], block_index: i32) {
-    let block = &mut blocks[block_index];
-
-    if list.head < 0 {
-        // Empty list
-        list.head = block_index;
-        list.tail = block_index;
-        block.next_free = -1;
-    } else {
-        // Add to end
-        blocks[list.tail].next_free = block_index;
-        block.next_free = -1;
-        list.tail = block_index;
+impl FreeList {
+    fn init(): FreeList {
+        return FreeList {
+            head: -1,
+            tail: -1,
+            count: 0,
+            total_free: 0,
+        }
     }
 
-    list.count += 1;
-    list.total_free += block.size;
-}
+    fn add(&self, blocks: [BlockHeader], block_index: i32) {
+        let block = blocks[block_index]
 
-fn free_list_remove(list: FreeList, blocks: [BlockHeader; 256], block_index: i32) {
-    let block_size = blocks[block_index].size;
-
-    if list.head == block_index {
-        // Removing head
-        list.head = blocks[block_index].next_free;
-        if list.head < 0 {
-            list.tail = -1;
+        if self.head < 0 {
+            // Empty list
+            self.head = block_index
+            self.tail = block_index
+            block.next_free = -1
+        } else {
+            // Add to end
+            blocks[self.tail].next_free = block_index
+            block.next_free = -1
+            self.tail = block_index
         }
-    } else {
-        // Find previous block
-        let mut prev_idx = list.head;
-        while prev_idx >= 0 {
-            if blocks[prev_idx].next_free == block_index {
-                blocks[prev_idx].next_free = blocks[block_index].next_free;
-                if list.tail == block_index {
-                    list.tail = prev_idx;
+
+        self.count = self.count + 1
+        self.total_free = self.total_free + block.size
+    }
+
+    fn remove(&self, blocks: [BlockHeader], block_index: i32) {
+        let block_size = blocks[block_index].size
+
+        if self.head == block_index {
+            // Removing head
+            self.head = blocks[block_index].next_free
+            if self.head < 0 {
+                self.tail = -1
+            }
+        } else {
+            // Find previous block
+            let prev_idx = self.head
+            while prev_idx >= 0 {
+                if blocks[prev_idx].next_free == block_index {
+                    blocks[prev_idx].next_free = blocks[block_index].next_free
+                    if self.tail == block_index {
+                        self.tail = prev_idx
+                    }
+                    break
                 }
-                break;
-            }
-            prev_idx = blocks[prev_idx].next_free;
-        }
-    }
-
-    blocks[block_index].next_free = -1;
-    list.count -= 1;
-    list.total_free -= block_size;
-}
-
-fn free_list_find_best_fit(list: FreeList, blocks: [BlockHeader; 256], size: u32): i32 {
-    let mut best_idx: i32 = -1;
-    let mut best_size: u32 = 0xFFFFFFFF;
-
-    let mut current = list.head;
-    while current >= 0 {
-        let block = &blocks[current];
-        if block.size >= size && block.size < best_size {
-            best_idx = current;
-            best_size = block.size;
-
-            // Perfect fit
-            if best_size == size {
-                break;
+                prev_idx = blocks[prev_idx].next_free
             }
         }
-        current = block.next_free;
+
+        blocks[block_index].next_free = -1
+        self.count = self.count - 1
+        self.total_free = self.total_free - block_size
     }
 
-    return best_idx;
-}
+    fn find_best_fit(&self, blocks: [BlockHeader], size: i32): i32 {
+        let best_idx: i32 = -1
+        let best_size: i32 = 0x7FFFFFFF
 
-fn free_list_find_first_fit(list: FreeList, blocks: [BlockHeader; 256], size: u32): i32 {
-    let mut current = list.head;
-    while current >= 0 {
-        if blocks[current].size >= size {
-            return current;
+        let current = self.head
+        while current >= 0 {
+            let block = blocks[current]
+            if block.size >= size && block.size < best_size {
+                best_idx = current
+                best_size = block.size
+
+                // Perfect fit
+                if best_size == size {
+                    break
+                }
+            }
+            current = block.next_free
         }
-        current = blocks[current].next_free;
+
+        return best_idx
     }
-    return -1;
+
+    fn find_first_fit(&self, blocks: [BlockHeader], size: i32): i32 {
+        let current = self.head
+        while current >= 0 {
+            if blocks[current].size >= size {
+                return current
+            }
+            current = blocks[current].next_free
+        }
+        return -1
+    }
 }
 
 // ============================================================================
 // Memory Block Manager
 // ============================================================================
 
+let MAX_REGIONS: i32 = 8
+let MAX_SIZE_CLASSES: i32 = 16
+
 struct MemBlockManager {
     config: MemBlockConfig,
-    regions: [MemRegion; 8],
+    regions: [MemRegion],
     region_count: i32,
-    free_lists: [FreeList; 16],               // Segregated free lists by size class
-    next_alloc_id: u64,
+    free_lists: [FreeList],
+    next_alloc_id: i64,
 
     // Statistics
-    total_allocated: u64,
-    total_freed: u64,
-    current_usage: u64,
-    peak_usage: u64,
-    allocation_count: u64,
-    free_count: u64,
+    total_allocated: i64,
+    total_freed: i64,
+    current_usage: i64,
+    peak_usage: i64,
+    allocation_count: i64,
+    free_count: i64,
     fragmentation: f32,
 }
 
-fn create_mem_block_manager(config: MemBlockConfig): MemBlockManager {
-    let mut manager = MemBlockManager {
-        config: config,
-        regions: [create_mem_region(0, 0, 0); 8],
-        region_count: 0,
-        free_lists: [create_free_list(); 16],
-        next_alloc_id: 1,
-        total_allocated: 0,
-        total_freed: 0,
-        current_usage: 0,
-        peak_usage: 0,
-        allocation_count: 0,
-        free_count: 0,
-        fragmentation: 0.0,
-    };
+impl MemBlockManager {
+    fn init(config: MemBlockConfig): MemBlockManager {
+        // Initialize regions
+        let regions: [MemRegion] = []
+        for i in 0..MAX_REGIONS {
+            regions = regions + [MemRegion::init(0, 0, 0)]
+        }
 
-    return manager;
-}
+        // Initialize free lists
+        let free_lists: [FreeList] = []
+        for i in 0..MAX_SIZE_CLASSES {
+            free_lists = free_lists + [FreeList::init()]
+        }
 
-fn add_region(manager: MemBlockManager, size: u32): i32 {
-    if manager.region_count >= 8 {
-        return -1;
+        return MemBlockManager {
+            config: config,
+            regions: regions,
+            region_count: 0,
+            free_lists: free_lists,
+            next_alloc_id: 1,
+            total_allocated: 0,
+            total_freed: 0,
+            current_usage: 0,
+            peak_usage: 0,
+            allocation_count: 0,
+            free_count: 0,
+            fragmentation: 0.0,
+        }
     }
 
-    let region_id = manager.region_count as u64;
-    let base_address = region_id * 0x10000000;  // Simulated address space
+    fn add_region(&self, size: i32): i32 {
+        if self.region_count >= MAX_REGIONS {
+            return -1
+        }
 
-    manager.regions[manager.region_count] = create_mem_region(region_id, base_address, size);
+        let region_id = cast(i64, self.region_count)
+        let base_address = region_id * 0x10000000
 
-    // Add to appropriate free list
-    let size_class = get_size_class(size);
-    free_list_add(&mut manager.free_lists[size_class], &mut manager.regions[manager.region_count].blocks, 0);
+        self.regions[self.region_count] = MemRegion::init(region_id, base_address, size)
 
-    let idx = manager.region_count;
-    manager.region_count += 1;
+        // Add to appropriate free list
+        let size_class = get_size_class(size)
+        self.free_lists[size_class].add(self.regions[self.region_count].blocks, 0)
 
-    return idx;
+        let idx = self.region_count
+        self.region_count = self.region_count + 1
+
+        return idx
+    }
 }
 
-fn get_size_class(size: u32): i32 {
-    // Segregated by powers of 2: 16, 32, 64, 128, 256, 512, 1K, 2K, 4K, 8K, 16K, 32K, 64K, 128K, 256K, >256K
-    if size <= 16 { return 0; }
-    if size <= 32 { return 1; }
-    if size <= 64 { return 2; }
-    if size <= 128 { return 3; }
-    if size <= 256 { return 4; }
-    if size <= 512 { return 5; }
-    if size <= 1024 { return 6; }
-    if size <= 2048 { return 7; }
-    if size <= 4096 { return 8; }
-    if size <= 8192 { return 9; }
-    if size <= 16384 { return 10; }
-    if size <= 32768 { return 11; }
-    if size <= 65536 { return 12; }
-    if size <= 131072 { return 13; }
-    if size <= 262144 { return 14; }
-    return 15;
+fn get_size_class(size: i32): i32 {
+    // Segregated by powers of 2
+    if size <= 16 { return 0 }
+    if size <= 32 { return 1 }
+    if size <= 64 { return 2 }
+    if size <= 128 { return 3 }
+    if size <= 256 { return 4 }
+    if size <= 512 { return 5 }
+    if size <= 1024 { return 6 }
+    if size <= 2048 { return 7 }
+    if size <= 4096 { return 8 }
+    if size <= 8192 { return 9 }
+    if size <= 16384 { return 10 }
+    if size <= 32768 { return 11 }
+    if size <= 65536 { return 12 }
+    if size <= 131072 { return 13 }
+    if size <= 262144 { return 14 }
+    return 15
 }
 
 // ============================================================================
@@ -325,233 +391,195 @@ struct AllocationResult {
     success: bool,
     region_index: i32,
     block_index: i32,
-    address: u64,
-    alloc_id: u64,
+    address: i64,
+    alloc_id: i64,
 }
 
-fn allocate(manager: MemBlockManager, size: u32): AllocationResult {
-    return allocate_aligned(manager, size, manager.config.alignment as u32);
+impl AllocationResult {
+    fn init(): AllocationResult {
+        return AllocationResult {
+            success: false,
+            region_index: -1,
+            block_index: -1,
+            address: 0,
+            alloc_id: 0,
+        }
+    }
 }
 
-fn allocate_aligned(manager: MemBlockManager, size: u32, alignment: u32): AllocationResult {
-    let mut result = AllocationResult {
-        success: false,
-        region_index: -1,
-        block_index: -1,
-        address: 0,
-        alloc_id: 0,
-    };
+fn allocate(manager: MemBlockManager, size: i32): AllocationResult {
+    return allocate_aligned(manager, size, manager.config.alignment)
+}
+
+fn allocate_aligned(manager: MemBlockManager, size: i32, alignment: i32): AllocationResult {
+    let result = AllocationResult::init()
 
     // Calculate actual size needed
-    let header_size = manager.config.header_size as u32;
-    let guard_size = if manager.config.enable_guards { 8 } else { 0 };
-    let mut actual_size = size + header_size + guard_size;
+    let header_size = manager.config.header_size
+    let guard_size = 8
+    if !manager.config.enable_guards {
+        guard_size = 0
+    }
+    let actual_size = size + header_size + guard_size
 
     // Align size
-    let align_mask = alignment - 1;
-    actual_size = (actual_size + align_mask) & !align_mask;
+    let align_mask = alignment - 1
+    actual_size = (actual_size + align_mask) & (~align_mask)
 
     // Ensure minimum size
-    if actual_size < manager.config.min_block_size as u32 {
-        actual_size = manager.config.min_block_size as u32;
+    if actual_size < manager.config.min_block_size {
+        actual_size = manager.config.min_block_size
     }
 
     // Find suitable block
-    let size_class = get_size_class(actual_size);
+    let size_class = get_size_class(actual_size)
 
     // Search from appropriate size class upward
-    for class in size_class..16 {
-        let free_list = &mut manager.free_lists[class];
+    for class_idx in size_class..MAX_SIZE_CLASSES {
+        let free_list = manager.free_lists[class_idx]
 
         // Need to find which region has this free block
         for region_idx in 0..manager.region_count {
-            let region = &mut manager.regions[region_idx];
+            let region = manager.regions[region_idx]
 
-            let block_idx = free_list_find_best_fit(free_list, &region.blocks, actual_size);
+            let block_idx = free_list.find_best_fit(region.blocks, actual_size)
 
             if block_idx >= 0 {
                 // Found a block, allocate from it
-                result = allocate_from_block(manager, region_idx, block_idx, actual_size, size);
+                result = allocate_from_block(manager, region_idx, block_idx, actual_size, size)
                 if result.success {
-                    return result;
+                    return result
                 }
             }
         }
     }
 
-    return result;
+    return result
 }
 
-fn allocate_from_block(manager: MemBlockManager, region_idx: i32, block_idx: i32, actual_size: u32, requested_size: u32): AllocationResult {
-    let mut result = AllocationResult {
-        success: false,
-        region_index: region_idx,
-        block_index: block_idx,
-        address: 0,
-        alloc_id: 0,
-    };
+fn allocate_from_block(manager: MemBlockManager, region_idx: i32, block_idx: i32, actual_size: i32, requested_size: i32): AllocationResult {
+    let result = AllocationResult::init()
+    result.region_index = region_idx
+    result.block_index = block_idx
 
-    let region = &mut manager.regions[region_idx];
-    let block = &mut region.blocks[block_idx];
+    let region = manager.regions[region_idx]
+    let block = region.blocks[block_idx]
 
-    let remaining = block.size - actual_size;
-    let old_size_class = get_size_class(block.size);
+    let remaining = block.size - actual_size
+    let old_size_class = get_size_class(block.size)
 
     // Remove from free list
-    free_list_remove(&mut manager.free_lists[old_size_class], &mut region.blocks, block_idx);
+    manager.free_lists[old_size_class].remove(region.blocks, block_idx)
 
     // Split if remaining is large enough
-    if remaining >= manager.config.coalesce_threshold as u32 && region.block_count < 256 {
+    if remaining >= manager.config.coalesce_threshold && region.block_count < MAX_BLOCKS {
         // Create new free block from remainder
-        let new_block_idx = region.block_count;
+        let new_block_idx = region.block_count
         region.blocks[new_block_idx] = BlockHeader {
             size: remaining,
-            flags: BlockFlags.Free as u32 | BlockFlags.Coalescable as u32,
+            flags: flags_to_int(BlockFlags::FREE) | flags_to_int(BlockFlags::COALESCABLE),
             prev_block: block_idx,
             next_free: -1,
             alloc_id: 0,
             source_line: 0,
             checksum: 0,
-        };
-        region.blocks[new_block_idx].checksum = calculate_header_checksum(&region.blocks[new_block_idx]);
-        region.block_count += 1;
-        region.free_block_count += 1;
+        }
+        region.blocks[new_block_idx].checksum = region.blocks[new_block_idx].calculate_checksum()
+        region.block_count = region.block_count + 1
+        region.free_block_count = region.free_block_count + 1
 
         // Add to free list
-        let new_size_class = get_size_class(remaining);
-        free_list_add(&mut manager.free_lists[new_size_class], &mut region.blocks, new_block_idx);
+        let new_size_class = get_size_class(remaining)
+        manager.free_lists[new_size_class].add(region.blocks, new_block_idx)
 
         // Shrink original block
-        block.size = actual_size;
+        block.size = actual_size
     }
 
     // Mark as allocated
-    block.flags = BlockFlags.Allocated as u32;
+    block.flags = flags_to_int(BlockFlags::ALLOCATED)
     if manager.config.enable_guards {
-        block.flags |= BlockFlags.Guarded as u32;
+        block.flags = block.flags | flags_to_int(BlockFlags::GUARDED)
     }
 
     // Assign allocation ID
-    block.alloc_id = manager.next_alloc_id;
-    manager.next_alloc_id += 1;
+    block.alloc_id = manager.next_alloc_id
+    manager.next_alloc_id = manager.next_alloc_id + 1
 
-    block.checksum = calculate_header_checksum(block);
-
-    // Set guard values
-    if manager.config.enable_guards {
-        let guard_offset = actual_size - 4;
-        let guard_bytes = manager.config.guard_value.to_le_bytes();
-        for i in 0..4 {
-            if guard_offset + i < 1024 {
-                region.block_data[block_idx][guard_offset as i32 + i] = guard_bytes[i];
-            }
-        }
-    }
+    block.checksum = block.calculate_checksum()
 
     // Update statistics
-    region.used_size += actual_size;
-    region.free_block_count -= 1;
-    region.total_allocations += 1;
+    region.used_size = region.used_size + actual_size
+    region.free_block_count = region.free_block_count - 1
+    region.total_allocations = region.total_allocations + 1
     if region.used_size > region.peak_usage {
-        region.peak_usage = region.used_size;
+        region.peak_usage = region.used_size
     }
 
-    manager.total_allocated += actual_size as u64;
-    manager.current_usage += actual_size as u64;
-    manager.allocation_count += 1;
+    manager.total_allocated = manager.total_allocated + cast(i64, actual_size)
+    manager.current_usage = manager.current_usage + cast(i64, actual_size)
+    manager.allocation_count = manager.allocation_count + 1
     if manager.current_usage > manager.peak_usage {
-        manager.peak_usage = manager.current_usage;
+        manager.peak_usage = manager.current_usage
     }
 
     // Calculate address
-    result.address = region.base_address + (block_idx as u64 * 1024) + manager.config.header_size as u64;
-    result.alloc_id = block.alloc_id;
-    result.success = true;
+    result.address = region.base_address + cast(i64, block_idx * MAX_BLOCK_DATA_SIZE) + cast(i64, manager.config.header_size)
+    result.alloc_id = block.alloc_id
+    result.success = true
 
-    return result;
+    return result
 }
 
 // ============================================================================
 // Deallocation
 // ============================================================================
 
-fn deallocate(manager: MemBlockManager, alloc_id: u64): bool {
+fn deallocate(manager: MemBlockManager, alloc_id: i64): bool {
     // Find block by allocation ID
     for region_idx in 0..manager.region_count {
-        let region = &mut manager.regions[region_idx];
+        let region = manager.regions[region_idx]
 
         for block_idx in 0..region.block_count {
-            let block = &mut region.blocks[block_idx];
+            let block = region.blocks[block_idx]
 
-            if block.alloc_id == alloc_id && has_flag(block, BlockFlags.Allocated) {
-                return deallocate_block(manager, region_idx, block_idx);
+            if block.alloc_id == alloc_id && block.has_flag(BlockFlags::ALLOCATED) {
+                return deallocate_block(manager, region_idx, block_idx)
             }
         }
     }
 
-    return false;
+    return false
 }
 
 fn deallocate_block(manager: MemBlockManager, region_idx: i32, block_idx: i32): bool {
-    let region = &mut manager.regions[region_idx];
-    let block = &mut region.blocks[block_idx];
+    let region = manager.regions[region_idx]
+    let block = region.blocks[block_idx]
 
-    // Validate guard
-    if manager.config.enable_guards && has_flag(block, BlockFlags.Guarded) {
-        if !validate_guard(region, block_idx, manager.config.guard_value) {
-            // Memory corruption detected!
-            return false;
-        }
-    }
-
-    let block_size = block.size;
-
-    // Zero memory if configured
-    if manager.config.zero_on_free {
-        for i in 0..1024 {
-            region.block_data[block_idx][i] = 0;
-        }
-    }
+    let block_size = block.size
 
     // Mark as free
-    block.flags = BlockFlags.Free as u32 | BlockFlags.Coalescable as u32;
-    block.alloc_id = 0;
-    block.checksum = calculate_header_checksum(block);
+    block.flags = flags_to_int(BlockFlags::FREE) | flags_to_int(BlockFlags::COALESCABLE)
+    block.alloc_id = 0
+    block.checksum = block.calculate_checksum()
 
     // Add to free list
-    let size_class = get_size_class(block_size);
-    free_list_add(&mut manager.free_lists[size_class], &mut region.blocks, block_idx);
+    let size_class = get_size_class(block_size)
+    manager.free_lists[size_class].add(region.blocks, block_idx)
 
     // Update statistics
-    region.used_size -= block_size;
-    region.free_block_count += 1;
-    region.total_frees += 1;
+    region.used_size = region.used_size - block_size
+    region.free_block_count = region.free_block_count + 1
+    region.total_frees = region.total_frees + 1
 
-    manager.total_freed += block_size as u64;
-    manager.current_usage -= block_size as u64;
-    manager.free_count += 1;
+    manager.total_freed = manager.total_freed + cast(i64, block_size)
+    manager.current_usage = manager.current_usage - cast(i64, block_size)
+    manager.free_count = manager.free_count + 1
 
     // Try to coalesce with neighbors
-    coalesce_free_blocks(manager, region_idx);
+    coalesce_free_blocks(manager, region_idx)
 
-    return true;
-}
-
-fn validate_guard(region: MemRegion, block_idx: i32, guard_value: u32): bool {
-    let block = &region.blocks[block_idx];
-    let guard_offset = block.size - 4;
-
-    let guard_bytes = guard_value.to_le_bytes();
-    for i in 0..4 {
-        let offset = guard_offset as i32 + i;
-        if offset < 1024 {
-            if region.block_data[block_idx][offset] != guard_bytes[i] {
-                return false;
-            }
-        }
-    }
-
-    return true;
+    return true
 }
 
 // ============================================================================
@@ -559,63 +587,63 @@ fn validate_guard(region: MemRegion, block_idx: i32, guard_value: u32): bool {
 // ============================================================================
 
 fn coalesce_free_blocks(manager: MemBlockManager, region_idx: i32) {
-    let region = &mut manager.regions[region_idx];
+    let region = manager.regions[region_idx]
 
     // Simple coalescing: merge adjacent free blocks
-    let mut i: i32 = 0;
+    let i: i32 = 0
     while i < region.block_count - 1 {
-        let current = &region.blocks[i];
-        let next = &region.blocks[i + 1];
+        let current = region.blocks[i]
+        let next_block = region.blocks[i + 1]
 
-        if has_flag(current, BlockFlags.Free) &&
-           has_flag(current, BlockFlags.Coalescable) &&
-           has_flag(next, BlockFlags.Free) &&
-           has_flag(next, BlockFlags.Coalescable) {
+        if current.has_flag(BlockFlags::FREE) &&
+           current.has_flag(BlockFlags::COALESCABLE) &&
+           next_block.has_flag(BlockFlags::FREE) &&
+           next_block.has_flag(BlockFlags::COALESCABLE) {
             // Can coalesce
-            let current_size = current.size;
-            let next_size = next.size;
+            let current_size = current.size
+            let next_size = next_block.size
 
             // Remove both from free lists
-            let current_class = get_size_class(current_size);
-            let next_class = get_size_class(next_size);
-            free_list_remove(&mut manager.free_lists[current_class], &mut region.blocks, i);
-            free_list_remove(&mut manager.free_lists[next_class], &mut region.blocks, i + 1);
+            let current_class = get_size_class(current_size)
+            let next_class = get_size_class(next_size)
+            manager.free_lists[current_class].remove(region.blocks, i)
+            manager.free_lists[next_class].remove(region.blocks, i + 1)
 
             // Merge into current
-            region.blocks[i].size = current_size + next_size;
-            region.blocks[i].checksum = calculate_header_checksum(&region.blocks[i]);
+            region.blocks[i].size = current_size + next_size
+            region.blocks[i].checksum = region.blocks[i].calculate_checksum()
 
             // Remove next block (shift remaining)
             for j in (i + 1)..(region.block_count - 1) {
-                region.blocks[j] = region.blocks[j + 1];
+                region.blocks[j] = region.blocks[j + 1]
                 // Update prev_block references
                 if region.blocks[j].prev_block > i {
-                    region.blocks[j].prev_block -= 1;
+                    region.blocks[j].prev_block = region.blocks[j].prev_block - 1
                 }
             }
-            region.block_count -= 1;
-            region.free_block_count -= 1;
+            region.block_count = region.block_count - 1
+            region.free_block_count = region.free_block_count - 1
 
             // Add merged block to free list
-            let merged_class = get_size_class(region.blocks[i].size);
-            free_list_add(&mut manager.free_lists[merged_class], &mut region.blocks, i);
+            let merged_class = get_size_class(region.blocks[i].size)
+            manager.free_lists[merged_class].add(region.blocks, i)
 
             // Don't increment i, check this block again
         } else {
-            i += 1;
+            i = i + 1
         }
     }
 
     // Update largest free
-    update_largest_free(region);
+    update_largest_free(region)
 }
 
 fn update_largest_free(region: MemRegion) {
-    region.largest_free = 0;
+    region.largest_free = 0
     for i in 0..region.block_count {
-        if has_flag(&region.blocks[i], BlockFlags.Free) {
+        if region.blocks[i].has_flag(BlockFlags::FREE) {
             if region.blocks[i].size > region.largest_free {
-                region.largest_free = region.blocks[i].size;
+                region.largest_free = region.blocks[i].size
             }
         }
     }
@@ -626,43 +654,59 @@ fn update_largest_free(region: MemRegion) {
 // ============================================================================
 
 fn calculate_fragmentation(manager: MemBlockManager): f32 {
-    let mut total_free: u64 = 0;
-    let mut largest_free: u64 = 0;
+    let total_free: i64 = 0
+    let largest_free: i64 = 0
 
     for i in 0..manager.region_count {
-        let region = &manager.regions[i];
-        let region_free = (region.total_size - region.used_size) as u64;
-        total_free += region_free;
+        let region = manager.regions[i]
+        let region_free = cast(i64, region.total_size - region.used_size)
+        total_free = total_free + region_free
 
-        if region.largest_free as u64 > largest_free {
-            largest_free = region.largest_free as u64;
+        if cast(i64, region.largest_free) > largest_free {
+            largest_free = cast(i64, region.largest_free)
         }
     }
 
     if total_free == 0 {
-        return 0.0;
+        return 0.0
     }
 
     // Fragmentation = 1 - (largest_free / total_free)
-    return 1.0 - (largest_free as f32 / total_free as f32);
+    return 1.0 - (cast(f32, largest_free) / cast(f32, total_free))
 }
 
 struct MemBlockStats {
-    total_allocated: u64,
-    total_freed: u64,
-    current_usage: u64,
-    peak_usage: u64,
-    allocation_count: u64,
-    free_count: u64,
+    total_allocated: i64,
+    total_freed: i64,
+    current_usage: i64,
+    peak_usage: i64,
+    allocation_count: i64,
+    free_count: i64,
     fragmentation: f32,
     region_count: i32,
-    total_capacity: u64,
+    total_capacity: i64,
+}
+
+impl MemBlockStats {
+    fn init(): MemBlockStats {
+        return MemBlockStats {
+            total_allocated: 0,
+            total_freed: 0,
+            current_usage: 0,
+            peak_usage: 0,
+            allocation_count: 0,
+            free_count: 0,
+            fragmentation: 0.0,
+            region_count: 0,
+            total_capacity: 0,
+        }
+    }
 }
 
 fn get_stats(manager: MemBlockManager): MemBlockStats {
-    let mut total_capacity: u64 = 0;
+    let total_capacity: i64 = 0
     for i in 0..manager.region_count {
-        total_capacity += manager.regions[i].total_size as u64;
+        total_capacity = total_capacity + cast(i64, manager.regions[i].total_size)
     }
 
     return MemBlockStats {
@@ -675,7 +719,7 @@ fn get_stats(manager: MemBlockManager): MemBlockStats {
         fragmentation: calculate_fragmentation(manager),
         region_count: manager.region_count,
         total_capacity: total_capacity,
-    };
+    }
 }
 
 // ============================================================================
@@ -683,50 +727,50 @@ fn get_stats(manager: MemBlockManager): MemBlockStats {
 // ============================================================================
 
 fn test_mem_block() {
-    print("Testing Memory Block Manager...");
+    print("Testing Memory Block Manager...")
 
     // Create manager
-    let config = MemBlockConfig {};
-    let mut manager = create_mem_block_manager(config);
+    let config = MemBlockConfig::init()
+    let manager = MemBlockManager::init(config)
 
     // Add region
-    let region_idx = add_region(&mut manager, 65536);
-    print("  Added region: " + region_idx as string);
+    let region_idx = manager.add_region(65536)
+    print("  Added region: " + str(region_idx))
 
     // Allocate some blocks
-    let alloc1 = allocate(&mut manager, 256);
-    print("  Allocation 1: success=" + alloc1.success as string + " id=" + alloc1.alloc_id as string);
+    let alloc1 = allocate(manager, 256)
+    print("  Allocation 1: success=" + str(alloc1.success) + " id=" + str(alloc1.alloc_id))
 
-    let alloc2 = allocate(&mut manager, 512);
-    print("  Allocation 2: success=" + alloc2.success as string + " id=" + alloc2.alloc_id as string);
+    let alloc2 = allocate(manager, 512)
+    print("  Allocation 2: success=" + str(alloc2.success) + " id=" + str(alloc2.alloc_id))
 
-    let alloc3 = allocate(&mut manager, 128);
-    print("  Allocation 3: success=" + alloc3.success as string + " id=" + alloc3.alloc_id as string);
+    let alloc3 = allocate(manager, 128)
+    print("  Allocation 3: success=" + str(alloc3.success) + " id=" + str(alloc3.alloc_id))
 
     // Get stats
-    let stats = get_stats(&manager);
-    print("  Current usage: " + stats.current_usage as string);
-    print("  Allocation count: " + stats.allocation_count as string);
+    let stats = get_stats(manager)
+    print("  Current usage: " + str(stats.current_usage))
+    print("  Allocation count: " + str(stats.allocation_count))
 
     // Free middle block
-    let freed = deallocate(&mut manager, alloc2.alloc_id);
-    print("  Freed allocation 2: " + freed as string);
+    let freed = deallocate(manager, alloc2.alloc_id)
+    print("  Freed allocation 2: " + str(freed))
 
-    let stats2 = get_stats(&manager);
-    print("  Current usage after free: " + stats2.current_usage as string);
-    print("  Fragmentation: " + stats2.fragmentation as string);
+    let stats2 = get_stats(manager)
+    print("  Current usage after free: " + str(stats2.current_usage))
+    print("  Fragmentation: " + str(stats2.fragmentation))
 
     // Allocate again
-    let alloc4 = allocate(&mut manager, 200);
-    print("  Allocation 4: success=" + alloc4.success as string);
+    let alloc4 = allocate(manager, 200)
+    print("  Allocation 4: success=" + str(alloc4.success))
 
     // Free all
-    deallocate(&mut manager, alloc1.alloc_id);
-    deallocate(&mut manager, alloc3.alloc_id);
-    deallocate(&mut manager, alloc4.alloc_id);
+    deallocate(manager, alloc1.alloc_id)
+    deallocate(manager, alloc3.alloc_id)
+    deallocate(manager, alloc4.alloc_id)
 
-    let stats3 = get_stats(&manager);
-    print("  Final usage: " + stats3.current_usage as string);
+    let stats3 = get_stats(manager)
+    print("  Final usage: " + str(stats3.current_usage))
 
-    print("Memory Block Manager tests complete!");
+    print("Memory Block Manager tests complete!")
 }

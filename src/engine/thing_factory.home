@@ -1,29 +1,158 @@
-// thing_factory.home - Object instantiation from templates
+// C&C Generals Zero Hour - Home Port
+// Thing Factory - Object instantiation from templates
+//
+// Original: ThingFactory and ThingTemplate classes from Thyme/SAGE engine
 // Creates game objects (Things) from ThingTemplates loaded from INI
+//
+// In Generals, "Things" are the base class for all game objects:
+// - Units (infantry, vehicles, aircraft)
+// - Buildings and structures
+// - Projectiles and effects
+// - Props and decorations
+// - Bridges and terrain features
 
-let MAX_THING_TEMPLATES: u32 = 2048
-let MAX_ACTIVE_THINGS: u32 = 8192
-let MAX_MODULES_PER_THING: u32 = 32
+let MAX_THING_TEMPLATES: i32 = 2048
+let MAX_ACTIVE_THINGS: i32 = 8192
+let MAX_MODULES_PER_THING: i32 = 32
+let MAX_KINDS: i32 = 8
+let MAX_PREREQUISITES: i32 = 8
+let MAX_PRODUCTION_QUEUE: i32 = 8
+let SPATIAL_GRID_SIZE: i32 = 128
+let MAX_ENTITIES_PER_CELL: i32 = 64
 
 // ============================================================================
-// Thing Template
+// ENUMS
 // ============================================================================
 
+// KindOf flags - determines what type of object this is
 enum KindOf {
-    Infantry,
-    Vehicle,
-    Aircraft,
-    Building,
-    Structure,
-    Projectile,
-    Crate,
-    Debris,
-    Bridge,
-    Prop,
-    Shrubbery,
-    Garrison,
-    Tunnel
+    INFANTRY,
+    VEHICLE,
+    AIRCRAFT,
+    BUILDING,
+    STRUCTURE,
+    PROJECTILE,
+    CRATE,
+    DEBRIS,
+    BRIDGE,
+    PROP,
+    SHRUBBERY,
+    GARRISON,
+    TUNNEL,
 }
+
+// Geometry type for collision
+enum GeometryType {
+    SPHERE,
+    CYLINDER,
+    BOX,
+}
+
+// Thing status
+enum ThingStatus {
+    ALIVE,
+    DYING,
+    DEAD,
+    BEING_CONSTRUCTED,
+}
+
+// ============================================================================
+// VECTOR TYPES
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3 {
+    fn init(x: f32, y: f32, z: f32): Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn zero(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn distance_squared(a: Vec3, b: Vec3): f32 {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dz = b.z - a.z
+        return dx * dx + dy * dy + dz * dz
+    }
+}
+
+struct Quat {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+impl Quat {
+    fn identity(): Quat {
+        return Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+    }
+
+    fn from_angle_y(angle: f32): Quat {
+        let half = angle * 0.5
+        return Quat {
+            x: 0.0,
+            y: sin(half),
+            z: 0.0,
+            w: cos(half),
+        }
+    }
+}
+
+// ============================================================================
+// MODULE TEMPLATE
+// ============================================================================
+
+struct ModuleParam {
+    key: string,
+    value: string,
+}
+
+impl ModuleParam {
+    fn init(key: string, value: string): ModuleParam {
+        return ModuleParam { key: key, value: value }
+    }
+}
+
+struct ModuleTemplate {
+    module_type: string,
+    module_tag: string,
+    parameters: [ModuleParam],
+}
+
+impl ModuleTemplate {
+    fn init(): ModuleTemplate {
+        return ModuleTemplate {
+            module_type: "",
+            module_tag: "",
+            parameters: [],
+        }
+    }
+
+    fn add_param(&self, key: string, value: string) {
+        self.parameters = self.parameters + [ModuleParam::init(key, value)]
+    }
+
+    fn get_param(&self, key: string): string? {
+        for i in 0..self.parameters.length {
+            if self.parameters[i].key == key {
+                return self.parameters[i].value
+            }
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// THING TEMPLATE
+// ============================================================================
 
 struct ThingTemplate {
     name: string,
@@ -37,14 +166,12 @@ struct ThingTemplate {
     selection_decal: string,
 
     // Type info
-    kind_of: [KindOf; 8],
-    kind_of_count: u32,
+    kind_of: [KindOf],
     buildable: bool,
-    prerequisite_count: u32,
-    prerequisites: [string; 8],
+    prerequisites: [string],
 
     // Stats
-    build_cost: u32,
+    build_cost: i32,
     build_time: f32,
     max_health: f32,
     armor_set: string,
@@ -71,12 +198,11 @@ struct ThingTemplate {
     energy_consumption: i32,
 
     // Experience
-    experience_value: u32,
-    experience_required: [u32; 4],      // Per veterancy level
+    experience_value: i32,
+    experience_required: [i32],      // Per veterancy level (4 levels)
 
     // Modules
-    modules: [ModuleTemplate; MAX_MODULES_PER_THING],
-    module_count: u32,
+    modules: [ModuleTemplate],
 
     // Audio
     voice_select: string,
@@ -96,104 +222,108 @@ struct ThingTemplate {
     scale: f32,
 
     // Draw priority
-    draw_priority: u32
+    draw_priority: i32,
 }
 
-enum GeometryType {
-    Sphere,
-    Cylinder,
-    Box
-}
+impl ThingTemplate {
+    fn init(): ThingTemplate {
+        return ThingTemplate {
+            name: "",
+            display_name: "",
+            side: "Civilian",
+            model_name: "",
+            portrait_image: "",
+            button_image: "",
+            selection_decal: "decals/selection.tga",
+            kind_of: [],
+            buildable: false,
+            prerequisites: [],
+            build_cost: 0,
+            build_time: 0.0,
+            max_health: 100.0,
+            armor_set: "None",
+            vision_range: 200.0,
+            shroud_clearing_range: 200.0,
+            locomotor: "",
+            speed: 0.0,
+            turn_rate: 180.0,
+            weapon_set: "",
+            primary_weapon: "",
+            secondary_weapon: "",
+            attack_range: 0.0,
+            can_produce: false,
+            production_queue_type: "",
+            energy_production: 0,
+            energy_consumption: 0,
+            experience_value: 0,
+            experience_required: [0, 100, 200, 400],
+            modules: [],
+            voice_select: "",
+            voice_move: "",
+            voice_attack: "",
+            voice_created: "",
+            sound_ambient: "",
+            sound_die: "",
+            geometry_type: GeometryType::CYLINDER,
+            geometry_major_radius: 10.0,
+            geometry_minor_radius: 10.0,
+            geometry_height: 20.0,
+            scale: 1.0,
+            draw_priority: 0,
+        }
+    }
 
-struct ModuleTemplate {
-    module_type: string,
-    module_tag: string,
-    parameters: [ModuleParam; 16],
-    param_count: u32
-}
+    fn add_kind(&self, kind: KindOf) {
+        if self.kind_of.length < MAX_KINDS {
+            self.kind_of = self.kind_of + [kind]
+        }
+    }
 
-struct ModuleParam {
-    key: string,
-    value: string
-}
+    fn has_kind(&self, kind: KindOf): bool {
+        for i in 0..self.kind_of.length {
+            if self.kind_of[i] == kind {
+                return true
+            }
+        }
+        return false
+    }
 
-fn default_thing_template(): ThingTemplate {
-    ThingTemplate {
-        name: "",
-        display_name: "",
-        side: "Civilian",
-        model_name: "",
-        portrait_image: "",
-        button_image: "",
-        selection_decal: "decals/selection.tga",
-        kind_of: undefined,
-        kind_of_count: 0,
-        buildable: false,
-        prerequisite_count: 0,
-        prerequisites: undefined,
-        build_cost: 0,
-        build_time: 0.0,
-        max_health: 100.0,
-        armor_set: "None",
-        vision_range: 200.0,
-        shroud_clearing_range: 200.0,
-        locomotor: "",
-        speed: 0.0,
-        turn_rate: 180.0,
-        weapon_set: "",
-        primary_weapon: "",
-        secondary_weapon: "",
-        attack_range: 0.0,
-        can_produce: false,
-        production_queue_type: "",
-        energy_production: 0,
-        energy_consumption: 0,
-        experience_value: 0,
-        experience_required: [0, 100, 200, 400],
-        modules: undefined,
-        module_count: 0,
-        voice_select: "",
-        voice_move: "",
-        voice_attack: "",
-        voice_created: "",
-        sound_ambient: "",
-        sound_die: "",
-        geometry_type: GeometryType::Cylinder,
-        geometry_major_radius: 10.0,
-        geometry_minor_radius: 10.0,
-        geometry_height: 20.0,
-        scale: 1.0,
-        draw_priority: 0
+    fn add_prerequisite(&self, prereq: string) {
+        if self.prerequisites.length < MAX_PREREQUISITES {
+            self.prerequisites = self.prerequisites + [prereq]
+        }
+    }
+
+    fn add_module(&self, module: ModuleTemplate) {
+        if self.modules.length < MAX_MODULES_PER_THING {
+            self.modules = self.modules + [module]
+        }
+    }
+
+    fn is_infantry(&self): bool {
+        return self.has_kind(KindOf::INFANTRY)
+    }
+
+    fn is_vehicle(&self): bool {
+        return self.has_kind(KindOf::VEHICLE)
+    }
+
+    fn is_aircraft(&self): bool {
+        return self.has_kind(KindOf::AIRCRAFT)
+    }
+
+    fn is_building(&self): bool {
+        return self.has_kind(KindOf::BUILDING)
     }
 }
 
 // ============================================================================
-// Thing Instance
+// THING INSTANCE
 // ============================================================================
 
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32
-}
-
-struct Quat {
-    x: f32,
-    y: f32,
-    z: f32,
-    w: f32
-}
-
-enum ThingStatus {
-    Alive,
-    Dying,
-    Dead,
-    BeingConstructed
-}
-
 struct Thing {
-    id: u32,
-    template_index: u32,
+    id: i32,
+    template_index: i32,
 
     // Transform
     position: Vec3,
@@ -206,206 +336,496 @@ struct Thing {
     max_health: f32,
 
     // Ownership
-    player_index: u32,
-    team_index: u32,
+    player_index: i32,
+    team_index: i32,
 
     // Selection
     is_selected: bool,
     control_group: i32,                 // -1 = none, 0-9 = group
 
     // Combat
-    target_id: u32,                     // 0 = no target
+    target_id: i32,                     // 0 = no target
     attack_cooldown: f32,
 
     // Movement
     destination: Vec3,
     is_moving: bool,
     current_speed: f32,
-    path_index: u32,
+    path_index: i32,
 
     // Production
     production_progress: f32,
-    production_queue: [u32; 8],         // Template indices
-    production_queue_count: u32,
+    production_queue: [i32],            // Template indices
 
     // Experience
-    veterancy_level: u32,               // 0-3
-    experience: u32,
+    veterancy_level: i32,               // 0-3
+    experience: i32,
 
     // Visual
-    drawable_id: u32,
+    drawable_id: i32,
     animation_state: string,
 
-    // Modules (runtime state)
-    module_data: [u64; MAX_MODULES_PER_THING],
+    // Module runtime data (indices into module systems)
+    module_data: [i32],
 
     // Flags
     is_visible: bool,
     is_under_construction: bool,
     is_garrisoned: bool,
-    garrison_building_id: u32
+    garrison_building_id: i32,
 }
 
-fn default_thing(): Thing {
-    Thing {
-        id: 0,
-        template_index: 0,
-        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
-        rotation: Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
-        facing: 0.0,
-        status: ThingStatus::Alive,
-        health: 100.0,
-        max_health: 100.0,
-        player_index: 0,
-        team_index: 0,
-        is_selected: false,
-        control_group: -1,
-        target_id: 0,
-        attack_cooldown: 0.0,
-        destination: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
-        is_moving: false,
-        current_speed: 0.0,
-        path_index: 0,
-        production_progress: 0.0,
-        production_queue: [0; 8],
-        production_queue_count: 0,
-        veterancy_level: 0,
-        experience: 0,
-        drawable_id: 0,
-        animation_state: "Idle",
-        module_data: [0; MAX_MODULES_PER_THING],
-        is_visible: true,
-        is_under_construction: false,
-        is_garrisoned: false,
-        garrison_building_id: 0
+impl Thing {
+    fn init(): Thing {
+        return Thing {
+            id: 0,
+            template_index: 0,
+            position: Vec3::zero(),
+            rotation: Quat::identity(),
+            facing: 0.0,
+            status: ThingStatus::ALIVE,
+            health: 100.0,
+            max_health: 100.0,
+            player_index: 0,
+            team_index: 0,
+            is_selected: false,
+            control_group: -1,
+            target_id: 0,
+            attack_cooldown: 0.0,
+            destination: Vec3::zero(),
+            is_moving: false,
+            current_speed: 0.0,
+            path_index: 0,
+            production_progress: 0.0,
+            production_queue: [],
+            veterancy_level: 0,
+            experience: 0,
+            drawable_id: 0,
+            animation_state: "Idle",
+            module_data: [],
+            is_visible: true,
+            is_under_construction: false,
+            is_garrisoned: false,
+            garrison_building_id: 0,
+        }
+    }
+
+    fn is_alive(&self): bool {
+        return self.status == ThingStatus::ALIVE
+    }
+
+    fn is_dead(&self): bool {
+        return self.status == ThingStatus::DEAD
+    }
+
+    fn is_valid(&self): bool {
+        return self.id != 0 && self.status != ThingStatus::DEAD
+    }
+
+    fn get_health_percent(&self): f32 {
+        if self.max_health <= 0.0 {
+            return 0.0
+        }
+        return self.health / self.max_health
+    }
+
+    fn damage(&self, amount: f32) {
+        self.health = self.health - amount
+        if self.health <= 0.0 {
+            self.health = 0.0
+            self.status = ThingStatus::DYING
+        }
+    }
+
+    fn heal(&self, amount: f32) {
+        self.health = self.health + amount
+        if self.health > self.max_health {
+            self.health = self.max_health
+        }
+    }
+
+    fn add_experience(&self, amount: i32, exp_required: [i32]) {
+        self.experience = self.experience + amount
+
+        // Check for veterancy level up
+        while self.veterancy_level < 3 {
+            let required = exp_required[self.veterancy_level + 1]
+            if self.experience >= required {
+                self.veterancy_level = self.veterancy_level + 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn queue_production(&self, template_index: i32): bool {
+        if self.production_queue.length >= MAX_PRODUCTION_QUEUE {
+            return false
+        }
+        self.production_queue = self.production_queue + [template_index]
+        return true
+    }
+
+    fn cancel_production(&self, queue_index: i32): bool {
+        if queue_index < 0 || queue_index >= self.production_queue.length {
+            return false
+        }
+
+        // Remove item from queue
+        let new_queue: [i32] = []
+        for i in 0..self.production_queue.length {
+            if i != queue_index {
+                new_queue = new_queue + [self.production_queue[i]]
+            }
+        }
+        self.production_queue = new_queue
+
+        // Reset progress if first item
+        if queue_index == 0 {
+            self.production_progress = 0.0
+        }
+        return true
     }
 }
 
 // ============================================================================
-// Thing Factory
+// SPATIAL CELL
+// ============================================================================
+
+struct SpatialCell {
+    entity_ids: [i32],
+}
+
+impl SpatialCell {
+    fn init(): SpatialCell {
+        return SpatialCell { entity_ids: [] }
+    }
+
+    fn add(&self, entity_id: i32) {
+        if self.entity_ids.length < MAX_ENTITIES_PER_CELL {
+            self.entity_ids = self.entity_ids + [entity_id]
+        }
+    }
+
+    fn remove(&self, entity_id: i32) {
+        let new_ids: [i32] = []
+        for i in 0..self.entity_ids.length {
+            if self.entity_ids[i] != entity_id {
+                new_ids = new_ids + [self.entity_ids[i]]
+            }
+        }
+        self.entity_ids = new_ids
+    }
+
+    fn contains(&self, entity_id: i32): bool {
+        for i in 0..self.entity_ids.length {
+            if self.entity_ids[i] == entity_id {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ============================================================================
+// SPATIAL GRID
+// ============================================================================
+
+struct SpatialGrid {
+    cell_size: f32,
+    cells: [SpatialCell],              // Flattened 2D grid
+    grid_width: i32,
+    grid_height: i32,
+    world_offset_x: f32,
+    world_offset_z: f32,
+}
+
+impl SpatialGrid {
+    fn init(cell_size: f32): SpatialGrid {
+        let total_cells = SPATIAL_GRID_SIZE * SPATIAL_GRID_SIZE
+        let cells: [SpatialCell] = []
+
+        for i in 0..total_cells {
+            cells = cells + [SpatialCell::init()]
+        }
+
+        return SpatialGrid {
+            cell_size: cell_size,
+            cells: cells,
+            grid_width: SPATIAL_GRID_SIZE,
+            grid_height: SPATIAL_GRID_SIZE,
+            world_offset_x: 0.0,
+            world_offset_z: 0.0,
+        }
+    }
+
+    fn get_cell_index(&self, x: i32, z: i32): i32 {
+        return z * self.grid_width + x
+    }
+
+    fn get_cell_coords(&self, pos: Vec3): (i32, i32) {
+        let x = ((pos.x - self.world_offset_x) / self.cell_size) as i32
+        let z = ((pos.z - self.world_offset_z) / self.cell_size) as i32
+
+        let cx = clamp_i32(x, 0, self.grid_width - 1)
+        let cz = clamp_i32(z, 0, self.grid_height - 1)
+
+        return (cx, cz)
+    }
+
+    fn insert(&self, entity_id: i32, pos: Vec3) {
+        let (cx, cz) = self.get_cell_coords(pos)
+        let idx = self.get_cell_index(cx, cz)
+        self.cells[idx].add(entity_id)
+    }
+
+    fn remove(&self, entity_id: i32) {
+        // Search all cells (could be optimized with entity->cell mapping)
+        for i in 0..self.cells.length {
+            if self.cells[i].contains(entity_id) {
+                self.cells[i].remove(entity_id)
+                return
+            }
+        }
+    }
+
+    fn move_entity(&self, entity_id: i32, old_pos: Vec3, new_pos: Vec3) {
+        let (old_cx, old_cz) = self.get_cell_coords(old_pos)
+        let (new_cx, new_cz) = self.get_cell_coords(new_pos)
+
+        if old_cx == new_cx && old_cz == new_cz {
+            return  // Same cell
+        }
+
+        // Remove from old cell
+        let old_idx = self.get_cell_index(old_cx, old_cz)
+        self.cells[old_idx].remove(entity_id)
+
+        // Add to new cell
+        let new_idx = self.get_cell_index(new_cx, new_cz)
+        self.cells[new_idx].add(entity_id)
+    }
+
+    fn query_radius(&self, center: Vec3, radius: f32): [i32] {
+        let (cx, cz) = self.get_cell_coords(center)
+        let cell_radius = (radius / self.cell_size) as i32 + 1
+
+        let results: [i32] = []
+
+        for dx in -cell_radius..(cell_radius + 1) {
+            for dz in -cell_radius..(cell_radius + 1) {
+                let x = cx + dx
+                let z = cz + dz
+
+                if x < 0 || x >= self.grid_width || z < 0 || z >= self.grid_height {
+                    continue
+                }
+
+                let idx = self.get_cell_index(x, z)
+                let cell = self.cells[idx]
+
+                for i in 0..cell.entity_ids.length {
+                    results = results + [cell.entity_ids[i]]
+                }
+            }
+        }
+
+        return results
+    }
+
+    fn query_box(&self, min: Vec3, max: Vec3): [i32] {
+        let (min_cx, min_cz) = self.get_cell_coords(min)
+        let (max_cx, max_cz) = self.get_cell_coords(max)
+
+        let results: [i32] = []
+
+        for x in min_cx..(max_cx + 1) {
+            for z in min_cz..(max_cz + 1) {
+                if x < 0 || x >= self.grid_width || z < 0 || z >= self.grid_height {
+                    continue
+                }
+
+                let idx = self.get_cell_index(x, z)
+                let cell = self.cells[idx]
+
+                for i in 0..cell.entity_ids.length {
+                    results = results + [cell.entity_ids[i]]
+                }
+            }
+        }
+
+        return results
+    }
+}
+
+// ============================================================================
+// TEMPLATE REGISTRY (replaces HashMap)
+// ============================================================================
+
+struct TemplateEntry {
+    name: string,
+    index: i32,
+}
+
+struct TemplateRegistry {
+    entries: [TemplateEntry],
+}
+
+impl TemplateRegistry {
+    fn init(): TemplateRegistry {
+        return TemplateRegistry { entries: [] }
+    }
+
+    fn insert(&self, name: string, index: i32) {
+        // Check if exists
+        for i in 0..self.entries.length {
+            if self.entries[i].name == name {
+                self.entries[i].index = index
+                return
+            }
+        }
+        // Add new
+        self.entries = self.entries + [TemplateEntry { name: name, index: index }]
+    }
+
+    fn get(&self, name: string): i32? {
+        for i in 0..self.entries.length {
+            if self.entries[i].name == name {
+                return self.entries[i].index
+            }
+        }
+        return null
+    }
+
+    fn contains(&self, name: string): bool {
+        return self.get(name) != null
+    }
+}
+
+// ============================================================================
+// THING FACTORY
 // ============================================================================
 
 struct ThingFactory {
     // Templates
-    templates: [ThingTemplate; MAX_THING_TEMPLATES],
-    template_count: u32,
-    template_name_to_index: HashMap<string, u32>,
+    templates: [ThingTemplate],
+    template_registry: TemplateRegistry,
 
     // Active things
-    things: [Thing; MAX_ACTIVE_THINGS],
-    thing_count: u32,
-    next_thing_id: u32,
+    things: [Thing],
+    next_thing_id: i32,
 
     // Free list for reuse
-    free_indices: [u32; MAX_ACTIVE_THINGS],
-    free_count: u32,
+    free_indices: [i32],
 
     // Spatial index for fast lookups
     spatial_grid: SpatialGrid,
 
-    // Callbacks
-    on_thing_created: fn(&Thing),
-    on_thing_destroyed: fn(u32),
-    on_thing_damaged: fn(u32, f32)
+    is_initialized: bool,
 }
 
 impl ThingFactory {
-    fn new(): ThingFactory {
-        var factory = ThingFactory {
-            templates: undefined,
-            template_count: 0,
-            template_name_to_index: HashMap::new(),
-            things: undefined,
-            thing_count: 0,
+    fn init(): ThingFactory {
+        return ThingFactory {
+            templates: [],
+            template_registry: TemplateRegistry::init(),
+            things: [],
             next_thing_id: 1,
-            free_indices: undefined,
-            free_count: 0,
-            spatial_grid: SpatialGrid::new(50.0),   // 50 unit cells
-            on_thing_created: null,
-            on_thing_destroyed: null,
-            on_thing_damaged: null
+            free_indices: [],
+            spatial_grid: SpatialGrid::init(50.0),   // 50 unit cells
+            is_initialized: true,
         }
-
-        // Initialize all things to default
-        for i in 0..MAX_ACTIVE_THINGS {
-            factory.things[i] = default_thing()
-        }
-
-        return factory
     }
 
     // ========================================================================
     // Template Management
     // ========================================================================
 
-    fn register_template(&self, template: ThingTemplate): u32 {
-        if self.template_count >= MAX_THING_TEMPLATES {
-            return 0xFFFFFFFF
+    fn register_template(&self, template: ThingTemplate): i32 {
+        if self.templates.length >= MAX_THING_TEMPLATES {
+            return -1
         }
 
-        let index = self.template_count
-        self.templates[index] = template
-        self.template_name_to_index.insert(template.name, index)
-        self.template_count += 1
+        let index = self.templates.length
+        self.templates = self.templates + [template]
+        self.template_registry.insert(template.name, index)
 
         return index
     }
 
-    fn get_template(&self, name: string): ?&ThingTemplate {
-        let index = self.template_name_to_index.get(name)
+    fn get_template(&self, name: string): ThingTemplate? {
+        let index = self.template_registry.get(name)
         if index == null {
             return null
         }
-        return &self.templates[index.unwrap()]
+        return self.templates[index]
     }
 
-    fn get_template_index(&self, name: string): ?u32 {
-        return self.template_name_to_index.get(name)
+    fn get_template_by_index(&self, index: i32): ThingTemplate? {
+        if index < 0 || index >= self.templates.length {
+            return null
+        }
+        return self.templates[index]
+    }
+
+    fn get_template_index(&self, name: string): i32? {
+        return self.template_registry.get(name)
     }
 
     // ========================================================================
     // Thing Creation
     // ========================================================================
 
-    fn create_thing(&self, template_name: string, position: Vec3, facing: f32, player: u32): ?u32 {
+    fn create_thing(&self, template_name: string, position: Vec3, facing: f32, player: i32): i32? {
         let template_index = self.get_template_index(template_name)
         if template_index == null {
             return null
         }
 
-        return self.create_thing_from_index(template_index.unwrap(), position, facing, player)
+        return self.create_thing_from_index(template_index, position, facing, player)
     }
 
-    fn create_thing_from_index(&self, template_index: u32, position: Vec3, facing: f32, player: u32): ?u32 {
-        if template_index >= self.template_count {
+    fn create_thing_from_index(&self, template_index: i32, position: Vec3, facing: f32, player: i32): i32? {
+        if template_index < 0 || template_index >= self.templates.length {
+            return null
+        }
+
+        // Check limits
+        let active_count = self.get_active_count()
+        if active_count >= MAX_ACTIVE_THINGS {
             return null
         }
 
         // Get a slot
-        var slot: u32 = 0
-        if self.free_count > 0 {
-            self.free_count -= 1
-            slot = self.free_indices[self.free_count]
-        } else {
-            if self.thing_count >= MAX_ACTIVE_THINGS {
-                return null
+        let slot: i32 = 0
+        if self.free_indices.length > 0 {
+            // Reuse free slot
+            slot = self.free_indices[self.free_indices.length - 1]
+
+            // Remove from free list
+            let new_free: [i32] = []
+            for i in 0..(self.free_indices.length - 1) {
+                new_free = new_free + [self.free_indices[i]]
             }
-            slot = self.thing_count
-            self.thing_count += 1
+            self.free_indices = new_free
+        } else {
+            // Allocate new slot
+            slot = self.things.length
+            self.things = self.things + [Thing::init()]
         }
 
-        let template = &self.templates[template_index]
+        let template = self.templates[template_index]
         let thing_id = self.next_thing_id
-        self.next_thing_id += 1
+        self.next_thing_id = self.next_thing_id + 1
 
         // Initialize thing from template
-        self.things[slot] = Thing {
+        let thing = Thing {
             id: thing_id,
             template_index: template_index,
             position: position,
-            rotation: quat_from_angle_y(facing),
+            rotation: Quat::from_angle_y(facing),
             facing: facing,
-            status: ThingStatus::Alive,
+            status: ThingStatus::ALIVE,
             health: template.max_health,
             max_health: template.max_health,
             player_index: player,
@@ -419,18 +839,19 @@ impl ThingFactory {
             current_speed: 0.0,
             path_index: 0,
             production_progress: 0.0,
-            production_queue: [0; 8],
-            production_queue_count: 0,
+            production_queue: [],
             veterancy_level: 0,
             experience: 0,
             drawable_id: 0,
             animation_state: "Idle",
-            module_data: [0; MAX_MODULES_PER_THING],
+            module_data: [],
             is_visible: true,
             is_under_construction: false,
             is_garrisoned: false,
-            garrison_building_id: 0
+            garrison_building_id: 0,
         }
+
+        self.things[slot] = thing
 
         // Add to spatial grid
         self.spatial_grid.insert(thing_id, position)
@@ -438,43 +859,36 @@ impl ThingFactory {
         // Initialize modules
         self.initialize_modules(slot)
 
-        // Callback
-        if self.on_thing_created != null {
-            self.on_thing_created(&self.things[slot])
-        }
-
         return thing_id
     }
 
-    fn create_building(&self, template_name: string, position: Vec3, facing: f32, player: u32): ?u32 {
+    fn create_building(&self, template_name: string, position: Vec3, facing: f32, player: i32): i32? {
         let thing_id = self.create_thing(template_name, position, facing, player)
         if thing_id == null {
             return null
         }
 
-        let slot = self.find_thing_slot(thing_id.unwrap())
+        let slot = self.find_thing_slot(thing_id)
         if slot == null {
             return thing_id
         }
 
-        let thing = &self.things[slot.unwrap()]
+        let thing = self.things[slot]
         thing.is_under_construction = true
-        thing.status = ThingStatus::BeingConstructed
+        thing.status = ThingStatus::BEING_CONSTRUCTED
         thing.health = thing.max_health * 0.01   // Start at 1% health
 
         return thing_id
     }
 
-    fn initialize_modules(&self, slot: u32) {
-        let thing = &self.things[slot]
-        let template = &self.templates[thing.template_index]
+    fn initialize_modules(&self, slot: i32) {
+        let thing = self.things[slot]
+        let template = self.templates[thing.template_index]
 
-        for i in 0..template.module_count {
-            let module = &template.modules[i]
-
-            // Initialize module based on type
-            // Store runtime data pointer
-            thing.module_data[i] = 0    // Would allocate actual module instance
+        // Initialize module data array
+        for i in 0..template.modules.length {
+            // Store module runtime data index (would allocate actual module instance)
+            thing.module_data = thing.module_data + [0]
         }
     }
 
@@ -482,38 +896,32 @@ impl ThingFactory {
     // Thing Destruction
     // ========================================================================
 
-    fn destroy_thing(&self, thing_id: u32) {
+    fn destroy_thing(&self, thing_id: i32) {
         let slot = self.find_thing_slot(thing_id)
         if slot == null {
             return
         }
 
-        let thing = &self.things[slot.unwrap()]
+        let thing = self.things[slot]
 
         // Remove from spatial grid
         self.spatial_grid.remove(thing_id)
 
-        // Callback
-        if self.on_thing_destroyed != null {
-            self.on_thing_destroyed(thing_id)
-        }
-
         // Reset and add to free list
         thing.id = 0
-        thing.status = ThingStatus::Dead
+        thing.status = ThingStatus::DEAD
 
-        self.free_indices[self.free_count] = slot.unwrap()
-        self.free_count += 1
+        self.free_indices = self.free_indices + [slot]
     }
 
-    fn kill_thing(&self, thing_id: u32) {
+    fn kill_thing(&self, thing_id: i32) {
         let slot = self.find_thing_slot(thing_id)
         if slot == null {
             return
         }
 
-        let thing = &self.things[slot.unwrap()]
-        thing.status = ThingStatus::Dying
+        let thing = self.things[slot]
+        thing.status = ThingStatus::DYING
         thing.health = 0.0
         thing.animation_state = "Die"
 
@@ -524,26 +932,17 @@ impl ThingFactory {
     // Thing Lookup
     // ========================================================================
 
-    fn get_thing(&self, thing_id: u32): ?&Thing {
-        for i in 0..self.thing_count {
-            if self.things[i].id == thing_id and self.things[i].status != ThingStatus::Dead {
-                return &self.things[i]
+    fn get_thing(&self, thing_id: i32): Thing? {
+        for i in 0..self.things.length {
+            if self.things[i].id == thing_id && self.things[i].is_valid() {
+                return self.things[i]
             }
         }
         return null
     }
 
-    fn get_thing_mut(&self, thing_id: u32): ?&mut Thing {
-        for i in 0..self.thing_count {
-            if self.things[i].id == thing_id and self.things[i].status != ThingStatus::Dead {
-                return &self.things[i]
-            }
-        }
-        return null
-    }
-
-    fn find_thing_slot(&self, thing_id: u32): ?u32 {
-        for i in 0..self.thing_count {
+    fn find_thing_slot(&self, thing_id: i32): i32? {
+        for i in 0..self.things.length {
             if self.things[i].id == thing_id {
                 return i
             }
@@ -555,40 +954,38 @@ impl ThingFactory {
     // Spatial Queries
     // ========================================================================
 
-    fn find_things_in_radius(&self, center: Vec3, radius: f32, results: [u32; 256]): u32 {
-        return self.spatial_grid.query_radius(center, radius, results)
+    fn find_things_in_radius(&self, center: Vec3, radius: f32): [i32] {
+        return self.spatial_grid.query_radius(center, radius)
     }
 
-    fn find_things_in_box(&self, min: Vec3, max: Vec3, results: [u32; 256]): u32 {
-        return self.spatial_grid.query_box(min, max, results)
+    fn find_things_in_box(&self, min: Vec3, max: Vec3): [i32] {
+        return self.spatial_grid.query_box(min, max)
     }
 
-    fn find_nearest_enemy(&self, position: Vec3, player: u32, max_range: f32): ?u32 {
-        var candidates: [u32; 256] = undefined
-        let count = self.find_things_in_radius(position, max_range, &mut candidates)
+    fn find_nearest_enemy(&self, position: Vec3, player: i32, max_range: f32): i32? {
+        let candidates = self.find_things_in_radius(position, max_range)
 
-        var nearest_id: u32 = 0
-        var nearest_dist: f32 = max_range * max_range
+        let nearest_id: i32 = 0
+        let nearest_dist: f32 = max_range * max_range
 
-        for i in 0..count {
+        for i in 0..candidates.length {
             let thing = self.get_thing(candidates[i])
             if thing == null {
                 continue
             }
 
-            let t = thing.unwrap()
-            if t.player_index == player {
+            if thing.player_index == player {
                 continue   // Same team
             }
 
-            if t.status != ThingStatus::Alive {
+            if !thing.is_alive() {
                 continue
             }
 
-            let dist = distance_squared(position, t.position)
+            let dist = Vec3::distance_squared(position, thing.position)
             if dist < nearest_dist {
                 nearest_dist = dist
-                nearest_id = t.id
+                nearest_id = thing.id
             }
         }
 
@@ -599,54 +996,55 @@ impl ThingFactory {
     }
 
     // ========================================================================
-    // Iteration
+    // Iteration Helpers
     // ========================================================================
 
-    fn for_each<F>(&self, func: F) where F: fn(&Thing) {
-        for i in 0..self.thing_count {
-            if self.things[i].status != ThingStatus::Dead and self.things[i].id != 0 {
-                func(&self.things[i])
+    fn get_all_things(&self): [Thing] {
+        let result: [Thing] = []
+        for i in 0..self.things.length {
+            if self.things[i].is_valid() {
+                result = result + [self.things[i]]
             }
         }
+        return result
     }
 
-    fn for_each_of_player<F>(&self, player: u32, func: F) where F: fn(&Thing) {
-        for i in 0..self.thing_count {
-            if self.things[i].status != ThingStatus::Dead and
-               self.things[i].id != 0 and
-               self.things[i].player_index == player {
-                func(&self.things[i])
+    fn get_things_for_player(&self, player: i32): [Thing] {
+        let result: [Thing] = []
+        for i in 0..self.things.length {
+            if self.things[i].is_valid() && self.things[i].player_index == player {
+                result = result + [self.things[i]]
             }
         }
+        return result
     }
 
-    fn for_each_of_type<F>(&self, template_name: string, func: F) where F: fn(&Thing) {
+    fn get_things_of_type(&self, template_name: string): [Thing] {
         let template_idx = self.get_template_index(template_name)
         if template_idx == null {
-            return
+            return []
         }
 
-        let idx = template_idx.unwrap()
-        for i in 0..self.thing_count {
-            if self.things[i].status != ThingStatus::Dead and
-               self.things[i].id != 0 and
-               self.things[i].template_index == idx {
-                func(&self.things[i])
+        let result: [Thing] = []
+        for i in 0..self.things.length {
+            if self.things[i].is_valid() && self.things[i].template_index == template_idx {
+                result = result + [self.things[i]]
             }
         }
+        return result
     }
 
     // ========================================================================
     // Position Updates
     // ========================================================================
 
-    fn update_position(&self, thing_id: u32, new_pos: Vec3) {
+    fn update_position(&self, thing_id: i32, new_pos: Vec3) {
         let slot = self.find_thing_slot(thing_id)
         if slot == null {
             return
         }
 
-        let thing = &self.things[slot.unwrap()]
+        let thing = self.things[slot]
         let old_pos = thing.position
         thing.position = new_pos
 
@@ -658,246 +1056,92 @@ impl ThingFactory {
     // Stats
     // ========================================================================
 
-    fn get_active_count(&self): u32 {
-        var count: u32 = 0
-        for i in 0..self.thing_count {
-            if self.things[i].status != ThingStatus::Dead and self.things[i].id != 0 {
-                count += 1
+    fn get_active_count(&self): i32 {
+        let count: i32 = 0
+        for i in 0..self.things.length {
+            if self.things[i].is_valid() {
+                count = count + 1
             }
         }
         return count
     }
 
-    fn get_count_for_player(&self, player: u32): u32 {
-        var count: u32 = 0
-        for i in 0..self.thing_count {
-            if self.things[i].status != ThingStatus::Dead and
-               self.things[i].id != 0 and
-               self.things[i].player_index == player {
-                count += 1
+    fn get_count_for_player(&self, player: i32): i32 {
+        let count: i32 = 0
+        for i in 0..self.things.length {
+            if self.things[i].is_valid() && self.things[i].player_index == player {
+                count = count + 1
             }
         }
         return count
     }
-}
 
-// ============================================================================
-// Spatial Grid
-// ============================================================================
-
-struct SpatialCell {
-    entity_ids: [u32; 64],
-    count: u32
-}
-
-struct SpatialGrid {
-    cell_size: f32,
-    cells: [[SpatialCell; 128]; 128],  // 128x128 grid
-    grid_width: u32,
-    grid_height: u32,
-    world_offset: Vec3
-}
-
-impl SpatialGrid {
-    fn new(cell_size: f32): SpatialGrid {
-        var grid = SpatialGrid {
-            cell_size: cell_size,
-            cells: undefined,
-            grid_width: 128,
-            grid_height: 128,
-            world_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 }
-        }
-
-        // Initialize all cells
-        for x in 0..128 {
-            for z in 0..128 {
-                grid.cells[x][z] = SpatialCell {
-                    entity_ids: [0; 64],
-                    count: 0
-                }
-            }
-        }
-
-        return grid
-    }
-
-    fn get_cell_coords(&self, pos: Vec3): (u32, u32) {
-        let x = ((pos.x - self.world_offset.x) / self.cell_size) as i32
-        let z = ((pos.z - self.world_offset.z) / self.cell_size) as i32
-
-        let cx = clamp_i32(x, 0, self.grid_width as i32 - 1) as u32
-        let cz = clamp_i32(z, 0, self.grid_height as i32 - 1) as u32
-
-        return (cx, cz)
-    }
-
-    fn insert(&self, entity_id: u32, pos: Vec3) {
-        let (cx, cz) = self.get_cell_coords(pos)
-        let cell = &self.cells[cx][cz]
-
-        if cell.count < 64 {
-            cell.entity_ids[cell.count] = entity_id
-            cell.count += 1
-        }
-    }
-
-    fn remove(&self, entity_id: u32) {
-        // Search all cells (could be optimized with entity->cell mapping)
-        for x in 0..self.grid_width {
-            for z in 0..self.grid_height {
-                let cell = &self.cells[x][z]
-                for i in 0..cell.count {
-                    if cell.entity_ids[i] == entity_id {
-                        // Remove by swapping with last
-                        cell.entity_ids[i] = cell.entity_ids[cell.count - 1]
-                        cell.count -= 1
-                        return
-                    }
-                }
-            }
-        }
-    }
-
-    fn move_entity(&self, entity_id: u32, old_pos: Vec3, new_pos: Vec3) {
-        let (old_cx, old_cz) = self.get_cell_coords(old_pos)
-        let (new_cx, new_cz) = self.get_cell_coords(new_pos)
-
-        if old_cx == new_cx and old_cz == new_cz {
-            return  // Same cell
-        }
-
-        // Remove from old cell
-        let old_cell = &self.cells[old_cx][old_cz]
-        for i in 0..old_cell.count {
-            if old_cell.entity_ids[i] == entity_id {
-                old_cell.entity_ids[i] = old_cell.entity_ids[old_cell.count - 1]
-                old_cell.count -= 1
-                break
-            }
-        }
-
-        // Add to new cell
-        let new_cell = &self.cells[new_cx][new_cz]
-        if new_cell.count < 64 {
-            new_cell.entity_ids[new_cell.count] = entity_id
-            new_cell.count += 1
-        }
-    }
-
-    fn query_radius(&self, center: Vec3, radius: f32, results: [u32; 256]): u32 {
-        let (cx, cz) = self.get_cell_coords(center)
-        let cell_radius = (radius / self.cell_size) as i32 + 1
-
-        var count: u32 = 0
-
-        for dx in -cell_radius..=cell_radius {
-            for dz in -cell_radius..=cell_radius {
-                let x = cx as i32 + dx
-                let z = cz as i32 + dz
-
-                if x < 0 or x >= self.grid_width as i32 or z < 0 or z >= self.grid_height as i32 {
-                    continue
-                }
-
-                let cell = &self.cells[x as u32][z as u32]
-                for i in 0..cell.count {
-                    if count < 256 {
-                        results[count] = cell.entity_ids[i]
-                        count += 1
-                    }
-                }
-            }
-        }
-
-        return count
-    }
-
-    fn query_box(&self, min: Vec3, max: Vec3, results: [u32; 256]): u32 {
-        let (min_cx, min_cz) = self.get_cell_coords(min)
-        let (max_cx, max_cz) = self.get_cell_coords(max)
-
-        var count: u32 = 0
-
-        for x in min_cx..=max_cx {
-            for z in min_cz..=max_cz {
-                if x >= self.grid_width or z >= self.grid_height {
-                    continue
-                }
-
-                let cell = &self.cells[x][z]
-                for i in 0..cell.count {
-                    if count < 256 {
-                        results[count] = cell.entity_ids[i]
-                        count += 1
-                    }
-                }
-            }
-        }
-
-        return count
+    fn get_template_count(&self): i32 {
+        return self.templates.length
     }
 }
 
 // ============================================================================
-// Helper Functions
+// HELPER FUNCTIONS
 // ============================================================================
-
-fn quat_from_angle_y(angle: f32): Quat {
-    let half = angle * 0.5
-    Quat {
-        x: 0.0,
-        y: sin(half),
-        z: 0.0,
-        w: cos(half)
-    }
-}
-
-fn distance_squared(a: Vec3, b: Vec3): f32 {
-    let dx = b.x - a.x
-    let dy = b.y - a.y
-    let dz = b.z - a.z
-    return dx * dx + dy * dy + dz * dz
-}
 
 fn clamp_i32(value: i32, min: i32, max: i32): i32 {
-    if value < min { return min }
-    if value > max { return max }
+    if value < min {
+        return min
+    }
+    if value > max {
+        return max
+    }
     return value
 }
 
-// Map type (simplified)
-struct HashMap<K, V> {
-    keys: [K; 2048],
-    values: [V; 2048],
-    count: u32
-}
-
-impl<K: Eq, V> HashMap<K, V> {
-    fn new(): HashMap<K, V> {
-        Map {
-            keys: undefined,
-            values: undefined,
-            count: 0
-        }
-    }
-
-    fn insert(&self, key: K, value: V) {
-        if self.count < 2048 {
-            self.keys[self.count] = key
-            self.values[self.count] = value
-            self.count += 1
-        }
-    }
-
-    fn get(&self, key: K): ?V {
-        for i in 0..self.count {
-            if self.keys[i] == key {
-                return self.values[i]
-            }
-        }
-        return null
-    }
-}
-
+// Math externs
 extern fn sin(x: f32): f32
 extern fn cos(x: f32): f32
+
+// ============================================================================
+// GLOBAL THING FACTORY INSTANCE
+// ============================================================================
+
+let g_thing_factory: ThingFactory? = null
+
+fn init_thing_factory(): ThingFactory {
+    let factory = ThingFactory::init()
+    g_thing_factory = factory
+    return factory
+}
+
+fn get_thing_factory(): ThingFactory? {
+    return g_thing_factory
+}
+
+fn shutdown_thing_factory() {
+    g_thing_factory = null
+}
+
+// Convenience functions
+fn create_thing(template_name: string, position: Vec3, facing: f32, player: i32): i32? {
+    if g_thing_factory == null {
+        return null
+    }
+    return g_thing_factory.create_thing(template_name, position, facing, player)
+}
+
+fn get_thing(thing_id: i32): Thing? {
+    if g_thing_factory == null {
+        return null
+    }
+    return g_thing_factory.get_thing(thing_id)
+}
+
+fn destroy_thing(thing_id: i32) {
+    if g_thing_factory != null {
+        g_thing_factory.destroy_thing(thing_id)
+    }
+}
+
+fn kill_thing(thing_id: i32) {
+    if g_thing_factory != null {
+        g_thing_factory.kill_thing(thing_id)
+    }
+}

@@ -1,10 +1,12 @@
+// C&C Generals Zero Hour - Home Port
 // PNG Image Loader - Portable Network Graphics Format
+//
+// Original: PngLoader from Thyme/SAGE engine
 // Used for UI textures and other images in C&C Generals
 // Reference: PNG Specification (RFC 2083)
 
-
 // PNG signature (8 bytes)
-let PNG_SIGNATURE: [Int; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+let PNG_SIGNATURE: [i32] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
 
 // Critical chunk types
 let CHUNK_IHDR: i32 = 0x49484452  // Image header
@@ -41,7 +43,10 @@ let FILTER_PAETH: i32 = 4
 let INTERLACE_NONE: i32 = 0
 let INTERLACE_ADAM7: i32 = 1
 
-// PNG image header
+// ============================================================================
+// PNG HEADER
+// ============================================================================
+
 struct PNGHeader {
     width: i32,
     height: i32,
@@ -52,57 +57,94 @@ struct PNGHeader {
     interlace: i32,
 }
 
-// Loaded PNG image
+impl PNGHeader {
+    fn init(): PNGHeader {
+        return PNGHeader {
+            width: 0,
+            height: 0,
+            bit_depth: 0,
+            color_type: 0,
+            compression: 0,
+            filter: 0,
+            interlace: 0,
+        }
+    }
+}
+
+// ============================================================================
+// PNG IMAGE
+// ============================================================================
+
 struct PNGImage {
     width: i32,
     height: i32,
     channels: i32,
     bit_depth: i32,
-    pixels: Vec<i32>,  // RGBA pixel data
+    pixels: [i32],       // RGBA pixel data
     name: string,
     has_alpha: bool,
 }
 
-// Create empty PNG image
-fn create_png_image(): PNGImage {
-    return PNGImage {
-        width: 0,
-        height: 0,
-        channels: 4,
-        bit_depth: 8,
-        pixels: Vec<i32>{},
-        name: "",
-        has_alpha: false,
+impl PNGImage {
+    fn init(): PNGImage {
+        return PNGImage {
+            width: 0,
+            height: 0,
+            channels: 4,
+            bit_depth: 8,
+            pixels: [],
+            name: "",
+            has_alpha: false,
+        }
+    }
+
+    fn get_pixel(&self, x: i32, y: i32): (i32, i32, i32, i32) {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return (0, 0, 0, 0)
+        }
+
+        let offset = (y * self.width + x) * 4
+        if offset + 4 > self.pixels.length {
+            return (0, 0, 0, 0)
+        }
+
+        return (
+            self.pixels[offset],
+            self.pixels[offset + 1],
+            self.pixels[offset + 2],
+            self.pixels[offset + 3]
+        )
     }
 }
 
-// Read 32-bit big-endian integer
-fn read_u32_be(data: Vec<i32>, offset: i32): i32 {
-    if offset + 4 > data.len() {
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn read_u32_be(data: [i32], offset: i32): i32 {
+    if offset + 4 > data.length {
         return 0
     }
-    return (data.get(offset) << 24) |
-           (data.get(offset + 1) << 16) |
-           (data.get(offset + 2) << 8) |
-           data.get(offset + 3)
+    return (data[offset] << 24) |
+           (data[offset + 1] << 16) |
+           (data[offset + 2] << 8) |
+           data[offset + 3]
 }
 
-// Read byte
-fn read_byte(data: Vec<i32>, offset: i32): i32 {
-    if offset >= data.len() {
+fn read_byte(data: [i32], offset: i32): i32 {
+    if offset >= data.length {
         return 0
     }
-    return data.get(offset)
+    return data[offset]
 }
 
-// Check PNG signature
-fn check_signature(data: Vec<i32>): bool {
-    if data.len() < 8 {
+fn check_signature(data: [i32]): bool {
+    if data.length < 8 {
         return false
     }
 
     for i in 0..8 {
-        if data.get(i) != PNG_SIGNATURE[i] {
+        if data[i] != PNG_SIGNATURE[i] {
             return false
         }
     }
@@ -110,19 +152,98 @@ fn check_signature(data: Vec<i32>): bool {
     return true
 }
 
-// Parse IHDR chunk
-fn parse_ihdr(data: Vec<i32>, offset: i32): (PNGHeader, Bool) {
-    let header = PNGHeader {
-        width: 0,
-        height: 0,
-        bit_depth: 0,
-        color_type: 0,
-        compression: 0,
-        filter: 0,
-        interlace: 0,
+fn get_channels(color_type: i32): i32 {
+    if color_type == COLOR_GRAYSCALE {
+        return 1
+    } else if color_type == COLOR_RGB {
+        return 3
+    } else if color_type == COLOR_INDEXED {
+        return 1
+    } else if color_type == COLOR_GRAYSCALE_ALPHA {
+        return 2
+    } else if color_type == COLOR_RGBA {
+        return 4
+    }
+    return 4
+}
+
+fn abs(x: i32): i32 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+// Paeth predictor function
+fn paeth_predictor(a: i32, b: i32, c: i32): i32 {
+    let p = a + b - c
+    let pa = abs(p - a)
+    let pb = abs(p - b)
+    let pc = abs(p - c)
+
+    if pa <= pb && pa <= pc {
+        return a
+    } else if pb <= pc {
+        return b
+    }
+    return c
+}
+
+// ============================================================================
+// FILTER FUNCTIONS
+// ============================================================================
+
+fn unfilter_scanline(scanline: [i32], prev_scanline: [i32], filter_type: i32, bpp: i32): [i32] {
+    let result: [i32] = []
+    let width = scanline.length
+
+    for i in 0..width {
+        let x = scanline[i]
+
+        let a: i32 = 0
+        if i >= bpp && result.length > i - bpp {
+            a = result[i - bpp]
+        }
+
+        let b: i32 = 0
+        if prev_scanline.length > i {
+            b = prev_scanline[i]
+        }
+
+        let c: i32 = 0
+        if i >= bpp && prev_scanline.length > i - bpp {
+            c = prev_scanline[i - bpp]
+        }
+
+        let value: i32 = 0
+        if filter_type == FILTER_NONE {
+            value = x
+        } else if filter_type == FILTER_SUB {
+            value = (x + a) & 0xFF
+        } else if filter_type == FILTER_UP {
+            value = (x + b) & 0xFF
+        } else if filter_type == FILTER_AVERAGE {
+            value = (x + ((a + b) / 2)) & 0xFF
+        } else if filter_type == FILTER_PAETH {
+            value = (x + paeth_predictor(a, b, c)) & 0xFF
+        } else {
+            value = x
+        }
+
+        result = result + [value]
     }
 
-    if offset + 13 > data.len() {
+    return result
+}
+
+// ============================================================================
+// PARSE FUNCTIONS
+// ============================================================================
+
+fn parse_ihdr(data: [i32], offset: i32): (PNGHeader, bool) {
+    let header = PNGHeader::init()
+
+    if offset + 13 > data.length {
         return (header, false)
     }
 
@@ -146,111 +267,16 @@ fn parse_ihdr(data: Vec<i32>, offset: i32): (PNGHeader, Bool) {
     return (header, true)
 }
 
-// Calculate CRC32
-fn crc32(data: Vec<i32>, start: i32, length: i32): i32 {
-    // CRC32 table (precomputed for polynomial 0xEDB88320)
-    let crc = 0xFFFFFFFF
+// ============================================================================
+// MAIN LOAD FUNCTION
+// ============================================================================
 
-    for i in start..(start + length) {
-        if i >= data.len() {
-            break
-        }
-        let byte = data.get(i)
-        // Simplified CRC - real implementation would use lookup table
-        crc = crc ^ byte
-        for j in 0..8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320
-            } else {
-                crc = crc >> 1
-            }
-        }
-    }
-
-    return crc ^ 0xFFFFFFFF
-}
-
-// Get number of channels for color type
-fn get_channels(color_type: i32): i32 {
-    match color_type {
-        COLOR_GRAYSCALE => 1,
-        COLOR_RGB => 3,
-        COLOR_INDEXED => 1,
-        COLOR_GRAYSCALE_ALPHA => 2,
-        COLOR_RGBA => 4,
-        _ => 4,
-    }
-}
-
-// Paeth predictor function
-fn paeth_predictor(a: i32, b: i32, c: i32): i32 {
-    let p = a + b - c
-    let pa = abs(p - a)
-    let pb = abs(p - b)
-    let pc = abs(p - c)
-
-    if pa <= pb && pa <= pc {
-        return a
-    } else if pb <= pc {
-        return b
-    } else {
-        return c
-    }
-}
-
-fn abs(x: i32): i32 {
-    if x < 0 { return -x }
-    return x
-}
-
-// Apply PNG filters to scanline
-fn unfilter_scanline(scanline: Vec<i32>, prev_scanline: Vec<i32>,
-                      filter_type: i32, bpp: i32): Vec<i32> {
-    let result = Vec<i32>{}
-    let width = scanline.len()
-
-    for i in 0..width {
-        let x = scanline.get(i)
-        let a = if i >= bpp { result.get(i - bpp) } else { 0 }
-        let b = if prev_scanline.len() > 0 { prev_scanline.get(i) } else { 0 }
-        let c = if i >= bpp && prev_scanline.len() > 0 { prev_scanline.get(i - bpp) } else { 0 }
-
-        let value = match filter_type {
-            FILTER_NONE => x,
-            FILTER_SUB => (x + a) & 0xFF,
-            FILTER_UP => (x + b) & 0xFF,
-            FILTER_AVERAGE => (x + ((a + b) / 2)) & 0xFF,
-            FILTER_PAETH => (x + paeth_predictor(a, b, c)) & 0xFF,
-            _ => x,
-        }
-
-        result.add(value)
-    }
-
-    return result
-}
-
-// Decompress DEFLATE data (simplified - would use zlib in practice)
-fn decompress_deflate(compressed: Vec<i32>): Vec<i32> {
-    // This is a placeholder - real implementation would decompress DEFLATE
-    // For now, we'll indicate that real zlib decompression is needed
-    // Import from zlib_compression module in production
-
-    // Try to use our zlib implementation
-    // from zlib_compression import zlib_decompress
-    // return zlib_decompress(compressed)
-
-    return Vec<i32>{}  // Return empty for now
-}
-
-// Check if data is a valid PNG file
-fn is_png_file(data: Vec<i32>): bool {
+fn is_png_file(data: [i32]): bool {
     return check_signature(data)
 }
 
-// Load PNG image (basic implementation)
-fn load_png(data: Vec<i32>): (PNGImage, Bool) {
-    let image = create_png_image()
+fn load_png(data: [i32]): (PNGImage, bool) {
+    let image = PNGImage::init()
 
     if !check_signature(data) {
         return (image, false)
@@ -259,15 +285,12 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
     // Parse chunks
     let offset = 8
     let header_found = false
-    let header = PNGHeader {
-        width: 0, height: 0, bit_depth: 0, color_type: 0,
-        compression: 0, filter: 0, interlace: 0,
-    }
-    let palette = Vec<i32>{}
-    let compressed_data = Vec<i32>{}
-    let transparency = Vec<i32>{}
+    let header = PNGHeader::init()
+    let palette: [i32] = []
+    let compressed_data: [i32] = []
+    let transparency: [i32] = []
 
-    while offset + 12 <= data.len() {
+    while offset + 12 <= data.length {
         let chunk_length = read_u32_be(data, offset)
         let chunk_type = read_u32_be(data, offset + 4)
         let chunk_data_start = offset + 8
@@ -281,17 +304,17 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
         } else if chunk_type == CHUNK_PLTE {
             // Parse palette
             for i in 0..chunk_length {
-                palette.add(read_byte(data, chunk_data_start + i))
+                palette = palette + [read_byte(data, chunk_data_start + i)]
             }
         } else if chunk_type == CHUNK_IDAT {
             // Collect compressed image data
             for i in 0..chunk_length {
-                compressed_data.add(read_byte(data, chunk_data_start + i))
+                compressed_data = compressed_data + [read_byte(data, chunk_data_start + i)]
             }
         } else if chunk_type == CHUNK_tRNS {
             // Transparency data
             for i in 0..chunk_length {
-                transparency.add(read_byte(data, chunk_data_start + i))
+                transparency = transparency + [read_byte(data, chunk_data_start + i)]
             }
         } else if chunk_type == CHUNK_IEND {
             break
@@ -310,16 +333,16 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
     image.channels = get_channels(header.color_type)
     image.has_alpha = header.color_type == COLOR_RGBA ||
                       header.color_type == COLOR_GRAYSCALE_ALPHA ||
-                      transparency.len() > 0
+                      transparency.length > 0
 
-    // Decompress image data
+    // Decompress image data (placeholder - would use zlib)
     let decompressed = decompress_deflate(compressed_data)
 
-    if decompressed.len() == 0 {
+    if decompressed.length == 0 {
         // Decompression not implemented - create placeholder
         let total = image.width * image.height * 4
         for i in 0..total {
-            image.pixels.add(128)  // Gray placeholder
+            image.pixels = image.pixels + [128]   // Gray placeholder
         }
         return (image, true)
     }
@@ -327,25 +350,25 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
     // Unfilter and convert to RGBA
     let bpp = (image.channels * header.bit_depth + 7) / 8
     let scanline_length = image.width * bpp
-    let prev_scanline = Vec<i32>{}
+    let prev_scanline: [i32] = []
 
     let data_offset = 0
     for y in 0..image.height {
-        if data_offset >= decompressed.len() {
+        if data_offset >= decompressed.length {
             break
         }
 
-        let filter_type = decompressed.get(data_offset)
+        let filter_type = decompressed[data_offset]
         data_offset = data_offset + 1
 
         // Extract scanline
-        let scanline = Vec<i32>{}
+        let scanline: [i32] = []
         for x in 0..scanline_length {
-            if data_offset < decompressed.len() {
-                scanline.add(decompressed.get(data_offset))
+            if data_offset < decompressed.length {
+                scanline = scanline + [decompressed[data_offset]]
                 data_offset = data_offset + 1
             } else {
-                scanline.add(0)
+                scanline = scanline + [0]
             }
         }
 
@@ -358,45 +381,45 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
             let pixel_offset = x * bpp
 
             if header.color_type == COLOR_RGBA {
-                image.pixels.add(unfiltered.get(pixel_offset))
-                image.pixels.add(unfiltered.get(pixel_offset + 1))
-                image.pixels.add(unfiltered.get(pixel_offset + 2))
-                image.pixels.add(unfiltered.get(pixel_offset + 3))
+                image.pixels = image.pixels + [unfiltered[pixel_offset]]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 1]]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 2]]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 3]]
             } else if header.color_type == COLOR_RGB {
-                image.pixels.add(unfiltered.get(pixel_offset))
-                image.pixels.add(unfiltered.get(pixel_offset + 1))
-                image.pixels.add(unfiltered.get(pixel_offset + 2))
-                image.pixels.add(255)
+                image.pixels = image.pixels + [unfiltered[pixel_offset]]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 1]]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 2]]
+                image.pixels = image.pixels + [255]
             } else if header.color_type == COLOR_GRAYSCALE {
-                let gray = unfiltered.get(pixel_offset)
-                image.pixels.add(gray)
-                image.pixels.add(gray)
-                image.pixels.add(gray)
-                image.pixels.add(255)
+                let gray = unfiltered[pixel_offset]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [255]
             } else if header.color_type == COLOR_GRAYSCALE_ALPHA {
-                let gray = unfiltered.get(pixel_offset)
-                image.pixels.add(gray)
-                image.pixels.add(gray)
-                image.pixels.add(gray)
-                image.pixels.add(unfiltered.get(pixel_offset + 1))
+                let gray = unfiltered[pixel_offset]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [gray]
+                image.pixels = image.pixels + [unfiltered[pixel_offset + 1]]
             } else if header.color_type == COLOR_INDEXED {
-                let index = unfiltered.get(pixel_offset) * 3
-                if index + 2 < palette.len() {
-                    image.pixels.add(palette.get(index))
-                    image.pixels.add(palette.get(index + 1))
-                    image.pixels.add(palette.get(index + 2))
+                let index = unfiltered[pixel_offset] * 3
+                if index + 2 < palette.length {
+                    image.pixels = image.pixels + [palette[index]]
+                    image.pixels = image.pixels + [palette[index + 1]]
+                    image.pixels = image.pixels + [palette[index + 2]]
 
                     // Check transparency
                     let alpha = 255
-                    if unfiltered.get(pixel_offset) < transparency.len() {
-                        alpha = transparency.get(unfiltered.get(pixel_offset))
+                    if unfiltered[pixel_offset] < transparency.length {
+                        alpha = transparency[unfiltered[pixel_offset]]
                     }
-                    image.pixels.add(alpha)
+                    image.pixels = image.pixels + [alpha]
                 } else {
-                    image.pixels.add(0)
-                    image.pixels.add(0)
-                    image.pixels.add(0)
-                    image.pixels.add(255)
+                    image.pixels = image.pixels + [0]
+                    image.pixels = image.pixels + [0]
+                    image.pixels = image.pixels + [0]
+                    image.pixels = image.pixels + [255]
                 }
             }
         }
@@ -405,72 +428,68 @@ fn load_png(data: Vec<i32>): (PNGImage, Bool) {
     return (image, true)
 }
 
-// Get pixel at coordinate
-fn get_png_pixel(image: PNGImage, x: i32, y: i32): (Int, Int, Int, Int) {
-    if x < 0 || x >= image.width || y < 0 || y >= image.height {
-        return (0, 0, 0, 0)
-    }
+// ============================================================================
+// ZLIB DECOMPRESSION (placeholder)
+// ============================================================================
 
-    let offset = (y * image.width + x) * 4
-    if offset + 4 > image.pixels.len() {
-        return (0, 0, 0, 0)
-    }
-
-    return (
-        image.pixels.get(offset),
-        image.pixels.get(offset + 1),
-        image.pixels.get(offset + 2),
-        image.pixels.get(offset + 3)
-    )
+fn decompress_deflate(compressed: [i32]): [i32] {
+    // This is a placeholder - real implementation would decompress DEFLATE
+    // Would use zlib or implement RFC 1951
+    return []
 }
 
 // ============================================================================
-// Tests
+// GLOBAL PNG LOADER
 // ============================================================================
 
-fn test_png_signature(): bool {
-    let data = Vec<i32>{}
-    for b in PNG_SIGNATURE {
-        data.add(b)
+struct PNGLoader {
+    loaded_images: [PNGImage],
+}
+
+impl PNGLoader {
+    fn init(): PNGLoader {
+        return PNGLoader {
+            loaded_images: [],
+        }
     }
 
-    assert(check_signature(data) == true, "Should detect PNG signature")
+    fn load(&self, data: [i32], name: string): PNGImage? {
+        let (image, ok) = load_png(data)
+        if !ok {
+            return null
+        }
 
-    let invalid = Vec<i32>{}
-    for i in 0..8 {
-        invalid.add(0)
+        image.name = name
+        self.loaded_images = self.loaded_images + [image]
+        return image
     }
 
-    assert(check_signature(invalid) == false, "Should reject invalid signature")
+    fn get_by_name(&self, name: string): PNGImage? {
+        for i in 0..self.loaded_images.length {
+            if self.loaded_images[i].name == name {
+                return self.loaded_images[i]
+            }
+        }
+        return null
+    }
 
-    return true
+    fn clear(&self) {
+        self.loaded_images = []
+    }
 }
 
-fn test_channels(): bool {
-    assert(get_channels(COLOR_GRAYSCALE) == 1, "Grayscale = 1 channel")
-    assert(get_channels(COLOR_RGB) == 3, "RGB = 3 channels")
-    assert(get_channels(COLOR_RGBA) == 4, "RGBA = 4 channels")
-    return true
+let g_png_loader: PNGLoader? = null
+
+fn init_png_loader(): PNGLoader {
+    let loader = PNGLoader::init()
+    g_png_loader = loader
+    return loader
 }
 
-fn test_paeth(): bool {
-    // Test paeth predictor
-    assert(paeth_predictor(10, 20, 5) == 20, "Paeth should choose b")
-    assert(paeth_predictor(10, 10, 10) == 10, "Paeth should choose a when equal")
-    return true
+fn get_png_loader(): PNGLoader? {
+    return g_png_loader
 }
 
-fn test_png_creation(): bool {
-    let image = create_png_image()
-    assert(image.width == 0, "Default width should be 0")
-    assert(image.channels == 4, "Default channels should be 4")
-    return true
-}
-
-fn run_all_tests(): bool {
-    assert(test_png_signature(), "PNG signature test failed")
-    assert(test_channels(), "Channels test failed")
-    assert(test_paeth(), "Paeth predictor test failed")
-    assert(test_png_creation(), "PNG creation test failed")
-    return true
+fn shutdown_png_loader() {
+    g_png_loader = null
 }

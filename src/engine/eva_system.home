@@ -73,21 +73,21 @@ enum EVAEvent {
     COUNTDOWN_3,
     COUNTDOWN_2,
     COUNTDOWN_1,
-    TIMER_EXPIRED
+    TIMER_EXPIRED,
 }
 
 enum EVAVoice {
     USA,
     CHINA,
     GLA,
-    NEUTRAL  // For shared announcements
+    NEUTRAL,  // For shared announcements
 }
 
 enum EVAPriority {
     LOW,        // Can be skipped if queue full
     NORMAL,     // Standard priority
     HIGH,       // Important events
-    CRITICAL    // Must play (superweapons, etc.)
+    CRITICAL,   // Must play (superweapons, etc.)
 }
 
 // ============================================================================
@@ -97,17 +97,41 @@ enum EVAPriority {
 struct EVAAudioClip {
     event: EVAEvent,
     voice: EVAVoice,
-    audio_file: [u8; 128],
-    text: [u8; 256],       // Subtitle text
-    duration: f32,          // Duration in seconds
+    audio_file: string,
+    text: string,       // Subtitle text
+    duration: f32,      // Duration in seconds
     priority: EVAPriority,
-    cooldown: f32           // Min time between plays
+    cooldown: f32,      // Min time between plays
+}
+
+impl EVAAudioClip {
+    fn init(): EVAAudioClip {
+        return EVAAudioClip {
+            event: EVAEvent::BUILDING_COMPLETE,
+            voice: EVAVoice::NEUTRAL,
+            audio_file: "",
+            text: "",
+            duration: 0.0,
+            priority: EVAPriority::LOW,
+            cooldown: 0.0,
+        }
+    }
 }
 
 struct EVAQueue {
-    clips: [EVAAudioClip; 16],
+    clips: [EVAAudioClip],
     count: i32,
-    current_index: i32
+    current_index: i32,
+}
+
+impl EVAQueue {
+    fn init(): EVAQueue {
+        return EVAQueue {
+            clips: [],
+            count: 0,
+            current_index: 0,
+        }
+    }
 }
 
 struct EVAManager {
@@ -118,7 +142,7 @@ struct EVAManager {
     play_timer: f32,
 
     // Cooldowns (prevent spam)
-    event_cooldowns: [f32; 64],
+    event_cooldowns: [f32],
 
     // Settings
     enabled: bool,
@@ -130,8 +154,31 @@ struct EVAManager {
     total_announcements: i32,
 
     // Current subtitle
-    current_subtitle: [u8; 256],
-    subtitle_timer: f32
+    current_subtitle: string,
+    subtitle_timer: f32,
+}
+
+impl EVAManager {
+    fn init(): EVAManager {
+        let cooldowns: [f32] = []
+        for i in 0..64 {
+            cooldowns = cooldowns + [0.0]
+        }
+        return EVAManager {
+            queue: EVAQueue::init(),
+            current_playing: EVAAudioClip::init(),
+            is_playing: false,
+            play_timer: 0.0,
+            event_cooldowns: cooldowns,
+            enabled: true,
+            voice: EVAVoice::USA,
+            volume: 1.0,
+            subtitles_enabled: true,
+            total_announcements: 0,
+            current_subtitle: "",
+            subtitle_timer: 0.0,
+        }
+    }
 }
 
 // ============================================================================
@@ -141,267 +188,298 @@ struct EVAManager {
 fn get_eva_clip(event: EVAEvent, voice: EVAVoice): EVAAudioClip {
     // Return appropriate audio clip for event and faction
 
-    match event {
-        EVAEvent::BUILDING_COMPLETE => {
-            match voice {
-                EVAVoice::USA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/USA/EVA_BuildingComplete.wav",
-                    text: "Construction complete.",
-                    duration: 1.2,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 2.0
-                },
-                EVAVoice::CHINA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/China/EVA_BuildingComplete.wav",
-                    text: "Construction complete.",
-                    duration: 1.3,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 2.0
-                },
-                EVAVoice::GLA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/GLA/EVA_BuildingComplete.wav",
-                    text: "Structure ready.",
-                    duration: 1.1,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 2.0
-                },
-                _ => {}
+    if event == EVAEvent::BUILDING_COMPLETE {
+        if voice == EVAVoice::USA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/USA/EVA_BuildingComplete.wav",
+                text: "Construction complete.",
+                duration: 1.2,
+                priority: EVAPriority::NORMAL,
+                cooldown: 2.0,
             }
-        },
-
-        EVAEvent::UNIT_READY => {
-            match voice {
-                EVAVoice::USA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/USA/EVA_UnitReady.wav",
-                    text: "Unit ready.",
-                    duration: 0.9,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 1.5
-                },
-                EVAVoice::CHINA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/China/EVA_UnitReady.wav",
-                    text: "Unit trained.",
-                    duration: 1.0,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 1.5
-                },
-                EVAVoice::GLA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/GLA/EVA_UnitReady.wav",
-                    text: "Fighter ready.",
-                    duration: 0.8,
-                    priority: EVAPriority::NORMAL,
-                    cooldown: 1.5
-                },
-                _ => {}
+        } else if voice == EVAVoice::CHINA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/China/EVA_BuildingComplete.wav",
+                text: "Construction complete.",
+                duration: 1.3,
+                priority: EVAPriority::NORMAL,
+                cooldown: 2.0,
             }
-        },
-
-        EVAEvent::BASE_UNDER_ATTACK => {
-            match voice {
-                EVAVoice::USA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/USA/EVA_BaseUnderAttack.wav",
-                    text: "Our base is under attack!",
-                    duration: 1.5,
-                    priority: EVAPriority::HIGH,
-                    cooldown: 10.0
-                },
-                EVAVoice::CHINA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/China/EVA_BaseUnderAttack.wav",
-                    text: "We are under attack!",
-                    duration: 1.4,
-                    priority: EVAPriority::HIGH,
-                    cooldown: 10.0
-                },
-                EVAVoice::GLA => return EVAAudioClip {
-                    event: event,
-                    voice: voice,
-                    audio_file: "Speech/GLA/EVA_BaseUnderAttack.wav",
-                    text: "The enemy attacks our base!",
-                    duration: 1.6,
-                    priority: EVAPriority::HIGH,
-                    cooldown: 10.0
-                },
-                _ => {}
+        } else if voice == EVAVoice::GLA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/GLA/EVA_BuildingComplete.wav",
+                text: "Structure ready.",
+                duration: 1.1,
+                priority: EVAPriority::NORMAL,
+                cooldown: 2.0,
             }
-        },
+        }
+    }
 
-        EVAEvent::INSUFFICIENT_FUNDS => return EVAAudioClip {
+    if event == EVAEvent::UNIT_READY {
+        if voice == EVAVoice::USA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/USA/EVA_UnitReady.wav",
+                text: "Unit ready.",
+                duration: 0.9,
+                priority: EVAPriority::NORMAL,
+                cooldown: 1.5,
+            }
+        } else if voice == EVAVoice::CHINA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/China/EVA_UnitReady.wav",
+                text: "Unit trained.",
+                duration: 1.0,
+                priority: EVAPriority::NORMAL,
+                cooldown: 1.5,
+            }
+        } else if voice == EVAVoice::GLA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/GLA/EVA_UnitReady.wav",
+                text: "Fighter ready.",
+                duration: 0.8,
+                priority: EVAPriority::NORMAL,
+                cooldown: 1.5,
+            }
+        }
+    }
+
+    if event == EVAEvent::BASE_UNDER_ATTACK {
+        if voice == EVAVoice::USA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/USA/EVA_BaseUnderAttack.wav",
+                text: "Our base is under attack!",
+                duration: 1.5,
+                priority: EVAPriority::HIGH,
+                cooldown: 10.0,
+            }
+        } else if voice == EVAVoice::CHINA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/China/EVA_BaseUnderAttack.wav",
+                text: "We are under attack!",
+                duration: 1.4,
+                priority: EVAPriority::HIGH,
+                cooldown: 10.0,
+            }
+        } else if voice == EVAVoice::GLA {
+            return EVAAudioClip {
+                event: event,
+                voice: voice,
+                audio_file: "Speech/GLA/EVA_BaseUnderAttack.wav",
+                text: "The enemy attacks our base!",
+                duration: 1.6,
+                priority: EVAPriority::HIGH,
+                cooldown: 10.0,
+            }
+        }
+    }
+
+    if event == EVAEvent::INSUFFICIENT_FUNDS {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_InsufficientFunds.wav",
             text: "Insufficient funds.",
             duration: 1.0,
             priority: EVAPriority::NORMAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::LOW_POWER => return EVAAudioClip {
+    if event == EVAEvent::LOW_POWER {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_LowPower.wav",
             text: "Low power.",
             duration: 0.8,
             priority: EVAPriority::HIGH,
-            cooldown: 15.0
-        },
+            cooldown: 15.0,
+        }
+    }
 
-        EVAEvent::SUPERWEAPON_READY => return EVAAudioClip {
+    if event == EVAEvent::SUPERWEAPON_READY {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_SuperweaponReady.wav",
             text: "Superweapon ready.",
             duration: 1.2,
             priority: EVAPriority::CRITICAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::SUPERWEAPON_DETECTED => return EVAAudioClip {
+    if event == EVAEvent::SUPERWEAPON_DETECTED {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_SuperweaponDetected.wav",
             text: "Warning: Enemy superweapon detected!",
             duration: 2.0,
             priority: EVAPriority::CRITICAL,
-            cooldown: 30.0
-        },
+            cooldown: 30.0,
+        }
+    }
 
-        EVAEvent::PARTICLE_CANNON_READY => return EVAAudioClip {
+    if event == EVAEvent::PARTICLE_CANNON_READY {
+        return EVAAudioClip {
             event: event,
             voice: EVAVoice::USA,
             audio_file: "Speech/USA/EVA_ParticleCannonReady.wav",
             text: "Particle cannon ready.",
             duration: 1.3,
             priority: EVAPriority::CRITICAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::NUCLEAR_MISSILE_READY => return EVAAudioClip {
+    if event == EVAEvent::NUCLEAR_MISSILE_READY {
+        return EVAAudioClip {
             event: event,
             voice: EVAVoice::CHINA,
             audio_file: "Speech/China/EVA_NukeMissileReady.wav",
             text: "Nuclear missile ready.",
             duration: 1.4,
             priority: EVAPriority::CRITICAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::SCUD_STORM_READY => return EVAAudioClip {
+    if event == EVAEvent::SCUD_STORM_READY {
+        return EVAAudioClip {
             event: event,
             voice: EVAVoice::GLA,
             audio_file: "Speech/GLA/EVA_SCUDStormReady.wav",
             text: "SCUD storm ready.",
             duration: 1.2,
             priority: EVAPriority::CRITICAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::NUCLEAR_MISSILE_LAUNCHED => return EVAAudioClip {
+    if event == EVAEvent::NUCLEAR_MISSILE_LAUNCHED {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_NukeLaunched.wav",
             text: "Warning: Nuclear missile launched!",
             duration: 2.5,
             priority: EVAPriority::CRITICAL,
-            cooldown: 5.0
-        },
+            cooldown: 5.0,
+        }
+    }
 
-        EVAEvent::GENERAL_PROMOTION => return EVAAudioClip {
+    if event == EVAEvent::GENERAL_PROMOTION {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_GeneralPromotion.wav",
             text: "You have been promoted!",
             duration: 1.5,
             priority: EVAPriority::HIGH,
-            cooldown: 1.0
-        },
+            cooldown: 1.0,
+        }
+    }
 
-        EVAEvent::UPGRADE_COMPLETE => return EVAAudioClip {
+    if event == EVAEvent::UPGRADE_COMPLETE {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_UpgradeComplete.wav",
             text: "Upgrade complete.",
             duration: 1.0,
             priority: EVAPriority::NORMAL,
-            cooldown: 2.0
-        },
+            cooldown: 2.0,
+        }
+    }
 
-        EVAEvent::UNIT_LOST => return EVAAudioClip {
+    if event == EVAEvent::UNIT_LOST {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_UnitLost.wav",
             text: "Unit lost.",
             duration: 0.8,
             priority: EVAPriority::LOW,
-            cooldown: 3.0
-        },
+            cooldown: 3.0,
+        }
+    }
 
-        EVAEvent::ALLY_UNDER_ATTACK => return EVAAudioClip {
+    if event == EVAEvent::ALLY_UNDER_ATTACK {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_AllyUnderAttack.wav",
             text: "Our ally is under attack!",
             duration: 1.5,
             priority: EVAPriority::NORMAL,
-            cooldown: 15.0
-        },
+            cooldown: 15.0,
+        }
+    }
 
-        EVAEvent::VICTORY => return EVAAudioClip {
+    if event == EVAEvent::VICTORY {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_Victory.wav",
             text: "Victory!",
             duration: 1.5,
             priority: EVAPriority::CRITICAL,
-            cooldown: 0.0
-        },
+            cooldown: 0.0,
+        }
+    }
 
-        EVAEvent::DEFEAT => return EVAAudioClip {
+    if event == EVAEvent::DEFEAT {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_Defeat.wav",
             text: "You have been defeated.",
             duration: 2.0,
             priority: EVAPriority::CRITICAL,
-            cooldown: 0.0
-        },
+            cooldown: 0.0,
+        }
+    }
 
-        EVAEvent::MISSION_ACCOMPLISHED => return EVAAudioClip {
+    if event == EVAEvent::MISSION_ACCOMPLISHED {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_MissionAccomplished.wav",
             text: "Mission accomplished!",
             duration: 1.8,
             priority: EVAPriority::CRITICAL,
-            cooldown: 0.0
-        },
+            cooldown: 0.0,
+        }
+    }
 
-        EVAEvent::MISSION_FAILED => return EVAAudioClip {
+    if event == EVAEvent::MISSION_FAILED {
+        return EVAAudioClip {
             event: event,
             voice: voice,
             audio_file: "Speech/EVA_MissionFailed.wav",
             text: "Mission failed.",
             duration: 1.5,
             priority: EVAPriority::CRITICAL,
-            cooldown: 0.0
-        },
-
-        _ => {}
+            cooldown: 0.0,
+        }
     }
 
     // Default fallback
@@ -412,7 +490,7 @@ fn get_eva_clip(event: EVAEvent, voice: EVAVoice): EVAAudioClip {
         text: "",
         duration: 0.0,
         priority: EVAPriority::LOW,
-        cooldown: 0.0
+        cooldown: 0.0,
     }
 }
 
@@ -421,56 +499,34 @@ fn get_eva_clip(event: EVAEvent, voice: EVAVoice): EVAAudioClip {
 // ============================================================================
 
 fn create_eva_manager(): EVAManager {
-    return EVAManager {
-        queue: EVAQueue {
-            clips: [],
-            count: 0,
-            current_index: 0
-        },
-        current_playing: EVAAudioClip {
-            event: EVAEvent::BUILDING_COMPLETE,
-            voice: EVAVoice::NEUTRAL,
-            audio_file: "",
-            text: "",
-            duration: 0.0,
-            priority: EVAPriority::LOW,
-            cooldown: 0.0
-        },
-        is_playing: false,
-        play_timer: 0.0,
-        event_cooldowns: [0.0; 64],
-        enabled: true,
-        voice: EVAVoice::USA,
-        volume: 1.0,
-        subtitles_enabled: true,
-        total_announcements: 0,
-        current_subtitle: "",
-        subtitle_timer: 0.0
+    return EVAManager::init()
+}
+
+fn set_eva_faction(manager: EVAManager, faction: i32) {
+    if faction == 0 {
+        manager.voice = EVAVoice::USA
+    } else if faction == 1 {
+        manager.voice = EVAVoice::CHINA
+    } else if faction == 2 {
+        manager.voice = EVAVoice::GLA
+    } else {
+        manager.voice = EVAVoice::USA
     }
 }
 
-fn set_eva_faction(manager: mut EVAManager, faction: i32) {
-    match faction {
-        0 => manager.voice = EVAVoice::USA,
-        1 => manager.voice = EVAVoice::CHINA,
-        2 => manager.voice = EVAVoice::GLA,
-        _ => manager.voice = EVAVoice::USA
-    }
-}
-
-fn trigger_eva_event(manager: mut EVAManager, event: EVAEvent) {
-    if not manager.enabled {
+fn trigger_eva_event(manager: EVAManager, event: EVAEvent) {
+    if !manager.enabled {
         return
     }
 
     // Check cooldown
-    let event_idx: i32 = cast(i32, event)
-    if event_idx < 64 and manager.event_cooldowns[event_idx] > 0.0 {
+    let event_idx = event as i32
+    if event_idx < 64 && manager.event_cooldowns[event_idx] > 0.0 {
         return
     }
 
     // Get clip for this event
-    let clip: EVAAudioClip = get_eva_clip(event, manager.voice)
+    let clip = get_eva_clip(event, manager.voice)
 
     if clip.duration == 0.0 {
         return  // No valid clip
@@ -485,14 +541,14 @@ fn trigger_eva_event(manager: mut EVAManager, event: EVAEvent) {
     }
 }
 
-fn add_to_queue(manager: mut EVAManager, clip: EVAAudioClip) {
-    let queue: mut EVAQueue = manager.queue
+fn add_to_queue(manager: EVAManager, clip: EVAAudioClip) {
+    let queue = manager.queue
 
     // Find insertion point based on priority
-    let mut insert_idx: i32 = queue.count
+    let insert_idx = queue.count
 
     for i in 0..queue.count {
-        if cast(i32, queue.clips[i].priority) < cast(i32, clip.priority) {
+        if (queue.clips[i].priority as i32) < (clip.priority as i32) {
             insert_idx = i
             break
         }
@@ -508,21 +564,20 @@ fn add_to_queue(manager: mut EVAManager, clip: EVAAudioClip) {
         queue.count = queue.count - 1
     }
 
-    // Shift items to make room
-    for i in 0..(queue.count - insert_idx) {
-        let src: i32 = queue.count - 1 - i
-        let dst: i32 = queue.count - i
-        if dst < 16 {
-            queue.clips[dst] = queue.clips[src]
-        }
+    // Insert clip - build new array
+    let new_clips: [EVAAudioClip] = []
+    for i in 0..insert_idx {
+        new_clips = new_clips + [queue.clips[i]]
     }
-
-    // Insert clip
-    queue.clips[insert_idx] = clip
+    new_clips = new_clips + [clip]
+    for i in insert_idx..queue.count {
+        new_clips = new_clips + [queue.clips[i]]
+    }
+    queue.clips = new_clips
     queue.count = queue.count + 1
 }
 
-fn update_eva(manager: mut EVAManager, delta_time: f32) {
+fn update_eva(manager: EVAManager, delta_time: f32) {
     // Update cooldowns
     for i in 0..64 {
         if manager.event_cooldowns[i] > 0.0 {
@@ -549,13 +604,13 @@ fn update_eva(manager: mut EVAManager, delta_time: f32) {
     }
 
     // Start next clip if not playing
-    if not manager.is_playing and manager.queue.count > 0 {
+    if !manager.is_playing && manager.queue.count > 0 {
         play_next_clip(manager)
     }
 }
 
-fn play_next_clip(manager: mut EVAManager) {
-    let queue: mut EVAQueue = manager.queue
+fn play_next_clip(manager: EVAManager) {
+    let queue = manager.queue
 
     if queue.count == 0 {
         return
@@ -573,28 +628,31 @@ fn play_next_clip(manager: mut EVAManager) {
         manager.subtitle_timer = manager.current_playing.duration + 0.5
     }
 
-    // Remove from queue
-    for i in 0..(queue.count - 1) {
-        queue.clips[i] = queue.clips[i + 1]
+    // Remove from queue - shift remaining items
+    let new_clips: [EVAAudioClip] = []
+    for i in 1..queue.count {
+        new_clips = new_clips + [queue.clips[i]]
     }
+    queue.clips = new_clips
     queue.count = queue.count - 1
 
     // Would trigger actual audio playback here
     play_eva_audio(manager.current_playing.audio_file, manager.volume)
 }
 
-fn play_eva_audio(file_path: [u8; 128], volume: f32) {
+fn play_eva_audio(file_path: string, volume: f32) {
     // Would integrate with audio system
     // audio_play_2d(file_path, volume)
 }
 
-fn clear_eva_queue(manager: mut EVAManager) {
+fn clear_eva_queue(manager: EVAManager) {
     manager.queue.count = 0
+    manager.queue.clips = []
     manager.is_playing = false
     manager.current_subtitle = ""
 }
 
-fn set_eva_volume(manager: mut EVAManager, volume: f32) {
+fn set_eva_volume(manager: EVAManager, volume: f32) {
     if volume < 0.0 {
         manager.volume = 0.0
     } else if volume > 1.0 {
@@ -604,16 +662,16 @@ fn set_eva_volume(manager: mut EVAManager, volume: f32) {
     }
 }
 
-fn enable_eva(manager: mut EVAManager, enabled: bool) {
+fn enable_eva(manager: EVAManager, enabled: bool) {
     manager.enabled = enabled
-    if not enabled {
+    if !enabled {
         clear_eva_queue(manager)
     }
 }
 
-fn enable_subtitles(manager: mut EVAManager, enabled: bool) {
+fn enable_subtitles(manager: EVAManager, enabled: bool) {
     manager.subtitles_enabled = enabled
-    if not enabled {
+    if !enabled {
         manager.current_subtitle = ""
     }
 }
@@ -622,54 +680,60 @@ fn enable_subtitles(manager: mut EVAManager, enabled: bool) {
 // CONVENIENCE FUNCTIONS
 // ============================================================================
 
-fn eva_building_complete(manager: mut EVAManager) {
+fn eva_building_complete(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::BUILDING_COMPLETE)
 }
 
-fn eva_unit_ready(manager: mut EVAManager) {
+fn eva_unit_ready(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::UNIT_READY)
 }
 
-fn eva_base_under_attack(manager: mut EVAManager) {
+fn eva_base_under_attack(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::BASE_UNDER_ATTACK)
 }
 
-fn eva_insufficient_funds(manager: mut EVAManager) {
+fn eva_insufficient_funds(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::INSUFFICIENT_FUNDS)
 }
 
-fn eva_low_power(manager: mut EVAManager) {
+fn eva_low_power(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::LOW_POWER)
 }
 
-fn eva_superweapon_ready(manager: mut EVAManager, weapon_type: i32) {
-    match weapon_type {
-        0 => trigger_eva_event(manager, EVAEvent::PARTICLE_CANNON_READY),
-        1 => trigger_eva_event(manager, EVAEvent::NUCLEAR_MISSILE_READY),
-        2 => trigger_eva_event(manager, EVAEvent::SCUD_STORM_READY),
-        _ => trigger_eva_event(manager, EVAEvent::SUPERWEAPON_READY)
+fn eva_superweapon_ready(manager: EVAManager, weapon_type: i32) {
+    if weapon_type == 0 {
+        trigger_eva_event(manager, EVAEvent::PARTICLE_CANNON_READY)
+    } else if weapon_type == 1 {
+        trigger_eva_event(manager, EVAEvent::NUCLEAR_MISSILE_READY)
+    } else if weapon_type == 2 {
+        trigger_eva_event(manager, EVAEvent::SCUD_STORM_READY)
+    } else {
+        trigger_eva_event(manager, EVAEvent::SUPERWEAPON_READY)
     }
 }
 
-fn eva_superweapon_launched(manager: mut EVAManager, weapon_type: i32) {
-    match weapon_type {
-        0 => trigger_eva_event(manager, EVAEvent::PARTICLE_CANNON_ACTIVATED),
-        1 => trigger_eva_event(manager, EVAEvent::NUCLEAR_MISSILE_LAUNCHED),
-        2 => trigger_eva_event(manager, EVAEvent::SCUD_STORM_LAUNCHED),
-        _ => trigger_eva_event(manager, EVAEvent::SUPERWEAPON_LAUNCHED)
+fn eva_superweapon_launched(manager: EVAManager, weapon_type: i32) {
+    if weapon_type == 0 {
+        trigger_eva_event(manager, EVAEvent::PARTICLE_CANNON_ACTIVATED)
+    } else if weapon_type == 1 {
+        trigger_eva_event(manager, EVAEvent::NUCLEAR_MISSILE_LAUNCHED)
+    } else if weapon_type == 2 {
+        trigger_eva_event(manager, EVAEvent::SCUD_STORM_LAUNCHED)
+    } else {
+        trigger_eva_event(manager, EVAEvent::SUPERWEAPON_LAUNCHED)
     }
 }
 
-fn eva_general_promotion(manager: mut EVAManager) {
+fn eva_general_promotion(manager: EVAManager) {
     trigger_eva_event(manager, EVAEvent::GENERAL_PROMOTION)
 }
 
-fn eva_victory(manager: mut EVAManager) {
+fn eva_victory(manager: EVAManager) {
     clear_eva_queue(manager)  // Clear queue for important message
     trigger_eva_event(manager, EVAEvent::VICTORY)
 }
 
-fn eva_defeat(manager: mut EVAManager) {
+fn eva_defeat(manager: EVAManager) {
     clear_eva_queue(manager)
     trigger_eva_event(manager, EVAEvent::DEFEAT)
 }
@@ -686,7 +750,22 @@ struct CountdownTimer {
     has_announced_4: bool,
     has_announced_3: bool,
     has_announced_2: bool,
-    has_announced_1: bool
+    has_announced_1: bool,
+}
+
+impl CountdownTimer {
+    fn init(): CountdownTimer {
+        return CountdownTimer {
+            time_remaining: 0.0,
+            is_active: false,
+            has_announced_10: false,
+            has_announced_5: false,
+            has_announced_4: false,
+            has_announced_3: false,
+            has_announced_2: false,
+            has_announced_1: false,
+        }
+    }
 }
 
 fn create_countdown_timer(duration: f32): CountdownTimer {
@@ -698,34 +777,34 @@ fn create_countdown_timer(duration: f32): CountdownTimer {
         has_announced_4: false,
         has_announced_3: false,
         has_announced_2: false,
-        has_announced_1: false
+        has_announced_1: false,
     }
 }
 
-fn update_countdown(timer: mut CountdownTimer, eva: mut EVAManager, delta_time: f32) {
-    if not timer.is_active {
+fn update_countdown(timer: CountdownTimer, eva: EVAManager, delta_time: f32) {
+    if !timer.is_active {
         return
     }
 
     timer.time_remaining = timer.time_remaining - delta_time
 
     // Check for countdown announcements
-    if timer.time_remaining <= 10.0 and timer.time_remaining > 9.0 and not timer.has_announced_10 {
+    if timer.time_remaining <= 10.0 && timer.time_remaining > 9.0 && !timer.has_announced_10 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_10)
         timer.has_announced_10 = true
-    } else if timer.time_remaining <= 5.0 and timer.time_remaining > 4.0 and not timer.has_announced_5 {
+    } else if timer.time_remaining <= 5.0 && timer.time_remaining > 4.0 && !timer.has_announced_5 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_5)
         timer.has_announced_5 = true
-    } else if timer.time_remaining <= 4.0 and timer.time_remaining > 3.0 and not timer.has_announced_4 {
+    } else if timer.time_remaining <= 4.0 && timer.time_remaining > 3.0 && !timer.has_announced_4 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_4)
         timer.has_announced_4 = true
-    } else if timer.time_remaining <= 3.0 and timer.time_remaining > 2.0 and not timer.has_announced_3 {
+    } else if timer.time_remaining <= 3.0 && timer.time_remaining > 2.0 && !timer.has_announced_3 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_3)
         timer.has_announced_3 = true
-    } else if timer.time_remaining <= 2.0 and timer.time_remaining > 1.0 and not timer.has_announced_2 {
+    } else if timer.time_remaining <= 2.0 && timer.time_remaining > 1.0 && !timer.has_announced_2 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_2)
         timer.has_announced_2 = true
-    } else if timer.time_remaining <= 1.0 and timer.time_remaining > 0.0 and not timer.has_announced_1 {
+    } else if timer.time_remaining <= 1.0 && timer.time_remaining > 0.0 && !timer.has_announced_1 {
         trigger_eva_event(eva, EVAEvent::COUNTDOWN_1)
         timer.has_announced_1 = true
     }
@@ -744,7 +823,7 @@ fn test_eva_system() {
     print("Testing EVA System...")
 
     // Create EVA manager
-    let mut eva: EVAManager = create_eva_manager()
+    let eva = create_eva_manager()
     print("EVA manager created")
 
     // Test faction setting
@@ -770,7 +849,7 @@ fn test_eva_system() {
 
     // Check if playing
     print("Is playing: " + str(eva.is_playing))
-    print("Current subtitle: " + str(eva.current_subtitle))
+    print("Current subtitle: " + eva.current_subtitle)
 
     // Test cooldown
     trigger_eva_event(eva, EVAEvent::BUILDING_COMPLETE)
@@ -796,7 +875,7 @@ fn test_eva_system() {
     print("Subtitles enabled")
 
     // Test countdown
-    let mut countdown: CountdownTimer = create_countdown_timer(15.0)
+    let countdown = create_countdown_timer(15.0)
     print("Countdown timer created: 15 seconds")
 
     // Simulate countdown

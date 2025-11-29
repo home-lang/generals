@@ -1,157 +1,301 @@
 // FX List Parser - Parses FXList INI files for C&C Generals
 // Handles FXList blocks from Data/INI/FXList.ini
+//
+// FX Lists define visual and audio effects for:
+// - Unit deaths, explosions
+// - Weapon firing effects
+// - Building construction
+// - Ability activations
+// - Environmental effects
 
+let MAX_FX_LISTS: i32 = 2048
+let MAX_NUGGETS_PER_LIST: i32 = 16
+let MAX_PARSE_ERRORS: i32 = 64
 
-// FX nugget types
+// ============================================================================
+// FX Nugget Types
+// ============================================================================
+
 enum FXNuggetType {
-    Sound,
-    ParticleSystem,
-    DynamicDecal,
-    TerrainScorch,
-    ViewShake,
-    TintDrawable,
-    FXListAtBone,
-    TracerFX,
-    LightPulse,
-    LaserFX,
-    CameraShakerVolume,
-    AttachedModel,
-    AttachedParticleSystem,
-    Streak,
+    SOUND,
+    PARTICLE_SYSTEM,
+    DYNAMIC_DECAL,
+    TERRAIN_SCORCH,
+    VIEW_SHAKE,
+    TINT_DRAWABLE,
+    FX_LIST_AT_BONE,
+    TRACER_FX,
+    LIGHT_PULSE,
+    LASER_FX,
+    CAMERA_SHAKER_VOLUME,
+    ATTACHED_MODEL,
+    ATTACHED_PARTICLE_SYSTEM,
+    STREAK,
 }
 
-// Base FX nugget
+// ============================================================================
+// Vector and Color Types
+// ============================================================================
+
+struct Vec3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Vec3 {
+    fn init(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+struct Color {
+    r: f64,
+    g: f64,
+    b: f64,
+    a: f64,
+}
+
+impl Color {
+    fn init(): Color {
+        return Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+    }
+
+    fn from_rgb(r: i32, g: i32, b: i32): Color {
+        return Color {
+            r: r as f64 / 255.0,
+            g: g as f64 / 255.0,
+            b: b as f64 / 255.0,
+            a: 1.0,
+        }
+    }
+}
+
+// ============================================================================
+// FX Nugget
+// ============================================================================
+
 struct FXNugget {
     nugget_type: FXNuggetType,
 
     // Common properties
     name: string,
-    required_flags: u32,
-    excluded_flags: u32,
+    required_flags: i32,
+    excluded_flags: i32,
 
     // Sound nugget
     sound_name: string,
-    sound_volume: f32,
-    sound_min_volume: f32,
-    sound_loop_count: u32,
+    sound_volume: f64,
+    sound_min_volume: f64,
+    sound_loop_count: i32,
 
     // Particle system
     particle_system_name: string,
     bone_name: string,
     orient_to_object: bool,
     offset: Vec3,
-    attached_system_lifetime: f32,
-    initial_delay: u32,
+    attached_system_lifetime: f64,
+    initial_delay: i32,
 
     // Decal
     decal_texture: string,
-    decal_size: f32,
-    decal_opacity: f32,
-    decal_lifetime: u32,
+    decal_size: f64,
+    decal_opacity: f64,
+    decal_lifetime: i32,
 
     // View shake
-    shake_intensity: f32,
-    shake_duration: u32,
-    shake_radius: f32,
+    shake_intensity: f64,
+    shake_duration: i32,
+    shake_radius: f64,
 
     // Tint
     tint_color: Color,
-    tint_pre_color_time: u32,
-    tint_post_color_time: u32,
-    tint_sustained_color_time: u32,
+    tint_pre_color_time: i32,
+    tint_post_color_time: i32,
+    tint_sustained_color_time: i32,
 
     // Light pulse
     light_color: Color,
-    light_radius: f32,
-    light_increase_time: u32,
-    light_decrease_time: u32,
+    light_radius: f64,
+    light_increase_time: i32,
+    light_decrease_time: i32,
 
     // Tracer
-    tracer_speed: f32,
-    tracer_length: f32,
-    tracer_width: f32,
+    tracer_speed: f64,
+    tracer_length: f64,
+    tracer_width: f64,
     tracer_color: Color,
-    tracer_probability: f32,
+    tracer_probability: f64,
 
     is_valid: bool,
 }
 
-// Vec3 for positions
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32,
+impl FXNugget {
+    fn init(): FXNugget {
+        return FXNugget {
+            nugget_type: FXNuggetType::SOUND,
+            name: "",
+            required_flags: 0,
+            excluded_flags: 0,
+            sound_name: "",
+            sound_volume: 1.0,
+            sound_min_volume: 0.0,
+            sound_loop_count: 1,
+            particle_system_name: "",
+            bone_name: "",
+            orient_to_object: false,
+            offset: Vec3::init(),
+            attached_system_lifetime: 0.0,
+            initial_delay: 0,
+            decal_texture: "",
+            decal_size: 1.0,
+            decal_opacity: 1.0,
+            decal_lifetime: 0,
+            shake_intensity: 0.0,
+            shake_duration: 0,
+            shake_radius: 0.0,
+            tint_color: Color::init(),
+            tint_pre_color_time: 0,
+            tint_post_color_time: 0,
+            tint_sustained_color_time: 0,
+            light_color: Color::init(),
+            light_radius: 0.0,
+            light_increase_time: 0,
+            light_decrease_time: 0,
+            tracer_speed: 0.0,
+            tracer_length: 0.0,
+            tracer_width: 0.0,
+            tracer_color: Color::init(),
+            tracer_probability: 1.0,
+            is_valid: false,
+        }
+    }
 }
 
-// Color
-struct Color {
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
-}
+// ============================================================================
+// FX List Definition
+// ============================================================================
 
-// Complete FX list definition
 struct FXListDefinition {
     name: string,
-    nuggets: [FXNugget; 16],
-    nugget_count: u32,
+    nuggets: [FXNugget],
+    nugget_count: i32,
     play_everywhere: bool,
     is_valid: bool,
 }
 
-let MAX_FX_LISTS: u32 = 2048
-let MAX_NUGGETS_PER_LIST: u32 = 16
+impl FXListDefinition {
+    fn init(): FXListDefinition {
+        let nuggets: [FXNugget] = []
+        for i in 0..MAX_NUGGETS_PER_LIST {
+            nuggets = nuggets + [FXNugget::init()]
+        }
+
+        return FXListDefinition {
+            name: "",
+            nuggets: nuggets,
+            nugget_count: 0,
+            play_everywhere: false,
+            is_valid: false,
+        }
+    }
+
+    fn add_nugget(&self, nugget: FXNugget): bool {
+        if self.nugget_count >= MAX_NUGGETS_PER_LIST {
+            return false
+        }
+
+        self.nuggets[self.nugget_count] = nugget
+        self.nugget_count = self.nugget_count + 1
+        return true
+    }
+
+    fn get_nugget(&self, index: i32): FXNugget? {
+        if index < 0 || index >= self.nugget_count {
+            return null
+        }
+        return self.nuggets[index]
+    }
+}
+
+// ============================================================================
+// Name to Index Mapping
+// ============================================================================
+
+struct FXNameEntry {
+    name: string,
+    index: i32,
+}
+
+// ============================================================================
+// FX List Parser
+// ============================================================================
 
 struct FXListParser {
-    fx_lists: [FXListDefinition; MAX_FX_LISTS],
-    fx_count: u32,
-    fx_name_to_index: HashMap<string, u32>,
+    fx_lists: [FXListDefinition],
+    fx_count: i32,
+    name_entries: [FXNameEntry],
+    name_count: i32,
 
     // Parse state
-    current_fx: u32,
-    current_nugget: u32,
+    current_fx: i32,
+    current_nugget: i32,
     in_fx_block: bool,
     in_nugget_block: bool,
     current_nugget_type: FXNuggetType,
 
     // Error tracking
-    parse_errors: [string; 64],
-    error_count: u32,
+    parse_errors: [string],
+    error_count: i32,
 }
 
 impl FXListParser {
-    fn new(): Self {
-        let parser = FXListParser {
-            fx_lists: [FXListDefinition::default(); MAX_FX_LISTS],
+    fn init(): FXListParser {
+        let lists: [FXListDefinition] = []
+        for i in 0..MAX_FX_LISTS {
+            lists = lists + [FXListDefinition::init()]
+        }
+
+        let names: [FXNameEntry] = []
+        for i in 0..MAX_FX_LISTS {
+            names = names + [FXNameEntry { name: "", index: -1 }]
+        }
+
+        let errors: [string] = []
+        for i in 0..MAX_PARSE_ERRORS {
+            errors = errors + [""]
+        }
+
+        return FXListParser {
+            fx_lists: lists,
             fx_count: 0,
-            fx_name_to_index: HashMap::new(),
+            name_entries: names,
+            name_count: 0,
             current_fx: 0,
             current_nugget: 0,
             in_fx_block: false,
             in_nugget_block: false,
-            current_nugget_type: FXNuggetType::Sound,
-            parse_errors: [string::default(); 64],
+            current_nugget_type: FXNuggetType::SOUND,
+            parse_errors: errors,
             error_count: 0,
         }
-        parser
     }
 
     fn parse_file(&self, file_path: string): bool {
-        let content = std::fs::read_to_string(file_path)
-        if content.is_empty() {
+        let content = read_file_to_string(file_path)
+        if content.length == 0 {
             self.add_error("Failed to read file: " + file_path)
             return false
         }
 
-        let lines = content.split('\n')
-        let line_num: u32 = 0
+        let lines = split_lines(content)
+        let line_num = 0
 
         for line in lines {
-            line_num += 1
-            let trimmed = line.trim()
+            line_num = line_num + 1
+            let trimmed = trim(line)
 
-            if trimmed.is_empty() || trimmed.starts_with(";") || trimmed.starts_with("//") {
+            if trimmed.length == 0 || starts_with(trimmed, ";") || starts_with(trimmed, "//") {
                 continue
             }
 
@@ -160,57 +304,57 @@ impl FXListParser {
             }
         }
 
-        true
+        return true
     }
 
-    fn parse_line(&self, line: string, line_num: u32): bool {
+    fn parse_line(&self, line: string, line_num: i32): bool {
         // FXList block start
-        if line.starts_with("FXList ") {
+        if starts_with(line, "FXList ") {
             return self.begin_fx_block(line)
         }
 
         // Nugget block starts
-        if line.starts_with("Sound") && !line.contains("=") {
-            return self.begin_nugget(FXNuggetType::Sound)
+        if starts_with(line, "Sound") && !contains(line, "=") {
+            return self.begin_nugget(FXNuggetType::SOUND)
         }
-        if line.starts_with("ParticleSystem") && !line.contains("=") {
-            return self.begin_nugget(FXNuggetType::ParticleSystem)
+        if starts_with(line, "ParticleSystem") && !contains(line, "=") {
+            return self.begin_nugget(FXNuggetType::PARTICLE_SYSTEM)
         }
-        if line.starts_with("DynamicDecal") {
-            return self.begin_nugget(FXNuggetType::DynamicDecal)
+        if starts_with(line, "DynamicDecal") {
+            return self.begin_nugget(FXNuggetType::DYNAMIC_DECAL)
         }
-        if line.starts_with("TerrainScorch") {
-            return self.begin_nugget(FXNuggetType::TerrainScorch)
+        if starts_with(line, "TerrainScorch") {
+            return self.begin_nugget(FXNuggetType::TERRAIN_SCORCH)
         }
-        if line.starts_with("ViewShake") {
-            return self.begin_nugget(FXNuggetType::ViewShake)
+        if starts_with(line, "ViewShake") {
+            return self.begin_nugget(FXNuggetType::VIEW_SHAKE)
         }
-        if line.starts_with("TintDrawable") {
-            return self.begin_nugget(FXNuggetType::TintDrawable)
+        if starts_with(line, "TintDrawable") {
+            return self.begin_nugget(FXNuggetType::TINT_DRAWABLE)
         }
-        if line.starts_with("FXListAtBonePos") || line.starts_with("FXListAtBone") {
-            return self.begin_nugget(FXNuggetType::FXListAtBone)
+        if starts_with(line, "FXListAtBonePos") || starts_with(line, "FXListAtBone") {
+            return self.begin_nugget(FXNuggetType::FX_LIST_AT_BONE)
         }
-        if line.starts_with("TracerFX") {
-            return self.begin_nugget(FXNuggetType::TracerFX)
+        if starts_with(line, "TracerFX") {
+            return self.begin_nugget(FXNuggetType::TRACER_FX)
         }
-        if line.starts_with("LightPulse") {
-            return self.begin_nugget(FXNuggetType::LightPulse)
+        if starts_with(line, "LightPulse") {
+            return self.begin_nugget(FXNuggetType::LIGHT_PULSE)
         }
-        if line.starts_with("LaserFX") {
-            return self.begin_nugget(FXNuggetType::LaserFX)
+        if starts_with(line, "LaserFX") {
+            return self.begin_nugget(FXNuggetType::LASER_FX)
         }
-        if line.starts_with("CameraShakerVolume") {
-            return self.begin_nugget(FXNuggetType::CameraShakerVolume)
+        if starts_with(line, "CameraShakerVolume") {
+            return self.begin_nugget(FXNuggetType::CAMERA_SHAKER_VOLUME)
         }
-        if line.starts_with("AttachedModel") {
-            return self.begin_nugget(FXNuggetType::AttachedModel)
+        if starts_with(line, "AttachedModel") {
+            return self.begin_nugget(FXNuggetType::ATTACHED_MODEL)
         }
-        if line.starts_with("AttachedParticleSys") {
-            return self.begin_nugget(FXNuggetType::AttachedParticleSystem)
+        if starts_with(line, "AttachedParticleSys") {
+            return self.begin_nugget(FXNuggetType::ATTACHED_PARTICLE_SYSTEM)
         }
-        if line.starts_with("Streak") {
-            return self.begin_nugget(FXNuggetType::Streak)
+        if starts_with(line, "Streak") {
+            return self.begin_nugget(FXNuggetType::STREAK)
         }
 
         // Block ends
@@ -227,7 +371,7 @@ impl FXListParser {
             return self.parse_fx_property(line)
         }
 
-        true
+        return true
     }
 
     fn begin_fx_block(&self, line: string): bool {
@@ -236,46 +380,52 @@ impl FXListParser {
             return false
         }
 
-        let parts = line.split(" ")
-        if parts.len() < 2 {
+        let parts = split_by_space(line)
+        if parts.length < 2 {
             self.add_error("Invalid FXList declaration")
             return false
         }
 
-        let fx_name = parts[1].trim()
+        let fx_name = trim(parts[1])
 
         self.current_fx = self.fx_count
-        self.fx_lists[self.current_fx] = FXListDefinition::default()
-        self.fx_lists[self.current_fx].name = fx_name.to_string()
+        self.fx_lists[self.current_fx] = FXListDefinition::init()
+        self.fx_lists[self.current_fx].name = fx_name
         self.fx_lists[self.current_fx].is_valid = true
 
-        self.fx_name_to_index.insert(fx_name.to_string(), self.current_fx)
-        self.fx_count += 1
+        // Add to name mapping
+        self.name_entries[self.name_count] = FXNameEntry {
+            name: fx_name,
+            index: self.current_fx,
+        }
+        self.name_count = self.name_count + 1
+
+        self.fx_count = self.fx_count + 1
         self.in_fx_block = true
 
-        true
+        return true
     }
 
     fn begin_nugget(&self, nugget_type: FXNuggetType): bool {
         if !self.in_fx_block {
-            return true // Ignore nuggets outside FXList
+            return true  // Ignore nuggets outside FXList
         }
 
-        let fx = &self.fx_lists[self.current_fx]
-        if fx.nugget_count >= MAX_NUGGETS_PER_LIST as u32 {
-            return true // Max nuggets, skip
+        let fx = self.fx_lists[self.current_fx]
+        if fx.nugget_count >= MAX_NUGGETS_PER_LIST {
+            return true  // Max nuggets, skip
         }
 
-        self.current_nugget = fx.nugget_count as u32
-        fx.nuggets[self.current_nugget as usize] = FXNugget::default()
-        fx.nuggets[self.current_nugget as usize].nugget_type = nugget_type
-        fx.nuggets[self.current_nugget as usize].is_valid = true
-        fx.nugget_count += 1
+        self.current_nugget = fx.nugget_count
+        fx.nuggets[self.current_nugget] = FXNugget::init()
+        fx.nuggets[self.current_nugget].nugget_type = nugget_type
+        fx.nuggets[self.current_nugget].is_valid = true
+        fx.nugget_count = fx.nugget_count + 1
 
         self.in_nugget_block = true
         self.current_nugget_type = nugget_type
 
-        true
+        return true
     }
 
     fn end_current_block(&self): bool {
@@ -284,308 +434,677 @@ impl FXListParser {
         } else if self.in_fx_block {
             self.in_fx_block = false
         }
-        true
+        return true
     }
 
     fn parse_fx_property(&self, line: string): bool {
         let parts = self.split_property(line)
-        if parts.0.is_empty() {
+        if parts.key.length == 0 {
             return true
         }
 
-        let key = parts.0
-        let value = parts.1
-        let fx = &self.fx_lists[self.current_fx]
+        let key = parts.key
+        let value = parts.value
+        let fx = self.fx_lists[self.current_fx]
 
-        match key.as_str() {
-            "PlayEverywhere" => fx.play_everywhere = self.parse_bool(value),
-            _ => {},
+        if key == "PlayEverywhere" {
+            fx.play_everywhere = self.parse_bool(value)
         }
 
-        true
+        return true
     }
 
     fn parse_nugget_property(&self, line: string): bool {
         let parts = self.split_property(line)
-        if parts.0.is_empty() {
+        if parts.key.length == 0 {
             return true
         }
 
-        let key = parts.0
-        let value = parts.1
-        let nugget = &self.fx_lists[self.current_fx].nuggets[self.current_nugget as usize]
+        let key = parts.key
+        let value = parts.value
+        let nugget = self.fx_lists[self.current_fx].nuggets[self.current_nugget]
 
         // Common properties
-        match key.as_str() {
-            "Name" => nugget.name = value,
-            "RequiredFlags" => nugget.required_flags = self.parse_flags(value),
-            "ExcludedFlags" => nugget.excluded_flags = self.parse_flags(value),
-            "InitialDelay" => nugget.initial_delay = self.parse_u32(value),
-            _ => {},
+        if key == "Name" {
+            nugget.name = value
+        } else if key == "RequiredFlags" {
+            nugget.required_flags = self.parse_flags(value)
+        } else if key == "ExcludedFlags" {
+            nugget.excluded_flags = self.parse_flags(value)
+        } else if key == "InitialDelay" {
+            nugget.initial_delay = self.parse_i32(value)
+        } else {
+            // Type-specific properties
+            if self.current_nugget_type == FXNuggetType::SOUND {
+                self.parse_sound_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::PARTICLE_SYSTEM {
+                self.parse_particle_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::DYNAMIC_DECAL ||
+                      self.current_nugget_type == FXNuggetType::TERRAIN_SCORCH {
+                self.parse_decal_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::VIEW_SHAKE ||
+                      self.current_nugget_type == FXNuggetType::CAMERA_SHAKER_VOLUME {
+                self.parse_shake_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::TINT_DRAWABLE {
+                self.parse_tint_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::LIGHT_PULSE {
+                self.parse_light_property(key, value, nugget)
+            } else if self.current_nugget_type == FXNuggetType::TRACER_FX {
+                self.parse_tracer_property(key, value, nugget)
+            }
         }
 
-        // Type-specific properties
-        match self.current_nugget_type {
-            FXNuggetType::Sound => self.parse_sound_property(key, value, nugget),
-            FXNuggetType::ParticleSystem => self.parse_particle_property(key, value, nugget),
-            FXNuggetType::DynamicDecal | FXNuggetType::TerrainScorch =>
-                self.parse_decal_property(key, value, nugget),
-            FXNuggetType::ViewShake | FXNuggetType::CameraShakerVolume =>
-                self.parse_shake_property(key, value, nugget),
-            FXNuggetType::TintDrawable => self.parse_tint_property(key, value, nugget),
-            FXNuggetType::LightPulse => self.parse_light_property(key, value, nugget),
-            FXNuggetType::TracerFX => self.parse_tracer_property(key, value, nugget),
-            _ => {},
-        }
-
-        true
+        return true
     }
 
     fn parse_sound_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "SoundName" | "Sound" => nugget.sound_name = value,
-            "Volume" | "SoundVolume" => nugget.sound_volume = self.parse_f32(value),
-            "MinVolume" => nugget.sound_min_volume = self.parse_f32(value),
-            "LoopCount" => nugget.sound_loop_count = self.parse_u32(value),
-            _ => {},
+        if key == "SoundName" || key == "Sound" {
+            nugget.sound_name = value
+        } else if key == "Volume" || key == "SoundVolume" {
+            nugget.sound_volume = self.parse_f64(value)
+        } else if key == "MinVolume" {
+            nugget.sound_min_volume = self.parse_f64(value)
+        } else if key == "LoopCount" {
+            nugget.sound_loop_count = self.parse_i32(value)
         }
     }
 
     fn parse_particle_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Name" | "ParticleSystemName" => nugget.particle_system_name = value,
-            "BoneName" | "Bone" => nugget.bone_name = value,
-            "OrientToObject" => nugget.orient_to_object = self.parse_bool(value),
-            "Offset" => nugget.offset = self.parse_vec3(value),
-            "SystemLifetime" | "AttachedSystemLifetime" =>
-                nugget.attached_system_lifetime = self.parse_f32(value),
-            _ => {},
+        if key == "Name" || key == "ParticleSystemName" {
+            nugget.particle_system_name = value
+        } else if key == "BoneName" || key == "Bone" {
+            nugget.bone_name = value
+        } else if key == "OrientToObject" {
+            nugget.orient_to_object = self.parse_bool(value)
+        } else if key == "Offset" {
+            nugget.offset = self.parse_vec3(value)
+        } else if key == "SystemLifetime" || key == "AttachedSystemLifetime" {
+            nugget.attached_system_lifetime = self.parse_f64(value)
         }
     }
 
     fn parse_decal_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Texture" | "DecalName" => nugget.decal_texture = value,
-            "Size" | "DecalSize" | "Radius" => nugget.decal_size = self.parse_f32(value),
-            "Opacity" | "DecalOpacity" => nugget.decal_opacity = self.parse_f32(value),
-            "Lifetime" => nugget.decal_lifetime = self.parse_u32(value),
-            _ => {},
+        if key == "Texture" || key == "DecalName" {
+            nugget.decal_texture = value
+        } else if key == "Size" || key == "DecalSize" || key == "Radius" {
+            nugget.decal_size = self.parse_f64(value)
+        } else if key == "Opacity" || key == "DecalOpacity" {
+            nugget.decal_opacity = self.parse_f64(value)
+        } else if key == "Lifetime" {
+            nugget.decal_lifetime = self.parse_i32(value)
         }
     }
 
     fn parse_shake_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Intensity" | "ShakeIntensity" => nugget.shake_intensity = self.parse_f32(value),
-            "Duration" | "ShakeDuration" => nugget.shake_duration = self.parse_u32(value),
-            "Radius" | "ShakeRadius" => nugget.shake_radius = self.parse_f32(value),
-            _ => {},
+        if key == "Intensity" || key == "ShakeIntensity" {
+            nugget.shake_intensity = self.parse_f64(value)
+        } else if key == "Duration" || key == "ShakeDuration" {
+            nugget.shake_duration = self.parse_i32(value)
+        } else if key == "Radius" || key == "ShakeRadius" {
+            nugget.shake_radius = self.parse_f64(value)
         }
     }
 
     fn parse_tint_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Color" | "TintColor" => nugget.tint_color = self.parse_color(value),
-            "PreColorTime" => nugget.tint_pre_color_time = self.parse_u32(value),
-            "PostColorTime" => nugget.tint_post_color_time = self.parse_u32(value),
-            "SustainedColorTime" => nugget.tint_sustained_color_time = self.parse_u32(value),
-            _ => {},
+        if key == "Color" || key == "TintColor" {
+            nugget.tint_color = self.parse_color(value)
+        } else if key == "PreColorTime" {
+            nugget.tint_pre_color_time = self.parse_i32(value)
+        } else if key == "PostColorTime" {
+            nugget.tint_post_color_time = self.parse_i32(value)
+        } else if key == "SustainedColorTime" {
+            nugget.tint_sustained_color_time = self.parse_i32(value)
         }
     }
 
     fn parse_light_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Color" | "LightColor" => nugget.light_color = self.parse_color(value),
-            "Radius" | "LightRadius" => nugget.light_radius = self.parse_f32(value),
-            "IncreaseTime" | "RadiusIncreaseTime" => nugget.light_increase_time = self.parse_u32(value),
-            "DecreaseTime" | "RadiusDecreaseTime" => nugget.light_decrease_time = self.parse_u32(value),
-            _ => {},
+        if key == "Color" || key == "LightColor" {
+            nugget.light_color = self.parse_color(value)
+        } else if key == "Radius" || key == "LightRadius" {
+            nugget.light_radius = self.parse_f64(value)
+        } else if key == "IncreaseTime" || key == "RadiusIncreaseTime" {
+            nugget.light_increase_time = self.parse_i32(value)
+        } else if key == "DecreaseTime" || key == "RadiusDecreaseTime" {
+            nugget.light_decrease_time = self.parse_i32(value)
         }
     }
 
     fn parse_tracer_property(&self, key: string, value: string, nugget: FXNugget) {
-        match key.as_str() {
-            "Speed" | "TracerSpeed" => nugget.tracer_speed = self.parse_f32(value),
-            "Length" | "TracerLength" => nugget.tracer_length = self.parse_f32(value),
-            "Width" | "TracerWidth" => nugget.tracer_width = self.parse_f32(value),
-            "Color" | "TracerColor" => nugget.tracer_color = self.parse_color(value),
-            "Probability" | "DecayAt" => nugget.tracer_probability = self.parse_f32(value),
-            _ => {},
+        if key == "Speed" || key == "TracerSpeed" {
+            nugget.tracer_speed = self.parse_f64(value)
+        } else if key == "Length" || key == "TracerLength" {
+            nugget.tracer_length = self.parse_f64(value)
+        } else if key == "Width" || key == "TracerWidth" {
+            nugget.tracer_width = self.parse_f64(value)
+        } else if key == "Color" || key == "TracerColor" {
+            nugget.tracer_color = self.parse_color(value)
+        } else if key == "Probability" || key == "DecayAt" {
+            nugget.tracer_probability = self.parse_f64(value)
         }
     }
 
-    fn parse_flags(&self, value: string): u32 {
-        let mut flags: u32 = 0
-        let parts = value.split(" ")
+    fn parse_flags(&self, value: string): i32 {
+        let flags = 0
+        let parts = split_by_space(value)
+
         for part in parts {
-            match part.to_uppercase().as_str() {
-                "NIGHT" => flags |= 1,
-                "DAY" => flags |= 2,
-                "WATER" => flags |= 4,
-                "UNDERWATER" => flags |= 8,
-                "HEAVILY_DAMAGED" => flags |= 16,
-                "PRISTINE" => flags |= 32,
-                _ => {},
+            let upper = to_uppercase(part)
+            if upper == "NIGHT" {
+                flags = flags | 1
+            } else if upper == "DAY" {
+                flags = flags | 2
+            } else if upper == "WATER" {
+                flags = flags | 4
+            } else if upper == "UNDERWATER" {
+                flags = flags | 8
+            } else if upper == "HEAVILY_DAMAGED" {
+                flags = flags | 16
+            } else if upper == "PRISTINE" {
+                flags = flags | 32
             }
         }
-        flags
+
+        return flags
     }
 
     fn parse_vec3(&self, value: string): Vec3 {
         // Format: "X:1.0 Y:2.0 Z:3.0"
-        let mut result = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
-        let parts = value.split(" ")
+        let result = Vec3::init()
+        let parts = split_by_space(value)
+
         for part in parts {
-            if part.starts_with("X:") {
-                result.x = self.parse_f32(part[2..].to_string())
-            } else if part.starts_with("Y:") {
-                result.y = self.parse_f32(part[2..].to_string())
-            } else if part.starts_with("Z:") {
-                result.z = self.parse_f32(part[2..].to_string())
+            if starts_with(part, "X:") {
+                result.x = self.parse_f64(substring_from(part, 2))
+            } else if starts_with(part, "Y:") {
+                result.y = self.parse_f64(substring_from(part, 2))
+            } else if starts_with(part, "Z:") {
+                result.z = self.parse_f64(substring_from(part, 2))
             }
         }
-        result
+
+        return result
     }
 
     fn parse_color(&self, value: string): Color {
         // Format: "R:255 G:128 B:64" or "255 128 64"
-        let mut color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+        let color = Color::init()
 
-        if value.contains(":") {
-            let parts = value.split(" ")
+        if contains(value, ":") {
+            let parts = split_by_space(value)
             for part in parts {
-                if part.starts_with("R:") {
-                    color.r = self.parse_f32(part[2..].to_string()) / 255.0
-                } else if part.starts_with("G:") {
-                    color.g = self.parse_f32(part[2..].to_string()) / 255.0
-                } else if part.starts_with("B:") {
-                    color.b = self.parse_f32(part[2..].to_string()) / 255.0
-                } else if part.starts_with("A:") {
-                    color.a = self.parse_f32(part[2..].to_string()) / 255.0
+                if starts_with(part, "R:") {
+                    color.r = self.parse_f64(substring_from(part, 2)) / 255.0
+                } else if starts_with(part, "G:") {
+                    color.g = self.parse_f64(substring_from(part, 2)) / 255.0
+                } else if starts_with(part, "B:") {
+                    color.b = self.parse_f64(substring_from(part, 2)) / 255.0
+                } else if starts_with(part, "A:") {
+                    color.a = self.parse_f64(substring_from(part, 2)) / 255.0
                 }
             }
         } else {
-            let parts = value.split(" ")
-            if parts.len() >= 3 {
-                color.r = self.parse_f32(parts[0].to_string()) / 255.0
-                color.g = self.parse_f32(parts[1].to_string()) / 255.0
-                color.b = self.parse_f32(parts[2].to_string()) / 255.0
+            let parts = split_by_space(value)
+            if parts.length >= 3 {
+                color.r = self.parse_f64(parts[0]) / 255.0
+                color.g = self.parse_f64(parts[1]) / 255.0
+                color.b = self.parse_f64(parts[2]) / 255.0
             }
         }
 
-        color
+        return color
     }
 
-    fn split_property(&self, line: string): (string, string) {
-        let eq_pos = line.find("=")
-        if eq_pos.is_some() {
-            let idx = eq_pos.unwrap()
-            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+    fn split_property(&self, line: string): PropertyParts {
+        let eq_pos = index_of(line, "=")
+        if eq_pos >= 0 {
+            return PropertyParts {
+                key: trim(substring(line, 0, eq_pos)),
+                value: trim(substring_from(line, eq_pos + 1)),
+            }
         }
 
-        let space_pos = line.find(" ")
-        if space_pos.is_some() {
-            let idx = space_pos.unwrap()
-            return (line[0..idx].trim().to_string(), line[idx+1..].trim().to_string())
+        let space_pos = index_of(line, " ")
+        if space_pos >= 0 {
+            return PropertyParts {
+                key: trim(substring(line, 0, space_pos)),
+                value: trim(substring_from(line, space_pos + 1)),
+            }
         }
 
-        (line, "".to_string())
+        return PropertyParts { key: line, value: "" }
     }
 
-    fn parse_f32(&self, value: string): f32 {
-        value.trim().parse::<f32>().unwrap_or(0.0)
+    fn parse_f64(&self, value: string): f64 {
+        return parse_float(trim(value))
     }
 
-    fn parse_u32(&self, value: string): u32 {
-        value.trim().parse::<u32>().unwrap_or(0)
+    fn parse_i32(&self, value: string): i32 {
+        return parse_int(trim(value))
     }
 
     fn parse_bool(&self, value: string): bool {
-        let v = value.to_uppercase()
-        v == "YES" || v == "TRUE" || v == "1"
+        let v = to_uppercase(value)
+        return v == "YES" || v == "TRUE" || v == "1"
     }
 
     fn add_error(&self, msg: string) {
-        if self.error_count < 64 {
-            self.parse_errors[self.error_count as usize] = msg
-            self.error_count += 1
+        if self.error_count < MAX_PARSE_ERRORS {
+            self.parse_errors[self.error_count] = msg
+            self.error_count = self.error_count + 1
         }
     }
 
     // Public API
-    fn get_fx_list(&self, name: string): Option<&FXListDefinition> {
-        if let Some(idx) = self.fx_name_to_index.get(&name) {
-            return Some(&self.fx_lists[*idx as usize])
+    fn get_fx_list(&self, name: string): FXListDefinition? {
+        for i in 0..self.name_count {
+            if self.name_entries[i].name == name {
+                let idx = self.name_entries[i].index
+                if idx >= 0 && idx < self.fx_count {
+                    return self.fx_lists[idx]
+                }
+            }
         }
-        None
+        return null
     }
 
-    fn get_fx_count(&self): u32 {
-        self.fx_count
+    fn get_fx_list_by_index(&self, index: i32): FXListDefinition? {
+        if index < 0 || index >= self.fx_count {
+            return null
+        }
+        return self.fx_lists[index]
+    }
+
+    fn get_fx_count(&self): i32 {
+        return self.fx_count
+    }
+
+    fn get_error_count(&self): i32 {
+        return self.error_count
+    }
+
+    fn get_error(&self, index: i32): string {
+        if index < 0 || index >= self.error_count {
+            return ""
+        }
+        return self.parse_errors[index]
     }
 }
 
-impl Default for Vec3 {
-    fn default(): Self {
-        Vec3 { x: 0.0, y: 0.0, z: 0.0 }
-    }
+// ============================================================================
+// Helper Types
+// ============================================================================
+
+struct PropertyParts {
+    key: string,
+    value: string,
 }
 
-impl Default for Color {
-    fn default(): Self {
-        Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
-    }
+// ============================================================================
+// String Helper Functions
+// ============================================================================
+
+fn read_file_to_string(path: string): string {
+    // Platform-specific implementation
+    return ""
 }
 
-impl Default for FXNugget {
-    fn default(): Self {
-        FXNugget {
-            nugget_type: FXNuggetType::Sound,
-            name: "".to_string(),
-            required_flags: 0,
-            excluded_flags: 0,
-            sound_name: "".to_string(),
-            sound_volume: 1.0,
-            sound_min_volume: 0.0,
-            sound_loop_count: 1,
-            particle_system_name: "".to_string(),
-            bone_name: "".to_string(),
-            orient_to_object: false,
-            offset: Vec3::default(),
-            attached_system_lifetime: 0.0,
-            initial_delay: 0,
-            decal_texture: "".to_string(),
-            decal_size: 1.0,
-            decal_opacity: 1.0,
-            decal_lifetime: 0,
-            shake_intensity: 0.0,
-            shake_duration: 0,
-            shake_radius: 0.0,
-            tint_color: Color::default(),
-            tint_pre_color_time: 0,
-            tint_post_color_time: 0,
-            tint_sustained_color_time: 0,
-            light_color: Color::default(),
-            light_radius: 0.0,
-            light_increase_time: 0,
-            light_decrease_time: 0,
-            tracer_speed: 0.0,
-            tracer_length: 0.0,
-            tracer_width: 0.0,
-            tracer_color: Color::default(),
-            tracer_probability: 1.0,
-            is_valid: false,
+fn split_lines(content: string): [string] {
+    // Split string by newlines
+    return []
+}
+
+fn split_by_space(content: string): [string] {
+    // Split string by spaces
+    return []
+}
+
+fn trim(s: string): string {
+    // Remove leading/trailing whitespace
+    return s
+}
+
+fn starts_with(s: string, prefix: string): bool {
+    // Check if string starts with prefix
+    return false
+}
+
+fn contains(s: string, sub: string): bool {
+    // Check if string contains substring
+    return false
+}
+
+fn to_uppercase(s: string): string {
+    // Convert string to uppercase
+    return s
+}
+
+fn index_of(s: string, sub: string): i32 {
+    // Find index of substring, -1 if not found
+    return -1
+}
+
+fn substring(s: string, start: i32, end: i32): string {
+    // Get substring from start to end
+    return ""
+}
+
+fn substring_from(s: string, start: i32): string {
+    // Get substring from start to end of string
+    return ""
+}
+
+fn parse_float(s: string): f64 {
+    // Parse string to float
+    return 0.0
+}
+
+fn parse_int(s: string): i32 {
+    // Parse string to int
+    return 0
+}
+
+// ============================================================================
+// FX Effect Application
+// ============================================================================
+
+struct FXEffectInstance {
+    fx_list: FXListDefinition,
+    position: Vec3,
+    elapsed_time: f64,
+    is_active: bool,
+}
+
+impl FXEffectInstance {
+    fn init(fx_list: FXListDefinition, position: Vec3): FXEffectInstance {
+        return FXEffectInstance {
+            fx_list: fx_list,
+            position: position,
+            elapsed_time: 0.0,
+            is_active: true,
+        }
+    }
+
+    fn update(&self, delta_time: f64) {
+        self.elapsed_time = self.elapsed_time + delta_time
+
+        // Process nuggets based on timing
+        for i in 0..self.fx_list.nugget_count {
+            let nugget = self.fx_list.nuggets[i]
+
+            // Check if this nugget should trigger
+            if nugget.initial_delay as f64 <= self.elapsed_time * 1000.0 {
+                self.apply_nugget(nugget)
+            }
+        }
+    }
+
+    fn apply_nugget(&self, nugget: FXNugget) {
+        if nugget.nugget_type == FXNuggetType::SOUND {
+            // Play sound at position
+            play_sound_at_position(nugget.sound_name, self.position, nugget.sound_volume)
+        } else if nugget.nugget_type == FXNuggetType::PARTICLE_SYSTEM {
+            // Spawn particle system
+            spawn_particle_system(nugget.particle_system_name, self.position, nugget.orient_to_object)
+        } else if nugget.nugget_type == FXNuggetType::DYNAMIC_DECAL ||
+                  nugget.nugget_type == FXNuggetType::TERRAIN_SCORCH {
+            // Create ground decal
+            create_decal(nugget.decal_texture, self.position, nugget.decal_size, nugget.decal_opacity, nugget.decal_lifetime)
+        } else if nugget.nugget_type == FXNuggetType::VIEW_SHAKE ||
+                  nugget.nugget_type == FXNuggetType::CAMERA_SHAKER_VOLUME {
+            // Shake camera
+            shake_camera(nugget.shake_intensity, nugget.shake_duration, nugget.shake_radius)
+        } else if nugget.nugget_type == FXNuggetType::LIGHT_PULSE {
+            // Create light pulse
+            create_light_pulse(self.position, nugget.light_color, nugget.light_radius,
+                               nugget.light_increase_time, nugget.light_decrease_time)
+        } else if nugget.nugget_type == FXNuggetType::TRACER_FX {
+            // Create tracer effect
+            if random_float() <= nugget.tracer_probability {
+                create_tracer(self.position, nugget.tracer_speed, nugget.tracer_length,
+                              nugget.tracer_width, nugget.tracer_color)
+            }
         }
     }
 }
 
-impl Default for FXListDefinition {
-    fn default(): Self {
-        FXListDefinition {
-            name: "".to_string(),
-            nuggets: [FXNugget::default(); 16],
-            nugget_count: 0,
-            play_everywhere: false,
-            is_valid: false,
+// ============================================================================
+// FX System Manager
+// ============================================================================
+
+let MAX_ACTIVE_EFFECTS: i32 = 256
+
+struct FXSystem {
+    parser: FXListParser,
+    active_effects: [FXEffectInstance],
+    effect_count: i32,
+    is_initialized: bool,
+}
+
+impl FXSystem {
+    fn init(): FXSystem {
+        let effects: [FXEffectInstance] = []
+        // Don't pre-allocate, just initialize empty array
+
+        return FXSystem {
+            parser: FXListParser::init(),
+            active_effects: effects,
+            effect_count: 0,
+            is_initialized: false,
         }
     }
+
+    fn load_fx_ini(&self, file_path: string): bool {
+        let result = self.parser.parse_file(file_path)
+        if result {
+            self.is_initialized = true
+        }
+        return result
+    }
+
+    fn play_fx(&self, fx_name: string, position: Vec3) {
+        let fx_list = self.parser.get_fx_list(fx_name)
+        if fx_list == null {
+            return
+        }
+
+        if self.effect_count >= MAX_ACTIVE_EFFECTS {
+            // Remove oldest effect
+            self.remove_effect(0)
+        }
+
+        let effect = FXEffectInstance::init(fx_list, position)
+        self.active_effects = self.active_effects + [effect]
+        self.effect_count = self.effect_count + 1
+    }
+
+    fn update(&self, delta_time: f64) {
+        let i = 0
+        while i < self.effect_count {
+            self.active_effects[i].update(delta_time)
+
+            // Check if effect is done (simplified - would check all nuggets)
+            // For now, effects last 5 seconds
+            if self.active_effects[i].elapsed_time > 5.0 {
+                self.remove_effect(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    fn remove_effect(&self, index: i32) {
+        if index < 0 || index >= self.effect_count {
+            return
+        }
+
+        // Shift remaining effects
+        for j in index..(self.effect_count - 1) {
+            self.active_effects[j] = self.active_effects[j + 1]
+        }
+        self.effect_count = self.effect_count - 1
+    }
+
+    fn get_active_effect_count(&self): i32 {
+        return self.effect_count
+    }
+}
+
+// ============================================================================
+// External Effect Functions (Platform Specific)
+// ============================================================================
+
+fn play_sound_at_position(sound_name: string, position: Vec3, volume: f64) {
+    // Platform-specific audio implementation
+}
+
+fn spawn_particle_system(name: string, position: Vec3, orient_to_object: bool) {
+    // Platform-specific particle system
+}
+
+fn create_decal(texture: string, position: Vec3, size: f64, opacity: f64, lifetime: i32) {
+    // Platform-specific decal rendering
+}
+
+fn shake_camera(intensity: f64, duration: i32, radius: f64) {
+    // Platform-specific camera shake
+}
+
+fn create_light_pulse(position: Vec3, color: Color, radius: f64, increase_time: i32, decrease_time: i32) {
+    // Platform-specific dynamic lighting
+}
+
+fn create_tracer(position: Vec3, speed: f64, length: f64, width: f64, color: Color) {
+    // Platform-specific tracer effect
+}
+
+fn random_float(): f64 {
+    // Return random float 0.0 to 1.0
+    return 0.5
+}
+
+// ============================================================================
+// Common FX Lists in C&C Generals
+// ============================================================================
+
+fn get_common_fx_names(): [string] {
+    return [
+        // Explosions
+        "FX_SmallExplosion",
+        "FX_MediumExplosion",
+        "FX_LargeExplosion",
+        "FX_NukeExplosion",
+        "FX_SCUDExplosion",
+        "FX_JetExplosion",
+
+        // Weapon effects
+        "FX_BulletImpact",
+        "FX_MissileImpact",
+        "FX_ShellImpact",
+        "FX_FlamerImpact",
+        "FX_TankShellFire",
+        "FX_MachineGunFire",
+
+        // Building effects
+        "FX_BuildingComplete",
+        "FX_BuildingDamaged",
+        "FX_BuildingDestroyed",
+        "FX_ConstructionDust",
+
+        // Unit effects
+        "FX_InfantryDeath",
+        "FX_VehicleDestroyed",
+        "FX_AircraftCrash",
+
+        // Environmental
+        "FX_DirtKick",
+        "FX_WaterSplash",
+        "FX_DebrisSpray",
+    ]
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_fx_nugget_creation() {
+    print("Testing FX nugget creation...")
+
+    let nugget = FXNugget::init()
+    nugget.nugget_type = FXNuggetType::SOUND
+    nugget.sound_name = "ExplosionLarge"
+    nugget.sound_volume = 0.8
+    nugget.is_valid = true
+
+    print("Created sound nugget: " + nugget.sound_name)
+    print("Volume: " + str(nugget.sound_volume))
+}
+
+fn test_fx_list_creation() {
+    print("Testing FX list creation...")
+
+    let fx_list = FXListDefinition::init()
+    fx_list.name = "FX_TestExplosion"
+    fx_list.is_valid = true
+
+    // Add sound nugget
+    let sound_nugget = FXNugget::init()
+    sound_nugget.nugget_type = FXNuggetType::SOUND
+    sound_nugget.sound_name = "ExplosionSound"
+    sound_nugget.is_valid = true
+    fx_list.add_nugget(sound_nugget)
+
+    // Add particle nugget
+    let particle_nugget = FXNugget::init()
+    particle_nugget.nugget_type = FXNuggetType::PARTICLE_SYSTEM
+    particle_nugget.particle_system_name = "ExplosionParticles"
+    particle_nugget.is_valid = true
+    fx_list.add_nugget(particle_nugget)
+
+    print("Created FX list: " + fx_list.name)
+    print("Nugget count: " + str(fx_list.nugget_count))
+}
+
+fn test_color_parsing() {
+    print("Testing color parsing...")
+
+    let parser = FXListParser::init()
+
+    // Test R:G:B: format
+    let color1 = parser.parse_color("R:255 G:128 B:64")
+    print("Color1 R: " + str(color1.r))
+    print("Color1 G: " + str(color1.g))
+    print("Color1 B: " + str(color1.b))
+}
+
+fn test_vec3_parsing() {
+    print("Testing Vec3 parsing...")
+
+    let parser = FXListParser::init()
+
+    let vec = parser.parse_vec3("X:10.5 Y:20.0 Z:30.5")
+    print("Vec X: " + str(vec.x))
+    print("Vec Y: " + str(vec.y))
+    print("Vec Z: " + str(vec.z))
+}
+
+fn test_fx_system() {
+    print("Testing FX system...")
+
+    let fx_system = FXSystem::init()
+
+    // Play an effect
+    let position = Vec3 { x: 100.0, y: 0.0, z: 100.0 }
+    // fx_system.play_fx("FX_SmallExplosion", position)
+
+    print("Active effects: " + str(fx_system.get_active_effect_count()))
+}
+
+fn run_all_tests() {
+    print("Running FX list parser tests...")
+    test_fx_nugget_creation()
+    test_fx_list_creation()
+    test_color_parsing()
+    test_vec3_parsing()
+    test_fx_system()
+    print("All FX list parser tests complete!")
 }

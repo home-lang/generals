@@ -1,22 +1,61 @@
 // Pathfinder - A* pathfinding with hierarchical pathfinding for large maps
 // Implements the C&C Generals pathfinding system
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+let MAX_PATH_NODES: i32 = 65536
+let MAX_WAYPOINTS: i32 = 256
+let MAX_PATH_REQUESTS: i32 = 64
+let CLUSTER_SIZE: i32 = 32  // 32x32 cells per cluster
+let MAX_FLOAT: f32 = 999999999.0
+
+// ============================================================================
+// LOCOMOTOR TYPES
+// ============================================================================
 
 // Locomotor types - how units move
 enum LocomotorType {
-    Ground,
-    Amphibious,
-    Air,
-    Hover,
-    CliffClimber,
-    Tank,
-    TwoLegs,
-    FourLegs,
-    WingsOnGround,
-    WingsInFlight,
+    GROUND,
+    AMPHIBIOUS,
+    AIR,
+    HOVER,
+    CLIFF_CLIMBER,
+    TANK,
+    TWO_LEGS,
+    FOUR_LEGS,
+    WINGS_ON_GROUND,
+    WINGS_IN_FLIGHT,
 }
 
-// Path node for A* algorithm
+// ============================================================================
+// VECTOR TYPE
+// ============================================================================
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn init(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+
+    fn new(x: f32, y: f32): Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn copy(&self): Vec2 {
+        return Vec2 { x: self.x, y: self.y }
+    }
+}
+
+// ============================================================================
+// PATH NODE
+// ============================================================================
+
 struct PathNode {
     x: i32,
     y: i32,
@@ -29,50 +68,146 @@ struct PathNode {
     is_closed: bool,
 }
 
-// Pathfinding result
-struct PathResult {
-    waypoints: [Vec2; 256],
-    waypoint_count: u32,
-    is_valid: bool,
-    is_partial: bool,
-    total_cost: f32,
+impl PathNode {
+    fn init(): PathNode {
+        return PathNode {
+            x: 0,
+            y: 0,
+            g_cost: MAX_FLOAT,
+            h_cost: 0.0,
+            f_cost: MAX_FLOAT,
+            parent_x: 0,
+            parent_y: 0,
+            is_open: false,
+            is_closed: false,
+        }
+    }
+
+    fn reset(&self, x: i32, y: i32) {
+        self.x = x
+        self.y = y
+        self.g_cost = MAX_FLOAT
+        self.h_cost = 0.0
+        self.f_cost = MAX_FLOAT
+        self.parent_x = x
+        self.parent_y = y
+        self.is_open = false
+        self.is_closed = false
+    }
 }
 
-// 2D position
-struct Vec2 {
-    x: f32,
-    y: f32,
-}
+// ============================================================================
+// NAV CELL
+// ============================================================================
 
-// Navigation cell for the grid
 struct NavCell {
     passable: bool,
     cost: f32,           // Movement cost multiplier
     height: f32,         // Terrain height
     slope: f32,          // Terrain slope
-    locomotor_flags: u32, // Which locomotors can pass
+    locomotor_flags: i32, // Which locomotors can pass (bitmask)
     bridge: bool,        // Is this a bridge cell
     water: bool,         // Is this water
     cliff: bool,         // Is this a cliff edge
 }
 
-// Hierarchical pathfinding cluster
+impl NavCell {
+    fn init(): NavCell {
+        return NavCell {
+            passable: true,
+            cost: 1.0,
+            height: 0.0,
+            slope: 0.0,
+            locomotor_flags: 0x7FFFFFFF,  // All locomotors by default
+            bridge: false,
+            water: false,
+            cliff: false,
+        }
+    }
+}
+
+// ============================================================================
+// PATH RESULT
+// ============================================================================
+
+struct PathResult {
+    waypoints: [Vec2],
+    waypoint_count: i32,
+    is_valid: bool,
+    is_partial: bool,
+    total_cost: f32,
+}
+
+impl PathResult {
+    fn init(): PathResult {
+        return PathResult {
+            waypoints: [],
+            waypoint_count: 0,
+            is_valid: false,
+            is_partial: false,
+            total_cost: 0.0,
+        }
+    }
+
+    fn invalid(): PathResult {
+        return PathResult::init()
+    }
+
+    fn add_waypoint(&self, point: Vec2) {
+        if self.waypoint_count < MAX_WAYPOINTS {
+            self.waypoints = self.waypoints + [point]
+            self.waypoint_count = self.waypoint_count + 1
+        }
+    }
+}
+
+// ============================================================================
+// NAV CLUSTER (Hierarchical pathfinding)
+// ============================================================================
+
 struct NavCluster {
-    id: u32,
+    id: i32,
     min_x: i32,
     min_y: i32,
     max_x: i32,
     max_y: i32,
     center_x: f32,
     center_y: f32,
-    connected_clusters: [u32; 8],
-    connection_count: u32,
+    connected_clusters: [i32],
+    connection_count: i32,
     is_valid: bool,
 }
 
-// Path request for async pathfinding
+impl NavCluster {
+    fn init(id: i32, min_x: i32, min_y: i32, max_x: i32, max_y: i32): NavCluster {
+        return NavCluster {
+            id: id,
+            min_x: min_x,
+            min_y: min_y,
+            max_x: max_x,
+            max_y: max_y,
+            center_x: cast(f32, min_x + max_x) / 2.0,
+            center_y: cast(f32, min_y + max_y) / 2.0,
+            connected_clusters: [],
+            connection_count: 0,
+            is_valid: true,
+        }
+    }
+
+    fn add_connection(&self, cluster_id: i32) {
+        if self.connection_count < 8 {
+            self.connected_clusters = self.connected_clusters + [cluster_id]
+            self.connection_count = self.connection_count + 1
+        }
+    }
+}
+
+// ============================================================================
+// PATH REQUEST (Async pathfinding)
+// ============================================================================
+
 struct PathRequest {
-    request_id: u32,
+    request_id: i32,
     start: Vec2,
     goal: Vec2,
     locomotor: LocomotorType,
@@ -81,65 +216,95 @@ struct PathRequest {
     result: PathResult,
 }
 
-let MAX_PATH_NODES: u32 = 65536
-let MAX_WAYPOINTS: u32 = 256
-let MAX_PATH_REQUESTS: u32 = 64
-let CLUSTER_SIZE: i32 = 32 // 32x32 cells per cluster
+impl PathRequest {
+    fn init(): PathRequest {
+        return PathRequest {
+            request_id: 0,
+            start: Vec2::init(),
+            goal: Vec2::init(),
+            locomotor: LocomotorType::GROUND,
+            unit_radius: 1.0,
+            is_complete: false,
+            result: PathResult::init(),
+        }
+    }
+}
+
+// ============================================================================
+// PATHFINDER
+// ============================================================================
 
 struct Pathfinder {
     // Navigation grid
-    nav_grid: Vec<NavCell>,
+    nav_grid: [NavCell],
     grid_width: i32,
     grid_height: i32,
     cell_size: f32,
 
     // Node pool for A*
-    node_pool: [PathNode; MAX_PATH_NODES],
-    node_map: HashMap<u64, u32>, // (x,y) hash -> node index
+    node_pool: [PathNode],
+    node_count: i32,
+    node_map_keys: [i64],    // Cell keys
+    node_map_values: [i32],  // Node indices
+    node_map_count: i32,
 
-    // Open list as priority queue
-    open_list: Vec<u32>, // Indices into node_pool
+    // Open list (indices into node_pool)
+    open_list: [i32],
+    open_list_count: i32,
 
     // Hierarchical clusters
-    clusters: Vec<NavCluster>,
+    clusters: [NavCluster],
+    cluster_count: i32,
     cluster_grid_width: i32,
     cluster_grid_height: i32,
 
     // Async path requests
-    pending_requests: [PathRequest; MAX_PATH_REQUESTS],
-    request_count: u32,
-    next_request_id: u32,
+    pending_requests: [PathRequest],
+    request_count: i32,
+    next_request_id: i32,
 
     // Settings
-    max_iterations: u32,
+    max_iterations: i32,
     diagonal_cost: f32,
 
     // Stats
-    paths_computed: u32,
+    paths_computed: i32,
     avg_path_time_ms: f32,
 }
 
 impl Pathfinder {
-    fn new(width: i32, height: i32, cell_size: f32): Self {
-        let grid_size = (width * height) as usize
-        let mut nav_grid = Vec::with_capacity(grid_size)
+    fn init(width: i32, height: i32, cell_size: f32): Pathfinder {
+        let grid_size = width * height
 
-        for _ in 0..grid_size {
-            nav_grid.push(NavCell::default())
+        // Initialize nav grid
+        let nav_grid: [NavCell] = []
+        for i in 0..grid_size {
+            nav_grid = nav_grid + [NavCell::init()]
         }
 
-        let mut pathfinder = Pathfinder {
+        // Initialize node pool
+        let node_pool: [PathNode] = []
+        for i in 0..MAX_PATH_NODES {
+            node_pool = node_pool + [PathNode::init()]
+        }
+
+        let pathfinder = Pathfinder {
             nav_grid: nav_grid,
             grid_width: width,
             grid_height: height,
             cell_size: cell_size,
-            node_pool: [PathNode::default(); MAX_PATH_NODES as usize],
-            node_map: HashMap::new(),
-            open_list: Vec::new(),
-            clusters: Vec::new(),
+            node_pool: node_pool,
+            node_count: 0,
+            node_map_keys: [],
+            node_map_values: [],
+            node_map_count: 0,
+            open_list: [],
+            open_list_count: 0,
+            clusters: [],
+            cluster_count: 0,
             cluster_grid_width: (width + CLUSTER_SIZE - 1) / CLUSTER_SIZE,
             cluster_grid_height: (height + CLUSTER_SIZE - 1) / CLUSTER_SIZE,
-            pending_requests: [PathRequest::default(); MAX_PATH_REQUESTS as usize],
+            pending_requests: [],
             request_count: 0,
             next_request_id: 1,
             max_iterations: 10000,
@@ -149,37 +314,40 @@ impl Pathfinder {
         }
 
         pathfinder.build_clusters()
-        pathfinder
+        return pathfinder
     }
 
-    // Initialize from terrain heightmap
+    // ========================================================================
+    // Terrain Initialization
+    // ========================================================================
+
     fn initialize_from_terrain(&self, heights: [f32], passability: [bool]) {
         for y in 0..self.grid_height {
             for x in 0..self.grid_width {
-                let idx = (y * self.grid_width + x) as usize
+                let idx = y * self.grid_width + x
 
-                if idx < heights.len() {
+                if idx < heights.length {
                     self.nav_grid[idx].height = heights[idx]
                 }
 
-                if idx < passability.len() {
+                if idx < passability.length {
                     self.nav_grid[idx].passable = passability[idx]
                 }
 
                 // Calculate slope from neighbors
                 if x > 0 && x < self.grid_width - 1 && y > 0 && y < self.grid_height - 1 {
                     let h = self.nav_grid[idx].height
-                    let h_left = heights[((y * self.grid_width + x - 1) as usize).min(heights.len() - 1)]
-                    let h_right = heights[((y * self.grid_width + x + 1) as usize).min(heights.len() - 1)]
-                    let h_up = heights[(((y - 1) * self.grid_width + x) as usize).min(heights.len() - 1)]
-                    let h_down = heights[(((y + 1) * self.grid_width + x) as usize).min(heights.len() - 1)]
+                    let h_left = heights[min_i32(y * self.grid_width + x - 1, heights.length - 1)]
+                    let h_right = heights[min_i32(y * self.grid_width + x + 1, heights.length - 1)]
+                    let h_up = heights[min_i32((y - 1) * self.grid_width + x, heights.length - 1)]
+                    let h_down = heights[min_i32((y + 1) * self.grid_width + x, heights.length - 1)]
 
                     let dx = (h_right - h_left) / (2.0 * self.cell_size)
                     let dy = (h_down - h_up) / (2.0 * self.cell_size)
-                    self.nav_grid[idx].slope = (dx * dx + dy * dy).sqrt()
+                    self.nav_grid[idx].slope = sqrt(dx * dx + dy * dy)
 
-                    // Mark as impassable if too steep
-                    if self.nav_grid[idx].slope > 0.7 { // ~35 degrees
+                    // Mark as impassable if too steep (~35 degrees)
+                    if self.nav_grid[idx].slope > 0.7 {
                         self.nav_grid[idx].passable = false
                         self.nav_grid[idx].cliff = true
                     }
@@ -195,64 +363,60 @@ impl Pathfinder {
     }
 
     fn update_locomotor_flags(&self, x: i32, y: i32) {
-        let idx = (y * self.grid_width + x) as usize
-        let cell = &self.nav_grid[idx]
+        let idx = y * self.grid_width + x
+        if idx >= self.nav_grid.length {
+            return
+        }
 
+        let cell = self.nav_grid[idx]
         cell.locomotor_flags = 0
 
         if cell.passable {
             // Ground units can pass
-            cell.locomotor_flags |= 1 << (LocomotorType::Ground as u32)
-            cell.locomotor_flags |= 1 << (LocomotorType::Tank as u32)
-            cell.locomotor_flags |= 1 << (LocomotorType::TwoLegs as u32)
-            cell.locomotor_flags |= 1 << (LocomotorType::FourLegs as u32)
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 0)  // GROUND
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 5)  // TANK
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 6)  // TWO_LEGS
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 7)  // FOUR_LEGS
         }
 
         if cell.water {
             // Only amphibious and hover can pass water
             cell.locomotor_flags = 0
-            cell.locomotor_flags |= 1 << (LocomotorType::Amphibious as u32)
-            cell.locomotor_flags |= 1 << (LocomotorType::Hover as u32)
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 1)  // AMPHIBIOUS
+            cell.locomotor_flags = cell.locomotor_flags | (1 << 3)  // HOVER
         }
 
         if cell.cliff {
             // Only cliff climbers can pass cliffs
-            cell.locomotor_flags = 1 << (LocomotorType::CliffClimber as u32)
+            cell.locomotor_flags = 1 << 4  // CLIFF_CLIMBER
         }
 
         // Air can always pass
-        cell.locomotor_flags |= 1 << (LocomotorType::Air as u32)
-        cell.locomotor_flags |= 1 << (LocomotorType::WingsInFlight as u32)
+        cell.locomotor_flags = cell.locomotor_flags | (1 << 2)  // AIR
+        cell.locomotor_flags = cell.locomotor_flags | (1 << 9)  // WINGS_IN_FLIGHT
     }
 
-    // Build hierarchical clusters
-    fn build_clusters(&self) {
-        self.clusters.clear()
+    // ========================================================================
+    // Cluster Building (Hierarchical Pathfinding)
+    // ========================================================================
 
-        let mut cluster_id: u32 = 0
+    fn build_clusters(&self) {
+        self.clusters = []
+        self.cluster_count = 0
+
+        let cluster_id = 0
 
         for cy in 0..self.cluster_grid_height {
             for cx in 0..self.cluster_grid_width {
                 let min_x = cx * CLUSTER_SIZE
                 let min_y = cy * CLUSTER_SIZE
-                let max_x = ((cx + 1) * CLUSTER_SIZE).min(self.grid_width)
-                let max_y = ((cy + 1) * CLUSTER_SIZE).min(self.grid_height)
+                let max_x = min_i32((cx + 1) * CLUSTER_SIZE, self.grid_width)
+                let max_y = min_i32((cy + 1) * CLUSTER_SIZE, self.grid_height)
 
-                let cluster = NavCluster {
-                    id: cluster_id,
-                    min_x: min_x,
-                    min_y: min_y,
-                    max_x: max_x,
-                    max_y: max_y,
-                    center_x: (min_x + max_x) as f32 / 2.0,
-                    center_y: (min_y + max_y) as f32 / 2.0,
-                    connected_clusters: [0; 8],
-                    connection_count: 0,
-                    is_valid: true,
-                }
-
-                self.clusters.push(cluster)
-                cluster_id += 1
+                let cluster = NavCluster::init(cluster_id, min_x, min_y, max_x, max_y)
+                self.clusters = self.clusters + [cluster]
+                self.cluster_count = self.cluster_count + 1
+                cluster_id = cluster_id + 1
             }
         }
 
@@ -261,106 +425,104 @@ impl Pathfinder {
     }
 
     fn build_cluster_connections(&self) {
-        let cluster_count = self.clusters.len()
-
-        for i in 0..cluster_count {
-            let cluster = &self.clusters[i]
+        for i in 0..self.cluster_count {
+            let cluster = self.clusters[i]
             let cx = cluster.min_x / CLUSTER_SIZE
             let cy = cluster.min_y / CLUSTER_SIZE
 
-            let mut connections = Vec::new()
-
             // Check 8 neighbors
-            let neighbors = [
-                (cx - 1, cy - 1), (cx, cy - 1), (cx + 1, cy - 1),
-                (cx - 1, cy),                   (cx + 1, cy),
-                (cx - 1, cy + 1), (cx, cy + 1), (cx + 1, cy + 1),
+            let neighbor_offsets = [
+                [-1, -1], [0, -1], [1, -1],
+                [-1, 0],          [1, 0],
+                [-1, 1],  [0, 1],  [1, 1],
             ]
 
-            for (nx, ny) in neighbors {
-                if nx >= 0 && nx < self.cluster_grid_width &&
-                   ny >= 0 && ny < self.cluster_grid_height {
-                    let neighbor_id = (ny * self.cluster_grid_width + nx) as u32
+            for j in 0..8 {
+                let nx = cx + neighbor_offsets[j][0]
+                let ny = cy + neighbor_offsets[j][1]
+
+                if nx >= 0 && nx < self.cluster_grid_width && ny >= 0 && ny < self.cluster_grid_height {
+                    let neighbor_id = ny * self.cluster_grid_width + nx
 
                     // Check if there's a passable connection between clusters
-                    if self.check_cluster_connection(i as u32, neighbor_id) {
-                        connections.push(neighbor_id)
+                    if self.check_cluster_connection(i, neighbor_id) {
+                        cluster.add_connection(neighbor_id)
                     }
                 }
-            }
-
-            // Store connections
-            let cluster = &self.clusters[i]
-            cluster.connection_count = connections.len().min(8) as u32
-            for j in 0..cluster.connection_count {
-                cluster.connected_clusters[j as usize] = connections[j as usize]
             }
         }
     }
 
-    fn check_cluster_connection(&self, cluster_a: u32, cluster_b: u32): bool {
+    fn check_cluster_connection(&self, cluster_a: i32, cluster_b: i32): bool {
         // Simplified check - see if there's any passable cell along the border
         // A real implementation would be more thorough
-        true
+        return true
     }
 
-    // Main pathfinding function
-    fn find_path(&self, start: Vec2, goal: Vec2, locomotor: LocomotorType,
-                 unit_radius: f32): PathResult {
-        let start_x = (start.x / self.cell_size) as i32
-        let start_y = (start.y / self.cell_size) as i32
-        let goal_x = (goal.x / self.cell_size) as i32
-        let goal_y = (goal.y / self.cell_size) as i32
+    // ========================================================================
+    // Main Pathfinding
+    // ========================================================================
+
+    fn find_path(&self, start: Vec2, goal: Vec2, locomotor: LocomotorType, unit_radius: f32): PathResult {
+        let start_x = cast(i32, start.x / self.cell_size)
+        let start_y = cast(i32, start.y / self.cell_size)
+        let goal_x = cast(i32, goal.x / self.cell_size)
+        let goal_y = cast(i32, goal.y / self.cell_size)
 
         // Quick validation
         if !self.is_valid_cell(start_x, start_y) || !self.is_valid_cell(goal_x, goal_y) {
             return PathResult::invalid()
         }
 
-        // Check if start and goal are passable
+        // Check if start is passable
         if !self.is_passable(start_x, start_y, locomotor) {
             return PathResult::invalid()
         }
 
         // Use hierarchical path for long distances
-        let dist_sq = ((goal_x - start_x) * (goal_x - start_x) +
-                       (goal_y - start_y) * (goal_y - start_y)) as f32
-        let use_hierarchical = dist_sq > (CLUSTER_SIZE * CLUSTER_SIZE * 4) as f32
+        let dx = goal_x - start_x
+        let dy = goal_y - start_y
+        let dist_sq = cast(f32, dx * dx + dy * dy)
+        let use_hierarchical = dist_sq > cast(f32, CLUSTER_SIZE * CLUSTER_SIZE * 4)
 
         if use_hierarchical {
             return self.find_hierarchical_path(start_x, start_y, goal_x, goal_y, locomotor)
         }
 
-        self.find_direct_path(start_x, start_y, goal_x, goal_y, locomotor)
+        return self.find_direct_path(start_x, start_y, goal_x, goal_y, locomotor)
     }
 
-    fn find_direct_path(&self, start_x: i32, start_y: i32, goal_x: i32, goal_y: i32,
-                        locomotor: LocomotorType): PathResult {
-        // Reset node pool
-        self.node_map.clear()
-        self.open_list.clear()
+    fn find_direct_path(&self, start_x: i32, start_y: i32, goal_x: i32, goal_y: i32, locomotor: LocomotorType): PathResult {
+        // Reset node map and open list
+        self.node_map_keys = []
+        self.node_map_values = []
+        self.node_map_count = 0
+        self.open_list = []
+        self.open_list_count = 0
+        self.node_count = 0
 
         // Initialize start node
         let start_idx = self.get_or_create_node(start_x, start_y)
         let h = self.heuristic(start_x, start_y, goal_x, goal_y)
 
-        self.node_pool[start_idx as usize].g_cost = 0.0
-        self.node_pool[start_idx as usize].h_cost = h
-        self.node_pool[start_idx as usize].f_cost = h
-        self.node_pool[start_idx as usize].is_open = true
+        self.node_pool[start_idx].g_cost = 0.0
+        self.node_pool[start_idx].h_cost = h
+        self.node_pool[start_idx].f_cost = h
+        self.node_pool[start_idx].is_open = true
 
-        self.open_list.push(start_idx)
+        self.open_list = self.open_list + [start_idx]
+        self.open_list_count = self.open_list_count + 1
 
-        let mut iterations: u32 = 0
-        let mut found_goal = false
-        let mut goal_node_idx: u32 = 0
+        let iterations = 0
+        let found_goal = false
+        let goal_node_idx = 0
 
-        while !self.open_list.is_empty() && iterations < self.max_iterations {
-            iterations += 1
+        while self.open_list_count > 0 && iterations < self.max_iterations {
+            iterations = iterations + 1
 
             // Get lowest f_cost node
             let current_idx = self.pop_lowest_f_cost()
-            let current = &self.node_pool[current_idx as usize]
+            let current = self.node_pool[current_idx]
             let current_x = current.x
             let current_y = current.y
 
@@ -372,24 +534,28 @@ impl Pathfinder {
             }
 
             // Mark as closed
-            self.node_pool[current_idx as usize].is_closed = true
-            self.node_pool[current_idx as usize].is_open = false
+            self.node_pool[current_idx].is_closed = true
+            self.node_pool[current_idx].is_open = false
 
-            // Expand neighbors
-            let neighbors = [
-                (current_x - 1, current_y - 1, self.diagonal_cost),
-                (current_x, current_y - 1, 1.0),
-                (current_x + 1, current_y - 1, self.diagonal_cost),
-                (current_x - 1, current_y, 1.0),
-                (current_x + 1, current_y, 1.0),
-                (current_x - 1, current_y + 1, self.diagonal_cost),
-                (current_x, current_y + 1, 1.0),
-                (current_x + 1, current_y + 1, self.diagonal_cost),
+            // Expand neighbors (8 directions)
+            let neighbor_offsets = [
+                [-1, -1, self.diagonal_cost],
+                [0, -1, 1.0],
+                [1, -1, self.diagonal_cost],
+                [-1, 0, 1.0],
+                [1, 0, 1.0],
+                [-1, 1, self.diagonal_cost],
+                [0, 1, 1.0],
+                [1, 1, self.diagonal_cost],
             ]
 
-            let current_g = self.node_pool[current_idx as usize].g_cost
+            let current_g = self.node_pool[current_idx].g_cost
 
-            for (nx, ny, base_cost) in neighbors {
+            for i in 0..8 {
+                let nx = current_x + cast(i32, neighbor_offsets[i][0])
+                let ny = current_y + cast(i32, neighbor_offsets[i][1])
+                let base_cost = neighbor_offsets[i][2]
+
                 if !self.is_valid_cell(nx, ny) {
                     continue
                 }
@@ -399,7 +565,7 @@ impl Pathfinder {
                 }
 
                 let neighbor_idx = self.get_or_create_node(nx, ny)
-                let neighbor = &self.node_pool[neighbor_idx as usize]
+                let neighbor = self.node_pool[neighbor_idx]
 
                 if neighbor.is_closed {
                     continue
@@ -412,15 +578,16 @@ impl Pathfinder {
                 if !neighbor.is_open || new_g < neighbor.g_cost {
                     let h = self.heuristic(nx, ny, goal_x, goal_y)
 
-                    self.node_pool[neighbor_idx as usize].g_cost = new_g
-                    self.node_pool[neighbor_idx as usize].h_cost = h
-                    self.node_pool[neighbor_idx as usize].f_cost = new_g + h
-                    self.node_pool[neighbor_idx as usize].parent_x = current_x
-                    self.node_pool[neighbor_idx as usize].parent_y = current_y
+                    self.node_pool[neighbor_idx].g_cost = new_g
+                    self.node_pool[neighbor_idx].h_cost = h
+                    self.node_pool[neighbor_idx].f_cost = new_g + h
+                    self.node_pool[neighbor_idx].parent_x = current_x
+                    self.node_pool[neighbor_idx].parent_y = current_y
 
-                    if !self.node_pool[neighbor_idx as usize].is_open {
-                        self.node_pool[neighbor_idx as usize].is_open = true
-                        self.open_list.push(neighbor_idx)
+                    if !self.node_pool[neighbor_idx].is_open {
+                        self.node_pool[neighbor_idx].is_open = true
+                        self.open_list = self.open_list + [neighbor_idx]
+                        self.open_list_count = self.open_list_count + 1
                     }
                 }
             }
@@ -431,12 +598,10 @@ impl Pathfinder {
         }
 
         // No path found, return partial path to closest node
-        self.find_partial_path(goal_x, goal_y)
+        return self.find_partial_path(goal_x, goal_y)
     }
 
-    fn find_hierarchical_path(&self, start_x: i32, start_y: i32,
-                              goal_x: i32, goal_y: i32,
-                              locomotor: LocomotorType): PathResult {
+    fn find_hierarchical_path(&self, start_x: i32, start_y: i32, goal_x: i32, goal_y: i32, locomotor: LocomotorType): PathResult {
         // Find clusters for start and goal
         let start_cluster = self.get_cluster_at(start_x, start_y)
         let goal_cluster = self.get_cluster_at(goal_x, goal_y)
@@ -444,33 +609,33 @@ impl Pathfinder {
         // Path through clusters first
         let cluster_path = self.find_cluster_path(start_cluster, goal_cluster)
 
-        if cluster_path.is_empty() {
+        if cluster_path.length == 0 {
             return PathResult::invalid()
         }
 
         // Refine path with detailed pathfinding
-        let mut result = PathResult::new()
+        let result = PathResult::init()
 
-        let mut last_x = start_x
-        let mut last_y = start_y
+        let last_x = start_x
+        let last_y = start_y
 
-        for cluster_id in cluster_path {
-            let cluster = &self.clusters[cluster_id as usize]
+        for i in 0..cluster_path.length {
+            let cluster_id = cluster_path[i]
+            let cluster = self.clusters[cluster_id]
 
             // Find waypoint in cluster
-            let waypoint_x = cluster.center_x as i32
-            let waypoint_y = cluster.center_y as i32
+            let waypoint_x = cast(i32, cluster.center_x)
+            let waypoint_y = cast(i32, cluster.center_y)
 
             // Path to cluster center
             let segment = self.find_direct_path(last_x, last_y, waypoint_x, waypoint_y, locomotor)
 
             // Add segment waypoints
-            for i in 0..segment.waypoint_count {
-                if result.waypoint_count >= MAX_WAYPOINTS as u32 {
+            for j in 0..segment.waypoint_count {
+                if result.waypoint_count >= MAX_WAYPOINTS {
                     break
                 }
-                result.waypoints[result.waypoint_count as usize] = segment.waypoints[i as usize].clone()
-                result.waypoint_count += 1
+                result.add_waypoint(segment.waypoints[j].copy())
             }
 
             last_x = waypoint_x
@@ -480,427 +645,520 @@ impl Pathfinder {
         // Final segment to goal
         let final_segment = self.find_direct_path(last_x, last_y, goal_x, goal_y, locomotor)
         for i in 0..final_segment.waypoint_count {
-            if result.waypoint_count >= MAX_WAYPOINTS as u32 {
+            if result.waypoint_count >= MAX_WAYPOINTS {
                 break
             }
-            result.waypoints[result.waypoint_count as usize] = final_segment.waypoints[i as usize].clone()
-            result.waypoint_count += 1
+            result.add_waypoint(final_segment.waypoints[i].copy())
         }
 
         result.is_valid = true
-        result
+        return result
     }
 
-    fn find_cluster_path(&self, start_cluster: u32, goal_cluster: u32): Vec<u32> {
+    fn find_cluster_path(&self, start_cluster: i32, goal_cluster: i32): [i32] {
         // Simple BFS for cluster-level path
-        let mut visited = HashMap::new()
-        let mut queue = Vec::new()
-        let mut parent: HashMap<u32, u32> = HashMap::new()
+        let visited: [bool] = []
+        for i in 0..self.cluster_count {
+            visited = visited + [false]
+        }
 
-        queue.push(start_cluster)
-        visited.insert(start_cluster, true)
+        let parent: [i32] = []
+        for i in 0..self.cluster_count {
+            parent = parent + [-1]
+        }
 
-        while !queue.is_empty() {
-            let current = queue.remove(0)
+        let queue: [i32] = [start_cluster]
+        let queue_start = 0
+        visited[start_cluster] = true
+
+        while queue_start < queue.length {
+            let current = queue[queue_start]
+            queue_start = queue_start + 1
 
             if current == goal_cluster {
                 // Reconstruct path
-                let mut path = Vec::new()
-                let mut node = goal_cluster
+                let path: [i32] = []
+                let node = goal_cluster
 
                 while node != start_cluster {
-                    path.push(node)
-                    if let Some(p) = parent.get(&node) {
-                        node = *p
+                    path = [node] + path
+                    if parent[node] >= 0 {
+                        node = parent[node]
                     } else {
                         break
                     }
                 }
-                path.push(start_cluster)
-                path.reverse()
+                path = [start_cluster] + path
                 return path
             }
 
-            let cluster = &self.clusters[current as usize]
+            let cluster = self.clusters[current]
             for i in 0..cluster.connection_count {
-                let neighbor = cluster.connected_clusters[i as usize]
-                if !visited.contains_key(&neighbor) {
-                    visited.insert(neighbor, true)
-                    parent.insert(neighbor, current)
-                    queue.push(neighbor)
+                let neighbor = cluster.connected_clusters[i]
+                if !visited[neighbor] {
+                    visited[neighbor] = true
+                    parent[neighbor] = current
+                    queue = queue + [neighbor]
                 }
             }
         }
 
-        Vec::new()
+        return []
     }
 
-    fn reconstruct_path(&self, goal_idx: u32): PathResult {
-        let mut result = PathResult::new()
-        let mut path = Vec::new()
+    fn reconstruct_path(&self, goal_idx: i32): PathResult {
+        let result = PathResult::init()
+        let path: [Vec2] = []
 
-        let mut current_idx = goal_idx
+        let current_idx = goal_idx
 
         // Trace back from goal to start
-        loop {
-            let node = &self.node_pool[current_idx as usize]
-            path.push(Vec2 {
-                x: node.x as f32 * self.cell_size + self.cell_size / 2.0,
-                y: node.y as f32 * self.cell_size + self.cell_size / 2.0,
-            })
+        let max_steps = MAX_WAYPOINTS
+        let steps = 0
+
+        while steps < max_steps {
+            let node = self.node_pool[current_idx]
+            let waypoint = Vec2::new(
+                cast(f32, node.x) * self.cell_size + self.cell_size / 2.0,
+                cast(f32, node.y) * self.cell_size + self.cell_size / 2.0
+            )
+            path = [waypoint] + path
 
             if node.parent_x == node.x && node.parent_y == node.y {
-                break // Reached start
+                break  // Reached start
             }
 
             // Find parent node
             let parent_key = self.cell_key(node.parent_x, node.parent_y)
-            if let Some(parent_idx) = self.node_map.get(&parent_key) {
-                current_idx = *parent_idx
-            } else {
+            let parent_idx = self.find_node_by_key(parent_key)
+            if parent_idx < 0 {
                 break
             }
 
-            if path.len() > MAX_WAYPOINTS as usize {
-                break
-            }
+            current_idx = parent_idx
+            steps = steps + 1
         }
 
-        // Reverse to get start-to-goal order
-        path.reverse()
-
         // Apply path smoothing
-        let smoothed = self.smooth_path(&path)
+        let smoothed = self.smooth_path(path)
 
-        result.waypoint_count = smoothed.len().min(MAX_WAYPOINTS as usize) as u32
-        for i in 0..result.waypoint_count {
-            result.waypoints[i as usize] = smoothed[i as usize].clone()
+        for i in 0..smoothed.length {
+            if result.waypoint_count >= MAX_WAYPOINTS {
+                break
+            }
+            result.add_waypoint(smoothed[i])
         }
 
         result.is_valid = true
-        result.total_cost = self.node_pool[goal_idx as usize].g_cost
-        result
+        result.total_cost = self.node_pool[goal_idx].g_cost
+        return result
     }
 
-    fn smooth_path(&self, path: Vec<Vec2>): Vec<Vec2> {
-        if path.len() <= 2 {
-            return path.clone()
+    fn smooth_path(&self, path: [Vec2]): [Vec2] {
+        if path.length <= 2 {
+            return path
         }
 
-        let mut smoothed = Vec::new()
-        smoothed.push(path[0].clone())
+        let smoothed: [Vec2] = [path[0].copy()]
 
-        let mut current = 0
-        while current < path.len() - 1 {
+        let current = 0
+        while current < path.length - 1 {
             // Find furthest visible point
-            let mut furthest = current + 1
+            let furthest = current + 1
 
-            for i in (current + 2)..path.len() {
-                if self.has_line_of_sight(&path[current], &path[i]) {
+            for i in (current + 2)..path.length {
+                if self.has_line_of_sight(path[current], path[i]) {
                     furthest = i
                 }
             }
 
-            smoothed.push(path[furthest].clone())
+            smoothed = smoothed + [path[furthest].copy()]
             current = furthest
         }
 
-        smoothed
+        return smoothed
     }
 
     fn has_line_of_sight(&self, from: Vec2, to: Vec2): bool {
         // Bresenham line check
-        let x0 = (from.x / self.cell_size) as i32
-        let y0 = (from.y / self.cell_size) as i32
-        let x1 = (to.x / self.cell_size) as i32
-        let y1 = (to.y / self.cell_size) as i32
+        let x0 = cast(i32, from.x / self.cell_size)
+        let y0 = cast(i32, from.y / self.cell_size)
+        let x1 = cast(i32, to.x / self.cell_size)
+        let y1 = cast(i32, to.y / self.cell_size)
 
-        let dx = (x1 - x0).abs()
-        let dy = (y1 - y0).abs()
-        let sx = if x0 < x1 { 1 } else { -1 }
-        let sy = if y0 < y1 { 1 } else { -1 }
-        let mut err = dx - dy
+        let dx = abs_i32(x1 - x0)
+        let dy = abs_i32(y1 - y0)
+        let sx = 1
+        if x0 >= x1 {
+            sx = -1
+        }
+        let sy = 1
+        if y0 >= y1 {
+            sy = -1
+        }
+        let err = dx - dy
 
-        let mut x = x0
-        let mut y = y0
+        let x = x0
+        let y = y0
 
         while x != x1 || y != y1 {
-            let idx = (y * self.grid_width + x) as usize
-            if idx < self.nav_grid.len() && !self.nav_grid[idx].passable {
-                return false
+            let idx = y * self.grid_width + x
+            if idx >= 0 && idx < self.nav_grid.length {
+                if !self.nav_grid[idx].passable {
+                    return false
+                }
             }
 
             let e2 = 2 * err
             if e2 > -dy {
-                err -= dy
-                x += sx
+                err = err - dy
+                x = x + sx
             }
             if e2 < dx {
-                err += dx
-                y += sy
+                err = err + dx
+                y = y + sy
             }
         }
 
-        true
+        return true
     }
 
     fn find_partial_path(&self, goal_x: i32, goal_y: i32): PathResult {
         // Find closest visited node to goal
-        let mut best_idx: u32 = 0
-        let mut best_h: f32 = f32::MAX
+        let best_idx = 0
+        let best_h = MAX_FLOAT
 
-        for (_, idx) in &self.node_map {
-            let node = &self.node_pool[*idx as usize]
+        for i in 0..self.node_count {
+            let node = self.node_pool[i]
             if node.is_closed && node.h_cost < best_h {
                 best_h = node.h_cost
-                best_idx = *idx
-            }
-        }
-
-        if best_h < f32::MAX {
-            let mut result = self.reconstruct_path(best_idx)
-            result.is_partial = true
-            return result
-        }
-
-        PathResult::invalid()
-    }
-
-    // Helper functions
-    fn get_or_create_node(&self, x: i32, y: i32): u32 {
-        let key = self.cell_key(x, y)
-
-        if let Some(idx) = self.node_map.get(&key) {
-            return *idx
-        }
-
-        // Find free slot in pool
-        let idx = self.node_map.len() as u32
-
-        if idx >= MAX_PATH_NODES {
-            return 0 // Pool exhausted
-        }
-
-        self.node_pool[idx as usize] = PathNode {
-            x: x,
-            y: y,
-            g_cost: f32::MAX,
-            h_cost: 0.0,
-            f_cost: f32::MAX,
-            parent_x: x,
-            parent_y: y,
-            is_open: false,
-            is_closed: false,
-        }
-
-        self.node_map.insert(key, idx)
-        idx
-    }
-
-    fn pop_lowest_f_cost(&self): u32 {
-        if self.open_list.is_empty() {
-            return 0
-        }
-
-        let mut best_idx = 0
-        let mut best_f = f32::MAX
-
-        for i in 0..self.open_list.len() {
-            let node_idx = self.open_list[i]
-            let f = self.node_pool[node_idx as usize].f_cost
-
-            if f < best_f {
-                best_f = f
                 best_idx = i
             }
         }
 
-        self.open_list.remove(best_idx)
+        if best_h < MAX_FLOAT {
+            let result = self.reconstruct_path(best_idx)
+            result.is_partial = true
+            return result
+        }
+
+        return PathResult::invalid()
+    }
+
+    // ========================================================================
+    // Helper Functions
+    // ========================================================================
+
+    fn get_or_create_node(&self, x: i32, y: i32): i32 {
+        let key = self.cell_key(x, y)
+
+        // Check if node exists
+        let existing = self.find_node_by_key(key)
+        if existing >= 0 {
+            return existing
+        }
+
+        // Create new node
+        if self.node_count >= MAX_PATH_NODES {
+            return 0  // Pool exhausted
+        }
+
+        let idx = self.node_count
+        self.node_pool[idx].reset(x, y)
+
+        self.node_map_keys = self.node_map_keys + [key]
+        self.node_map_values = self.node_map_values + [idx]
+        self.node_map_count = self.node_map_count + 1
+        self.node_count = self.node_count + 1
+
+        return idx
+    }
+
+    fn find_node_by_key(&self, key: i64): i32 {
+        for i in 0..self.node_map_count {
+            if self.node_map_keys[i] == key {
+                return self.node_map_values[i]
+            }
+        }
+        return -1
+    }
+
+    fn pop_lowest_f_cost(&self): i32 {
+        if self.open_list_count == 0 {
+            return 0
+        }
+
+        let best_idx = 0
+        let best_f = MAX_FLOAT
+        let best_pos = 0
+
+        for i in 0..self.open_list_count {
+            let node_idx = self.open_list[i]
+            let f = self.node_pool[node_idx].f_cost
+
+            if f < best_f {
+                best_f = f
+                best_idx = node_idx
+                best_pos = i
+            }
+        }
+
+        // Remove from open list
+        let new_open_list: [i32] = []
+        for i in 0..self.open_list_count {
+            if i != best_pos {
+                new_open_list = new_open_list + [self.open_list[i]]
+            }
+        }
+        self.open_list = new_open_list
+        self.open_list_count = self.open_list_count - 1
+
+        return best_idx
     }
 
     fn heuristic(&self, x1: i32, y1: i32, x2: i32, y2: i32): f32 {
         // Octile distance
-        let dx = (x2 - x1).abs() as f32
-        let dy = (y2 - y1).abs() as f32
-        (dx + dy) + (self.diagonal_cost - 2.0) * dx.min(dy)
+        let dx = cast(f32, abs_i32(x2 - x1))
+        let dy = cast(f32, abs_i32(y2 - y1))
+        let min_d = dx
+        if dy < min_d {
+            min_d = dy
+        }
+        return (dx + dy) + (self.diagonal_cost - 2.0) * min_d
     }
 
-    fn cell_key(&self, x: i32, y: i32): u64 {
-        ((y as u64) << 32) | (x as u64)
+    fn cell_key(&self, x: i32, y: i32): i64 {
+        return cast(i64, y) * 1000000 + cast(i64, x)
     }
 
     fn is_valid_cell(&self, x: i32, y: i32): bool {
-        x >= 0 && x < self.grid_width && y >= 0 && y < self.grid_height
+        return x >= 0 && x < self.grid_width && y >= 0 && y < self.grid_height
     }
 
     fn is_passable(&self, x: i32, y: i32, locomotor: LocomotorType): bool {
-        let idx = (y * self.grid_width + x) as usize
-        if idx >= self.nav_grid.len() {
+        let idx = y * self.grid_width + x
+        if idx < 0 || idx >= self.nav_grid.length {
             return false
         }
 
-        let cell = &self.nav_grid[idx]
-        let flag = 1 << (locomotor as u32)
-        (cell.locomotor_flags & flag) != 0
+        let cell = self.nav_grid[idx]
+        let locomotor_bit = self.locomotor_to_bit(locomotor)
+        return (cell.locomotor_flags & locomotor_bit) != 0
+    }
+
+    fn locomotor_to_bit(&self, locomotor: LocomotorType): i32 {
+        if locomotor == LocomotorType::GROUND {
+            return 1 << 0
+        } else if locomotor == LocomotorType::AMPHIBIOUS {
+            return 1 << 1
+        } else if locomotor == LocomotorType::AIR {
+            return 1 << 2
+        } else if locomotor == LocomotorType::HOVER {
+            return 1 << 3
+        } else if locomotor == LocomotorType::CLIFF_CLIMBER {
+            return 1 << 4
+        } else if locomotor == LocomotorType::TANK {
+            return 1 << 5
+        } else if locomotor == LocomotorType::TWO_LEGS {
+            return 1 << 6
+        } else if locomotor == LocomotorType::FOUR_LEGS {
+            return 1 << 7
+        } else if locomotor == LocomotorType::WINGS_ON_GROUND {
+            return 1 << 8
+        } else if locomotor == LocomotorType::WINGS_IN_FLIGHT {
+            return 1 << 9
+        }
+        return 1
     }
 
     fn get_cell_cost(&self, x: i32, y: i32): f32 {
-        let idx = (y * self.grid_width + x) as usize
-        if idx >= self.nav_grid.len() {
-            return f32::MAX
+        let idx = y * self.grid_width + x
+        if idx < 0 || idx >= self.nav_grid.length {
+            return MAX_FLOAT
         }
 
-        self.nav_grid[idx].cost.max(1.0)
+        let cost = self.nav_grid[idx].cost
+        if cost < 1.0 {
+            return 1.0
+        }
+        return cost
     }
 
-    fn get_cluster_at(&self, x: i32, y: i32): u32 {
+    fn get_cluster_at(&self, x: i32, y: i32): i32 {
         let cx = x / CLUSTER_SIZE
         let cy = y / CLUSTER_SIZE
-        (cy * self.cluster_grid_width + cx) as u32
+        return cy * self.cluster_grid_width + cx
     }
 
-    // Mark cell as blocked/unblocked
+    // ========================================================================
+    // Cell Modification
+    // ========================================================================
+
     fn set_cell_blocked(&self, x: i32, y: i32, blocked: bool) {
-        let idx = (y * self.grid_width + x) as usize
-        if idx < self.nav_grid.len() {
+        let idx = y * self.grid_width + x
+        if idx >= 0 && idx < self.nav_grid.length {
             self.nav_grid[idx].passable = !blocked
         }
     }
 
     fn set_cell_cost(&self, x: i32, y: i32, cost: f32) {
-        let idx = (y * self.grid_width + x) as usize
-        if idx < self.nav_grid.len() {
+        let idx = y * self.grid_width + x
+        if idx >= 0 && idx < self.nav_grid.length {
             self.nav_grid[idx].cost = cost
         }
     }
 
-    // Async pathfinding
-    fn request_path(&self, start: Vec2, goal: Vec2, locomotor: LocomotorType,
-                    unit_radius: f32): u32 {
-        if self.request_count >= MAX_PATH_REQUESTS as u32 {
+    // ========================================================================
+    // Async Pathfinding
+    // ========================================================================
+
+    fn request_path(&self, start: Vec2, goal: Vec2, locomotor: LocomotorType, unit_radius: f32): i32 {
+        if self.request_count >= MAX_PATH_REQUESTS {
             return 0
         }
 
         let request_id = self.next_request_id
-        self.next_request_id += 1
+        self.next_request_id = self.next_request_id + 1
 
-        let idx = self.request_count as usize
-        self.pending_requests[idx] = PathRequest {
-            request_id: request_id,
-            start: start,
-            goal: goal,
-            locomotor: locomotor,
-            unit_radius: unit_radius,
-            is_complete: false,
-            result: PathResult::new(),
-        }
-        self.request_count += 1
+        let request = PathRequest::init()
+        request.request_id = request_id
+        request.start = start
+        request.goal = goal
+        request.locomotor = locomotor
+        request.unit_radius = unit_radius
+        request.is_complete = false
 
-        request_id
+        self.pending_requests = self.pending_requests + [request]
+        self.request_count = self.request_count + 1
+
+        return request_id
     }
 
-    fn process_pending_requests(&self, max_count: u32) {
-        let mut processed: u32 = 0
+    fn process_pending_requests(&self, max_count: i32) {
+        let processed = 0
 
         for i in 0..self.request_count {
             if processed >= max_count {
                 break
             }
 
-            let request = &self.pending_requests[i as usize]
+            let request = self.pending_requests[i]
             if !request.is_complete {
                 request.result = self.find_path(
-                    request.start.clone(),
-                    request.goal.clone(),
+                    request.start.copy(),
+                    request.goal.copy(),
                     request.locomotor,
                     request.unit_radius
                 )
                 request.is_complete = true
-                processed += 1
+                processed = processed + 1
             }
         }
     }
 
-    fn get_path_result(&self, request_id: u32): Option<&PathResult> {
+    fn get_path_result(&self, request_id: i32): PathResult? {
         for i in 0..self.request_count {
-            let request = &self.pending_requests[i as usize]
+            let request = self.pending_requests[i]
             if request.request_id == request_id && request.is_complete {
-                return Some(&request.result)
+                return request.result
             }
         }
-        None
+        return null
     }
 }
 
-impl Default for PathNode {
-    fn default(): Self {
-        PathNode {
-            x: 0,
-            y: 0,
-            g_cost: f32::MAX,
-            h_cost: 0.0,
-            f_cost: f32::MAX,
-            parent_x: 0,
-            parent_y: 0,
-            is_open: false,
-            is_closed: false,
+// ============================================================================
+// GLOBAL PATHFINDER INSTANCE
+// ============================================================================
+
+let g_pathfinder: Pathfinder? = null
+
+fn init_pathfinder(width: i32, height: i32, cell_size: f32): Pathfinder {
+    let pf = Pathfinder::init(width, height, cell_size)
+    g_pathfinder = pf
+    return pf
+}
+
+fn get_pathfinder(): Pathfinder? {
+    return g_pathfinder
+}
+
+fn shutdown_pathfinder() {
+    g_pathfinder = null
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn min_i32(a: i32, b: i32): i32 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn abs_i32(x: i32): i32 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+fn sqrt(x: f32): f32 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    // Newton's method approximation
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_pathfinder() {
+    print("Testing Pathfinder...")
+
+    // Create a 100x100 grid with 1.0 cell size
+    let pf = init_pathfinder(100, 100, 1.0)
+    print("Pathfinder created: " + str(pf.grid_width) + "x" + str(pf.grid_height))
+    print("Clusters: " + str(pf.cluster_count))
+
+    // Test simple path
+    let start = Vec2::new(10.0, 10.0)
+    let goal = Vec2::new(50.0, 50.0)
+    let result = pf.find_path(start, goal, LocomotorType::GROUND, 1.0)
+
+    print("Path found: " + str(result.is_valid))
+    print("Waypoints: " + str(result.waypoint_count))
+    print("Total cost: " + str(result.total_cost))
+
+    // Test blocked path
+    for x in 25..30 {
+        for y in 0..100 {
+            pf.set_cell_blocked(x, y, true)
         }
     }
-}
 
-impl Default for NavCell {
-    fn default(): Self {
-        NavCell {
-            passable: true,
-            cost: 1.0,
-            height: 0.0,
-            slope: 0.0,
-            locomotor_flags: 0xFFFFFFFF, // All by default
-            bridge: false,
-            water: false,
-            cliff: false,
-        }
-    }
-}
+    let result2 = pf.find_path(start, goal, LocomotorType::GROUND, 1.0)
+    print("Blocked path valid: " + str(result2.is_valid))
+    print("Blocked path partial: " + str(result2.is_partial))
 
-impl Default for Vec2 {
-    fn default(): Self {
-        Vec2 { x: 0.0, y: 0.0 }
-    }
-}
+    // Test async pathfinding
+    let request_id = pf.request_path(start, goal, LocomotorType::GROUND, 1.0)
+    print("Async request ID: " + str(request_id))
 
-impl Clone for Vec2 {
-    fn clone(&self): Self {
-        Vec2 { x: self.x, y: self.y }
-    }
-}
-
-impl PathResult {
-    fn new(): Self {
-        PathResult {
-            waypoints: [Vec2::default(); MAX_WAYPOINTS as usize],
-            waypoint_count: 0,
-            is_valid: false,
-            is_partial: false,
-            total_cost: 0.0,
-        }
+    pf.process_pending_requests(10)
+    let async_result = pf.get_path_result(request_id)
+    if async_result != null {
+        print("Async path waypoints: " + str(async_result.waypoint_count))
     }
 
-    fn invalid(): Self {
-        PathResult::new()
-    }
-}
-
-impl Default for PathRequest {
-    fn default(): Self {
-        PathRequest {
-            request_id: 0,
-            start: Vec2::default(),
-            goal: Vec2::default(),
-            locomotor: LocomotorType::Ground,
-            unit_radius: 1.0,
-            is_complete: false,
-            result: PathResult::new(),
-        }
-    }
+    shutdown_pathfinder()
+    print("Pathfinder tests complete!")
 }

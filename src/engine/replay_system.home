@@ -1,12 +1,17 @@
+// C&C Generals Zero Hour - Home Port
 // Replay System - Record and playback game replays
+//
+// Original: ReplaySystem from Thyme/SAGE engine
 // Implements authentic C&C Generals Zero Hour replay functionality
 
-// ============================================================================
-// REPLAY FORMAT
-// ============================================================================
+let REPLAY_VERSION: i32 = 6   // Zero Hour replay version
+let MAX_REPLAY_COMMANDS: i32 = 1048576
+let MAX_COMPRESSED_SIZE: i32 = 16777216
+let MAX_UNITS_PER_COMMAND: i32 = 64
 
-let REPLAY_SIGNATURE: [u8; 4] = [0x47, 0x45, 0x4E, 0x52]  // "GENR"
-let REPLAY_VERSION: u32 = 6  // Zero Hour replay version
+// ============================================================================
+// ENUMS
+// ============================================================================
 
 enum ReplayCommandType {
     // Unit commands
@@ -17,125 +22,70 @@ enum ReplayCommandType {
     GUARD,
     STOP,
     SCATTER,
-
     // Building commands
     BUILD_UNIT,
     BUILD_BUILDING,
     SELL_BUILDING,
     CANCEL_BUILD,
-
     // Special commands
     USE_ABILITY,
     USE_SUPERWEAPON,
     SET_RALLY_POINT,
-
     // Control groups
     SELECT_UNITS,
     CREATE_GROUP,
     SELECT_GROUP,
     ADD_TO_GROUP,
-
     // Game commands
     SET_STANCE,
     UPGRADE,
     EVACUATE,
     ENTER_VEHICLE,
     EXIT_VEHICLE,
-
     // Meta
     CHAT_MESSAGE,
     PAUSE_GAME,
     SURRENDER,
-    GAME_SPEED
+    GAME_SPEED,
 }
+
+enum PlaybackState {
+    STOPPED,
+    PLAYING,
+    PAUSED,
+    FAST_FORWARD,
+    REWIND,
+}
+
+// ============================================================================
+// REPLAY HEADER
+// ============================================================================
 
 struct ReplayHeader {
-    signature: [u8; 4],
-    version: u32,
-    timestamp: u64,
-    game_duration_frames: u32,
-    random_seed: u32,
-
-    // Map info
-    map_name: [u8; 128],
-    map_crc: u32,
-
-    // Players
-    player_count: u8,
-    player_names: [[u8; 32]; 8],
-    player_factions: [u8; 8],
-    player_colors: [u8; 8],
-    player_positions: [u8; 8],
-    player_generals: [u8; 8],
-    player_teams: [u8; 8],
-    player_is_ai: [bool; 8],
-    ai_difficulty: [u8; 8],
-
-    // Game settings
-    starting_cash: u32,
+    version: i32,
+    timestamp: i64,
+    game_duration_frames: i32,
+    random_seed: i32,
+    map_name: string,
+    map_crc: i32,
+    player_count: i32,
+    player_names: [string],
+    player_factions: [i32],
+    player_colors: [i32],
+    player_positions: [i32],
+    player_generals: [i32],
+    player_teams: [i32],
+    player_is_ai: [bool],
+    ai_difficulty: [i32],
+    starting_cash: i32,
     superweapons_enabled: bool,
     crates_enabled: bool,
-    build_time_multiplier: f32
+    build_time_multiplier: f32,
 }
 
-struct ReplayCommand {
-    frame: u32,
-    player_id: u8,
-    command_type: ReplayCommandType,
-
-    // Command data (varies by type)
-    target_x: f32,
-    target_y: f32,
-    target_z: f32,
-    target_object_id: u32,
-    source_object_ids: [u32; 64],
-    source_count: u8,
-
-    // Extra data
-    ability_id: u32,
-    building_type: u32,
-    unit_type: u32,
-    upgrade_type: u32,
-    group_number: u8,
-    stance: u8,
-    chat_message: [u8; 256]
-}
-
-struct ReplayFile {
-    header: ReplayHeader,
-    commands: [ReplayCommand; 1048576],  // 1M commands max
-    command_count: u32,
-
-    // Compressed data
-    compressed_data: [u8; 16777216],
-    compressed_size: u32
-}
-
-// ============================================================================
-// REPLAY RECORDER
-// ============================================================================
-
-struct ReplayRecorder {
-    is_recording: bool,
-    current_frame: u32,
-    start_time: u64,
-
-    header: ReplayHeader,
-    commands: [ReplayCommand; 1048576],
-    command_count: u32,
-
-    // Buffer for pending commands
-    pending_commands: [ReplayCommand; 256],
-    pending_count: u32
-}
-
-fn create_replay_recorder(): ReplayRecorder {
-    return ReplayRecorder {
-        is_recording: false,
-        current_frame: 0,
-        start_time: 0,
-        header: ReplayHeader {
-            signature: REPLAY_SIGNATURE,
+impl ReplayHeader {
+    fn init(): ReplayHeader {
+        return ReplayHeader {
             version: REPLAY_VERSION,
             timestamp: 0,
             game_duration_frames: 0,
@@ -154,472 +104,439 @@ fn create_replay_recorder(): ReplayRecorder {
             starting_cash: 10000,
             superweapons_enabled: true,
             crates_enabled: true,
-            build_time_multiplier: 1.0
-        },
-        commands: [],
-        command_count: 0,
-        pending_commands: [],
-        pending_count: 0
-    }
-}
-
-fn start_recording(recorder: mut ReplayRecorder, map_name: [u8; 128], seed: u32) {
-    recorder.is_recording = true
-    recorder.current_frame = 0
-    recorder.command_count = 0
-    recorder.pending_count = 0
-
-    recorder.header.signature = REPLAY_SIGNATURE
-    recorder.header.version = REPLAY_VERSION
-    recorder.header.timestamp = get_current_timestamp()
-    recorder.header.random_seed = seed
-    recorder.header.map_name = map_name
-
-    recorder.start_time = get_current_timestamp()
-}
-
-fn stop_recording(recorder: mut ReplayRecorder) {
-    recorder.is_recording = false
-    recorder.header.game_duration_frames = recorder.current_frame
-
-    // Flush pending commands
-    flush_pending_commands(recorder)
-}
-
-fn record_command(recorder: mut ReplayRecorder, cmd: ReplayCommand) {
-    if not recorder.is_recording {
-        return
-    }
-
-    let mut command: ReplayCommand = cmd
-    command.frame = recorder.current_frame
-
-    // Add to pending buffer
-    if recorder.pending_count < 256 {
-        recorder.pending_commands[recorder.pending_count] = command
-        recorder.pending_count = recorder.pending_count + 1
-    }
-
-    // Flush if buffer getting full
-    if recorder.pending_count >= 200 {
-        flush_pending_commands(recorder)
-    }
-}
-
-fn flush_pending_commands(recorder: mut ReplayRecorder) {
-    for i in 0..cast(i32, recorder.pending_count) {
-        if recorder.command_count < 1048576 {
-            recorder.commands[recorder.command_count] = recorder.pending_commands[i]
-            recorder.command_count = recorder.command_count + 1
+            build_time_multiplier: 1.0,
         }
     }
-    recorder.pending_count = 0
 }
 
-fn advance_frame(recorder: mut ReplayRecorder) {
-    if recorder.is_recording {
-        recorder.current_frame = recorder.current_frame + 1
+// ============================================================================
+// REPLAY COMMAND
+// ============================================================================
+
+struct ReplayCommand {
+    frame: i32,
+    player_id: i32,
+    command_type: ReplayCommandType,
+    target_x: f32,
+    target_y: f32,
+    target_z: f32,
+    target_object_id: i32,
+    source_object_ids: [i32],
+    source_count: i32,
+    ability_id: i32,
+    building_type: i32,
+    unit_type: i32,
+    upgrade_type: i32,
+    group_number: i32,
+    stance: i32,
+    chat_message: string,
+}
+
+impl ReplayCommand {
+    fn init(): ReplayCommand {
+        return ReplayCommand {
+            frame: 0,
+            player_id: 0,
+            command_type: ReplayCommandType::MOVE,
+            target_x: 0.0,
+            target_y: 0.0,
+            target_z: 0.0,
+            target_object_id: 0,
+            source_object_ids: [],
+            source_count: 0,
+            ability_id: 0,
+            building_type: 0,
+            unit_type: 0,
+            upgrade_type: 0,
+            group_number: 0,
+            stance: 0,
+            chat_message: "",
+        }
     }
 }
 
-fn add_player_info(recorder: mut ReplayRecorder, player_id: u8, name: [u8; 32],
-                   faction: u8, color: u8, position: u8, general: u8, team: u8,
-                   is_ai: bool, ai_diff: u8) {
-    if player_id < 8 {
-        recorder.header.player_names[player_id] = name
-        recorder.header.player_factions[player_id] = faction
-        recorder.header.player_colors[player_id] = color
-        recorder.header.player_positions[player_id] = position
-        recorder.header.player_generals[player_id] = general
-        recorder.header.player_teams[player_id] = team
-        recorder.header.player_is_ai[player_id] = is_ai
-        recorder.header.ai_difficulty[player_id] = ai_diff
-        recorder.header.player_count = recorder.header.player_count + 1
+// ============================================================================
+// REPLAY FILE
+// ============================================================================
+
+struct ReplayFile {
+    header: ReplayHeader,
+    commands: [ReplayCommand],
+    compressed_data: [i32],
+    compressed_size: i32,
+}
+
+impl ReplayFile {
+    fn init(): ReplayFile {
+        return ReplayFile {
+            header: ReplayHeader::init(),
+            commands: [],
+            compressed_data: [],
+            compressed_size: 0,
+        }
     }
 }
 
-// Helper functions for recording specific commands
-fn record_move_command(recorder: mut ReplayRecorder, player: u8, units: [u32; 64],
-                       count: u8, x: f32, y: f32, z: f32) {
-    let cmd: ReplayCommand = ReplayCommand {
-        frame: recorder.current_frame,
-        player_id: player,
-        command_type: ReplayCommandType::MOVE,
-        target_x: x,
-        target_y: y,
-        target_z: z,
-        target_object_id: 0,
-        source_object_ids: units,
-        source_count: count,
-        ability_id: 0,
-        building_type: 0,
-        unit_type: 0,
-        upgrade_type: 0,
-        group_number: 0,
-        stance: 0,
-        chat_message: ""
-    }
-    record_command(recorder, cmd)
+// ============================================================================
+// REPLAY RECORDER
+// ============================================================================
+
+struct ReplayRecorder {
+    is_recording: bool,
+    current_frame: i32,
+    start_time: i64,
+    header: ReplayHeader,
+    commands: [ReplayCommand],
+    pending_commands: [ReplayCommand],
 }
 
-fn record_attack_command(recorder: mut ReplayRecorder, player: u8, units: [u32; 64],
-                         count: u8, target: u32) {
-    let cmd: ReplayCommand = ReplayCommand {
-        frame: recorder.current_frame,
-        player_id: player,
-        command_type: ReplayCommandType::ATTACK,
-        target_x: 0.0,
-        target_y: 0.0,
-        target_z: 0.0,
-        target_object_id: target,
-        source_object_ids: units,
-        source_count: count,
-        ability_id: 0,
-        building_type: 0,
-        unit_type: 0,
-        upgrade_type: 0,
-        group_number: 0,
-        stance: 0,
-        chat_message: ""
+impl ReplayRecorder {
+    fn init(): ReplayRecorder {
+        return ReplayRecorder {
+            is_recording: false,
+            current_frame: 0,
+            start_time: 0,
+            header: ReplayHeader::init(),
+            commands: [],
+            pending_commands: [],
+        }
     }
-    record_command(recorder, cmd)
-}
 
-fn record_build_unit(recorder: mut ReplayRecorder, player: u8, building: u32, unit_type: u32) {
-    let cmd: ReplayCommand = ReplayCommand {
-        frame: recorder.current_frame,
-        player_id: player,
-        command_type: ReplayCommandType::BUILD_UNIT,
-        target_x: 0.0,
-        target_y: 0.0,
-        target_z: 0.0,
-        target_object_id: building,
-        source_object_ids: [],
-        source_count: 0,
-        ability_id: 0,
-        building_type: 0,
-        unit_type: unit_type,
-        upgrade_type: 0,
-        group_number: 0,
-        stance: 0,
-        chat_message: ""
-    }
-    record_command(recorder, cmd)
-}
+    fn start_recording(&self, map_name: string, seed: i32) {
+        self.is_recording = true
+        self.current_frame = 0
+        self.commands = []
+        self.pending_commands = []
 
-fn record_ability_use(recorder: mut ReplayRecorder, player: u8, ability: u32,
-                      x: f32, y: f32, z: f32) {
-    let cmd: ReplayCommand = ReplayCommand {
-        frame: recorder.current_frame,
-        player_id: player,
-        command_type: ReplayCommandType::USE_ABILITY,
-        target_x: x,
-        target_y: y,
-        target_z: z,
-        target_object_id: 0,
-        source_object_ids: [],
-        source_count: 0,
-        ability_id: ability,
-        building_type: 0,
-        unit_type: 0,
-        upgrade_type: 0,
-        group_number: 0,
-        stance: 0,
-        chat_message: ""
+        self.header.version = REPLAY_VERSION
+        self.header.timestamp = get_current_timestamp()
+        self.header.random_seed = seed
+        self.header.map_name = map_name
+
+        self.start_time = get_current_timestamp()
     }
-    record_command(recorder, cmd)
+
+    fn stop_recording(&self) {
+        self.is_recording = false
+        self.header.game_duration_frames = self.current_frame
+
+        // Flush pending commands
+        self.flush_pending_commands()
+    }
+
+    fn record_command(&self, cmd: ReplayCommand) {
+        if !self.is_recording {
+            return
+        }
+
+        let command = cmd
+        command.frame = self.current_frame
+
+        // Add to pending buffer
+        if self.pending_commands.length < 256 {
+            self.pending_commands = self.pending_commands + [command]
+        }
+
+        // Flush if buffer getting full
+        if self.pending_commands.length >= 200 {
+            self.flush_pending_commands()
+        }
+    }
+
+    fn flush_pending_commands(&self) {
+        for i in 0..self.pending_commands.length {
+            if self.commands.length < MAX_REPLAY_COMMANDS {
+                self.commands = self.commands + [self.pending_commands[i]]
+            }
+        }
+        self.pending_commands = []
+    }
+
+    fn advance_frame(&self) {
+        if self.is_recording {
+            self.current_frame = self.current_frame + 1
+        }
+    }
+
+    fn add_player_info(&self, player_id: i32, name: string, faction: i32, color: i32, position: i32, general: i32, team: i32, is_ai: bool, ai_diff: i32) {
+        if player_id < 8 {
+            self.header.player_names = self.header.player_names + [name]
+            self.header.player_factions = self.header.player_factions + [faction]
+            self.header.player_colors = self.header.player_colors + [color]
+            self.header.player_positions = self.header.player_positions + [position]
+            self.header.player_generals = self.header.player_generals + [general]
+            self.header.player_teams = self.header.player_teams + [team]
+            self.header.player_is_ai = self.header.player_is_ai + [is_ai]
+            self.header.ai_difficulty = self.header.ai_difficulty + [ai_diff]
+            self.header.player_count = self.header.player_count + 1
+        }
+    }
+
+    fn record_move_command(&self, player: i32, units: [i32], x: f32, y: f32, z: f32) {
+        let cmd = ReplayCommand {
+            frame: self.current_frame,
+            player_id: player,
+            command_type: ReplayCommandType::MOVE,
+            target_x: x,
+            target_y: y,
+            target_z: z,
+            target_object_id: 0,
+            source_object_ids: units,
+            source_count: units.length,
+            ability_id: 0,
+            building_type: 0,
+            unit_type: 0,
+            upgrade_type: 0,
+            group_number: 0,
+            stance: 0,
+            chat_message: "",
+        }
+        self.record_command(cmd)
+    }
+
+    fn record_attack_command(&self, player: i32, units: [i32], target: i32) {
+        let cmd = ReplayCommand {
+            frame: self.current_frame,
+            player_id: player,
+            command_type: ReplayCommandType::ATTACK,
+            target_x: 0.0,
+            target_y: 0.0,
+            target_z: 0.0,
+            target_object_id: target,
+            source_object_ids: units,
+            source_count: units.length,
+            ability_id: 0,
+            building_type: 0,
+            unit_type: 0,
+            upgrade_type: 0,
+            group_number: 0,
+            stance: 0,
+            chat_message: "",
+        }
+        self.record_command(cmd)
+    }
+
+    fn record_build_unit(&self, player: i32, building: i32, unit_type: i32) {
+        let cmd = ReplayCommand {
+            frame: self.current_frame,
+            player_id: player,
+            command_type: ReplayCommandType::BUILD_UNIT,
+            target_x: 0.0,
+            target_y: 0.0,
+            target_z: 0.0,
+            target_object_id: building,
+            source_object_ids: [],
+            source_count: 0,
+            ability_id: 0,
+            building_type: 0,
+            unit_type: unit_type,
+            upgrade_type: 0,
+            group_number: 0,
+            stance: 0,
+            chat_message: "",
+        }
+        self.record_command(cmd)
+    }
+
+    fn record_ability_use(&self, player: i32, ability: i32, x: f32, y: f32, z: f32) {
+        let cmd = ReplayCommand {
+            frame: self.current_frame,
+            player_id: player,
+            command_type: ReplayCommandType::USE_ABILITY,
+            target_x: x,
+            target_y: y,
+            target_z: z,
+            target_object_id: 0,
+            source_object_ids: [],
+            source_count: 0,
+            ability_id: ability,
+            building_type: 0,
+            unit_type: 0,
+            upgrade_type: 0,
+            group_number: 0,
+            stance: 0,
+            chat_message: "",
+        }
+        self.record_command(cmd)
+    }
+
+    fn get_command_count(&self): i32 {
+        return self.commands.length
+    }
 }
 
 // ============================================================================
 // REPLAY PLAYER
 // ============================================================================
 
-enum PlaybackState {
-    STOPPED,
-    PLAYING,
-    PAUSED,
-    FAST_FORWARD,
-    REWIND
-}
-
 struct ReplayPlayer {
     state: PlaybackState,
-    current_frame: u32,
+    current_frame: i32,
     playback_speed: f32,
-
     replay: ReplayFile,
-    command_index: u32,
-
-    // Playback controls
-    target_frame: u32,
+    command_index: i32,
+    target_frame: i32,
     seeking: bool,
-
-    // Camera following
-    follow_player: i8,  // -1 = free camera
-
-    // Timeline scrubbing
+    follow_player: i32,   // -1 = free camera
     timeline_position: f32,
-
-    // Observers
-    show_all_players: bool
+    show_all_players: bool,
 }
 
-fn create_replay_player(): ReplayPlayer {
-    return ReplayPlayer {
-        state: PlaybackState::STOPPED,
-        current_frame: 0,
-        playback_speed: 1.0,
-        replay: ReplayFile {
-            header: ReplayHeader {
-                signature: [0; 4],
-                version: 0,
-                timestamp: 0,
-                game_duration_frames: 0,
-                random_seed: 0,
-                map_name: "",
-                map_crc: 0,
-                player_count: 0,
-                player_names: [],
-                player_factions: [],
-                player_colors: [],
-                player_positions: [],
-                player_generals: [],
-                player_teams: [],
-                player_is_ai: [],
-                ai_difficulty: [],
-                starting_cash: 0,
-                superweapons_enabled: true,
-                crates_enabled: true,
-                build_time_multiplier: 1.0
-            },
-            commands: [],
-            command_count: 0,
-            compressed_data: [],
-            compressed_size: 0
-        },
-        command_index: 0,
-        target_frame: 0,
-        seeking: false,
-        follow_player: -1,
-        timeline_position: 0.0,
-        show_all_players: true
-    }
-}
-
-fn load_replay(player: mut ReplayPlayer, data: [u8; 16777216], size: u32): bool {
-    // Check signature
-    if data[0] != REPLAY_SIGNATURE[0] or data[1] != REPLAY_SIGNATURE[1] or
-       data[2] != REPLAY_SIGNATURE[2] or data[3] != REPLAY_SIGNATURE[3] {
-        return false
-    }
-
-    // Parse header
-    player.replay.header.signature[0] = data[0]
-    player.replay.header.signature[1] = data[1]
-    player.replay.header.signature[2] = data[2]
-    player.replay.header.signature[3] = data[3]
-
-    player.replay.header.version = read_u32_le(data, 4)
-    player.replay.header.timestamp = read_u64_le(data, 8)
-    player.replay.header.game_duration_frames = read_u32_le(data, 16)
-    player.replay.header.random_seed = read_u32_le(data, 20)
-
-    // Read map name (128 bytes starting at offset 24)
-    for i in 0..128 {
-        player.replay.header.map_name[i] = data[24 + i]
-    }
-
-    player.replay.header.map_crc = read_u32_le(data, 152)
-    player.replay.header.player_count = data[156]
-
-    // Parse player data (starting at offset 157)
-    let player_data_offset: i32 = 157
-    for i in 0..8 {
-        // Player name (32 bytes each)
-        for j in 0..32 {
-            player.replay.header.player_names[i][j] = data[player_data_offset + i * 32 + j]
+impl ReplayPlayer {
+    fn init(): ReplayPlayer {
+        return ReplayPlayer {
+            state: PlaybackState::STOPPED,
+            current_frame: 0,
+            playback_speed: 1.0,
+            replay: ReplayFile::init(),
+            command_index: 0,
+            target_frame: 0,
+            seeking: false,
+            follow_player: -1,
+            timeline_position: 0.0,
+            show_all_players: true,
         }
     }
 
-    // Parse commands (compressed section)
-    // Would decompress and parse command stream
+    fn load_replay(&self, data: [i32]): bool {
+        // Check signature ("GENR" = 0x47, 0x45, 0x4E, 0x52)
+        if data.length < 8 {
+            return false
+        }
 
-    player.state = PlaybackState::STOPPED
-    player.current_frame = 0
-    player.command_index = 0
+        if data[0] != 0x47 || data[1] != 0x45 || data[2] != 0x4E || data[3] != 0x52 {
+            return false
+        }
 
-    return true
-}
+        // Parse header
+        self.replay.header.version = read_u32_le(data, 4)
+        self.replay.header.timestamp = read_u64_le(data, 8)
+        self.replay.header.game_duration_frames = read_u32_le(data, 16)
+        self.replay.header.random_seed = read_u32_le(data, 20)
 
-fn play_replay(player: mut ReplayPlayer) {
-    player.state = PlaybackState::PLAYING
-}
+        // Read map name would go here
 
-fn pause_replay(player: mut ReplayPlayer) {
-    player.state = PlaybackState::PAUSED
-}
+        self.state = PlaybackState::STOPPED
+        self.current_frame = 0
+        self.command_index = 0
 
-fn stop_replay(player: mut ReplayPlayer) {
-    player.state = PlaybackState::STOPPED
-    player.current_frame = 0
-    player.command_index = 0
-}
+        return true
+    }
 
-fn set_playback_speed(player: mut ReplayPlayer, speed: f32) {
-    // Valid speeds: 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
-    if speed >= 0.25 and speed <= 8.0 {
-        player.playback_speed = speed
+    fn play(&self) {
+        self.state = PlaybackState::PLAYING
+    }
 
-        if speed > 1.0 {
-            player.state = PlaybackState::FAST_FORWARD
-        } else {
-            player.state = PlaybackState::PLAYING
+    fn pause(&self) {
+        self.state = PlaybackState::PAUSED
+    }
+
+    fn stop(&self) {
+        self.state = PlaybackState::STOPPED
+        self.current_frame = 0
+        self.command_index = 0
+    }
+
+    fn set_playback_speed(&self, speed: f32) {
+        if speed >= 0.25 && speed <= 8.0 {
+            self.playback_speed = speed
+
+            if speed > 1.0 {
+                self.state = PlaybackState::FAST_FORWARD
+            } else {
+                self.state = PlaybackState::PLAYING
+            }
         }
     }
-}
 
-fn seek_to_frame(player: mut ReplayPlayer, frame: u32) {
-    if frame <= player.replay.header.game_duration_frames {
-        player.seeking = true
-        player.target_frame = frame
+    fn seek_to_frame(&self, frame: i32) {
+        if frame <= self.replay.header.game_duration_frames {
+            self.seeking = true
+            self.target_frame = frame
 
-        // If seeking backwards, need to restart from beginning
-        if frame < player.current_frame {
-            player.current_frame = 0
-            player.command_index = 0
+            // If seeking backwards, need to restart from beginning
+            if frame < self.current_frame {
+                self.current_frame = 0
+                self.command_index = 0
+            }
         }
     }
-}
 
-fn seek_to_percent(player: mut ReplayPlayer, percent: f32) {
-    let target: u32 = cast(u32, cast(f32, player.replay.header.game_duration_frames) * percent)
-    seek_to_frame(player, target)
-}
+    fn seek_to_percent(&self, percent: f32) {
+        let target = (self.replay.header.game_duration_frames as f32 * percent) as i32
+        self.seek_to_frame(target)
+    }
 
-fn update_replay(player: mut ReplayPlayer, delta_time: f32): [ReplayCommand; 256] {
-    let mut commands_this_frame: [ReplayCommand; 256] = []
-    let mut command_count: i32 = 0
+    fn update(&self, delta_time: f32): [ReplayCommand] {
+        let commands_this_frame: [ReplayCommand] = []
 
-    if player.state == PlaybackState::STOPPED or player.state == PlaybackState::PAUSED {
+        if self.state == PlaybackState::STOPPED || self.state == PlaybackState::PAUSED {
+            return commands_this_frame
+        }
+
+        // Calculate frames to advance
+        let frames_per_second: f32 = 30.0
+        let frames_to_advance = delta_time * frames_per_second * self.playback_speed
+
+        let target_frame = self.current_frame + frames_to_advance as i32
+
+        // Handle seeking
+        if self.seeking {
+            if self.current_frame < self.target_frame {
+                // Fast forward without rendering
+                while self.current_frame < self.target_frame && self.command_index < self.replay.commands.length {
+                    self.current_frame = self.current_frame + 1
+                }
+            }
+            if self.current_frame >= self.target_frame {
+                self.seeking = false
+            }
+        }
+
+        // Get commands for current frame
+        while self.command_index < self.replay.commands.length {
+            let cmd = self.replay.commands[self.command_index]
+
+            if cmd.frame <= target_frame {
+                commands_this_frame = commands_this_frame + [cmd]
+                self.command_index = self.command_index + 1
+            } else {
+                break
+            }
+        }
+
+        self.current_frame = target_frame
+
+        // Update timeline position
+        if self.replay.header.game_duration_frames > 0 {
+            self.timeline_position = self.current_frame as f32 / self.replay.header.game_duration_frames as f32
+        }
+
+        // Check for end of replay
+        if self.current_frame >= self.replay.header.game_duration_frames {
+            self.state = PlaybackState::STOPPED
+        }
+
         return commands_this_frame
     }
 
-    // Calculate frames to advance
-    let frames_per_second: f32 = 30.0
-    let frames_to_advance: f32 = delta_time * frames_per_second * player.playback_speed
-
-    let target_frame: u32 = player.current_frame + cast(u32, frames_to_advance)
-
-    // Handle seeking
-    if player.seeking {
-        if player.current_frame < player.target_frame {
-            // Fast forward without rendering
-            while player.current_frame < player.target_frame and
-                  player.command_index < player.replay.command_count {
-                // Execute commands silently
-                player.current_frame = player.current_frame + 1
-            }
-        }
-        if player.current_frame >= player.target_frame {
-            player.seeking = false
-        }
+    fn follow_player_camera(&self, player_id: i32) {
+        self.follow_player = player_id
     }
 
-    // Get commands for current frame
-    while player.command_index < player.replay.command_count {
-        let cmd: ReplayCommand = player.replay.commands[player.command_index]
-
-        if cmd.frame <= target_frame {
-            if command_count < 256 {
-                commands_this_frame[command_count] = cmd
-                command_count = command_count + 1
-            }
-            player.command_index = player.command_index + 1
-        } else {
-            break
-        }
+    fn get_time_string(&self): string {
+        let total_seconds = self.current_frame / 30
+        let minutes = total_seconds / 60
+        let seconds = total_seconds % 60
+        return format_time(minutes, seconds)
     }
 
-    player.current_frame = target_frame
-
-    // Update timeline position
-    player.timeline_position = cast(f32, player.current_frame) /
-                               cast(f32, player.replay.header.game_duration_frames)
-
-    // Check for end of replay
-    if player.current_frame >= player.replay.header.game_duration_frames {
-        player.state = PlaybackState::STOPPED
+    fn get_duration_string(&self): string {
+        let total_seconds = self.replay.header.game_duration_frames / 30
+        let minutes = total_seconds / 60
+        let seconds = total_seconds % 60
+        return format_time(minutes, seconds)
     }
-
-    return commands_this_frame
-}
-
-fn follow_player_camera(player: mut ReplayPlayer, player_id: i8) {
-    player.follow_player = player_id
-}
-
-fn get_replay_time_string(player: ReplayPlayer): [u8; 16] {
-    let total_seconds: i32 = cast(i32, player.current_frame) / 30
-    let minutes: i32 = total_seconds / 60
-    let seconds: i32 = total_seconds % 60
-
-    // Would format as "MM:SS"
-    return "00:00"
-}
-
-fn get_replay_duration_string(player: ReplayPlayer): [u8; 16] {
-    let total_seconds: i32 = cast(i32, player.replay.header.game_duration_frames) / 30
-    let minutes: i32 = total_seconds / 60
-    let seconds: i32 = total_seconds % 60
-
-    return "00:00"
-}
-
-// ============================================================================
-// REPLAY FILE I/O
-// ============================================================================
-
-fn save_replay(recorder: ReplayRecorder, filename: [u8; 256]): bool {
-    // Create replay file structure
-    let mut replay: ReplayFile = ReplayFile {
-        header: recorder.header,
-        commands: recorder.commands,
-        command_count: recorder.command_count,
-        compressed_data: [],
-        compressed_size: 0
-    }
-
-    // Compress command data
-    compress_replay_data(replay)
-
-    // Write to file
-    // Would write header + compressed data to disk
-
-    return true
-}
-
-fn compress_replay_data(replay: mut ReplayFile) {
-    // Use zlib/deflate compression (authentic to original)
-    // Commands are serialized and then compressed
-
-    let mut uncompressed_size: u32 = replay.command_count * 128  // Approx size per command
-    // Would compress data here
-}
-
-fn decompress_replay_data(replay: mut ReplayFile) {
-    // Decompress command stream
-    // Parse into ReplayCommand structures
-}
-
-fn get_replay_filename(map_name: [u8; 128], timestamp: u64): [u8; 256] {
-    // Format: "LastReplay_MapName_YYYYMMDD_HHMMSS.rep"
-    return "LastReplay.rep"
-}
-
-fn list_replay_files(directory: [u8; 256]): [[u8; 256]; 100] {
-    // Would scan directory for .rep files
-    let replays: [[u8; 256]; 100] = []
-    return replays
 }
 
 // ============================================================================
@@ -634,148 +551,106 @@ struct ReplayUI {
     timeline_height: i32,
     timeline_handle_x: i32,
     dragging_timeline: bool,
-
     // Playback controls
     controls_x: i32,
     controls_y: i32,
-
-    // Speed buttons
-    speed_buttons: [i32; 6],  // 0.25x, 0.5x, 1x, 2x, 4x, 8x
-
+    // Speed buttons (0.25x, 0.5x, 1x, 2x, 4x, 8x)
+    speed_button_count: i32,
     // Player list
     player_list_x: i32,
     player_list_y: i32,
-    selected_player: i8,
-
+    selected_player: i32,
     // Stats overlay
     show_stats: bool,
     stats_x: i32,
-    stats_y: i32
+    stats_y: i32,
 }
 
-fn create_replay_ui(): ReplayUI {
-    return ReplayUI {
-        timeline_x: 100,
-        timeline_y: 550,
-        timeline_width: 600,
-        timeline_height: 20,
-        timeline_handle_x: 100,
-        dragging_timeline: false,
-        controls_x: 350,
-        controls_y: 580,
-        speed_buttons: [0; 6],
-        player_list_x: 10,
-        player_list_y: 100,
-        selected_player: -1,
-        show_stats: false,
-        stats_x: 10,
-        stats_y: 300
-    }
-}
-
-fn render_replay_timeline(ui: ReplayUI, player: ReplayPlayer) {
-    // Draw timeline background
-    // Draw progress filled portion
-    // Draw frame markers at key events
-    // Draw scrubber handle
-}
-
-fn render_replay_controls(ui: ReplayUI, player: ReplayPlayer) {
-    // Draw play/pause button
-    // Draw stop button
-    // Draw speed buttons
-    // Draw current time / total time
-}
-
-fn render_player_list(ui: ReplayUI, player: ReplayPlayer) {
-    // Draw each player with:
-    // - Color indicator
-    // - Name
-    // - Faction icon
-    // - General portrait (if Zero Hour)
-    // - APM (actions per minute)
-}
-
-fn handle_timeline_click(ui: mut ReplayUI, player: mut ReplayPlayer, mouse_x: i32) {
-    if mouse_x >= ui.timeline_x and mouse_x <= ui.timeline_x + ui.timeline_width {
-        let percent: f32 = cast(f32, mouse_x - ui.timeline_x) / cast(f32, ui.timeline_width)
-        seek_to_percent(player, percent)
-        ui.timeline_handle_x = mouse_x
-    }
-}
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-fn read_u32_le(data: [u8; 16777216], offset: i32): u32 {
-    return cast(u32, data[offset]) |
-           (cast(u32, data[offset + 1]) << 8) |
-           (cast(u32, data[offset + 2]) << 16) |
-           (cast(u32, data[offset + 3]) << 24)
-}
-
-fn read_u64_le(data: [u8; 16777216], offset: i32): u64 {
-    return cast(u64, read_u32_le(data, offset)) |
-           (cast(u64, read_u32_le(data, offset + 4)) << 32)
-}
-
-fn get_current_timestamp(): u64 {
-    // Would return current Unix timestamp
-    return 0
-}
-
-// ============================================================================
-// TEST FUNCTIONS
-// ============================================================================
-
-fn test_replay_system() {
-    print("Testing Replay System...")
-
-    // Test recorder
-    let mut recorder: ReplayRecorder = create_replay_recorder()
-    print("Replay recorder created")
-
-    start_recording(recorder, "Tournament City", 12345)
-    print("Recording started")
-
-    // Add player info
-    add_player_info(recorder, 0, "Player1", 0, 1, 0, 0, 0, false, 0)
-    add_player_info(recorder, 1, "Player2", 1, 2, 1, 0, 1, false, 0)
-    print("Players added: 2")
-
-    // Simulate some commands
-    let units: [u32; 64] = [1, 2, 3, 0, 0, 0, 0, 0]
-    for i in 0..100 {
-        advance_frame(recorder)
-        if i % 10 == 0 {
-            record_move_command(recorder, 0, units, 3, 100.0 + cast(f32, i), 200.0, 0.0)
+impl ReplayUI {
+    fn init(): ReplayUI {
+        return ReplayUI {
+            timeline_x: 100,
+            timeline_y: 550,
+            timeline_width: 600,
+            timeline_height: 20,
+            timeline_handle_x: 100,
+            dragging_timeline: false,
+            controls_x: 350,
+            controls_y: 580,
+            speed_button_count: 6,
+            player_list_x: 10,
+            player_list_y: 100,
+            selected_player: -1,
+            show_stats: false,
+            stats_x: 10,
+            stats_y: 300,
         }
     }
-    print("Recorded 10 move commands over 100 frames")
 
-    stop_recording(recorder)
-    print("Recording stopped")
-    print("Total commands: " + str(recorder.command_count))
-    print("Duration: " + str(recorder.current_frame) + " frames")
+    fn handle_timeline_click(&self, player: ReplayPlayer, mouse_x: i32) {
+        if mouse_x >= self.timeline_x && mouse_x <= self.timeline_x + self.timeline_width {
+            let percent = (mouse_x - self.timeline_x) as f32 / self.timeline_width as f32
+            player.seek_to_percent(percent)
+            self.timeline_handle_x = mouse_x
+        }
+    }
+}
 
-    // Test player
-    let mut player: ReplayPlayer = create_replay_player()
-    print("Replay player created")
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
-    // Test playback controls
-    play_replay(player)
-    print("Playback started")
+fn read_u32_le(data: [i32], offset: i32): i32 {
+    if offset + 4 > data.length {
+        return 0
+    }
+    return (data[offset]) |
+           (data[offset + 1] << 8) |
+           (data[offset + 2] << 16) |
+           (data[offset + 3] << 24)
+}
 
-    set_playback_speed(player, 2.0)
-    print("Speed set to 2x")
+fn read_u64_le(data: [i32], offset: i32): i64 {
+    let low = read_u32_le(data, offset)
+    let high = read_u32_le(data, offset + 4)
+    return (high as i64 << 32) | (low as i64)
+}
 
-    pause_replay(player)
-    print("Playback paused")
+fn format_time(minutes: i32, seconds: i32): string {
+    // Would format as "MM:SS"
+    return "00:00"
+}
 
-    // Test UI
-    let ui: ReplayUI = create_replay_ui()
-    print("Replay UI created")
+extern fn get_current_timestamp(): i64
 
-    print("Replay System tests complete!")
+// ============================================================================
+// GLOBAL REPLAY SYSTEM INSTANCES
+// ============================================================================
+
+let g_replay_recorder: ReplayRecorder? = null
+let g_replay_player: ReplayPlayer? = null
+
+fn init_replay_recorder(): ReplayRecorder {
+    let recorder = ReplayRecorder::init()
+    g_replay_recorder = recorder
+    return recorder
+}
+
+fn get_replay_recorder(): ReplayRecorder? {
+    return g_replay_recorder
+}
+
+fn init_replay_player(): ReplayPlayer {
+    let player = ReplayPlayer::init()
+    g_replay_player = player
+    return player
+}
+
+fn get_replay_player(): ReplayPlayer? {
+    return g_replay_player
+}
+
+fn shutdown_replay_system() {
+    g_replay_recorder = null
+    g_replay_player = null
 }

@@ -11,35 +11,27 @@
 // - Call count statistics
 // - Frame-by-frame data collection
 // - Export to CSV for analysis
-//
-// Usage:
-// ```
-// let PROF_UPDATE_LOGIC = ProfileScope.init("UpdateLogic")
-//
-// fn update_game_logic(delta_time: f32) {
-//     let _prof = PROF_UPDATE_LOGIC.start()  // Auto-stops on scope exit
-//     // ... game logic ...
-// }
-// ```
 
-import basics/allocator
-import basics/string
-import basics/time
+let MAX_PROFILE_SCOPES: i32 = 512
+let MAX_PROFILE_HISTORY_FRAMES: i32 = 300   // 5 seconds at 60 FPS
+let MAX_SCOPE_STACK_DEPTH: i32 = 32
 
-let MAX_PROFILE_SCOPES: u32 = 512
-let MAX_PROFILE_HISTORY_FRAMES: u32 = 300  // 5 seconds at 60 FPS
+// ============================================================================
+// PRECISION TIMER
+// ============================================================================
 
-// High-precision timer using monotonic clock
 struct PrecisionTimer {
-    start_time_ns: i64
+    start_time_ns: i64,
+}
 
+impl PrecisionTimer {
     fn init(): PrecisionTimer {
         return PrecisionTimer {
-            start_time_ns: 0
+            start_time_ns: 0,
         }
     }
 
-    fn start(self) {
+    fn start(&self) {
         self.start_time_ns = get_time_nanoseconds()
     }
 
@@ -49,78 +41,95 @@ struct PrecisionTimer {
     }
 
     fn elapsed_us(&self): f64 {
-        return @intToFloat(f64, self.elapsed_ns()) / 1000.0
+        return self.elapsed_ns() as f64 / 1000.0
     }
 
     fn elapsed_ms(&self): f64 {
-        return @intToFloat(f64, self.elapsed_ns()) / 1000000.0
+        return self.elapsed_ns() as f64 / 1000000.0
     }
 }
 
-// Profile scope data (one per named profiling region)
+// ============================================================================
+// PROFILE SCOPE
+// ============================================================================
+
 struct ProfileScope {
-    name: string
+    name: string,
 
     // Current frame stats
-    start_time_ns: i64
-    gross_time_ns: i64  // Total time including child scopes
-    net_time_ns: i64    // Time excluding child scopes
-    call_count: u32
+    start_time_ns: i64,
+    gross_time_ns: i64,     // Total time including child scopes
+    net_time_ns: i64,       // Time excluding child scopes
+    call_count: i32,
 
     // Frame history (for averaging)
-    history_gross_ns: [MAX_PROFILE_HISTORY_FRAMES]i64
-    history_net_ns: [MAX_PROFILE_HISTORY_FRAMES]i64
-    history_calls: [MAX_PROFILE_HISTORY_FRAMES]u32
-    history_index: u32
-    history_count: u32
+    history_gross_ns: [i64],
+    history_net_ns: [i64],
+    history_calls: [i32],
+    history_index: i32,
+    history_count: i32,
 
     // Parent tracking (for hierarchical profiling)
-    parent_scope_id: i32  // -1 if no parent
+    parent_scope_id: i32,   // -1 if no parent
+}
 
+impl ProfileScope {
     fn init(name: string): ProfileScope {
+        let history_gross: [i64] = []
+        let history_net: [i64] = []
+        let history_calls: [i32] = []
+
+        // Pre-allocate history arrays
+        for i in 0..MAX_PROFILE_HISTORY_FRAMES {
+            history_gross = history_gross + [0]
+            history_net = history_net + [0]
+            history_calls = history_calls + [0]
+        }
+
         return ProfileScope {
-            name: name
-            start_time_ns: 0
-            gross_time_ns: 0
-            net_time_ns: 0
-            call_count: 0
-            history_gross_ns: [0; MAX_PROFILE_HISTORY_FRAMES]
-            history_net_ns: [0; MAX_PROFILE_HISTORY_FRAMES]
-            history_calls: [0; MAX_PROFILE_HISTORY_FRAMES]
-            history_index: 0
-            history_count: 0
-            parent_scope_id: -1
+            name: name,
+            start_time_ns: 0,
+            gross_time_ns: 0,
+            net_time_ns: 0,
+            call_count: 0,
+            history_gross_ns: history_gross,
+            history_net_ns: history_net,
+            history_calls: history_calls,
+            history_index: 0,
+            history_count: 0,
+            parent_scope_id: -1,
         }
     }
 
-    fn start(self): AutoProfileScope {
+    fn begin(&self) {
         self.start_time_ns = get_time_nanoseconds()
-        return AutoProfileScope.init(&self)
     }
 
-    fn stop(self, parent_scope: ?*ProfileScope) {
+    fn end(&self, parent_scope: ProfileScope?) {
         let elapsed_ns = get_time_nanoseconds() - self.start_time_ns
 
-        self.gross_time_ns += elapsed_ns
-        self.net_time_ns += elapsed_ns
-        self.call_count += 1
+        self.gross_time_ns = self.gross_time_ns + elapsed_ns
+        self.net_time_ns = self.net_time_ns + elapsed_ns
+        self.call_count = self.call_count + 1
 
         // Subtract this time from parent's net time (EA's hierarchical profiling)
-        if parent_scope {
-            parent_scope.?.net_time_ns -= elapsed_ns
+        if parent_scope != null {
+            parent_scope.net_time_ns = parent_scope.net_time_ns - elapsed_ns
         }
     }
 
-    fn end_frame(self) {
+    fn end_frame(&self) {
         // Store current frame stats in history
-        self.history_gross_ns[self.history_index] = self.gross_time_ns
-        self.history_net_ns[self.history_index] = self.net_time_ns
-        self.history_calls[self.history_index] = self.call_count
+        if self.history_index < MAX_PROFILE_HISTORY_FRAMES {
+            self.history_gross_ns[self.history_index] = self.gross_time_ns
+            self.history_net_ns[self.history_index] = self.net_time_ns
+            self.history_calls[self.history_index] = self.call_count
+        }
 
         self.history_index = (self.history_index + 1) % MAX_PROFILE_HISTORY_FRAMES
 
         if self.history_count < MAX_PROFILE_HISTORY_FRAMES {
-            self.history_count += 1
+            self.history_count = self.history_count + 1
         }
 
         // Reset current frame stats
@@ -134,12 +143,12 @@ struct ProfileScope {
             return 0.0
         }
 
-        let mut total_ns: i64 = 0
+        let total_ns: i64 = 0
         for i in 0..self.history_count {
-            total_ns += self.history_gross_ns[i]
+            total_ns = total_ns + self.history_gross_ns[i]
         }
 
-        let avg_ns = @intToFloat(f64, total_ns) / @intToFloat(f64, self.history_count)
+        let avg_ns = total_ns as f64 / self.history_count as f64
         return avg_ns / 1000000.0
     }
 
@@ -148,12 +157,12 @@ struct ProfileScope {
             return 0.0
         }
 
-        let mut total_ns: i64 = 0
+        let total_ns: i64 = 0
         for i in 0..self.history_count {
-            total_ns += self.history_net_ns[i]
+            total_ns = total_ns + self.history_net_ns[i]
         }
 
-        let avg_ns = @intToFloat(f64, total_ns) / @intToFloat(f64, self.history_count)
+        let avg_ns = total_ns as f64 / self.history_count as f64
         return avg_ns / 1000000.0
     }
 
@@ -162,156 +171,165 @@ struct ProfileScope {
             return 0.0
         }
 
-        let mut total_calls: u32 = 0
+        let total_calls: i32 = 0
         for i in 0..self.history_count {
-            total_calls += self.history_calls[i]
+            total_calls = total_calls + self.history_calls[i]
         }
 
-        return @intToFloat(f32, total_calls) / @intToFloat(f32, self.history_count)
+        return total_calls as f32 / self.history_count as f32
     }
 }
 
-// RAII scope guard for automatic profiler stop
-struct AutoProfileScope {
-    scope: *ProfileScope
+// ============================================================================
+// FRAME STATISTICS
+// ============================================================================
 
-    fn init(scope: *ProfileScope): AutoProfileScope {
-        return AutoProfileScope {
-            scope: scope
-        }
-    }
-
-    // In Home, this would be called automatically when scope exits
-    fn drop(self) {
-        // Get parent scope from profiler stack
-        let parent = get_profiler().get_parent_scope()
-        self.scope.stop(parent)
-    }
-}
-
-// Frame statistics
 struct FrameStats {
-    frame_number: u32
-
-    frame_time_ms: f32
-    fps: f32
-
-    logic_time_ms: f32
-    render_time_ms: f32
-    audio_time_ms: f32
-
-    entity_count: u32
-    draw_calls: u32
-    triangles: u32
-
-    memory_used_mb: f32
-    memory_peak_mb: f32
+    frame_number: i32,
+    frame_time_ms: f32,
+    fps: f32,
+    logic_time_ms: f32,
+    render_time_ms: f32,
+    audio_time_ms: f32,
+    entity_count: i32,
+    draw_calls: i32,
+    triangles: i32,
+    memory_used_mb: f32,
+    memory_peak_mb: f32,
 }
 
-// Global profiler manager
+impl FrameStats {
+    fn init(): FrameStats {
+        return FrameStats {
+            frame_number: 0,
+            frame_time_ms: 0.0,
+            fps: 0.0,
+            logic_time_ms: 0.0,
+            render_time_ms: 0.0,
+            audio_time_ms: 0.0,
+            entity_count: 0,
+            draw_calls: 0,
+            triangles: 0,
+            memory_used_mb: 0.0,
+            memory_peak_mb: 0.0,
+        }
+    }
+}
+
+// ============================================================================
+// PROFILER
+// ============================================================================
+
 struct Profiler {
-    scopes: [MAX_PROFILE_SCOPES]ProfileScope
-    scope_count: u32
+    scopes: [ProfileScope],
+    scope_stack: [i32],
+    scope_stack_depth: i32,
 
-    // Scope stack (for hierarchical profiling)
-    scope_stack: [32]*ProfileScope
-    scope_stack_depth: u32
-
-    frame_number: u32
-    frame_timer: PrecisionTimer
+    frame_number: i32,
+    frame_timer: PrecisionTimer,
 
     // Frame stats history
-    frame_stats: [MAX_PROFILE_HISTORY_FRAMES]FrameStats
-    frame_stats_index: u32
-    frame_stats_count: u32
+    frame_stats: [FrameStats],
+    frame_stats_index: i32,
+    frame_stats_count: i32,
 
     // Display settings
-    show_profiler: bool
-    show_graph: bool
+    show_profiler: bool,
+    show_graph: bool,
+}
 
-    allocator: Allocator
-
-    fn init(allocator: Allocator): Profiler {
-        let mut prof = Profiler {
-            scopes: [ProfileScope.init(""); MAX_PROFILE_SCOPES]
-            scope_count: 0
-            scope_stack: [null; 32]
-            scope_stack_depth: 0
-            frame_number: 0
-            frame_timer: PrecisionTimer.init()
-            frame_stats: [FrameStats {
-                frame_number: 0
-                frame_time_ms: 0.0
-                fps: 0.0
-                logic_time_ms: 0.0
-                render_time_ms: 0.0
-                audio_time_ms: 0.0
-                entity_count: 0
-                draw_calls: 0
-                triangles: 0
-                memory_used_mb: 0.0
-                memory_peak_mb: 0.0
-            }; MAX_PROFILE_HISTORY_FRAMES]
-            frame_stats_index: 0
-            frame_stats_count: 0
-            show_profiler: false
-            show_graph: false
-            allocator: allocator
+impl Profiler {
+    fn init(): Profiler {
+        let stats: [FrameStats] = []
+        for i in 0..MAX_PROFILE_HISTORY_FRAMES {
+            stats = stats + [FrameStats::init()]
         }
 
-        prof.frame_timer.start()
-        return prof
+        let stack: [i32] = []
+        for i in 0..MAX_SCOPE_STACK_DEPTH {
+            stack = stack + [-1]
+        }
+
+        let profiler = Profiler {
+            scopes: [],
+            scope_stack: stack,
+            scope_stack_depth: 0,
+            frame_number: 0,
+            frame_timer: PrecisionTimer::init(),
+            frame_stats: stats,
+            frame_stats_index: 0,
+            frame_stats_count: 0,
+            show_profiler: false,
+            show_graph: false,
+        }
+
+        profiler.frame_timer.start()
+        return profiler
     }
 
-    fn register_scope(self, name: string): ?*ProfileScope {
-        if self.scope_count >= MAX_PROFILE_SCOPES {
-            println("Profiler: Cannot register scope '{name}' - max limit reached!")
-            return null
+    fn register_scope(&self, name: string): i32 {
+        if self.scopes.length >= MAX_PROFILE_SCOPES {
+            return -1
         }
 
         // Check if scope already exists
-        for i in 0..self.scope_count {
+        for i in 0..self.scopes.length {
             if self.scopes[i].name == name {
-                return &self.scopes[i]
+                return i
             }
         }
 
         // Create new scope
-        self.scopes[self.scope_count] = ProfileScope.init(name)
-        let scope = &self.scopes[self.scope_count]
-        self.scope_count += 1
+        let scope = ProfileScope::init(name)
+        self.scopes = self.scopes + [scope]
 
-        return scope
+        return self.scopes.length - 1
     }
 
-    fn push_scope(self, scope: *ProfileScope) {
-        if self.scope_stack_depth < 32 {
-            self.scope_stack[self.scope_stack_depth] = scope
-            self.scope_stack_depth += 1
+    fn begin_scope(&self, scope_id: i32) {
+        if scope_id < 0 || scope_id >= self.scopes.length {
+            return
+        }
+
+        self.scopes[scope_id].begin()
+
+        // Push to stack
+        if self.scope_stack_depth < MAX_SCOPE_STACK_DEPTH {
+            self.scope_stack[self.scope_stack_depth] = scope_id
+            self.scope_stack_depth = self.scope_stack_depth + 1
         }
     }
 
-    fn pop_scope(self) {
-        if self.scope_stack_depth > 0 {
-            self.scope_stack_depth -= 1
+    fn end_scope(&self, scope_id: i32) {
+        if scope_id < 0 || scope_id >= self.scopes.length {
+            return
         }
-    }
 
-    fn get_parent_scope(&self): ?*ProfileScope {
+        // Get parent scope
+        let parent: ProfileScope? = null
         if self.scope_stack_depth >= 2 {
-            return self.scope_stack[self.scope_stack_depth - 2]
+            let parent_id = self.scope_stack[self.scope_stack_depth - 2]
+            if parent_id >= 0 && parent_id < self.scopes.length {
+                parent = self.scopes[parent_id]
+            }
         }
-        return null
+
+        self.scopes[scope_id].end(parent)
+
+        // Pop from stack
+        if self.scope_stack_depth > 0 {
+            self.scope_stack_depth = self.scope_stack_depth - 1
+        }
     }
 
-    fn end_frame(self) {
+    fn end_frame(&self) {
         // End all scopes
-        for i in 0..self.scope_count {
+        for i in 0..self.scopes.length {
             self.scopes[i].end_frame()
         }
 
         // Calculate frame time
-        let frame_time_ms = @floatCast(f32, self.frame_timer.elapsed_ms())
+        let frame_time_ms = self.frame_timer.elapsed_ms() as f32
         self.frame_timer.start()
 
         // Store frame stats
@@ -324,34 +342,34 @@ struct Profiler {
         }
 
         // Get timings from known scopes
-        let logic_scope = self.get_scope("UpdateLogic")
-        if logic_scope {
-            self.frame_stats[stats_idx].logic_time_ms = @floatCast(f32, logic_scope.?.get_average_gross_ms())
+        let logic_scope = self.get_scope_by_name("UpdateLogic")
+        if logic_scope != null {
+            self.frame_stats[stats_idx].logic_time_ms = logic_scope.get_average_gross_ms() as f32
         }
 
-        let render_scope = self.get_scope("Render")
-        if render_scope {
-            self.frame_stats[stats_idx].render_time_ms = @floatCast(f32, render_scope.?.get_average_gross_ms())
+        let render_scope = self.get_scope_by_name("Render")
+        if render_scope != null {
+            self.frame_stats[stats_idx].render_time_ms = render_scope.get_average_gross_ms() as f32
         }
 
-        let audio_scope = self.get_scope("UpdateAudio")
-        if audio_scope {
-            self.frame_stats[stats_idx].audio_time_ms = @floatCast(f32, audio_scope.?.get_average_gross_ms())
+        let audio_scope = self.get_scope_by_name("UpdateAudio")
+        if audio_scope != null {
+            self.frame_stats[stats_idx].audio_time_ms = audio_scope.get_average_gross_ms() as f32
         }
 
         self.frame_stats_index = (self.frame_stats_index + 1) % MAX_PROFILE_HISTORY_FRAMES
 
         if self.frame_stats_count < MAX_PROFILE_HISTORY_FRAMES {
-            self.frame_stats_count += 1
+            self.frame_stats_count = self.frame_stats_count + 1
         }
 
-        self.frame_number += 1
+        self.frame_number = self.frame_number + 1
     }
 
-    fn get_scope(self, name: string): ?*ProfileScope {
-        for i in 0..self.scope_count {
+    fn get_scope_by_name(&self, name: string): ProfileScope? {
+        for i in 0..self.scopes.length {
             if self.scopes[i].name == name {
-                return &self.scopes[i]
+                return self.scopes[i]
             }
         }
         return null
@@ -362,46 +380,16 @@ struct Profiler {
             return 0.0
         }
 
-        let mut total_fps: f32 = 0.0
+        let total_fps: f32 = 0.0
         for i in 0..self.frame_stats_count {
-            total_fps += self.frame_stats[i].fps
+            total_fps = total_fps + self.frame_stats[i].fps
         }
 
-        return total_fps / @intToFloat(f32, self.frame_stats_count)
+        return total_fps / self.frame_stats_count as f32
     }
 
-    fn print_stats(&self) {
-        println("\n=== Performance Profiler ===")
-        println("Frame: {self.frame_number}")
-        println("Average FPS: {self.get_average_fps():.1}")
-        println("")
-
-        println("Scope                          | Avg Gross | Avg Net  | Calls/Frame")
-        println("-------------------------------|-----------|----------|------------")
-
-        for i in 0..self.scope_count {
-            let scope = &self.scopes[i]
-
-            let gross_ms = scope.get_average_gross_ms()
-            let net_ms = scope.get_average_net_ms()
-            let calls = scope.get_average_calls_per_frame()
-
-            if gross_ms > 0.01 or calls > 0.1 {
-                println("{scope.name:30} | {gross_ms:7.3}ms | {net_ms:6.3}ms | {calls:6.1}")
-            }
-        }
-
-        println("")
-    }
-
-    fn export_to_csv(&self, filepath: string): bool {
-        // TODO: Export frame stats to CSV for analysis in external tools
-        println("Profiler: Exporting stats to {filepath}...")
-        return true
-    }
-
-    fn reset(self) {
-        for i in 0..self.scope_count {
+    fn reset(&self) {
+        for i in 0..self.scopes.length {
             self.scopes[i].history_count = 0
             self.scopes[i].history_index = 0
         }
@@ -409,82 +397,54 @@ struct Profiler {
         self.frame_stats_count = 0
         self.frame_stats_index = 0
         self.frame_number = 0
+    }
 
-        println("Profiler: Stats reset")
+    fn toggle_display(&self) {
+        self.show_profiler = !self.show_profiler
     }
 }
 
-// Global profiler instance
-var g_profiler: ?Profiler = null
+// ============================================================================
+// GLOBAL PROFILER INSTANCE
+// ============================================================================
 
-export fn init_profiler(allocator: Allocator) {
-    g_profiler = Profiler.init(allocator)
-    println("Profiler: Initialized")
+let g_profiler: Profiler? = null
+
+fn init_profiler(): Profiler {
+    let profiler = Profiler::init()
+    g_profiler = profiler
+    return profiler
 }
 
-export fn shutdown_profiler() {
+fn get_profiler(): Profiler? {
+    return g_profiler
+}
+
+fn shutdown_profiler() {
     g_profiler = null
-    println("Profiler: Shutdown")
 }
 
-fn get_profiler(): *Profiler {
-    // TODO: Return reference to global profiler
-    // For now, this is a placeholder
-    return &g_profiler.?
-}
-
-export fn profiler_end_frame() {
-    if !g_profiler {
-        return
+fn profiler_end_frame() {
+    if g_profiler != null {
+        g_profiler.end_frame()
     }
-
-    g_profiler.?.end_frame()
 }
 
-export fn profiler_print_stats() {
-    if !g_profiler {
-        return
+fn profiler_reset() {
+    if g_profiler != null {
+        g_profiler.reset()
     }
-
-    g_profiler.?.print_stats()
 }
 
-export fn profiler_reset() {
-    if !g_profiler {
-        return
+fn profiler_toggle_display() {
+    if g_profiler != null {
+        g_profiler.toggle_display()
     }
-
-    g_profiler.?.reset()
 }
 
-export fn profiler_toggle_display() {
-    if !g_profiler {
-        return
-    }
+// ============================================================================
+// PLATFORM-SPECIFIC HIGH-PRECISION TIMER
+// ============================================================================
 
-    g_profiler.?.show_profiler = !g_profiler.?.show_profiler
-}
-
-export fn profiler_export_csv(filepath: string): bool {
-    if !g_profiler {
-        return false
-    }
-
-    return g_profiler.?.export_to_csv(filepath)
-}
-
-// Platform-specific high-precision timer
-fn get_time_nanoseconds(): i64 {
-    // TODO: Use platform-specific monotonic clock
-    // On Windows: QueryPerformanceCounter
-    // On macOS/Linux: clock_gettime(CLOCK_MONOTONIC)
-    // On x86: __rdtsc() (CPU cycle counter)
-
-    // Placeholder - return current time in nanoseconds
-    return 0
-}
-
-fn get_global_allocator(): Allocator {
-    // TODO: Return global allocator
-    return Allocator {}
-}
+// Extern: returns current time in nanoseconds (would use platform clock)
+extern fn get_time_nanoseconds(): i64

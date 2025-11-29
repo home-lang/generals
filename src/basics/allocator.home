@@ -1,83 +1,334 @@
-// Basic Allocator trait and implementations for Generals
+// Basic Allocator abstractions for Generals
 // Provides memory allocation abstractions
+//
+// Original: EA used custom allocator pools and memory tracking
+// This provides a simplified interface for the Home language port
 
-trait Allocator {
-    fn alloc(&mut self, size: usize): ?*void;
-    fn free(&mut self, ptr: *void): void;
-    fn realloc(&mut self, ptr: *void, new_size: usize): ?*void;
+// ============================================================================
+// Allocator Stats
+// ============================================================================
+
+struct AllocatorStats {
+    total_allocated: i32,
+    total_freed: i32,
+    current_usage: i32,
+    peak_usage: i32,
+    allocation_count: i32,
+    free_count: i32,
 }
 
-// System allocator using malloc/free
+impl AllocatorStats {
+    fn init(): AllocatorStats {
+        return AllocatorStats {
+            total_allocated: 0,
+            total_freed: 0,
+            current_usage: 0,
+            peak_usage: 0,
+            allocation_count: 0,
+            free_count: 0,
+        }
+    }
+
+    fn record_alloc(&self, size: i32) {
+        self.total_allocated = self.total_allocated + size
+        self.current_usage = self.current_usage + size
+        self.allocation_count = self.allocation_count + 1
+        if self.current_usage > self.peak_usage {
+            self.peak_usage = self.current_usage
+        }
+    }
+
+    fn record_free(&self, size: i32) {
+        self.total_freed = self.total_freed + size
+        self.current_usage = self.current_usage - size
+        self.free_count = self.free_count + 1
+    }
+}
+
+// ============================================================================
+// System Allocator
+// ============================================================================
+
 struct SystemAllocator {
-    allocated_bytes: usize,
+    stats: AllocatorStats,
+    is_initialized: bool,
 }
 
 impl SystemAllocator {
-    fn new(): SystemAllocator {
-        SystemAllocator {
-            allocated_bytes: 0,
+    fn init(): SystemAllocator {
+        return SystemAllocator {
+            stats: AllocatorStats::init(),
+            is_initialized: true,
         }
     }
+
+    fn alloc(&self, size: i32): bool {
+        // In a real implementation, this would call platform malloc
+        // For now, just track stats
+        self.stats.record_alloc(size)
+        return true
+    }
+
+    fn free(&self, size: i32) {
+        // In a real implementation, this would call platform free
+        self.stats.record_free(size)
+    }
+
+    fn realloc(&self, old_size: i32, new_size: i32): bool {
+        self.stats.record_free(old_size)
+        self.stats.record_alloc(new_size)
+        return true
+    }
+
+    fn get_stats(&self): AllocatorStats {
+        return self.stats
+    }
 }
 
-impl Allocator for SystemAllocator {
-    fn alloc(&mut self, size: usize): ?*void {
-        // In a real implementation, this would call malloc
-        // For now, return None
-        self.allocated_bytes = self.allocated_bytes + size
-        None
-    }
+// ============================================================================
+// Arena Allocator
+// ============================================================================
 
-    fn free(&mut self, ptr: *void): void {
-        // In a real implementation, this would call free
-        _ = ptr
-    }
+let ARENA_SIZE: i32 = 1048576  // 1 MB
 
-    fn realloc(&mut self, ptr: *void, new_size: usize): ?*void {
-        // In a real implementation, this would call realloc
-        _ = ptr
-        self.alloc(new_size)
-    }
-}
-
-// Arena allocator for fast bulk allocations
-// 1024 * 1024 = 1048576
 struct ArenaAllocator {
-    buffer: [1048576]u8,
-    offset: usize,
+    offset: i32,
+    capacity: i32,
+    stats: AllocatorStats,
+    is_initialized: bool,
 }
 
 impl ArenaAllocator {
-    fn new(): ArenaAllocator {
-        ArenaAllocator {
-            buffer: [0; 1048576],
+    fn init(): ArenaAllocator {
+        return ArenaAllocator {
             offset: 0,
+            capacity: ARENA_SIZE,
+            stats: AllocatorStats::init(),
+            is_initialized: true,
         }
     }
 
-    fn reset(self: &mut Self): void {
-        self.offset = 0;
+    fn init_with_size(size: i32): ArenaAllocator {
+        return ArenaAllocator {
+            offset: 0,
+            capacity: size,
+            stats: AllocatorStats::init(),
+            is_initialized: true,
+        }
+    }
+
+    fn alloc(&self, size: i32): bool {
+        if self.offset + size > self.capacity {
+            return false  // Out of memory
+        }
+
+        self.stats.record_alloc(size)
+        self.offset = self.offset + size
+        return true
+    }
+
+    fn free(&self, size: i32) {
+        // Arena allocator doesn't free individual allocations
+        // Just track for stats
+        self.stats.record_free(size)
+    }
+
+    fn reset(&self) {
+        // Reset arena to beginning
+        self.offset = 0
+        self.stats = AllocatorStats::init()
+    }
+
+    fn get_remaining(&self): i32 {
+        return self.capacity - self.offset
+    }
+
+    fn get_stats(&self): AllocatorStats {
+        return self.stats
     }
 }
 
-impl Allocator for ArenaAllocator {
-    fn alloc(&mut self, size: usize): ?*void {
-        if self.offset + size > 1048576 {
-            return None
+// ============================================================================
+// Pool Allocator
+// ============================================================================
+
+struct PoolBlock {
+    is_free: bool,
+    next_free: i32,  // Index of next free block, -1 if none
+}
+
+struct PoolAllocator {
+    block_size: i32,
+    block_count: i32,
+    blocks: [PoolBlock],
+    first_free: i32,
+    stats: AllocatorStats,
+    is_initialized: bool,
+}
+
+impl PoolAllocator {
+    fn init(block_size: i32, block_count: i32): PoolAllocator {
+        let blocks: [PoolBlock] = []
+
+        // Initialize free list
+        for i in 0..block_count {
+            let next = i + 1
+            if next >= block_count {
+                next = -1
+            }
+            blocks = blocks + [PoolBlock {
+                is_free: true,
+                next_free: next,
+            }]
         }
 
+        return PoolAllocator {
+            block_size: block_size,
+            block_count: block_count,
+            blocks: blocks,
+            first_free: 0,
+            stats: AllocatorStats::init(),
+            is_initialized: true,
+        }
+    }
+
+    fn alloc(&self): i32 {
+        if self.first_free < 0 {
+            return -1  // No free blocks
+        }
+
+        let block_idx = self.first_free
+        self.first_free = self.blocks[block_idx].next_free
+        self.blocks[block_idx].is_free = false
+        self.blocks[block_idx].next_free = -1
+
+        self.stats.record_alloc(self.block_size)
+        return block_idx
+    }
+
+    fn free(&self, block_idx: i32) {
+        if block_idx < 0 || block_idx >= self.block_count {
+            return
+        }
+        if self.blocks[block_idx].is_free {
+            return  // Already free
+        }
+
+        self.blocks[block_idx].is_free = true
+        self.blocks[block_idx].next_free = self.first_free
+        self.first_free = block_idx
+
+        self.stats.record_free(self.block_size)
+    }
+
+    fn get_free_count(&self): i32 {
+        let count: i32 = 0
+        for i in 0..self.block_count {
+            if self.blocks[i].is_free {
+                count = count + 1
+            }
+        }
+        return count
+    }
+
+    fn get_stats(&self): AllocatorStats {
+        return self.stats
+    }
+}
+
+// ============================================================================
+// Stack Allocator
+// ============================================================================
+
+struct StackMarker {
+    offset: i32,
+}
+
+struct StackAllocator {
+    offset: i32,
+    capacity: i32,
+    stats: AllocatorStats,
+    is_initialized: bool,
+}
+
+impl StackAllocator {
+    fn init(capacity: i32): StackAllocator {
+        return StackAllocator {
+            offset: 0,
+            capacity: capacity,
+            stats: AllocatorStats::init(),
+            is_initialized: true,
+        }
+    }
+
+    fn alloc(&self, size: i32): bool {
+        if self.offset + size > self.capacity {
+            return false
+        }
+
+        self.stats.record_alloc(size)
         self.offset = self.offset + size
-        None
+        return true
     }
 
-    fn free(&mut self, ptr: *void): void {
-        // Arena allocator doesn't free individual allocations
-        _ = ptr
+    fn get_marker(&self): StackMarker {
+        return StackMarker { offset: self.offset }
     }
 
-    fn realloc(&mut self, ptr: *void, new_size: usize): ?*void {
-        // For arena, just allocate new memory
-        _ = ptr
-        self.alloc(new_size)
+    fn free_to_marker(&self, marker: StackMarker) {
+        if marker.offset < 0 || marker.offset > self.offset {
+            return
+        }
+
+        let freed = self.offset - marker.offset
+        self.stats.record_free(freed)
+        self.offset = marker.offset
+    }
+
+    fn reset(&self) {
+        self.stats.record_free(self.offset)
+        self.offset = 0
+    }
+
+    fn get_remaining(&self): i32 {
+        return self.capacity - self.offset
+    }
+}
+
+// ============================================================================
+// GLOBAL ALLOCATOR INSTANCES
+// ============================================================================
+
+let g_system_allocator: SystemAllocator? = null
+let g_arena_allocator: ArenaAllocator? = null
+
+fn init_allocators() {
+    g_system_allocator = SystemAllocator::init()
+    g_arena_allocator = ArenaAllocator::init()
+}
+
+fn get_system_allocator(): SystemAllocator? {
+    return g_system_allocator
+}
+
+fn get_arena_allocator(): ArenaAllocator? {
+    return g_arena_allocator
+}
+
+fn shutdown_allocators() {
+    g_system_allocator = null
+    g_arena_allocator = null
+}
+
+fn alloc(size: i32): bool {
+    if g_system_allocator != null {
+        return g_system_allocator.alloc(size)
+    }
+    return false
+}
+
+fn free(size: i32) {
+    if g_system_allocator != null {
+        g_system_allocator.free(size)
     }
 }

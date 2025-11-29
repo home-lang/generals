@@ -1,42 +1,56 @@
+// C&C Generals Zero Hour - Home Port
 // Campaign Manager - Campaign progression and mission flow
+//
+// Original: CampaignManager from Thyme/SAGE engine
 // Implements the C&C Generals campaign system with missions, briefings, and unlocks
+//
+// Generals has 3 campaigns:
+// - USA: 7 missions
+// - China: 7 missions
+// - GLA: 7 missions
+// Plus Zero Hour adds 3 more campaigns with General's Challenge mode
 
-import game/script_engine {ScriptEngine, init_script_engine}
-import ui/loading_screen {LoadingScreen, on_loading_complete}
-import audio/music_system {music_play_ambient, music_play_victory, music_play_defeat}
+let MAX_MISSIONS_PER_CAMPAIGN: i32 = 10
+let MAX_CAMPAIGNS: i32 = 6
+let MAX_OBJECTIVES: i32 = 10
+let MAX_PREREQUISITES: i32 = 5
+let MAX_UNLOCKED_POWERS: i32 = 50
 
-// Campaign faction
+// ============================================================================
+// ENUMS
+// ============================================================================
+
 enum CampaignFaction {
     USA,
-    China,
+    CHINA,
     GLA,
 }
 
-// Mission difficulty
 enum MissionDifficulty {
-    Easy,
-    Medium,
-    Hard,
-    Brutal,
+    EASY,
+    MEDIUM,
+    HARD,
+    BRUTAL,
 }
 
-// Mission status
 enum MissionStatus {
-    Locked,
-    Available,
-    InProgress,
-    Completed,
-    Failed,
+    LOCKED,
+    AVAILABLE,
+    IN_PROGRESS,
+    COMPLETED,
+    FAILED,
 }
 
-// Mission objective type
 enum ObjectiveType {
-    Primary,       // Must complete to win
-    Secondary,     // Optional bonus
-    Hidden,        // Revealed during mission
+    PRIMARY,        // Must complete to win
+    SECONDARY,      // Optional bonus
+    HIDDEN,         // Revealed during mission
 }
 
-// Single objective
+// ============================================================================
+// MISSION OBJECTIVE
+// ============================================================================
+
 struct MissionObjective {
     id: string,
     description: string,
@@ -44,92 +58,293 @@ struct MissionObjective {
     is_completed: bool,
     is_failed: bool,
     is_revealed: bool,
-    bonus_reward: u32,  // Extra cash for secondary objectives
+    bonus_reward: i32,  // Extra cash for secondary objectives
 }
 
-// Mission briefing screen data
+impl MissionObjective {
+    fn init(): MissionObjective {
+        return MissionObjective {
+            id: "",
+            description: "",
+            objective_type: ObjectiveType::PRIMARY,
+            is_completed: false,
+            is_failed: false,
+            is_revealed: true,
+            bonus_reward: 0,
+        }
+    }
+
+    fn create(id: string, description: string, obj_type: ObjectiveType, bonus: i32): MissionObjective {
+        return MissionObjective {
+            id: id,
+            description: description,
+            objective_type: obj_type,
+            is_completed: false,
+            is_failed: false,
+            is_revealed: obj_type != ObjectiveType::HIDDEN,
+            bonus_reward: bonus,
+        }
+    }
+
+    fn reset(&self) {
+        self.is_completed = false
+        self.is_failed = false
+        if self.objective_type == ObjectiveType::HIDDEN {
+            self.is_revealed = false
+        }
+    }
+}
+
+// ============================================================================
+// MISSION BRIEFING
+// ============================================================================
+
 struct MissionBriefing {
     title: string,
     location: string,
     description: string,
     intelligence: string,
-    video_intro: string,      // Pre-mission video path
-    video_outro_win: string,  // Post-mission victory video
-    video_outro_lose: string, // Post-mission defeat video
-    voice_briefing: string,   // Voice-over file
+    video_intro: string,       // Pre-mission video path
+    video_outro_win: string,   // Post-mission victory video
+    video_outro_lose: string,  // Post-mission defeat video
+    voice_briefing: string,    // Voice-over file
 }
 
-// Mission definition
+impl MissionBriefing {
+    fn init(): MissionBriefing {
+        return MissionBriefing {
+            title: "",
+            location: "",
+            description: "",
+            intelligence: "",
+            video_intro: "",
+            video_outro_win: "",
+            video_outro_lose: "",
+            voice_briefing: "",
+        }
+    }
+}
+
+// ============================================================================
+// MISSION
+// ============================================================================
+
 struct Mission {
     id: string,
     name: string,
     map_file: string,
     faction: CampaignFaction,
-    index: u32,            // Mission number in campaign
+    index: i32,             // Mission number in campaign
 
     // Briefing
     briefing: MissionBriefing,
 
     // Objectives
-    objectives: [MissionObjective; 10],
-    objective_count: u32,
+    objectives: [MissionObjective],
 
     // Status
     status: MissionStatus,
-    best_time: f32,        // Best completion time
-    times_completed: u32,
-    times_failed: u32,
+    best_time: f32,         // Best completion time
+    times_completed: i32,
+    times_failed: i32,
 
     // Prerequisites
-    requires_missions: [string; 5],
-    requires_count: u32,
+    requires_missions: [string],
 
     // Rewards
     unlocks_general_power: string,
     unlocks_unit: string,
 }
 
-let MAX_MISSIONS_PER_CAMPAIGN: u32 = 10
-let MAX_CAMPAIGNS: u32 = 3
+impl Mission {
+    fn init(): Mission {
+        return Mission {
+            id: "",
+            name: "",
+            map_file: "",
+            faction: CampaignFaction::USA,
+            index: 0,
+            briefing: MissionBriefing::init(),
+            objectives: [],
+            status: MissionStatus::LOCKED,
+            best_time: 0.0,
+            times_completed: 0,
+            times_failed: 0,
+            requires_missions: [],
+            unlocks_general_power: "",
+            unlocks_unit: "",
+        }
+    }
 
-// Campaign definition
+    fn add_objective(&self, objective: MissionObjective) {
+        if self.objectives.length < MAX_OBJECTIVES {
+            self.objectives = self.objectives + [objective]
+        }
+    }
+
+    fn add_prerequisite(&self, mission_id: string) {
+        if self.requires_missions.length < MAX_PREREQUISITES {
+            self.requires_missions = self.requires_missions + [mission_id]
+        }
+    }
+
+    fn reset_objectives(&self) {
+        for i in 0..self.objectives.length {
+            self.objectives[i].reset()
+        }
+    }
+
+    fn get_objective(&self, objective_id: string): MissionObjective? {
+        for i in 0..self.objectives.length {
+            if self.objectives[i].id == objective_id {
+                return self.objectives[i]
+            }
+        }
+        return null
+    }
+
+    fn check_all_primary_completed(&self): bool {
+        for i in 0..self.objectives.length {
+            let obj = self.objectives[i]
+            if obj.objective_type == ObjectiveType::PRIMARY && !obj.is_completed {
+                return false
+            }
+        }
+        return true
+    }
+
+    fn check_any_primary_failed(&self): bool {
+        for i in 0..self.objectives.length {
+            let obj = self.objectives[i]
+            if obj.objective_type == ObjectiveType::PRIMARY && obj.is_failed {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ============================================================================
+// CAMPAIGN
+// ============================================================================
+
 struct Campaign {
     faction: CampaignFaction,
     name: string,
     description: string,
-
-    missions: [Mission; MAX_MISSIONS_PER_CAMPAIGN],
-    mission_count: u32,
-
-    // Progression
-    current_mission: u32,
+    missions: [Mission],
+    current_mission: i32,
     is_completed: bool,
 }
 
-// Campaign save data
+impl Campaign {
+    fn init(faction: CampaignFaction, name: string, description: string): Campaign {
+        return Campaign {
+            faction: faction,
+            name: name,
+            description: description,
+            missions: [],
+            current_mission: 0,
+            is_completed: false,
+        }
+    }
+
+    fn add_mission(&self, mission: Mission) {
+        if self.missions.length < MAX_MISSIONS_PER_CAMPAIGN {
+            self.missions = self.missions + [mission]
+        }
+    }
+
+    fn get_mission(&self, index: i32): Mission? {
+        if index >= 0 && index < self.missions.length {
+            return self.missions[index]
+        }
+        return null
+    }
+
+    fn get_mission_by_id(&self, mission_id: string): Mission? {
+        for i in 0..self.missions.length {
+            if self.missions[i].id == mission_id {
+                return self.missions[i]
+            }
+        }
+        return null
+    }
+
+    fn check_completion(&self): bool {
+        for i in 0..self.missions.length {
+            if self.missions[i].status != MissionStatus::COMPLETED {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+// ============================================================================
+// CAMPAIGN SAVE DATA
+// ============================================================================
+
 struct CampaignSaveData {
     // Per-campaign progress
-    usa_progress: u32,    // Highest completed mission
-    china_progress: u32,
-    gla_progress: u32,
+    usa_progress: i32,      // Highest completed mission
+    china_progress: i32,
+    gla_progress: i32,
 
     // Mission completion times
-    mission_times: [f32; 30],
+    mission_times: [f32],
 
     // Unlocks
-    unlocked_powers: [string; 50],
-    unlock_count: u32,
+    unlocked_powers: [string],
 
     // Statistics
-    total_missions_completed: u32,
-    total_missions_failed: u32,
+    total_missions_completed: i32,
+    total_missions_failed: i32,
     total_play_time: f32,
 }
 
-// Campaign manager
+impl CampaignSaveData {
+    fn init(): CampaignSaveData {
+        return CampaignSaveData {
+            usa_progress: 0,
+            china_progress: 0,
+            gla_progress: 0,
+            mission_times: [],
+            unlocked_powers: [],
+            total_missions_completed: 0,
+            total_missions_failed: 0,
+            total_play_time: 0.0,
+        }
+    }
+
+    fn add_unlocked_power(&self, power_name: string) {
+        if self.unlocked_powers.length < MAX_UNLOCKED_POWERS {
+            // Check if already unlocked
+            for i in 0..self.unlocked_powers.length {
+                if self.unlocked_powers[i] == power_name {
+                    return
+                }
+            }
+            self.unlocked_powers = self.unlocked_powers + [power_name]
+        }
+    }
+
+    fn is_power_unlocked(&self, power_name: string): bool {
+        for i in 0..self.unlocked_powers.length {
+            if self.unlocked_powers[i] == power_name {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ============================================================================
+// CAMPAIGN MANAGER
+// ============================================================================
+
 struct CampaignManager {
-    campaigns: [Campaign; MAX_CAMPAIGNS],
-    campaign_count: u32,
+    campaigns: [Campaign],
 
     // Current state
     current_campaign: i32,
@@ -139,18 +354,17 @@ struct CampaignManager {
     // Mission state
     mission_start_time: f32,
     mission_elapsed_time: f32,
-    objectives_completed: u32,
-    objectives_failed: u32,
+    objectives_completed: i32,
+    objectives_failed: i32,
 
     // Save data
     save_data: CampaignSaveData,
 }
 
 impl CampaignManager {
-    fn new(): CampaignManager {
+    fn init(): CampaignManager {
         let manager = CampaignManager {
             campaigns: [],
-            campaign_count: 0,
             current_campaign: -1,
             current_mission: -1,
             is_in_mission: false,
@@ -158,7 +372,7 @@ impl CampaignManager {
             mission_elapsed_time: 0.0,
             objectives_completed: 0,
             objectives_failed: 0,
-            save_data: CampaignSaveData::default(),
+            save_data: CampaignSaveData::init(),
         }
 
         manager.build_campaigns()
@@ -167,207 +381,184 @@ impl CampaignManager {
         return manager
     }
 
-    fn build_campaigns(self: Self) {
+    // ========================================================================
+    // Campaign Building
+    // ========================================================================
+
+    fn build_campaigns(&self) {
         // USA Campaign
-        self.campaigns[0] = Campaign {
-            faction: CampaignFaction::USA,
-            name: "USA Campaign",
-            description: "Lead the United States military against the Global Liberation Army.",
-            missions: [],
-            mission_count: 0,
-            current_mission: 0,
-            is_completed: false,
+        let usa_campaign = Campaign::init(
+            CampaignFaction::USA,
+            "USA Campaign",
+            "Lead the United States military against the Global Liberation Army."
+        )
+
+        let usa01 = Mission::init()
+        usa01.id = "USA01"
+        usa01.name = "Final Justice"
+        usa01.map_file = "maps/usa01/usa01.map"
+        usa01.faction = CampaignFaction::USA
+        usa01.index = 1
+        usa01.status = MissionStatus::AVAILABLE
+        usa01.briefing = MissionBriefing {
+            title: "Operation: Final Justice",
+            location: "Baghdad, Iraq",
+            description: "The GLA has seized control of a key military installation. Lead a strike force to recapture the base and eliminate all hostile forces.",
+            intelligence: "Enemy forces consist primarily of light vehicles and infantry. Air support is available.",
+            video_intro: "Data/Movies/USA01_Intro.bik",
+            video_outro_win: "Data/Movies/USA01_Win.bik",
+            video_outro_lose: "Data/Movies/USA01_Lose.bik",
+            voice_briefing: "Data/Audio/Voice/USA01_Briefing.wav",
         }
+        usa01.add_objective(MissionObjective::create("capture_base", "Capture the enemy base", ObjectiveType::PRIMARY, 0))
+        usa01.add_objective(MissionObjective::create("destroy_all", "Eliminate all GLA forces", ObjectiveType::PRIMARY, 0))
+        usa01.add_objective(MissionObjective::create("save_civilians", "Rescue all civilian hostages", ObjectiveType::SECONDARY, 5000))
+        usa_campaign.add_mission(usa01)
 
-        self.add_mission_to_campaign(0, Mission {
-            id: "USA01",
-            name: "Final Justice",
-            map_file: "maps/usa01/usa01.map",
-            faction: CampaignFaction::USA,
-            index: 1,
-            briefing: MissionBriefing {
-                title: "Operation: Final Justice",
-                location: "Baghdad, Iraq",
-                description: "The GLA has seized control of a key military installation. Lead a strike force to recapture the base and eliminate all hostile forces.",
-                intelligence: "Enemy forces consist primarily of light vehicles and infantry. Air support is available.",
-                video_intro: "Data/Movies/USA01_Intro.bik",
-                video_outro_win: "Data/Movies/USA01_Win.bik",
-                video_outro_lose: "Data/Movies/USA01_Lose.bik",
-                voice_briefing: "Data/Audio/Voice/USA01_Briefing.wav",
-            },
-            objectives: [
-                MissionObjective { id: "capture_base", description: "Capture the enemy base", objective_type: ObjectiveType::Primary, is_completed: false, is_failed: false, is_revealed: true, bonus_reward: 0 },
-                MissionObjective { id: "destroy_all", description: "Eliminate all GLA forces", objective_type: ObjectiveType::Primary, is_completed: false, is_failed: false, is_revealed: true, bonus_reward: 0 },
-                MissionObjective { id: "save_civilians", description: "Rescue all civilian hostages", objective_type: ObjectiveType::Secondary, is_completed: false, is_failed: false, is_revealed: true, bonus_reward: 5000 },
-            ],
-            objective_count: 3,
-            status: MissionStatus::Available,
-            best_time: 0.0,
-            times_completed: 0,
-            times_failed: 0,
-            requires_missions: [],
-            requires_count: 0,
-            unlocks_general_power: "",
-            unlocks_unit: "",
-        })
+        let usa02 = Mission::init()
+        usa02.id = "USA02"
+        usa02.name = "Guardian Angel"
+        usa02.map_file = "maps/usa02/usa02.map"
+        usa02.faction = CampaignFaction::USA
+        usa02.index = 2
+        usa02.status = MissionStatus::LOCKED
+        usa02.briefing = MissionBriefing {
+            title: "Operation: Guardian Angel",
+            location: "Kazakhstan",
+            description: "A UN convoy is under attack by GLA forces. Escort the convoy to safety while eliminating threats.",
+            intelligence: "The GLA has positioned ambush points along the convoy route. Air support is limited due to SAM sites.",
+            video_intro: "Data/Movies/USA02_Intro.bik",
+            video_outro_win: "Data/Movies/USA02_Win.bik",
+            video_outro_lose: "Data/Movies/USA02_Lose.bik",
+            voice_briefing: "Data/Audio/Voice/USA02_Briefing.wav",
+        }
+        usa02.add_prerequisite("USA01")
+        usa02.unlocks_general_power = "Paladin_Tank"
+        usa_campaign.add_mission(usa02)
 
-        self.add_mission_to_campaign(0, Mission {
-            id: "USA02",
-            name: "Guardian Angel",
-            map_file: "maps/usa02/usa02.map",
-            faction: CampaignFaction::USA,
-            index: 2,
-            briefing: MissionBriefing {
-                title: "Operation: Guardian Angel",
-                location: "Kazakhstan",
-                description: "A UN convoy is under attack by GLA forces. Escort the convoy to safety while eliminating threats.",
-                intelligence: "The GLA has positioned ambush points along the convoy route. Air support is limited due to SAM sites.",
-                video_intro: "Data/Movies/USA02_Intro.bik",
-                video_outro_win: "Data/Movies/USA02_Win.bik",
-                video_outro_lose: "Data/Movies/USA02_Lose.bik",
-                voice_briefing: "Data/Audio/Voice/USA02_Briefing.wav",
-            },
-            objectives: [],
-            objective_count: 0,
-            status: MissionStatus::Locked,
-            best_time: 0.0,
-            times_completed: 0,
-            times_failed: 0,
-            requires_missions: ["USA01"],
-            requires_count: 1,
-            unlocks_general_power: "Paladin_Tank",
-            unlocks_unit: "",
-        })
+        self.campaigns = self.campaigns + [usa_campaign]
 
         // China Campaign
-        self.campaigns[1] = Campaign {
-            faction: CampaignFaction::China,
-            name: "China Campaign",
-            description: "Command the People's Liberation Army in the fight against terrorism.",
-            missions: [],
-            mission_count: 0,
-            current_mission: 0,
-            is_completed: false,
-        }
+        let china_campaign = Campaign::init(
+            CampaignFaction::CHINA,
+            "China Campaign",
+            "Command the People's Liberation Army in the fight against terrorism."
+        )
 
-        self.add_mission_to_campaign(1, Mission {
-            id: "CHINA01",
-            name: "The Dragon Awakes",
-            map_file: "maps/china01/china01.map",
-            faction: CampaignFaction::China,
-            index: 1,
-            briefing: MissionBriefing {
-                title: "Operation: The Dragon Awakes",
-                location: "Hong Kong",
-                description: "GLA terrorists have attacked Hong Kong. Deploy forces to secure key locations and eliminate the threat.",
-                intelligence: "The enemy has established fortified positions throughout the city. Heavy armor is recommended.",
-                video_intro: "Data/Movies/CHINA01_Intro.bik",
-                video_outro_win: "Data/Movies/CHINA01_Win.bik",
-                video_outro_lose: "Data/Movies/CHINA01_Lose.bik",
-                voice_briefing: "Data/Audio/Voice/CHINA01_Briefing.wav",
-            },
-            objectives: [],
-            objective_count: 0,
-            status: MissionStatus::Available,
-            best_time: 0.0,
-            times_completed: 0,
-            times_failed: 0,
-            requires_missions: [],
-            requires_count: 0,
-            unlocks_general_power: "",
-            unlocks_unit: "",
-        })
+        let china01 = Mission::init()
+        china01.id = "CHINA01"
+        china01.name = "The Dragon Awakes"
+        china01.map_file = "maps/china01/china01.map"
+        china01.faction = CampaignFaction::CHINA
+        china01.index = 1
+        china01.status = MissionStatus::AVAILABLE
+        china01.briefing = MissionBriefing {
+            title: "Operation: The Dragon Awakes",
+            location: "Hong Kong",
+            description: "GLA terrorists have attacked Hong Kong. Deploy forces to secure key locations and eliminate the threat.",
+            intelligence: "The enemy has established fortified positions throughout the city. Heavy armor is recommended.",
+            video_intro: "Data/Movies/CHINA01_Intro.bik",
+            video_outro_win: "Data/Movies/CHINA01_Win.bik",
+            video_outro_lose: "Data/Movies/CHINA01_Lose.bik",
+            voice_briefing: "Data/Audio/Voice/CHINA01_Briefing.wav",
+        }
+        china_campaign.add_mission(china01)
+
+        self.campaigns = self.campaigns + [china_campaign]
 
         // GLA Campaign
-        self.campaigns[2] = Campaign {
-            faction: CampaignFaction::GLA,
-            name: "GLA Campaign",
-            description: "Lead the Global Liberation Army in their struggle for independence.",
-            missions: [],
-            mission_count: 0,
-            current_mission: 0,
-            is_completed: false,
+        let gla_campaign = Campaign::init(
+            CampaignFaction::GLA,
+            "GLA Campaign",
+            "Lead the Global Liberation Army in their struggle for independence."
+        )
+
+        let gla01 = Mission::init()
+        gla01.id = "GLA01"
+        gla01.name = "Operation: Black Rain"
+        gla01.map_file = "maps/gla01/gla01.map"
+        gla01.faction = CampaignFaction::GLA
+        gla01.index = 1
+        gla01.status = MissionStatus::AVAILABLE
+        gla01.briefing = MissionBriefing {
+            title: "Operation: Black Rain",
+            location: "Central Asia",
+            description: "Strike at the heart of the enemy's supply lines. Destroy the convoy and escape before reinforcements arrive.",
+            intelligence: "The convoy is lightly guarded but air support will arrive within minutes of detection.",
+            video_intro: "Data/Movies/GLA01_Intro.bik",
+            video_outro_win: "Data/Movies/GLA01_Win.bik",
+            video_outro_lose: "Data/Movies/GLA01_Lose.bik",
+            voice_briefing: "Data/Audio/Voice/GLA01_Briefing.wav",
         }
+        gla_campaign.add_mission(gla01)
 
-        self.add_mission_to_campaign(2, Mission {
-            id: "GLA01",
-            name: "Operation: Black Rain",
-            map_file: "maps/gla01/gla01.map",
-            faction: CampaignFaction::GLA,
-            index: 1,
-            briefing: MissionBriefing {
-                title: "Operation: Black Rain",
-                location: "Central Asia",
-                description: "Strike at the heart of the enemy's supply lines. Destroy the convoy and escape before reinforcements arrive.",
-                intelligence: "The convoy is lightly guarded but air support will arrive within minutes of detection.",
-                video_intro: "Data/Movies/GLA01_Intro.bik",
-                video_outro_win: "Data/Movies/GLA01_Win.bik",
-                video_outro_lose: "Data/Movies/GLA01_Lose.bik",
-                voice_briefing: "Data/Audio/Voice/GLA01_Briefing.wav",
-            },
-            objectives: [],
-            objective_count: 0,
-            status: MissionStatus::Available,
-            best_time: 0.0,
-            times_completed: 0,
-            times_failed: 0,
-            requires_missions: [],
-            requires_count: 0,
-            unlocks_general_power: "",
-            unlocks_unit: "",
-        })
-
-        self.campaign_count = 3
+        self.campaigns = self.campaigns + [gla_campaign]
     }
 
-    fn add_mission_to_campaign(self: Self, campaign_index: u32, mission: Mission) {
-        if campaign_index < MAX_CAMPAIGNS {
-            let campaign = &self.campaigns[campaign_index]
-            if campaign.mission_count < MAX_MISSIONS_PER_CAMPAIGN {
-                campaign.missions[campaign.mission_count] = mission
-                campaign.mission_count = campaign.mission_count + 1
-            }
-        }
-    }
+    // ========================================================================
+    // Campaign Selection
+    // ========================================================================
 
-    fn select_campaign(self: Self, faction: CampaignFaction) {
-        match faction {
-            CampaignFaction::USA => self.current_campaign = 0,
-            CampaignFaction::China => self.current_campaign = 1,
-            CampaignFaction::GLA => self.current_campaign = 2,
+    fn select_campaign(&self, faction: CampaignFaction) {
+        if faction == CampaignFaction::USA {
+            self.current_campaign = 0
+        } else if faction == CampaignFaction::CHINA {
+            self.current_campaign = 1
+        } else if faction == CampaignFaction::GLA {
+            self.current_campaign = 2
         }
         self.current_mission = -1
     }
 
-    fn select_mission(self: Self, mission_index: u32): bool {
-        if self.current_campaign < 0 {
+    fn select_mission(&self, mission_index: i32): bool {
+        if self.current_campaign < 0 || self.current_campaign >= self.campaigns.length {
             return false
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        if mission_index >= campaign.mission_count {
+        let campaign = self.campaigns[self.current_campaign]
+        if mission_index < 0 || mission_index >= campaign.missions.length {
             return false
         }
 
-        let mission = &campaign.missions[mission_index]
-        if mission.status == MissionStatus::Locked {
+        let mission = campaign.missions[mission_index]
+        if mission.status == MissionStatus::LOCKED {
             return false
         }
 
-        self.current_mission = mission_index as i32
+        self.current_mission = mission_index
         return true
     }
 
-    fn start_mission(self: Self): bool {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    fn get_current_campaign(&self): Campaign? {
+        if self.current_campaign >= 0 && self.current_campaign < self.campaigns.length {
+            return self.campaigns[self.current_campaign]
+        }
+        return null
+    }
+
+    fn get_current_mission(&self): Mission? {
+        let campaign = self.get_current_campaign()
+        if campaign == null {
+            return null
+        }
+        if self.current_mission >= 0 && self.current_mission < campaign.missions.length {
+            return campaign.missions[self.current_mission]
+        }
+        return null
+    }
+
+    // ========================================================================
+    // Mission Execution
+    // ========================================================================
+
+    fn start_mission(&self): bool {
+        let mission = self.get_current_mission()
+        if mission == null {
             return false
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &mut campaign.missions[self.current_mission as u32]
-
         // Mark as in progress
-        mission.status = MissionStatus::InProgress
+        mission.status = MissionStatus::IN_PROGRESS
         self.is_in_mission = true
         self.mission_start_time = 0.0
         self.mission_elapsed_time = 0.0
@@ -375,28 +566,20 @@ impl CampaignManager {
         self.objectives_failed = 0
 
         // Reset objectives
-        for i in 0..mission.objective_count {
-            mission.objectives[i].is_completed = false
-            mission.objectives[i].is_failed = false
-        }
+        mission.reset_objectives()
 
-        // Load the map
+        // Load the map (would call map loader)
         self.load_mission_map(mission.map_file)
-
-        // Play faction-appropriate music
-        music_play_ambient()
 
         return true
     }
 
-    fn load_mission_map(self: Self, map_file: string) {
-        // Load map file
-        // Initialize terrain, objects, scripts
-        // Show loading screen
+    fn load_mission_map(&self, map_file: string) {
+        // Would load map file, initialize terrain, objects, scripts
     }
 
-    fn update(self: Self, delta_time: f32) {
-        if not self.is_in_mission {
+    fn update(&self, delta_time: f32) {
+        if !self.is_in_mission {
             return
         }
 
@@ -406,109 +589,84 @@ impl CampaignManager {
         self.check_mission_completion()
     }
 
-    fn check_mission_completion(self: Self) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    fn check_mission_completion(&self) {
+        let mission = self.get_current_mission()
+        if mission == null {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &campaign.missions[self.current_mission as u32]
-
-        // Check if all primary objectives completed
-        let mut all_primary_completed = true
-        let mut any_primary_failed = false
-
-        for i in 0..mission.objective_count {
-            let obj = &mission.objectives[i]
-            if obj.objective_type == ObjectiveType::Primary {
-                if not obj.is_completed {
-                    all_primary_completed = false
-                }
-                if obj.is_failed {
-                    any_primary_failed = true
-                }
-            }
-        }
-
-        if all_primary_completed {
+        if mission.check_all_primary_completed() {
             self.complete_mission(true)
-        } else if any_primary_failed {
+        } else if mission.check_any_primary_failed() {
             self.complete_mission(false)
         }
     }
 
-    fn complete_objective(self: Self, objective_id: string) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    // ========================================================================
+    // Objective Management
+    // ========================================================================
+
+    fn complete_objective(&self, objective_id: string) {
+        let mission = self.get_current_mission()
+        if mission == null {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &mut campaign.missions[self.current_mission as u32]
+        let obj = mission.get_objective(objective_id)
+        if obj != null && !obj.is_completed {
+            obj.is_completed = true
+            self.objectives_completed = self.objectives_completed + 1
 
-        for i in 0..mission.objective_count {
-            if mission.objectives[i].id == objective_id {
-                mission.objectives[i].is_completed = true
-                self.objectives_completed = self.objectives_completed + 1
-
-                // Award bonus for secondary objectives
-                if mission.objectives[i].objective_type == ObjectiveType::Secondary {
-                    // Add bonus cash to player
-                }
-
-                break
+            // Award bonus for secondary objectives
+            if obj.objective_type == ObjectiveType::SECONDARY && obj.bonus_reward > 0 {
+                // Would add bonus cash to player
             }
         }
     }
 
-    fn fail_objective(self: Self, objective_id: string) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    fn fail_objective(&self, objective_id: string) {
+        let mission = self.get_current_mission()
+        if mission == null {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &mut campaign.missions[self.current_mission as u32]
-
-        for i in 0..mission.objective_count {
-            if mission.objectives[i].id == objective_id {
-                mission.objectives[i].is_failed = true
-                self.objectives_failed = self.objectives_failed + 1
-                break
-            }
+        let obj = mission.get_objective(objective_id)
+        if obj != null && !obj.is_failed {
+            obj.is_failed = true
+            self.objectives_failed = self.objectives_failed + 1
         }
     }
 
-    fn reveal_objective(self: Self, objective_id: string) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    fn reveal_objective(&self, objective_id: string) {
+        let mission = self.get_current_mission()
+        if mission == null {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &mut campaign.missions[self.current_mission as u32]
-
-        for i in 0..mission.objective_count {
-            if mission.objectives[i].id == objective_id {
-                mission.objectives[i].is_revealed = true
-                break
-            }
+        let obj = mission.get_objective(objective_id)
+        if obj != null {
+            obj.is_revealed = true
         }
     }
 
-    fn complete_mission(self: Self, victory: bool) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    // ========================================================================
+    // Mission Completion
+    // ========================================================================
+
+    fn complete_mission(&self, victory: bool) {
+        let mission = self.get_current_mission()
+        if mission == null {
             return
         }
-
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &mut campaign.missions[self.current_mission as u32]
 
         self.is_in_mission = false
 
         if victory {
-            mission.status = MissionStatus::Completed
+            mission.status = MissionStatus::COMPLETED
             mission.times_completed = mission.times_completed + 1
 
             // Update best time
-            if mission.best_time == 0.0 or self.mission_elapsed_time < mission.best_time {
+            if mission.best_time == 0.0 || self.mission_elapsed_time < mission.best_time {
                 mission.best_time = self.mission_elapsed_time
             }
 
@@ -516,20 +674,18 @@ impl CampaignManager {
             self.unlock_next_mission()
 
             // Process unlocks
-            if mission.unlocks_general_power.len() > 0 {
-                self.unlock_power(mission.unlocks_general_power)
+            if mission.unlocks_general_power != "" {
+                self.save_data.add_unlocked_power(mission.unlocks_general_power)
             }
 
-            music_play_victory()
             self.save_data.total_missions_completed = self.save_data.total_missions_completed + 1
 
             // Check campaign completion
             self.check_campaign_completion()
         } else {
-            mission.status = MissionStatus::Available  // Allow retry
+            mission.status = MissionStatus::AVAILABLE  // Allow retry
             mission.times_failed = mission.times_failed + 1
 
-            music_play_defeat()
             self.save_data.total_missions_failed = self.save_data.total_missions_failed + 1
         }
 
@@ -537,177 +693,188 @@ impl CampaignManager {
         self.save_progress()
     }
 
-    fn unlock_next_mission(self: Self) {
-        if self.current_campaign < 0 or self.current_mission < 0 {
+    fn unlock_next_mission(&self) {
+        let campaign = self.get_current_campaign()
+        if campaign == null {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let next_index = (self.current_mission as u32) + 1
-
-        if next_index < campaign.mission_count {
-            // Check if prerequisites are met
-            let next_mission = &mut campaign.missions[next_index]
-            let mut all_prereqs_met = true
-
-            for i in 0..next_mission.requires_count {
-                let req_id = &next_mission.requires_missions[i]
-                if not self.is_mission_completed(req_id) {
-                    all_prereqs_met = false
-                    break
-                }
-            }
-
-            if all_prereqs_met {
-                next_mission.status = MissionStatus::Available
-            }
-        }
-    }
-
-    fn is_mission_completed(self: Self, mission_id: string): bool {
-        for c in 0..self.campaign_count {
-            let campaign = &self.campaigns[c]
-            for m in 0..campaign.mission_count {
-                if campaign.missions[m].id == *mission_id {
-                    return campaign.missions[m].status == MissionStatus::Completed
-                }
-            }
-        }
-        return false
-    }
-
-    fn check_campaign_completion(self: Self) {
-        if self.current_campaign < 0 {
+        let next_index = self.current_mission + 1
+        if next_index >= campaign.missions.length {
             return
         }
 
-        let campaign = &self.campaigns[self.current_campaign as u32]
+        let next_mission = campaign.missions[next_index]
 
-        let mut all_completed = true
-        for i in 0..campaign.mission_count {
-            if campaign.missions[i].status != MissionStatus::Completed {
-                all_completed = false
+        // Check if prerequisites are met
+        let all_prereqs_met = true
+        for i in 0..next_mission.requires_missions.length {
+            let req_id = next_mission.requires_missions[i]
+            if !self.is_mission_completed(req_id) {
+                all_prereqs_met = false
                 break
             }
         }
 
-        campaign.is_completed = all_completed
-    }
-
-    fn unlock_power(self: Self, power_name: string) {
-        if self.save_data.unlock_count < 50 {
-            self.save_data.unlocked_powers[self.save_data.unlock_count] = power_name
-            self.save_data.unlock_count = self.save_data.unlock_count + 1
+        if all_prereqs_met {
+            next_mission.status = MissionStatus::AVAILABLE
         }
     }
 
-    fn is_power_unlocked(self: Self, power_name: string): bool {
-        for i in 0..self.save_data.unlock_count {
-            if self.save_data.unlocked_powers[i] == power_name {
-                return true
+    fn is_mission_completed(&self, mission_id: string): bool {
+        for c in 0..self.campaigns.length {
+            let campaign = self.campaigns[c]
+            for m in 0..campaign.missions.length {
+                if campaign.missions[m].id == mission_id {
+                    return campaign.missions[m].status == MissionStatus::COMPLETED
+                }
             }
         }
         return false
     }
 
-    // Briefing access
-    fn get_current_briefing(self: Self): MissionBriefing {
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &campaign.missions[self.current_mission as u32]
-        return &mission.briefing
+    fn check_campaign_completion(&self) {
+        let campaign = self.get_current_campaign()
+        if campaign == null {
+            return
+        }
+
+        campaign.is_completed = campaign.check_completion()
     }
 
-    fn get_current_objectives(self: Self): [MissionObjective; 10] {
-        let campaign = &self.campaigns[self.current_campaign as u32]
-        let mission = &campaign.missions[self.current_mission as u32]
-        return &mission.objectives
+    // ========================================================================
+    // Briefing Access
+    // ========================================================================
+
+    fn get_current_briefing(&self): MissionBriefing? {
+        let mission = self.get_current_mission()
+        if mission != null {
+            return mission.briefing
+        }
+        return null
     }
 
+    fn get_current_objectives(&self): [MissionObjective] {
+        let mission = self.get_current_mission()
+        if mission != null {
+            return mission.objectives
+        }
+        return []
+    }
+
+    // ========================================================================
     // Save/Load
-    fn save_progress(self: Self) {
-        // Save to campaign save file
-        // Serialize save_data
+    // ========================================================================
+
+    fn save_progress(&self) {
+        // Would save to campaign save file
     }
 
-    fn load_save_data(self: Self) {
-        // Load from campaign save file
-        // Deserialize into save_data
+    fn load_save_data(&self) {
+        // Would load from campaign save file
         // Update mission unlock status based on progress
     }
 
-    fn reset_progress(self: Self) {
-        self.save_data = CampaignSaveData::default()
+    fn reset_progress(&self) {
+        self.save_data = CampaignSaveData::init()
+        self.campaigns = []
         self.build_campaigns()
         self.save_progress()
     }
 }
 
-impl CampaignSaveData {
-    fn default(): CampaignSaveData {
-        return CampaignSaveData {
-            usa_progress: 0,
-            china_progress: 0,
-            gla_progress: 0,
-            mission_times: [],
-            unlocked_powers: [],
-            unlock_count: 0,
-            total_missions_completed: 0,
-            total_missions_failed: 0,
-            total_play_time: 0.0,
-        }
+// ============================================================================
+// GLOBAL CAMPAIGN MANAGER INSTANCE
+// ============================================================================
+
+let g_campaign_manager: CampaignManager? = null
+
+fn init_campaign_manager(): CampaignManager {
+    let manager = CampaignManager::init()
+    g_campaign_manager = manager
+    return manager
+}
+
+fn get_campaign_manager(): CampaignManager? {
+    return g_campaign_manager
+}
+
+fn shutdown_campaign_manager() {
+    g_campaign_manager = null
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+fn campaign_select(faction: i32) {
+    if g_campaign_manager == null {
+        return
+    }
+
+    if faction == 0 {
+        g_campaign_manager.select_campaign(CampaignFaction::USA)
+    } else if faction == 1 {
+        g_campaign_manager.select_campaign(CampaignFaction::CHINA)
+    } else if faction == 2 {
+        g_campaign_manager.select_campaign(CampaignFaction::GLA)
     }
 }
 
-// Global campaign manager
-var g_campaign_manager: CampaignManager = CampaignManager::new()
-
-// Export functions
-export fn campaign_init() {
-    g_campaign_manager = CampaignManager::new()
-}
-
-export fn campaign_select(faction: u32) {
-    let f = match faction {
-        0 => CampaignFaction::USA,
-        1 => CampaignFaction::China,
-        2 => CampaignFaction::GLA,
-        _ => CampaignFaction::USA,
+fn campaign_select_mission(index: i32): bool {
+    if g_campaign_manager != null {
+        return g_campaign_manager.select_mission(index)
     }
-    g_campaign_manager.select_campaign(f)
+    return false
 }
 
-export fn campaign_select_mission(index: u32): bool {
-    return g_campaign_manager.select_mission(index)
+fn campaign_start_mission(): bool {
+    if g_campaign_manager != null {
+        return g_campaign_manager.start_mission()
+    }
+    return false
 }
 
-export fn campaign_start_mission(): bool {
-    return g_campaign_manager.start_mission()
+fn campaign_update(delta_time: f32) {
+    if g_campaign_manager != null {
+        g_campaign_manager.update(delta_time)
+    }
 }
 
-export fn campaign_update(delta_time: f32) {
-    g_campaign_manager.update(delta_time)
+fn campaign_complete_objective(objective_id: string) {
+    if g_campaign_manager != null {
+        g_campaign_manager.complete_objective(objective_id)
+    }
 }
 
-export fn campaign_complete_objective(objective_id: string) {
-    g_campaign_manager.complete_objective(objective_id)
+fn campaign_fail_objective(objective_id: string) {
+    if g_campaign_manager != null {
+        g_campaign_manager.fail_objective(objective_id)
+    }
 }
 
-export fn campaign_fail_objective(objective_id: string) {
-    g_campaign_manager.fail_objective(objective_id)
+fn campaign_reveal_objective(objective_id: string) {
+    if g_campaign_manager != null {
+        g_campaign_manager.reveal_objective(objective_id)
+    }
 }
 
-export fn campaign_reveal_objective(objective_id: string) {
-    g_campaign_manager.reveal_objective(objective_id)
+fn campaign_end_mission(victory: bool) {
+    if g_campaign_manager != null {
+        g_campaign_manager.complete_mission(victory)
+    }
 }
 
-export fn campaign_end_mission(victory: bool) {
-    g_campaign_manager.complete_mission(victory)
+fn campaign_is_in_mission(): bool {
+    if g_campaign_manager != null {
+        return g_campaign_manager.is_in_mission
+    }
+    return false
 }
 
-export fn campaign_is_in_mission(): bool {
-    return g_campaign_manager.is_in_mission
-}
-
-export fn campaign_get_elapsed_time(): f32 {
-    return g_campaign_manager.mission_elapsed_time
+fn campaign_get_elapsed_time(): f32 {
+    if g_campaign_manager != null {
+        return g_campaign_manager.mission_elapsed_time
+    }
+    return 0.0
 }
