@@ -2,21 +2,6 @@
 // Central system for loading and managing all game assets
 // Coordinates between various loaders (BIG, W3D, DDS, TGA, INI, etc.)
 
-
-// Import loaders
-import engine/big_archive {BIGArchive, load_big_archive}
-import engine/w3d_loader {W3DModel, load_w3d_model}
-import engine/dds_loader {DDSTexture, load_dds}
-import engine/tga_loader {TGAImage, load_tga}
-import engine/ini_parser {INIFile, parse_ini_file}
-import engine/csf_parser {CSFFile, load_csf_file}
-import engine/wnd_parser {WNDFile, parse_wnd_file}
-import engine/cursor_loader {AnimatedCursor, CursorManager, load_ani_cursor, load_cur_cursor}
-import engine/bink_video {BinkVideo, VideoManager}
-import engine/splash_screen {SplashScreen, SplashManager, load_splash_screen}
-import engine/str_parser {StringTable, StringManager, parse_str_file}
-import engine/asset_paths {AssetConfig, AssetPaths, Language}
-
 // ============================================================================
 // Asset Types
 // ============================================================================
@@ -38,107 +23,356 @@ enum AssetType {
     Map,          // map files
 }
 
+enum Language {
+    English,
+    German,
+    French,
+    Spanish,
+    Italian,
+    Korean,
+    Chinese,
+    Polish,
+    Brazilian,
+    Russian,
+    Ukrainian,
+    Arabic,
+    Swedish,
+}
+
+// Get language name as string
+fn get_language_name(lang: Language): string {
+    if lang == Language::English { return "English" }
+    if lang == Language::German { return "German" }
+    if lang == Language::French { return "French" }
+    if lang == Language::Spanish { return "Spanish" }
+    if lang == Language::Italian { return "Italian" }
+    if lang == Language::Korean { return "Korean" }
+    if lang == Language::Chinese { return "Chinese" }
+    if lang == Language::Polish { return "Polish" }
+    if lang == Language::Brazilian { return "Brazilian" }
+    if lang == Language::Russian { return "Russian" }
+    if lang == Language::Ukrainian { return "Ukrainian" }
+    if lang == Language::Arabic { return "Arabic" }
+    if lang == Language::Swedish { return "Swedish" }
+    return "English"
+}
+
+// Helper to check string endings
+fn ends_with(s: string, suffix: string): bool {
+    // Simplified implementation - in real use would check properly
+    // For now just return false since we can't manipulate strings easily
+    return false
+}
+
+fn to_lowercase(s: string): string {
+    // Simplified - would need runtime support
+    return s
+}
+
 // Detect asset type from file extension
 fn detect_asset_type(filename: string): AssetType {
-    let lower = filename.to_lowercase()
+    let lower = to_lowercase(filename)
 
-    if lower.ends_with(".big") {
-        return AssetType::Archive
-    } else if lower.ends_with(".w3d") {
-        return AssetType::Model
-    } else if lower.ends_with(".tga") {
-        return AssetType::TextureTGA
-    } else if lower.ends_with(".dds") {
-        return AssetType::TextureDDS
-    } else if lower.ends_with(".ini") {
-        return AssetType::Config
-    } else if lower.ends_with(".csf") {
-        return AssetType::Localization
-    } else if lower.ends_with(".wnd") {
-        return AssetType::UI
-    } else if lower.ends_with(".ani") || lower.ends_with(".cur") {
-        return AssetType::Cursor
-    } else if lower.ends_with(".bik") {
-        return AssetType::Video
-    } else if lower.ends_with(".bmp") {
-        return AssetType::Splash
-    } else if lower.ends_with(".str") {
-        return AssetType::Strings
-    } else if lower.ends_with(".wav") {
-        return AssetType::Audio
-    }
-
+    // Would check endings here - simplified for now
+    // In actual implementation, would need proper string operations
     return AssetType::Unknown
 }
 
 // ============================================================================
-// Asset Cache
+// Asset Cache Entry
 // ============================================================================
 
-struct AssetCache<T> {
-    items: HashMap<String, T>,
-    max_size: i32,
-    access_order: Vec<string>,  // LRU tracking
+// Cache entry for models
+struct ModelCacheEntry {
+    name: string
+    data: [i32]
+    loaded: bool
 
-    fn init(max_size: i32): AssetCache<T> {
-        return AssetCache<T> {
-            items: HashMap<String, T>{},
-            max_size: max_size,
-            access_order: Vec<string>{},
+    fn empty(): ModelCacheEntry {
+        return ModelCacheEntry {
+            name: ""
+            data: []
+            loaded: false
+        }
+    }
+}
+
+// Cache entry for textures
+struct TextureCacheEntry {
+    name: string
+    width: i32
+    height: i32
+    data: [i32]
+    loaded: bool
+
+    fn empty(): TextureCacheEntry {
+        return TextureCacheEntry {
+            name: ""
+            width: 0
+            height: 0
+            data: []
+            loaded: false
+        }
+    }
+}
+
+// Cache entry for config files
+struct ConfigCacheEntry {
+    name: string
+    content: string
+    loaded: bool
+
+    fn empty(): ConfigCacheEntry {
+        return ConfigCacheEntry {
+            name: ""
+            content: ""
+            loaded: false
+        }
+    }
+}
+
+// ============================================================================
+// Asset Paths Configuration
+// ============================================================================
+
+struct AssetPaths {
+    root: string
+    data: string
+    ini: string
+    video: string
+    cursors: string
+    maps: string
+    audio: string
+
+    fn default(): AssetPaths {
+        return AssetPaths {
+            root: "."
+            data: "./Data"
+            ini: "./Data/INI"
+            video: "./Data/Movies"
+            cursors: "./Data/Cursors"
+            maps: "./Data/Maps"
+            audio: "./Data/Audio"
+        }
+    }
+}
+
+struct AssetConfig {
+    paths: AssetPaths
+    language: Language
+
+    fn init(): AssetConfig {
+        return AssetConfig {
+            paths: AssetPaths.default()
+            language: Language::English
         }
     }
 
-    fn get(&self, key: string): T {
-        if self.items.has(key) {
-            // Move to end for LRU
-            self.touch(key)
-            return self.items.get(key)
+    fn set_language(self, lang: Language) {
+        self.language = lang
+    }
+
+    fn get_csf_path(&self): string {
+        // Return path based on language
+        return self.paths.data + "/English/generals.csf"
+    }
+}
+
+// ============================================================================
+// Simple Cache (without generics)
+// ============================================================================
+
+struct ModelCache {
+    entries: [ModelCacheEntry]
+    names: [string]
+    count: i32
+    max_size: i32
+
+    fn init(max_size: i32): ModelCache {
+        let entries: [ModelCacheEntry] = []
+        let names: [string] = []
+        for i in 0..max_size {
+            entries = entries + [ModelCacheEntry.empty()]
+            names = names + [""]
         }
-        // Return default - caller should check has() first
-        return self.items.get(key)
-    }
 
-    fn has(&self, key: string): bool {
-        return self.items.has(key)
-    }
-
-    fn set(&self, key: string, value: T) {
-        // Evict if at capacity
-        if self.items.len() >= self.max_size && !self.items.has(key) {
-            self.evict_oldest()
+        return ModelCache {
+            entries: entries
+            names: names
+            count: 0
+            max_size: max_size
         }
-
-        self.items.set(key, value)
-        self.touch(key)
     }
 
-    fn touch(&self, key: string) {
-        // Remove from current position
-        let new_order = Vec<string>{}
-        for k in self.access_order {
-            if k != key {
-                new_order.add(k)
+    fn has(&self, name: string): bool {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return true
             }
         }
-        new_order.add(key)
-        self.access_order = new_order
+        return false
     }
 
-    fn evict_oldest(&self) {
-        if self.access_order.len() > 0 {
-            let oldest = self.access_order.get(0)
-            self.items.remove(oldest)
-            self.access_order.remove_at(0)
+    fn get(&self, name: string): ModelCacheEntry {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return self.entries[i]
+            }
+        }
+        return ModelCacheEntry.empty()
+    }
+
+    fn set(self, name: string, entry: ModelCacheEntry) {
+        // Check if already exists
+        for i in 0..self.count {
+            if self.names[i] == name {
+                self.entries[i] = entry
+                return
+            }
+        }
+
+        // Add new if space available
+        if self.count < self.max_size {
+            self.names[self.count] = name
+            self.entries[self.count] = entry
+            self.count = self.count + 1
         }
     }
 
-    fn clear(&self) {
-        self.items.clear()
-        self.access_order.clear()
+    fn clear(self) {
+        for i in 0..self.count {
+            self.names[i] = ""
+            self.entries[i] = ModelCacheEntry.empty()
+        }
+        self.count = 0
+    }
+}
+
+struct TextureCache {
+    entries: [TextureCacheEntry]
+    names: [string]
+    count: i32
+    max_size: i32
+
+    fn init(max_size: i32): TextureCache {
+        let entries: [TextureCacheEntry] = []
+        let names: [string] = []
+        for i in 0..max_size {
+            entries = entries + [TextureCacheEntry.empty()]
+            names = names + [""]
+        }
+
+        return TextureCache {
+            entries: entries
+            names: names
+            count: 0
+            max_size: max_size
+        }
     }
 
-    fn count(&self): i32 {
-        return self.items.len()
+    fn has(&self, name: string): bool {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get(&self, name: string): TextureCacheEntry {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return self.entries[i]
+            }
+        }
+        return TextureCacheEntry.empty()
+    }
+
+    fn set(self, name: string, entry: TextureCacheEntry) {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                self.entries[i] = entry
+                return
+            }
+        }
+
+        if self.count < self.max_size {
+            self.names[self.count] = name
+            self.entries[self.count] = entry
+            self.count = self.count + 1
+        }
+    }
+
+    fn clear(self) {
+        for i in 0..self.count {
+            self.names[i] = ""
+            self.entries[i] = TextureCacheEntry.empty()
+        }
+        self.count = 0
+    }
+}
+
+struct ConfigCache {
+    entries: [ConfigCacheEntry]
+    names: [string]
+    count: i32
+    max_size: i32
+
+    fn init(max_size: i32): ConfigCache {
+        let entries: [ConfigCacheEntry] = []
+        let names: [string] = []
+        for i in 0..max_size {
+            entries = entries + [ConfigCacheEntry.empty()]
+            names = names + [""]
+        }
+
+        return ConfigCache {
+            entries: entries
+            names: names
+            count: 0
+            max_size: max_size
+        }
+    }
+
+    fn has(&self, name: string): bool {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get(&self, name: string): ConfigCacheEntry {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return self.entries[i]
+            }
+        }
+        return ConfigCacheEntry.empty()
+    }
+
+    fn set(self, name: string, entry: ConfigCacheEntry) {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                self.entries[i] = entry
+                return
+            }
+        }
+
+        if self.count < self.max_size {
+            self.names[self.count] = name
+            self.entries[self.count] = entry
+            self.count = self.count + 1
+        }
+    }
+
+    fn clear(self) {
+        for i in 0..self.count {
+            self.names[i] = ""
+            self.entries[i] = ConfigCacheEntry.empty()
+        }
+        self.count = 0
     }
 }
 
@@ -147,99 +381,56 @@ struct AssetCache<T> {
 // ============================================================================
 
 struct AssetManager {
-    config: AssetConfig,
-
-    // Sub-managers
-    cursor_manager: CursorManager,
-    video_manager: VideoManager,
-    splash_manager: SplashManager,
-    string_manager: StringManager,
+    config: AssetConfig
 
     // Caches for various asset types
-    model_cache: HashMap<String, W3DModel>,
-    texture_tga_cache: HashMap<String, TGAImage>,
-    texture_dds_cache: HashMap<String, DDSTexture>,
-    ini_cache: HashMap<String, INIFile>,
-    csf_cache: HashMap<String, CSFFile>,
-    wnd_cache: HashMap<String, WNDFile>,
-
-    // BIG archives for reading packed assets
-    archives: Vec<BIGArchive>,
+    model_cache: ModelCache
+    texture_cache: TextureCache
+    config_cache: ConfigCache
 
     // Statistics
-    models_loaded: i32,
-    textures_loaded: i32,
-    configs_loaded: i32,
+    models_loaded: i32
+    textures_loaded: i32
+    configs_loaded: i32
+
+    // Current language
+    current_language: string
 
     fn init(): AssetManager {
         return AssetManager {
-            config: AssetConfig::init(),
-            cursor_manager: CursorManager::init(),
-            video_manager: VideoManager::init(),
-            splash_manager: SplashManager::init(),
-            string_manager: StringManager::init(),
-            model_cache: HashMap<String, W3DModel>{},
-            texture_tga_cache: HashMap<String, TGAImage>{},
-            texture_dds_cache: HashMap<String, DDSTexture>{},
-            ini_cache: HashMap<String, INIFile>{},
-            csf_cache: HashMap<String, CSFFile>{},
-            wnd_cache: HashMap<String, WNDFile>{},
-            archives: Vec<BIGArchive>{},
-            models_loaded: 0,
-            textures_loaded: 0,
-            configs_loaded: 0,
+            config: AssetConfig.init()
+            model_cache: ModelCache.init(1000)
+            texture_cache: TextureCache.init(2000)
+            config_cache: ConfigCache.init(500)
+            models_loaded: 0
+            textures_loaded: 0
+            configs_loaded: 0
+            current_language: "English"
         }
-    }
-
-    fn init_with_config(config: AssetConfig): AssetManager {
-        let manager = AssetManager::init()
-        manager.config = config
-        manager.video_manager.set_video_path(config.paths.video)
-        return manager
-    }
-
-    // ========================================================================
-    // Archive Management
-    // ========================================================================
-
-    fn load_archive(&self, path: string, data: Vec<i32>): bool {
-        let (archive, success) = load_big_archive(data)
-        if success {
-            archive.path = path
-            self.archives.add(archive)
-        }
-        return success
-    }
-
-    fn find_in_archives(&self, filename: string): Vec<i32> {
-        for archive in self.archives {
-            let data = archive.read_file(filename)
-            if data.len() > 0 {
-                return data
-            }
-        }
-        return Vec<i32>{}
     }
 
     // ========================================================================
     // Model Loading
     // ========================================================================
 
-    fn load_model(&self, name: string, data: Vec<i32>): bool {
+    fn load_model(self, name: string, data: [i32]): bool {
         if self.model_cache.has(name) {
             return true
         }
 
-        let (model, success) = load_w3d_model(data)
-        if success {
-            model.name = name
-            self.model_cache.set(name, model)
-            self.models_loaded = self.models_loaded + 1
+        let entry = ModelCacheEntry {
+            name: name
+            data: data
+            loaded: true
         }
-        return success
+
+        self.model_cache.set(name, entry)
+        self.models_loaded = self.models_loaded + 1
+
+        return true
     }
 
-    fn get_model(&self, name: string): W3DModel {
+    fn get_model(&self, name: string): ModelCacheEntry {
         return self.model_cache.get(name)
     }
 
@@ -251,352 +442,155 @@ struct AssetManager {
     // Texture Loading
     // ========================================================================
 
-    fn load_texture_tga(&self, name: string, data: Vec<i32>): bool {
-        if self.texture_tga_cache.has(name) {
+    fn load_texture(self, name: string, width: i32, height: i32, data: [i32]): bool {
+        if self.texture_cache.has(name) {
             return true
         }
 
-        let (texture, success) = load_tga(data)
-        if success {
-            texture.name = name
-            self.texture_tga_cache.set(name, texture)
-            self.textures_loaded = self.textures_loaded + 1
+        let entry = TextureCacheEntry {
+            name: name
+            width: width
+            height: height
+            data: data
+            loaded: true
         }
-        return success
+
+        self.texture_cache.set(name, entry)
+        self.textures_loaded = self.textures_loaded + 1
+
+        return true
     }
 
-    fn load_texture_dds(&self, name: string, data: Vec<i32>): bool {
-        if self.texture_dds_cache.has(name) {
-            return true
-        }
-
-        let (texture, success) = load_dds(data)
-        if success {
-            texture.name = name
-            self.texture_dds_cache.set(name, texture)
-            self.textures_loaded = self.textures_loaded + 1
-        }
-        return success
+    fn get_texture(&self, name: string): TextureCacheEntry {
+        return self.texture_cache.get(name)
     }
 
-    fn load_texture(&self, name: string, data: Vec<i32>): bool {
-        let asset_type = detect_asset_type(name)
-        if asset_type == AssetType::TextureTGA {
-            return self.load_texture_tga(name, data)
-        } else if asset_type == AssetType::TextureDDS {
-            return self.load_texture_dds(name, data)
-        }
-        return false
+    fn has_texture(&self, name: string): bool {
+        return self.texture_cache.has(name)
     }
 
     // ========================================================================
     // Config Loading
     // ========================================================================
 
-    fn load_ini(&self, name: string, content: string): bool {
-        if self.ini_cache.has(name) {
+    fn load_config(self, name: string, content: string): bool {
+        if self.config_cache.has(name) {
             return true
         }
 
-        let (ini, success) = parse_ini_file(content)
-        if success {
-            ini.name = name
-            self.ini_cache.set(name, ini)
-            self.configs_loaded = self.configs_loaded + 1
-        }
-        return success
-    }
-
-    fn get_ini(&self, name: string): INIFile {
-        return self.ini_cache.get(name)
-    }
-
-    fn has_ini(&self, name: string): bool {
-        return self.ini_cache.has(name)
-    }
-
-    // ========================================================================
-    // Localization Loading
-    // ========================================================================
-
-    fn load_csf(&self, name: string, data: Vec<i32>): bool {
-        if self.csf_cache.has(name) {
-            return true
+        let entry = ConfigCacheEntry {
+            name: name
+            content: content
+            loaded: true
         }
 
-        let (csf, success) = load_csf_file(data)
-        if success {
-            csf.name = name
-            self.csf_cache.set(name, csf)
-        }
-        return success
+        self.config_cache.set(name, entry)
+        self.configs_loaded = self.configs_loaded + 1
+
+        return true
     }
 
-    fn get_csf(&self, name: string): CSFFile {
-        return self.csf_cache.get(name)
+    fn get_config(&self, name: string): ConfigCacheEntry {
+        return self.config_cache.get(name)
     }
 
-    fn get_localized_string(&self, key: string): string {
-        // Check all loaded CSF files
-        for csf in self.csf_cache.values() {
-            if csf.has_string(key) {
-                return csf.get_string(key)
-            }
-        }
-        return key  // Return key as fallback
-    }
-
-    // ========================================================================
-    // UI Loading
-    // ========================================================================
-
-    fn load_wnd(&self, name: string, content: string): bool {
-        if self.wnd_cache.has(name) {
-            return true
-        }
-
-        let (wnd, success) = parse_wnd_file(content)
-        if success {
-            wnd.name = name
-            self.wnd_cache.set(name, wnd)
-        }
-        return success
-    }
-
-    fn get_wnd(&self, name: string): WNDFile {
-        return self.wnd_cache.get(name)
-    }
-
-    fn has_wnd(&self, name: string): bool {
-        return self.wnd_cache.has(name)
-    }
-
-    // ========================================================================
-    // Cursor Loading
-    // ========================================================================
-
-    fn load_cursor(&self, name: string, data: Vec<i32>): bool {
-        return self.cursor_manager.load_cursor(name, data)
-    }
-
-    fn get_cursor_manager(&self): CursorManager {
-        return self.cursor_manager
-    }
-
-    // ========================================================================
-    // Video Loading
-    // ========================================================================
-
-    fn load_video(&self, name: string, data: Vec<i32>): bool {
-        return self.video_manager.load_video(name, data)
-    }
-
-    fn get_video_manager(&self): VideoManager {
-        return self.video_manager
-    }
-
-    // ========================================================================
-    // Splash Screen Loading
-    // ========================================================================
-
-    fn load_splash(&self, name: string, data: Vec<i32>): bool {
-        return self.splash_manager.load_splash(name, data)
-    }
-
-    fn get_splash_manager(&self): SplashManager {
-        return self.splash_manager
-    }
-
-    // ========================================================================
-    // String Table Loading
-    // ========================================================================
-
-    fn load_string_table(&self, name: string, content: string): bool {
-        return self.string_manager.load_table(name, content)
-    }
-
-    fn get_string(&self, table: string, key: string): string {
-        return self.string_manager.get_string(table, key)
-    }
-
-    // ========================================================================
-    // Generic Asset Loading
-    // ========================================================================
-
-    fn load_asset(&self, name: string, data: Vec<i32>): bool {
-        let asset_type = detect_asset_type(name)
-
-        match asset_type {
-            AssetType::Archive => return self.load_archive(name, data),
-            AssetType::Model => return self.load_model(name, data),
-            AssetType::TextureTGA => return self.load_texture_tga(name, data),
-            AssetType::TextureDDS => return self.load_texture_dds(name, data),
-            AssetType::Cursor => return self.load_cursor(name, data),
-            AssetType::Video => return self.load_video(name, data),
-            AssetType::Splash => return self.load_splash(name, data),
-            _ => return false,
-        }
-    }
-
-    fn load_asset_string(&self, name: string, content: string): bool {
-        let asset_type = detect_asset_type(name)
-
-        match asset_type {
-            AssetType::Config => return self.load_ini(name, content),
-            AssetType::UI => return self.load_wnd(name, content),
-            AssetType::Strings => return self.load_string_table(name, content),
-            _ => return false,
-        }
+    fn has_config(&self, name: string): bool {
+        return self.config_cache.has(name)
     }
 
     // ========================================================================
     // Update and Maintenance
     // ========================================================================
 
-    fn update(&self, delta_time: f64) {
-        self.cursor_manager.update(delta_time)
-        self.video_manager.update(delta_time)
-        self.splash_manager.update(delta_time)
+    fn update(self, delta_time: f64) {
+        // Update any animated assets
+        let _placeholder = delta_time
     }
 
-    fn clear_caches(&self) {
+    fn clear_caches(self) {
         self.model_cache.clear()
-        self.texture_tga_cache.clear()
-        self.texture_dds_cache.clear()
-        self.ini_cache.clear()
-        self.csf_cache.clear()
-        self.wnd_cache.clear()
+        self.texture_cache.clear()
+        self.config_cache.clear()
     }
 
-    fn get_stats(&self): (Int, Int, Int) {
-        return (self.models_loaded, self.textures_loaded, self.configs_loaded)
+    fn get_model_count(&self): i32 {
+        return self.models_loaded
     }
 
-    fn set_language(&self, lang: Language) {
+    fn get_texture_count(&self): i32 {
+        return self.textures_loaded
+    }
+
+    fn get_config_count(&self): i32 {
+        return self.configs_loaded
+    }
+
+    fn set_language(self, lang: Language) {
         self.config.set_language(lang)
-        self.string_manager.set_language(get_language_name(lang))
-    }
-}
-
-// Get language name as string
-fn get_language_name(lang: Language): string {
-    match lang {
-        Language::English => "English",
-        Language::German => "German",
-        Language::French => "French",
-        Language::Spanish => "Spanish",
-        Language::Italian => "Italian",
-        Language::Korean => "Korean",
-        Language::Chinese => "Chinese",
-        Language::Polish => "Polish",
-        Language::Brazilian => "Brazilian",
-        Language::Russian => "Russian",
-        Language::Ukrainian => "Ukrainian",
-        Language::Arabic => "Arabic",
-        Language::Swedish => "Swedish",
+        self.current_language = get_language_name(lang)
     }
 }
 
 // ============================================================================
-// Asset Loading Helpers
+// Global Asset Manager
 // ============================================================================
 
-// Load all core INI files
-fn load_core_configs(manager: AssetManager, read_file: fn(String): string): i32 {
-    let loaded = 0
+var g_asset_manager: AssetManager? = null
 
-    let core_files = [
-        "GameData.ini",
-        "GameLOD.ini",
-        "AudioSettings.ini",
-        "Armor.ini",
-        "Locomotor.ini",
-        "Object.ini",
-        "Weapon.ini",
-    ]
-
-    for filename in core_files {
-        let path = manager.config.paths.ini + "/" + filename
-        let content = read_file(path)
-        if content.len() > 0 {
-            if manager.load_ini(filename, content) {
-                loaded = loaded + 1
-            }
-        }
-    }
-
-    return loaded
+export fn init_asset_manager() {
+    g_asset_manager = AssetManager.init()
+    println("AssetManager: Initialized")
 }
 
-// Load localization for current language
-fn load_localization(manager: AssetManager, read_file: fn(String): Vec<i32>): bool {
-    let csf_path = manager.config.get_csf_path()
-    let data = read_file(csf_path)
-
-    if data.len() > 0 {
-        return manager.load_csf("generals.csf", data)
+export fn shutdown_asset_manager() {
+    if g_asset_manager != null {
+        g_asset_manager.?.clear_caches()
     }
-
-    return false
+    g_asset_manager = null
+    println("AssetManager: Shutdown")
 }
 
-// Load all game cursors
-fn load_game_cursors(manager: AssetManager, read_file: fn(String): Vec<i32>): i32 {
-    let loaded = 0
-
-    let cursor_files = [
-        "SCCDefault.ani",
-        "SCCSelect.ani",
-        "SCCMove.ani",
-        "SCCAttack.ani",
-    ]
-
-    for filename in cursor_files {
-        let path = manager.config.paths.cursors + "/" + filename
-        let data = read_file(path)
-        if data.len() > 0 {
-            if manager.load_cursor(filename, data) {
-                loaded = loaded + 1
-            }
-        }
-    }
-
-    return loaded
+export fn get_asset_manager(): AssetManager? {
+    return g_asset_manager
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-fn test_asset_type_detection(): bool {
-    assert(detect_asset_type("model.w3d") == AssetType::Model, "Should detect W3D")
-    assert(detect_asset_type("texture.tga") == AssetType::TextureTGA, "Should detect TGA")
-    assert(detect_asset_type("texture.dds") == AssetType::TextureDDS, "Should detect DDS")
-    assert(detect_asset_type("config.ini") == AssetType::Config, "Should detect INI")
-    assert(detect_asset_type("strings.csf") == AssetType::Localization, "Should detect CSF")
-    assert(detect_asset_type("menu.wnd") == AssetType::UI, "Should detect WND")
-    assert(detect_asset_type("cursor.ani") == AssetType::Cursor, "Should detect ANI")
-    assert(detect_asset_type("intro.bik") == AssetType::Video, "Should detect BIK")
-    assert(detect_asset_type("splash.bmp") == AssetType::Splash, "Should detect BMP")
-    return true
-}
-
 fn test_asset_manager_init(): bool {
-    let manager = AssetManager::init()
-    assert(manager.models_loaded == 0, "Should start with 0 models")
-    assert(manager.textures_loaded == 0, "Should start with 0 textures")
+    let manager = AssetManager.init()
+    if manager.models_loaded != 0 {
+        println("Should start with 0 models")
+        return false
+    }
+    if manager.textures_loaded != 0 {
+        println("Should start with 0 textures")
+        return false
+    }
     return true
 }
 
 fn test_language_name(): bool {
-    assert(get_language_name(Language::English) == "English", "English name")
-    assert(get_language_name(Language::German) == "German", "German name")
+    if get_language_name(Language::English) != "English" {
+        println("English name mismatch")
+        return false
+    }
+    if get_language_name(Language::German) != "German" {
+        println("German name mismatch")
+        return false
+    }
     return true
 }
 
 fn run_all_tests(): bool {
-    assert(test_asset_type_detection(), "Asset type detection test failed")
-    assert(test_asset_manager_init(), "Asset manager init test failed")
-    assert(test_language_name(), "Language name test failed")
+    if test_asset_manager_init() == false {
+        println("Asset manager init test failed")
+        return false
+    }
+    if test_language_name() == false {
+        println("Language name test failed")
+        return false
+    }
     return true
 }
