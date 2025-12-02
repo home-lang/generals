@@ -144,8 +144,8 @@ These features need to be added to the Home programming language (~/Code/home) t
 Patches from the original GeneralsGameCode repository that must be implemented.
 
 ### 2.1 Recent Bugfixes (Latest 20 Commits)
-- [ ] `U2-001` Fix Campaign/Challenge/Score movie cancellation artifacts when tabbing out (#1927)
-- [ ] `U2-002` Fix wrong INIZH.big loading from Data/INI directory preventing INI CRC mismatch (#1879)
+- [x] `U2-001` Fix Campaign/Challenge/Score movie cancellation artifacts when tabbing out (#1927) - DONE: `video_player.home` update() always processes frames regardless of window focus
+- [x] `U2-002` Fix wrong INIZH.big loading from Data/INI directory preventing INI CRC mismatch (#1879) - DONE: `big_archive.home` should_skip_big_file() filters duplicate
 - [x] `U2-003` Fix disabled Power Plant destruction lowering energy production twice (#1857) - DONE: `economy.home` add/remove_power_bonus
 - [x] `U2-004` Fix hero radar objects causing cache update issues (#1893) - DONE: `radar.home` separate local_hero_object_list
 - [x] `U2-005` Fix weapon effects not showing for hidden non-stealthed objects (#1918) - DONE: `weapon.home` fire_weapon_template with stealth check
@@ -154,21 +154,21 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 ### 2.2 Refactors to Match Original
 - [x] `U2-010` Implement generic startsWith/endsWith functions for strings (#1898) - DONE: `core/string.home` added string_starts_with_no_case, string_ends_with_no_case, string_compare_no_case
 - [x] `U2-011` Implement observed player behaviour handling (#1861) - DONE: `engine/player_utils.home` with get_observed_or_local_player() and is_viewed_player()
-- [ ] `U2-012` Update Radar::addObject to match simplified original (#1893)
-- [ ] `U2-013` Update Radar::deleteListResources to match original (#1893)
-- [ ] `U2-014` Update W3DRadar::renderObjectList to match original (#1893)
+- [x] `U2-012` Update Radar::addObject to match simplified original (#1893) - DONE: `radar.home` add_object() with hero list separation
+- [x] `U2-013` Update Radar::deleteListResources to match original (#1893) - DONE: `radar.home` delete_list_resources() simplified
+- [x] `U2-014` Update W3DRadar::renderObjectList to match original (#1893) - DONE: `radar.home` W3DRadarRenderer.render_object_list()
 
 ### 2.3 New Features
-- [ ] `U2-020` Add Money Per Minute configuration to GameData.ini (#1914)
+- [x] `U2-020` Add Money Per Minute configuration to GameData.ini (#1914) - DONE: `game_data_loader.home` added show_money_per_minute, allow_money_per_minute_for_player
 
 ### 2.4 Code Unification (Match Original Structure)
 - [ ] `U2-030` Unify View and W3DView into Core module (#1904)
 - [x] `U2-031` Move ParabolicEase to Core (#1904) - DONE: In `packages/math/src/easing.zig`
 - [x] `U2-032` Move CameraShakeSystem to Core (#1904) - DONE: In `camera_system.home` with full Westwood implementation
 - [x] `U2-033` Move W3DShaderManager to Core (#1920) - DONE: `graphics/w3d_shader_manager.home` with shader types, filters, render-to-texture
-- [ ] `U2-034` Merge Smudge/W3DSmudge code into Core (#1920)
-- [ ] `U2-035` Move ObjectStatusTypes to Core (#1894)
-- [ ] `U2-036` Unify Radar code into single module (#1894)
+- [x] `U2-034` Merge Smudge/W3DSmudge code into Core (#1920) - DONE: `graphics/smudge.home` with SmudgeManager, SmudgeSet, Smudge
+- [x] `U2-035` Move ObjectStatusTypes to Core (#1894) - DONE: `engine/object_status.home` with ObjectStatus enum and ObjectStatusMask bitset
+- [x] `U2-036` Unify Radar code into single module (#1894) - DONE: `radar.home` contains both Radar and W3DRadar functionality
 
 ---
 

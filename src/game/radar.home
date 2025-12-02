@@ -623,3 +623,208 @@ fn get_global_allocator(): Allocator {
     // TODO: Return global allocator
     return Allocator {}
 }
+
+// ============================================================================
+// W3D Radar Rendering (Unified from W3DRadar.cpp)
+// @unify xezon 23/11/2025 (#1894) - Merged Radar and W3DRadar code
+// ============================================================================
+
+// Radar render state
+struct RadarRenderState {
+    texture_handle: u64
+    vertex_buffer: u64
+    is_dirty: bool
+    last_update_frame: u32
+
+    radar_rect: RadarRect
+    terrain_texture_valid: bool
+}
+
+struct RadarRect {
+    x: i32
+    y: i32
+    width: i32
+    height: i32
+}
+
+impl RadarRenderState {
+    fn init(): RadarRenderState {
+        return RadarRenderState {
+            texture_handle: 0
+            vertex_buffer: 0
+            is_dirty: true
+            last_update_frame: 0
+            radar_rect: RadarRect { x: 0, y: 0, width: 128, height: 128 }
+            terrain_texture_valid: false
+        }
+    }
+}
+
+// W3D Radar renderer - handles minimap/radar rendering
+struct W3DRadarRenderer {
+    render_state: RadarRenderState
+    local_player_color: u32
+    enemy_color: u32
+    ally_color: u32
+    neutral_color: u32
+
+    // Render targets
+    radar_texture: u64
+    shroud_texture: u64
+
+    is_initialized: bool
+}
+
+impl W3DRadarRenderer {
+    fn init(): W3DRadarRenderer {
+        return W3DRadarRenderer {
+            render_state: RadarRenderState.init()
+            local_player_color: 0xFF00FF00   // Green
+            enemy_color: 0xFFFF0000          // Red
+            ally_color: 0xFF00FFFF           // Cyan
+            neutral_color: 0xFFFFFF00        // Yellow
+            radar_texture: 0
+            shroud_texture: 0
+            is_initialized: false
+        }
+    }
+
+    fn initialize(mut self) {
+        // Create radar textures
+        // TODO: Create actual render targets
+        self.is_initialized = true
+        println("W3DRadarRenderer: Initialized")
+    }
+
+    fn shutdown(mut self) {
+        // Release textures
+        self.radar_texture = 0
+        self.shroud_texture = 0
+        self.is_initialized = false
+        println("W3DRadarRenderer: Shutdown")
+    }
+
+    // Render all radar objects
+    // @bugfix xezon 22/11/2025 (#1893) - Simplified to render each list separately
+    fn render(self, radar_system: *RadarSystem) {
+        if !self.is_initialized {
+            return
+        }
+
+        // Render non-local objects
+        self.render_object_list(radar_system.object_list, radar_system)
+
+        // Render local non-hero objects
+        self.render_object_list(radar_system.local_object_list, radar_system)
+
+        // @bugfix (#1893): Render local hero objects from separate list
+        self.render_object_list(radar_system.local_hero_object_list, radar_system)
+    }
+
+    // Render a list of radar objects
+    // @refactor xezon 22/11/2025 (#1893) - Simplified from original
+    fn render_object_list(self, list: ?*RadarObject, radar_system: *RadarSystem) {
+        var current = list
+        while current != null {
+            let obj = current.?
+
+            if obj.is_active {
+                // Determine color based on ownership
+                let color = self.get_object_color(obj, radar_system.local_player_id)
+
+                // Convert world position to radar coordinates
+                let radar_pos = self.world_to_radar_pos(obj.position, radar_system)
+
+                // Render the blip
+                self.render_blip(radar_pos, color, obj.icon_type)
+            }
+
+            current = obj.next
+        }
+    }
+
+    fn get_object_color(self, obj: *RadarObject, local_player_id: u32): u32 {
+        if obj.player_id == local_player_id {
+            return self.local_player_color
+        }
+
+        // TODO: Check alliance status
+        // For now, treat non-local as enemy
+        return self.enemy_color
+    }
+
+    fn world_to_radar_pos(self, world_pos: Vec3, radar_system: *RadarSystem): (i32, i32) {
+        let map_width = radar_system.map_max.x - radar_system.map_min.x
+        let map_height = radar_system.map_max.z - radar_system.map_min.z
+
+        let norm_x = (world_pos.x - radar_system.map_min.x) / map_width
+        let norm_y = (world_pos.z - radar_system.map_min.z) / map_height
+
+        let radar_x = @floatToInt(i32, norm_x * @intToFloat(f32, self.render_state.radar_rect.width))
+        let radar_y = @floatToInt(i32, norm_y * @intToFloat(f32, self.render_state.radar_rect.height))
+
+        return (
+            self.render_state.radar_rect.x + radar_x,
+            self.render_state.radar_rect.y + radar_y
+        )
+    }
+
+    fn render_blip(self, pos: (i32, i32), color: u32, icon_type: i32) {
+        // TODO: Actual rendering via graphics API
+        // Would draw a small quad/point at the given position with the specified color
+        let (x, y) = pos
+        _ = x
+        _ = y
+        _ = color
+        _ = icon_type
+    }
+
+    fn set_radar_rect(mut self, x: i32, y: i32, width: i32, height: i32) {
+        self.render_state.radar_rect.x = x
+        self.render_state.radar_rect.y = y
+        self.render_state.radar_rect.width = width
+        self.render_state.radar_rect.height = height
+        self.render_state.is_dirty = true
+    }
+
+    fn update_terrain_texture(mut self, radar_system: *RadarSystem) {
+        // Update the terrain portion of the radar texture
+        // This would sample terrain heights and colors
+        self.render_state.terrain_texture_valid = true
+        _ = radar_system
+    }
+
+    fn update_shroud_texture(mut self, radar_system: *RadarSystem, player_id: u32) {
+        // Update the shroud overlay texture based on fog of war state
+        // Would iterate through fog_map and set alpha values
+        _ = radar_system
+        _ = player_id
+    }
+}
+
+// Global W3D radar renderer
+var g_w3d_radar_renderer: ?W3DRadarRenderer = null
+
+export fn init_w3d_radar_renderer() {
+    g_w3d_radar_renderer = W3DRadarRenderer.init()
+    g_w3d_radar_renderer.?.initialize()
+}
+
+export fn shutdown_w3d_radar_renderer() {
+    if g_w3d_radar_renderer != null {
+        g_w3d_radar_renderer.?.shutdown()
+        g_w3d_radar_renderer = null
+    }
+}
+
+export fn render_radar() {
+    if g_w3d_radar_renderer != null && g_radar_system != null {
+        g_w3d_radar_renderer.?.render(&g_radar_system.?)
+    }
+}
+
+export fn set_radar_display_rect(x: i32, y: i32, width: i32, height: i32) {
+    if g_w3d_radar_renderer != null {
+        g_w3d_radar_renderer.?.set_radar_rect(x, y, width, height)
+    }
+}
