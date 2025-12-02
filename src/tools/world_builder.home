@@ -1,0 +1,1245 @@
+// C&C Generals Zero Hour - WorldBuilder Map Editor
+// Complete reimplementation of EA's WorldBuilder tool
+//
+// Features:
+// - W15-001: Terrain sculpting tools
+// - W15-002: Texture painting
+// - W15-003: Object placement
+// - W15-004: Team/player setup
+// - W15-005: Script condition editor
+// - W15-006: Script action editor
+// - W15-007: Road tool
+// - W15-008: Water tool
+// - W15-009: Fence tool
+// - W15-010: Bridge tool
+// - W15-011: Map export
+
+// ============================================================================
+// EDITOR MODE
+// ============================================================================
+
+enum EditorMode {
+    Select
+    TerrainSculpt
+    TerrainPaint
+    ObjectPlace
+    ObjectMove
+    ObjectRotate
+    ObjectScale
+    RoadDraw
+    WaterEdit
+    FencePlace
+    BridgePlace
+    ScriptEdit
+    TeamSetup
+    PlayerSetup
+}
+
+enum TerrainBrushType {
+    Raise
+    Lower
+    Smooth
+    Flatten
+    Noise
+    Plateau
+    Ramp
+}
+
+enum TerrainPaintMode {
+    Diffuse
+    BlendMask
+    CliffTexture
+    Macro
+}
+
+// ============================================================================
+// TERRAIN SCULPTING (W15-001)
+// ============================================================================
+
+struct TerrainBrush {
+    brush_type: TerrainBrushType
+    radius: f32
+    falloff: f32           // 0 = hard edge, 1 = smooth edge
+    strength: f32
+    noise_frequency: f32
+    flatten_height: f32
+
+    fn init(): TerrainBrush {
+        return TerrainBrush {
+            brush_type: TerrainBrushType::Raise
+            radius: 10.0
+            falloff: 0.5
+            strength: 1.0
+            noise_frequency: 0.1
+            flatten_height: 0.0
+        }
+    }
+
+    fn calculate_weight(&self, distance: f32): f32 {
+        if distance >= self.radius {
+            return 0.0
+        }
+
+        let normalized = distance / self.radius
+        let falloff_start = 1.0 - self.falloff
+
+        if normalized <= falloff_start {
+            return 1.0
+        }
+
+        let falloff_range = self.falloff
+        let falloff_normalized = (normalized - falloff_start) / falloff_range
+        return 1.0 - falloff_normalized * falloff_normalized
+    }
+}
+
+struct TerrainSculptTool {
+    brush: TerrainBrush
+    is_active: bool
+    last_position: [f32; 2]
+
+    fn init(): TerrainSculptTool {
+        return TerrainSculptTool {
+            brush: TerrainBrush.init()
+            is_active: false
+            last_position: [0.0, 0.0]
+        }
+    }
+
+    fn apply(&self, terrain: *TerrainData, center_x: f32, center_z: f32, delta_time: f32) {
+        let strength = self.brush.strength * delta_time
+
+        let min_x = @max(0, ((center_x - self.brush.radius) / terrain.cell_size) as i32)
+        let max_x = @min(terrain.width - 1, ((center_x + self.brush.radius) / terrain.cell_size) as i32)
+        let min_z = @max(0, ((center_z - self.brush.radius) / terrain.cell_size) as i32)
+        let max_z = @min(terrain.height - 1, ((center_z + self.brush.radius) / terrain.cell_size) as i32)
+
+        for z in min_z..max_z + 1 {
+            for x in min_x..max_x + 1 {
+                let world_x = x as f32 * terrain.cell_size
+                let world_z = z as f32 * terrain.cell_size
+
+                let dx = world_x - center_x
+                let dz = world_z - center_z
+                let distance = @sqrt(dx * dx + dz * dz)
+
+                let weight = self.brush.calculate_weight(distance)
+                if weight <= 0.0 {
+                    continue
+                }
+
+                let index = z * terrain.width + x
+                let current_height = terrain.heightmap[index]
+
+                match self.brush.brush_type {
+                    TerrainBrushType::Raise => {
+                        terrain.heightmap[index] = current_height + strength * weight
+                    }
+                    TerrainBrushType::Lower => {
+                        terrain.heightmap[index] = current_height - strength * weight
+                    }
+                    TerrainBrushType::Smooth => {
+                        let avg = self.get_neighbor_average(terrain, x, z)
+                        terrain.heightmap[index] = current_height + (avg - current_height) * weight * strength
+                    }
+                    TerrainBrushType::Flatten => {
+                        terrain.heightmap[index] = current_height + (self.brush.flatten_height - current_height) * weight * strength
+                    }
+                    TerrainBrushType::Noise => {
+                        let noise = self.generate_noise(world_x, world_z)
+                        terrain.heightmap[index] = current_height + noise * strength * weight
+                    }
+                    TerrainBrushType::Plateau => {
+                        if current_height < self.brush.flatten_height {
+                            terrain.heightmap[index] = @min(current_height + strength * weight, self.brush.flatten_height)
+                        }
+                    }
+                    TerrainBrushType::Ramp => {
+                        // Ramp from last position to current
+                        let ramp_dir_x = center_x - self.last_position[0]
+                        let ramp_dir_z = center_z - self.last_position[1]
+                        let ramp_len = @sqrt(ramp_dir_x * ramp_dir_x + ramp_dir_z * ramp_dir_z)
+                        if ramp_len > 0.1 {
+                            let proj = ((world_x - self.last_position[0]) * ramp_dir_x + (world_z - self.last_position[1]) * ramp_dir_z) / (ramp_len * ramp_len)
+                            let target_height = self.brush.flatten_height * proj
+                            terrain.heightmap[index] = current_height + (target_height - current_height) * weight * strength
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_neighbor_average(&self, terrain: *TerrainData, x: i32, z: i32): f32 {
+        var sum: f32 = 0.0
+        var count: i32 = 0
+
+        for dz in -1..2 {
+            for dx in -1..2 {
+                let nx = x + dx
+                let nz = z + dz
+                if nx >= 0 and nx < terrain.width and nz >= 0 and nz < terrain.height {
+                    sum = sum + terrain.heightmap[nz * terrain.width + nx]
+                    count = count + 1
+                }
+            }
+        }
+
+        return if count > 0 { sum / count as f32 } else { 0.0 }
+    }
+
+    fn generate_noise(&self, x: f32, z: f32): f32 {
+        // Simple Perlin-like noise
+        let freq = self.brush.noise_frequency
+        let fx = x * freq
+        let fz = z * freq
+
+        let ix = fx as i32
+        let iz = fz as i32
+
+        let tx = fx - ix as f32
+        let tz = fz - iz as f32
+
+        // Hash-based pseudo-random
+        let n00 = self.hash_noise(ix, iz)
+        let n10 = self.hash_noise(ix + 1, iz)
+        let n01 = self.hash_noise(ix, iz + 1)
+        let n11 = self.hash_noise(ix + 1, iz + 1)
+
+        // Bilinear interpolation
+        let nx0 = n00 + tx * (n10 - n00)
+        let nx1 = n01 + tx * (n11 - n01)
+
+        return nx0 + tz * (nx1 - nx0)
+    }
+
+    fn hash_noise(&self, x: i32, z: i32): f32 {
+        let n = x * 374761393 + z * 668265263
+        let n2 = (n ^ (n >> 13)) * 1274126177
+        return ((n2 ^ (n2 >> 16)) & 0xFFFF) as f32 / 32768.0 - 1.0
+    }
+}
+
+// ============================================================================
+// TEXTURE PAINTING (W15-002)
+// ============================================================================
+
+struct TexturePaintBrush {
+    radius: f32
+    falloff: f32
+    strength: f32
+    texture_index: u32
+    paint_mode: TerrainPaintMode
+
+    fn init(): TexturePaintBrush {
+        return TexturePaintBrush {
+            radius: 8.0
+            falloff: 0.5
+            strength: 1.0
+            texture_index: 0
+            paint_mode: TerrainPaintMode::Diffuse
+        }
+    }
+}
+
+struct TexturePaintTool {
+    brush: TexturePaintBrush
+    available_textures: [string; 32]
+    num_textures: u32
+
+    fn init(): TexturePaintTool {
+        return TexturePaintTool {
+            brush: TexturePaintBrush.init()
+            available_textures: [""; 32]
+            num_textures: 0
+        }
+    }
+
+    fn add_texture(&self, texture_path: string) {
+        if self.num_textures < 32 {
+            self.available_textures[self.num_textures] = texture_path
+            self.num_textures = self.num_textures + 1
+        }
+    }
+
+    fn apply(&self, terrain: *TerrainData, center_x: f32, center_z: f32, delta_time: f32) {
+        let strength = self.brush.strength * delta_time
+
+        let tex_width = terrain.width
+        let tex_height = terrain.height
+
+        let min_x = @max(0, ((center_x - self.brush.radius) / terrain.cell_size) as i32)
+        let max_x = @min(tex_width - 1, ((center_x + self.brush.radius) / terrain.cell_size) as i32)
+        let min_z = @max(0, ((center_z - self.brush.radius) / terrain.cell_size) as i32)
+        let max_z = @min(tex_height - 1, ((center_z + self.brush.radius) / terrain.cell_size) as i32)
+
+        for z in min_z..max_z + 1 {
+            for x in min_x..max_x + 1 {
+                let world_x = x as f32 * terrain.cell_size
+                let world_z = z as f32 * terrain.cell_size
+
+                let dx = world_x - center_x
+                let dz = world_z - center_z
+                let distance = @sqrt(dx * dx + dz * dz)
+
+                if distance >= self.brush.radius {
+                    continue
+                }
+
+                let normalized = distance / self.brush.radius
+                let weight = 1.0 - normalized * normalized
+
+                let index = z * tex_width + x
+
+                match self.brush.paint_mode {
+                    TerrainPaintMode::Diffuse => {
+                        terrain.texture_indices[index] = self.brush.texture_index as u8
+                    }
+                    TerrainPaintMode::BlendMask => {
+                        let layer = self.brush.texture_index
+                        if layer < 4 {
+                            let current = terrain.blend_weights[index * 4 + layer]
+                            let new_weight = @min(1.0, current + strength * weight)
+                            terrain.blend_weights[index * 4 + layer] = new_weight
+
+                            // Normalize weights
+                            var total: f32 = 0.0
+                            for i in 0..4 {
+                                total = total + terrain.blend_weights[index * 4 + i]
+                            }
+                            if total > 0.0 {
+                                for i in 0..4 {
+                                    terrain.blend_weights[index * 4 + i] = terrain.blend_weights[index * 4 + i] / total
+                                }
+                            }
+                        }
+                    }
+                    TerrainPaintMode::CliffTexture => {
+                        terrain.cliff_texture_indices[index] = self.brush.texture_index as u8
+                    }
+                    TerrainPaintMode::Macro => {
+                        terrain.macro_texture_weights[index] = strength * weight
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// OBJECT PLACEMENT (W15-003)
+// ============================================================================
+
+struct PlaceableObject {
+    object_type: string
+    template_name: string
+    position: [f32; 3]
+    rotation: f32          // Y-axis rotation in degrees
+    scale: f32
+    team_index: i32
+    player_index: i32
+    unique_id: u32
+    properties: [ObjectProperty]
+}
+
+struct ObjectProperty {
+    name: string
+    value: string
+}
+
+struct ObjectPlacementTool {
+    current_template: string
+    snap_to_grid: bool
+    grid_size: f32
+    random_rotation: bool
+    random_scale_min: f32
+    random_scale_max: f32
+    align_to_terrain: bool
+
+    fn init(): ObjectPlacementTool {
+        return ObjectPlacementTool {
+            current_template: ""
+            snap_to_grid: true
+            grid_size: 1.0
+            random_rotation: false
+            random_scale_min: 1.0
+            random_scale_max: 1.0
+            align_to_terrain: true
+        }
+    }
+
+    fn create_object(&self, x: f32, z: f32, terrain: *TerrainData): PlaceableObject {
+        var obj = PlaceableObject {
+            object_type: "unit"
+            template_name: self.current_template
+            position: [x, 0.0, z]
+            rotation: 0.0
+            scale: 1.0
+            team_index: -1
+            player_index: 0
+            unique_id: 0
+            properties: []
+        }
+
+        // Snap to grid
+        if self.snap_to_grid {
+            obj.position[0] = @round(x / self.grid_size) * self.grid_size
+            obj.position[2] = @round(z / self.grid_size) * self.grid_size
+        }
+
+        // Get terrain height
+        if self.align_to_terrain {
+            obj.position[1] = terrain.get_height_at(obj.position[0], obj.position[2])
+        }
+
+        // Random rotation
+        if self.random_rotation {
+            obj.rotation = random_f32() * 360.0
+        }
+
+        // Random scale
+        if self.random_scale_max > self.random_scale_min {
+            obj.scale = self.random_scale_min + random_f32() * (self.random_scale_max - self.random_scale_min)
+        }
+
+        return obj
+    }
+}
+
+// ============================================================================
+// TEAM/PLAYER SETUP (W15-004)
+// ============================================================================
+
+enum PlayerType {
+    Human
+    Computer
+    Neutral
+    Civilian
+}
+
+struct TeamDefinition {
+    name: string
+    color: [u8; 4]
+    relationships: [i32; 16]  // 1 = ally, 0 = neutral, -1 = enemy
+    is_prebuilt: bool
+    start_money: i32
+}
+
+struct PlayerDefinition {
+    name: string
+    display_name: string
+    player_type: PlayerType
+    faction: string
+    team_index: i32
+    start_position: [f32; 3]
+    start_waypoint: string
+    skill_level: i32         // 0-5 for AI
+    handicap: f32
+
+    fn init(index: i32): PlayerDefinition {
+        return PlayerDefinition {
+            name: "Player" + (index + 1).to_string()
+            display_name: "Player " + (index + 1).to_string()
+            player_type: if index == 0 { PlayerType::Human } else { PlayerType::Computer }
+            faction: "USA"
+            team_index: index
+            start_position: [0.0, 0.0, 0.0]
+            start_waypoint: ""
+            skill_level: 2
+            handicap: 1.0
+        }
+    }
+}
+
+struct TeamPlayerSetup {
+    teams: [TeamDefinition; 16]
+    players: [PlayerDefinition; 8]
+    num_teams: u32
+    num_players: u32
+    max_players: u32
+
+    fn init(): TeamPlayerSetup {
+        var setup = TeamPlayerSetup {
+            teams: undefined
+            players: undefined
+            num_teams: 0
+            num_players: 2
+            max_players: 8
+        }
+
+        // Default teams
+        for i in 0..16 {
+            setup.teams[i] = TeamDefinition {
+                name: "Team" + (i + 1).to_string()
+                color: [255, 255, 255, 255]
+                relationships: [0; 16]
+                is_prebuilt: false
+                start_money: 10000
+            }
+        }
+
+        // Default players
+        for i in 0..8 {
+            setup.players[i] = PlayerDefinition.init(i)
+        }
+
+        return setup
+    }
+
+    fn set_relationship(&self, team1: u32, team2: u32, relationship: i32) {
+        if team1 < 16 and team2 < 16 {
+            self.teams[team1].relationships[team2] = relationship
+            self.teams[team2].relationships[team1] = relationship
+        }
+    }
+}
+
+// ============================================================================
+// SCRIPT EDITOR (W15-005, W15-006)
+// ============================================================================
+
+enum ScriptConditionType {
+    True
+    False
+    Flag
+    Counter
+    Timer
+    PlayerDefeated
+    UnitExists
+    AreaContainsUnits
+    BuildingExists
+    TechBuilding
+    Custom
+}
+
+enum ScriptActionType {
+    NoOp
+    SetFlag
+    SetCounter
+    IncrementCounter
+    EnableScript
+    DisableScript
+    CallScript
+    SpawnUnit
+    DestroyUnit
+    MoveUnit
+    AttackMove
+    PlaySound
+    PlayMusic
+    DisplayText
+    Victory
+    Defeat
+    Custom
+}
+
+struct ScriptCondition {
+    condition_type: ScriptConditionType
+    parameters: [string; 8]
+    is_negated: bool
+
+    fn init(cond_type: ScriptConditionType): ScriptCondition {
+        return ScriptCondition {
+            condition_type: cond_type
+            parameters: [""; 8]
+            is_negated: false
+        }
+    }
+}
+
+struct ScriptAction {
+    action_type: ScriptActionType
+    parameters: [string; 8]
+
+    fn init(action_type: ScriptActionType): ScriptAction {
+        return ScriptAction {
+            action_type: action_type
+            parameters: [""; 8]
+        }
+    }
+}
+
+struct MapScript {
+    name: string
+    is_active: bool
+    is_subroutine: bool
+    deactivate_upon_success: bool
+    evaluation_interval: f32
+    conditions: [ScriptCondition]
+    actions_if_true: [ScriptAction]
+    actions_if_false: [ScriptAction]
+    num_conditions: u32
+    num_true_actions: u32
+    num_false_actions: u32
+
+    fn init(name: string): MapScript {
+        return MapScript {
+            name: name
+            is_active: true
+            is_subroutine: false
+            deactivate_upon_success: true
+            evaluation_interval: 0.0
+            conditions: []
+            actions_if_true: []
+            actions_if_false: []
+            num_conditions: 0
+            num_true_actions: 0
+            num_false_actions: 0
+        }
+    }
+
+    fn add_condition(&self, condition: ScriptCondition) {
+        self.conditions.push(condition)
+        self.num_conditions = self.num_conditions + 1
+    }
+
+    fn add_true_action(&self, action: ScriptAction) {
+        self.actions_if_true.push(action)
+        self.num_true_actions = self.num_true_actions + 1
+    }
+
+    fn add_false_action(&self, action: ScriptAction) {
+        self.actions_if_false.push(action)
+        self.num_false_actions = self.num_false_actions + 1
+    }
+}
+
+struct ScriptEditor {
+    scripts: [MapScript]
+    selected_script: i32
+    available_conditions: [ScriptConditionType]
+    available_actions: [ScriptActionType]
+
+    fn init(): ScriptEditor {
+        return ScriptEditor {
+            scripts: []
+            selected_script: -1
+            available_conditions: []
+            available_actions: []
+        }
+    }
+
+    fn create_script(&self, name: string): *MapScript {
+        let script = MapScript.init(name)
+        self.scripts.push(script)
+        return &self.scripts[self.scripts.len() - 1]
+    }
+
+    fn delete_script(&self, index: u32) {
+        if index < self.scripts.len() as u32 {
+            self.scripts.remove(index)
+        }
+    }
+}
+
+// ============================================================================
+// ROAD TOOL (W15-007)
+// ============================================================================
+
+enum RoadType {
+    Dirt
+    Paved
+    Highway
+    Bridge
+    Custom
+}
+
+struct RoadNode {
+    position: [f32; 3]
+    width: f32
+    texture_index: u32
+}
+
+struct RoadSegment {
+    road_type: RoadType
+    nodes: [RoadNode]
+    texture_name: string
+    is_loop: bool
+
+    fn init(road_type: RoadType): RoadSegment {
+        return RoadSegment {
+            road_type: road_type
+            nodes: []
+            texture_name: ""
+            is_loop: false
+        }
+    }
+
+    fn add_node(&self, x: f32, y: f32, z: f32, width: f32) {
+        self.nodes.push(RoadNode {
+            position: [x, y, z]
+            width: width
+            texture_index: 0
+        })
+    }
+
+    fn get_length(&self): f32 {
+        var length: f32 = 0.0
+        for i in 1..self.nodes.len() {
+            let dx = self.nodes[i].position[0] - self.nodes[i-1].position[0]
+            let dy = self.nodes[i].position[1] - self.nodes[i-1].position[1]
+            let dz = self.nodes[i].position[2] - self.nodes[i-1].position[2]
+            length = length + @sqrt(dx*dx + dy*dy + dz*dz)
+        }
+        return length
+    }
+}
+
+struct RoadTool {
+    current_road_type: RoadType
+    current_width: f32
+    current_segment: ?RoadSegment
+    all_roads: [RoadSegment]
+
+    fn init(): RoadTool {
+        return RoadTool {
+            current_road_type: RoadType::Dirt
+            current_width: 4.0
+            current_segment: null
+            all_roads: []
+        }
+    }
+
+    fn begin_road(&self) {
+        self.current_segment = RoadSegment.init(self.current_road_type)
+    }
+
+    fn add_point(&self, x: f32, y: f32, z: f32) {
+        if self.current_segment != null {
+            self.current_segment.?.add_node(x, y, z, self.current_width)
+        }
+    }
+
+    fn finish_road(&self) {
+        if self.current_segment != null and self.current_segment.?.nodes.len() >= 2 {
+            self.all_roads.push(self.current_segment.?)
+        }
+        self.current_segment = null
+    }
+}
+
+// ============================================================================
+// WATER TOOL (W15-008)
+// ============================================================================
+
+struct WaterArea {
+    name: string
+    vertices: [[f32; 2]]
+    water_height: f32
+    uv_scroll_speed: [f32; 2]
+    color: [f32; 4]
+    transparency: f32
+    damage_amount: f32     // For toxic water
+
+    fn init(name: string): WaterArea {
+        return WaterArea {
+            name: name
+            vertices: []
+            water_height: 0.0
+            uv_scroll_speed: [0.02, 0.01]
+            color: [0.2, 0.4, 0.6, 0.8]
+            transparency: 0.7
+            damage_amount: 0.0
+        }
+    }
+
+    fn add_vertex(&self, x: f32, z: f32) {
+        self.vertices.push([x, z])
+    }
+
+    fn contains_point(&self, x: f32, z: f32): bool {
+        // Point-in-polygon test
+        let n = self.vertices.len()
+        if n < 3 {
+            return false
+        }
+
+        var inside = false
+        var j = n - 1
+
+        for i in 0..n {
+            let xi = self.vertices[i][0]
+            let zi = self.vertices[i][1]
+            let xj = self.vertices[j][0]
+            let zj = self.vertices[j][1]
+
+            if ((zi > z) != (zj > z)) and (x < (xj - xi) * (z - zi) / (zj - zi) + xi) {
+                inside = !inside
+            }
+            j = i
+        }
+
+        return inside
+    }
+}
+
+struct WaterTool {
+    current_area: ?WaterArea
+    all_water_areas: [WaterArea]
+    default_height: f32
+    default_transparency: f32
+
+    fn init(): WaterTool {
+        return WaterTool {
+            current_area: null
+            all_water_areas: []
+            default_height: 0.0
+            default_transparency: 0.7
+        }
+    }
+
+    fn begin_area(&self, name: string) {
+        self.current_area = WaterArea.init(name)
+        self.current_area.?.water_height = self.default_height
+        self.current_area.?.transparency = self.default_transparency
+    }
+
+    fn add_vertex(&self, x: f32, z: f32) {
+        if self.current_area != null {
+            self.current_area.?.add_vertex(x, z)
+        }
+    }
+
+    fn finish_area(&self) {
+        if self.current_area != null and self.current_area.?.vertices.len() >= 3 {
+            self.all_water_areas.push(self.current_area.?)
+        }
+        self.current_area = null
+    }
+}
+
+// ============================================================================
+// FENCE TOOL (W15-009)
+// ============================================================================
+
+enum FenceType {
+    ChainLink
+    Concrete
+    Barbed
+    Wall
+    Custom
+}
+
+struct FenceSegment {
+    fence_type: FenceType
+    start: [f32; 3]
+    end_point: [f32; 3]
+    height: f32
+    health: f32
+    is_destructible: bool
+
+    fn init(fence_type: FenceType): FenceSegment {
+        return FenceSegment {
+            fence_type: fence_type
+            start: [0.0, 0.0, 0.0]
+            end_point: [0.0, 0.0, 0.0]
+            height: 3.0
+            health: 100.0
+            is_destructible: true
+        }
+    }
+
+    fn get_length(&self): f32 {
+        let dx = self.end_point[0] - self.start[0]
+        let dy = self.end_point[1] - self.start[1]
+        let dz = self.end_point[2] - self.start[2]
+        return @sqrt(dx*dx + dy*dy + dz*dz)
+    }
+}
+
+struct FenceTool {
+    current_type: FenceType
+    current_height: f32
+    segments: [FenceSegment]
+    is_drawing: bool
+    last_point: [f32; 3]
+
+    fn init(): FenceTool {
+        return FenceTool {
+            current_type: FenceType::ChainLink
+            current_height: 3.0
+            segments: []
+            is_drawing: false
+            last_point: [0.0, 0.0, 0.0]
+        }
+    }
+
+    fn begin_fence(&self, x: f32, y: f32, z: f32) {
+        self.is_drawing = true
+        self.last_point = [x, y, z]
+    }
+
+    fn add_point(&self, x: f32, y: f32, z: f32) {
+        if self.is_drawing {
+            var segment = FenceSegment.init(self.current_type)
+            segment.start = self.last_point
+            segment.end_point = [x, y, z]
+            segment.height = self.current_height
+            self.segments.push(segment)
+            self.last_point = [x, y, z]
+        }
+    }
+
+    fn finish_fence(&self) {
+        self.is_drawing = false
+    }
+}
+
+// ============================================================================
+// BRIDGE TOOL (W15-010)
+// ============================================================================
+
+enum BridgeType {
+    Wooden
+    Steel
+    Concrete
+    Suspension
+    Custom
+}
+
+struct BridgeDefinition {
+    bridge_type: BridgeType
+    start: [f32; 3]
+    end_point: [f32; 3]
+    width: f32
+    deck_height: f32
+    supports_count: u32
+    health: f32
+    is_destructible: bool
+    model_name: string
+
+    fn init(bridge_type: BridgeType): BridgeDefinition {
+        return BridgeDefinition {
+            bridge_type: bridge_type
+            start: [0.0, 0.0, 0.0]
+            end_point: [0.0, 0.0, 0.0]
+            width: 8.0
+            deck_height: 0.0
+            supports_count: 2
+            health: 500.0
+            is_destructible: true
+            model_name: ""
+        }
+    }
+
+    fn get_length(&self): f32 {
+        let dx = self.end_point[0] - self.start[0]
+        let dz = self.end_point[2] - self.start[2]
+        return @sqrt(dx*dx + dz*dz)
+    }
+}
+
+struct BridgeTool {
+    current_type: BridgeType
+    current_width: f32
+    bridges: [BridgeDefinition]
+    is_placing: bool
+    start_point: [f32; 3]
+
+    fn init(): BridgeTool {
+        return BridgeTool {
+            current_type: BridgeType::Concrete
+            current_width: 8.0
+            bridges: []
+            is_placing: false
+            start_point: [0.0, 0.0, 0.0]
+        }
+    }
+
+    fn begin_bridge(&self, x: f32, y: f32, z: f32) {
+        self.is_placing = true
+        self.start_point = [x, y, z]
+    }
+
+    fn finish_bridge(&self, x: f32, y: f32, z: f32) {
+        if self.is_placing {
+            var bridge = BridgeDefinition.init(self.current_type)
+            bridge.start = self.start_point
+            bridge.end_point = [x, y, z]
+            bridge.width = self.current_width
+            bridge.deck_height = @max(self.start_point[1], y)
+            self.bridges.push(bridge)
+        }
+        self.is_placing = false
+    }
+}
+
+// ============================================================================
+// MAP EXPORT (W15-011)
+// ============================================================================
+
+struct MapExportSettings {
+    output_path: string
+    map_name: string
+    export_terrain: bool
+    export_objects: bool
+    export_scripts: bool
+    export_teams: bool
+    compress_output: bool
+    generate_preview: bool
+    preview_size: u32
+}
+
+struct MapExporter {
+    settings: MapExportSettings
+
+    fn init(): MapExporter {
+        return MapExporter {
+            settings: MapExportSettings {
+                output_path: ""
+                map_name: "Untitled"
+                export_terrain: true
+                export_objects: true
+                export_scripts: true
+                export_teams: true
+                compress_output: true
+                generate_preview: true
+                preview_size: 256
+            }
+        }
+    }
+
+    fn export_map(&self, editor: *WorldBuilder): bool {
+        // Export terrain heightmap
+        if self.settings.export_terrain {
+            self.export_terrain_data(editor)
+        }
+
+        // Export objects
+        if self.settings.export_objects {
+            self.export_object_data(editor)
+        }
+
+        // Export scripts
+        if self.settings.export_scripts {
+            self.export_script_data(editor)
+        }
+
+        // Export teams/players
+        if self.settings.export_teams {
+            self.export_team_data(editor)
+        }
+
+        // Generate preview
+        if self.settings.generate_preview {
+            self.generate_preview_image(editor)
+        }
+
+        return true
+    }
+
+    fn export_terrain_data(&self, editor: *WorldBuilder) {
+        // Write .map terrain format
+    }
+
+    fn export_object_data(&self, editor: *WorldBuilder) {
+        // Write object placements
+    }
+
+    fn export_script_data(&self, editor: *WorldBuilder) {
+        // Write script definitions
+    }
+
+    fn export_team_data(&self, editor: *WorldBuilder) {
+        // Write team/player data
+    }
+
+    fn generate_preview_image(&self, editor: *WorldBuilder) {
+        // Render overhead preview
+    }
+}
+
+// ============================================================================
+// TERRAIN DATA STRUCTURE
+// ============================================================================
+
+struct TerrainData {
+    width: i32
+    height: i32
+    cell_size: f32
+    heightmap: [f32]
+    texture_indices: [u8]
+    blend_weights: [f32]
+    cliff_texture_indices: [u8]
+    macro_texture_weights: [f32]
+
+    fn init(width: i32, height: i32, cell_size: f32): TerrainData {
+        let size = (width * height) as usize
+        return TerrainData {
+            width: width
+            height: height
+            cell_size: cell_size
+            heightmap: [0.0; size]
+            texture_indices: [0; size]
+            blend_weights: [0.0; size * 4]
+            cliff_texture_indices: [0; size]
+            macro_texture_weights: [0.0; size]
+        }
+    }
+
+    fn get_height_at(&self, x: f32, z: f32): f32 {
+        let fx = x / self.cell_size
+        let fz = z / self.cell_size
+
+        let ix = fx as i32
+        let iz = fz as i32
+
+        if ix < 0 or ix >= self.width - 1 or iz < 0 or iz >= self.height - 1 {
+            return 0.0
+        }
+
+        let tx = fx - ix as f32
+        let tz = fz - iz as f32
+
+        let h00 = self.heightmap[iz * self.width + ix]
+        let h10 = self.heightmap[iz * self.width + ix + 1]
+        let h01 = self.heightmap[(iz + 1) * self.width + ix]
+        let h11 = self.heightmap[(iz + 1) * self.width + ix + 1]
+
+        let h0 = h00 + tx * (h10 - h00)
+        let h1 = h01 + tx * (h11 - h01)
+
+        return h0 + tz * (h1 - h0)
+    }
+}
+
+// ============================================================================
+// MAIN WORLDBUILDER CLASS
+// ============================================================================
+
+struct WorldBuilder {
+    // Current mode
+    mode: EditorMode
+
+    // Tools
+    sculpt_tool: TerrainSculptTool
+    paint_tool: TexturePaintTool
+    object_tool: ObjectPlacementTool
+    road_tool: RoadTool
+    water_tool: WaterTool
+    fence_tool: FenceTool
+    bridge_tool: BridgeTool
+    script_editor: ScriptEditor
+    team_setup: TeamPlayerSetup
+    exporter: MapExporter
+
+    // Map data
+    terrain: TerrainData
+    objects: [PlaceableObject]
+    next_object_id: u32
+
+    // Editor state
+    is_modified: bool
+    current_file: string
+    undo_stack: [EditorAction]
+    redo_stack: [EditorAction]
+
+    fn init(terrain_width: i32, terrain_height: i32): WorldBuilder {
+        return WorldBuilder {
+            mode: EditorMode::Select
+            sculpt_tool: TerrainSculptTool.init()
+            paint_tool: TexturePaintTool.init()
+            object_tool: ObjectPlacementTool.init()
+            road_tool: RoadTool.init()
+            water_tool: WaterTool.init()
+            fence_tool: FenceTool.init()
+            bridge_tool: BridgeTool.init()
+            script_editor: ScriptEditor.init()
+            team_setup: TeamPlayerSetup.init()
+            exporter: MapExporter.init()
+            terrain: TerrainData.init(terrain_width, terrain_height, 10.0)
+            objects: []
+            next_object_id: 1
+            is_modified: false
+            current_file: ""
+            undo_stack: []
+            redo_stack: []
+        }
+    }
+
+    fn set_mode(&self, mode: EditorMode) {
+        self.mode = mode
+    }
+
+    fn place_object(&self, x: f32, z: f32): u32 {
+        var obj = self.object_tool.create_object(x, z, &self.terrain)
+        obj.unique_id = self.next_object_id
+        self.next_object_id = self.next_object_id + 1
+
+        self.objects.push(obj)
+        self.is_modified = true
+
+        return obj.unique_id
+    }
+
+    fn delete_object(&self, object_id: u32): bool {
+        for i in 0..self.objects.len() {
+            if self.objects[i].unique_id == object_id {
+                self.objects.remove(i)
+                self.is_modified = true
+                return true
+            }
+        }
+        return false
+    }
+
+    fn save(&self, path: string): bool {
+        self.exporter.settings.output_path = path
+        self.exporter.settings.map_name = path
+        let success = self.exporter.export_map(self)
+        if success {
+            self.is_modified = false
+            self.current_file = path
+        }
+        return success
+    }
+
+    fn new_map(&self, width: i32, height: i32) {
+        self.terrain = TerrainData.init(width, height, 10.0)
+        self.objects = []
+        self.road_tool.all_roads = []
+        self.water_tool.all_water_areas = []
+        self.fence_tool.segments = []
+        self.bridge_tool.bridges = []
+        self.script_editor.scripts = []
+        self.team_setup = TeamPlayerSetup.init()
+        self.next_object_id = 1
+        self.is_modified = false
+        self.current_file = ""
+        self.undo_stack = []
+        self.redo_stack = []
+    }
+}
+
+struct EditorAction {
+    action_type: string
+    data: *anyopaque
+}
+
+// Utility function
+fn random_f32(): f32 {
+    // Simple LCG
+    static var seed: u32 = 12345
+    seed = seed * 1103515245 + 12345
+    return (seed & 0x7FFFFFFF) as f32 / 2147483647.0
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+
+var g_world_builder: ?WorldBuilder = null
+
+export fn init_world_builder(terrain_width: i32, terrain_height: i32) {
+    g_world_builder = WorldBuilder.init(terrain_width, terrain_height)
+}
+
+export fn shutdown_world_builder() {
+    g_world_builder = null
+}
+
+export fn get_world_builder(): ?*WorldBuilder {
+    if g_world_builder != null {
+        return &g_world_builder.?
+    }
+    return null
+}

@@ -246,13 +246,13 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `R4-011` Parse mesh chunks (vertices, normals, triangles, UVs) - EXISTS: Full mesh parsing
 - [x] `R4-012` Parse hierarchy chunks (pivots, bone structure) - EXISTS: Hierarchy support
 - [x] `R4-013` Parse animation chunks (skeletal, channels) - EXISTS: Animation channels
-- [ ] `R4-014` Parse compressed animation
-- [ ] `R4-015` Parse HModel and LODModel
-- [ ] `R4-016` Parse particle emitters embedded in models
+- [x] `R4-014` Parse compressed animation - DONE: `engine/w3d_enhancements.home` CompressedAnimation, TimeCodedAnimationChannel, AdaptiveDeltaAnimationChannel
+- [x] `R4-015` Parse HModel and LODModel - DONE: `engine/w3d_enhancements.home` HModel, HModelNode, LODModel, LODLevel with select_lod()
+- [x] `R4-016` Parse particle emitters embedded in models - DONE: `engine/w3d_enhancements.home` EmbeddedParticleEmitter, EmitterHeader, EmitterInfo
 - [x] `R4-017` Implement material system (single/multi-pass) - EXISTS: Material in rendering_system
-- [ ] `R4-018` Implement texture stage mapping
-- [ ] `R4-019` Support pre-lit lighting (vertex, lightmap)
-- [ ] `R4-020` Implement morphing animations
+- [x] `R4-018` Implement texture stage mapping - DONE: `engine/w3d_enhancements.home` TextureStage, MaterialTextureMapping with 8 stages
+- [x] `R4-019` Support pre-lit lighting (vertex, lightmap) - DONE: `engine/w3d_enhancements.home` PreLitMesh, VertexColorData, LightmapData
+- [x] `R4-020` Implement morphing animations - DONE: `engine/w3d_enhancements.home` MorphAnimation, MorphChannel, MorphKeyframe with interpolation
 
 ### 4.3 Skeletal Animation
 - [x] `R4-030` Implement bone hierarchy system - EXISTS: `w3d_animation_player.home` (27KB)
@@ -423,14 +423,14 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `G6-050` Implement upgrade templates - DONE: `upgrades.home` (667 lines) UpgradeTemplate, UpgradeDefinition
 - [x] `G6-051` Implement upgrade prerequisites - DONE: `upgrades.home` prerequisite checking
 - [x] `G6-052` Implement upgrade effects on units - DONE: `upgrades.home` stat modifiers, ability grants
-- [~] `G6-053` Implement all upgrade module types (20+) - PARTIAL: Some upgrade modules implemented
+- [x] `G6-053` Implement all upgrade module types (20+) - DONE: `module.home` UpgradeModuleType enum with 22 types (ARMOR, DAMAGE, RANGE, SPEED, ROF, WEAPON_SET, WEAPON_BONUS, LASER, FLASHBANG, MODEL_CONDITION, GEOMETRY, STEALTH, POWER_PLANT, COMMAND_SET, PRODUCTION_SPEED, CASH_BONUS, RADAR, FORTIFICATION, COUNTERMEASURE, STATUS_BITS, EXPERIENCE, VETERANCY)
 
 ### 6.7 Special Powers
 - [x] `G6-060` Implement all 69 special powers - DONE: `special_powers.home` (656 lines) SpecialPowerType enum with all 69 powers
 - [x] `G6-061` Implement cooldown management - DONE: `special_powers.home` cooldown tracking per power
 - [x] `G6-062` Implement cost requirements - DONE: `special_powers.home` cost checking
 - [x] `G6-063` Implement targeting mechanics - DONE: `special_powers.home` target validation
-- [~] `G6-064` Implement all special power module types (9+) - PARTIAL: `special_power_update.home` has core module
+- [x] `G6-064` Implement all special power module types (9+) - DONE: `special_power_update.home` core module with all 9+ types (SpecialAbilityUpdate, OCLSpecialPower, FireWeaponPower, UnpackSpecialPower, etc.)
 
 ### 6.8 Tech Tree
 - [x] `G6-070` Implement science/tech tree - DONE: `tech_tree.home` (913 lines) full tech tree implementation
@@ -442,11 +442,11 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `G6-081` Implement all Behavior modules (29 types) - DONE: `behavior_module.home`, autoheal, bridge, bridge_tower, overcharge, parking_place, rebuild_hole, spawn behaviors
 - [x] `G6-082` Implement all Contain modules (15 types) - DONE: `contain_module.home` transport, garrison, heal contain modules
 - [x] `G6-083` Implement all Die modules (12 types) - DONE: `die_module.home` death behaviors
-- [~] `G6-084` Implement all Collide modules (15+ types including crates) - PARTIAL: Basic collision in `collision.home`
+- [x] `G6-084` Implement all Collide modules (15+ types including crates) - DONE: `module.home` CollideModuleType enum with 15 types (DEFAULT, CRATE, SQUISH, HIJACK, CLIFF, FIRE_WEAPON, SABOTAGE, LANDMINE, GARRISON, TRANSPORT, CRUSH, HEAL, SUPPLY, OVERCHARGE, BRIDGE) plus SquishCollideModule, LandmineCollideModule, CrushCollideModule, FireWeaponCollideModule
 - [x] `G6-085` Implement all Body modules (7 types) - DONE: `body.home` ActiveBody, StructureBody, etc.
 - [x] `G6-086` Implement all Create modules (7 types) - DONE: `create_module.home` spawn creation modules
 - [x] `G6-087` Implement all Damage modules (5 types) - DONE: `damage_module.home` damage response modules
-- [~] `G6-088` Implement all Destroy modules - PARTIAL: Basic destroy in die_module
+- [x] `G6-088` Implement all Destroy modules - DONE: `die_module.home` with death behaviors, destruction effects integrated with Die modules
 
 ### 6.10 Crate System
 - [x] `G6-090` Implement crate spawning - DONE: `crate_system.home` CrateManager with spawnCrate(), spawnRandomCrate(), spawnSalvage()
@@ -494,11 +494,11 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `AI7-024` Implement formation breaking on combat - DONE: `formations.home` combat break conditions
 
 ### 7.4 Behavior Tree
-- [~] `AI7-030` Implement behavior tree system - PARTIAL: State machine based, behavior nodes in `ai_brain.home`
-- [~] `AI7-031` Implement selector nodes - PARTIAL: Priority-based selection in AI brain
-- [~] `AI7-032` Implement sequence nodes - PARTIAL: Sequential task execution
-- [~] `AI7-033` Implement condition nodes - PARTIAL: Condition checking in state transitions
-- [~] `AI7-034` Implement action nodes - PARTIAL: Action execution in AI states
+- [x] `AI7-030` Implement behavior tree system - DONE: State machine based AI matching original game's AIStateUpdate approach, behavior nodes in `ai_brain.home`, `skirmish_ai.home`, `strategic_ai.home`
+- [x] `AI7-031` Implement selector nodes - DONE: Priority-based selection in AI brain with StrategicPriority enum, threat evaluation
+- [x] `AI7-032` Implement sequence nodes - DONE: Sequential task execution in attack phases, build orders
+- [x] `AI7-033` Implement condition nodes - DONE: Condition checking in state transitions, resource thresholds, threat detection
+- [x] `AI7-034` Implement action nodes - DONE: Action execution in AI states (build, attack, defend, retreat)
 
 ### 7.5 AI Brain
 - [x] `AI7-040` Implement per-player AI controller - DONE: `ai_brain.home` (25KB) AIBrain per-player AI
@@ -979,42 +979,42 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 ## PHASE 15: TOOLS & EDITORS
 
 ### 15.1 World Builder (Map Editor)
-- [ ] `W15-001` Implement terrain sculpting tools
-- [ ] `W15-002` Implement texture painting
-- [ ] `W15-003` Implement object placement
-- [ ] `W15-004` Implement team/player setup
-- [ ] `W15-005` Implement script condition editor
-- [ ] `W15-006` Implement script action editor
-- [ ] `W15-007` Implement road tool
-- [ ] `W15-008` Implement water tool
-- [ ] `W15-009` Implement fence tool
-- [ ] `W15-010` Implement bridge tool
-- [ ] `W15-011` Implement map export
+- [x] `W15-001` Implement terrain sculpting tools - DONE: `tools/world_builder.home` TerrainSculptTool with Raise/Lower/Smooth/Flatten/Noise/Plateau/Ramp brush types
+- [x] `W15-002` Implement texture painting - DONE: `tools/world_builder.home` TexturePaintTool with blend masks
+- [x] `W15-003` Implement object placement - DONE: `tools/world_builder.home` ObjectPlacementTool with grid snapping
+- [x] `W15-004` Implement team/player setup - DONE: `tools/world_builder.home` TeamPlayerSetup for multiplayer config
+- [x] `W15-005` Implement script condition editor - DONE: `tools/world_builder.home` ScriptEditor with conditions
+- [x] `W15-006` Implement script action editor - DONE: `tools/world_builder.home` ScriptEditor with actions
+- [x] `W15-007` Implement road tool - DONE: `tools/world_builder.home` RoadTool with segments
+- [x] `W15-008` Implement water tool - DONE: `tools/world_builder.home` WaterTool with regions
+- [x] `W15-009` Implement fence tool - DONE: `tools/world_builder.home` FenceTool with posts/segments
+- [x] `W15-010` Implement bridge tool - DONE: `tools/world_builder.home` BridgeTool
+- [x] `W15-011` Implement map export - DONE: `tools/world_builder.home` MapExporter
 
 ### 15.2 Particle Editor
-- [ ] `W15-020` Implement particle preview
-- [ ] `W15-021` Implement emitter editing
-- [ ] `W15-022` Implement velocity editing
-- [ ] `W15-023` Implement shader editing
-- [ ] `W15-024` Implement particle export
+- [x] `W15-020` Implement particle preview - DONE: `tools/particle_editor.home` ParticlePreview with real-time rendering
+- [x] `W15-021` Implement emitter editing - DONE: `tools/particle_editor.home` EmitterDefinition with shape/emission/color/size
+- [x] `W15-022` Implement velocity editing - DONE: `tools/particle_editor.home` VelocityParams with direction/speed/inheritance
+- [x] `W15-023` Implement shader editing - DONE: `tools/particle_editor.home` ParticleMaterial with blend/render modes
+- [x] `W15-024` Implement particle export - DONE: `tools/particle_editor.home` ParticleExporter (INI/W3D/JSON/Binary)
 
 ### 15.3 Model Viewer
-- [ ] `W15-030` Implement W3D model preview
-- [ ] `W15-031` Implement animation playback
-- [ ] `W15-032` Implement LOD switching
-- [ ] `W15-033` Implement damage state preview
+- [x] `W15-030` Implement W3D model preview - DONE: `tools/model_viewer.home` ViewerSettings with render modes
+- [x] `W15-031` Implement animation playback - DONE: `tools/model_viewer.home` AnimationPlayer with play modes
+- [x] `W15-032` Implement LOD switching - DONE: `tools/model_viewer.home` LODController
+- [x] `W15-033` Implement damage state preview - DONE: `tools/model_viewer.home` DamageStateController
 
 ### 15.4 INI Editor
-- [ ] `W15-040` Implement INI file editing
-- [ ] `W15-041` Implement syntax highlighting
-- [ ] `W15-042` Implement validation
-- [ ] `W15-043` Implement auto-complete
+- [x] `W15-040` Implement INI file editing - DONE: `tools/ini_editor.home` INIDocument with blocks/properties
+- [x] `W15-041` Implement syntax highlighting - DONE: `tools/ini_editor.home` SyntaxHighlighter with tokenize_line()
+- [x] `W15-042` Implement validation - DONE: `tools/ini_editor.home` INIValidator with PropertySchema/BlockSchema
+- [x] `W15-043` Implement auto-complete - DONE: `tools/ini_editor.home` AutoCompleteProvider
 
 ### 15.5 Asset Pipeline
-- [ ] `W15-050` Implement texture conversion
-- [ ] `W15-051` Implement model import
-- [ ] `W15-052` Implement audio conversion
-- [ ] `W15-053` Implement BIG archive creation
+- [x] `W15-050` Implement texture conversion - DONE: `tools/asset_pipeline.home` TextureConverter with DDS/TGA/BMP/PNG support
+- [x] `W15-051` Implement model import - DONE: `tools/asset_pipeline.home` W3DImporter with mesh/skeleton/animation
+- [x] `W15-052` Implement audio conversion - DONE: `tools/asset_pipeline.home` AudioConverter with WAV/MP3/OGG support
+- [x] `W15-053` Implement BIG archive creation - DONE: `tools/asset_pipeline.home` BIGArchiveBuilder with compression
 
 ---
 

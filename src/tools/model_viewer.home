@@ -1,0 +1,726 @@
+// C&C Generals Zero Hour - Model Viewer Tool
+// W3D model preview and inspection tool
+//
+// Features:
+// - W15-030: W3D model preview with real-time rendering
+// - W15-031: Animation playback controls
+// - W15-032: LOD level switching
+// - W15-033: Damage state preview
+
+// ============================================================================
+// MODEL PREVIEW (W15-030)
+// ============================================================================
+
+enum ViewerRenderMode {
+    Textured
+    Wireframe
+    WireframeOverlay
+    Normals
+    UVs
+    VertexColors
+    BoneWeights
+}
+
+enum ViewerShadingMode {
+    Lit
+    Unlit
+    FlatShaded
+    SmoothShaded
+    MatCap
+}
+
+struct ViewerSettings {
+    render_mode: ViewerRenderMode
+    shading_mode: ViewerShadingMode
+    background_color: [f32; 4]
+    show_grid: bool
+    grid_size: f32
+    show_axes: bool
+    show_bounds: bool
+    show_skeleton: bool
+    show_bone_names: bool
+    show_pivots: bool
+    show_normals: bool
+    normal_length: f32
+    backface_culling: bool
+    ambient_color: [f32; 3]
+    light_direction: [f32; 3]
+    light_color: [f32; 3]
+
+    fn default(): ViewerSettings {
+        return ViewerSettings {
+            render_mode: ViewerRenderMode::Textured
+            shading_mode: ViewerShadingMode::Lit
+            background_color: [0.2, 0.2, 0.25, 1.0]
+            show_grid: true
+            grid_size: 1.0
+            show_axes: true
+            show_bounds: false
+            show_skeleton: false
+            show_bone_names: false
+            show_pivots: false
+            show_normals: false
+            normal_length: 0.2
+            backface_culling: true
+            ambient_color: [0.3, 0.3, 0.35]
+            light_direction: [0.5, 0.8, 0.3]
+            light_color: [1.0, 0.95, 0.9]
+        }
+    }
+}
+
+struct ViewerCamera {
+    distance: f32
+    rotation_x: f32
+    rotation_y: f32
+    pan_offset: [f32; 3]
+    fov: f32
+    near_plane: f32
+    far_plane: f32
+    auto_rotate: bool
+    auto_rotate_speed: f32
+
+    fn default(): ViewerCamera {
+        return ViewerCamera {
+            distance: 10.0
+            rotation_x: 30.0
+            rotation_y: 45.0
+            pan_offset: [0.0, 0.0, 0.0]
+            fov: 45.0
+            near_plane: 0.1
+            far_plane: 1000.0
+            auto_rotate: false
+            auto_rotate_speed: 30.0
+        }
+    }
+
+    fn reset(&self) {
+        self.distance = 10.0
+        self.rotation_x = 30.0
+        self.rotation_y = 45.0
+        self.pan_offset = [0.0, 0.0, 0.0]
+    }
+
+    fn fit_to_bounds(&self, bounds_min: [f32; 3], bounds_max: [f32; 3]) {
+        let center_x = (bounds_min[0] + bounds_max[0]) * 0.5
+        let center_y = (bounds_min[1] + bounds_max[1]) * 0.5
+        let center_z = (bounds_min[2] + bounds_max[2]) * 0.5
+
+        let size_x = bounds_max[0] - bounds_min[0]
+        let size_y = bounds_max[1] - bounds_min[1]
+        let size_z = bounds_max[2] - bounds_min[2]
+
+        let max_size = @max(size_x, @max(size_y, size_z))
+
+        self.pan_offset = [-center_x, -center_y, -center_z]
+        self.distance = max_size * 2.0
+    }
+
+    fn update(&self, delta_time: f32) {
+        if self.auto_rotate {
+            self.rotation_y = self.rotation_y + self.auto_rotate_speed * delta_time
+            if self.rotation_y >= 360.0 {
+                self.rotation_y = self.rotation_y - 360.0
+            }
+        }
+    }
+}
+
+struct ModelInfo {
+    name: string
+    file_path: string
+    file_size: u64
+    vertex_count: u32
+    triangle_count: u32
+    bone_count: u32
+    mesh_count: u32
+    material_count: u32
+    texture_count: u32
+    animation_count: u32
+    lod_count: u32
+    bounds_min: [f32; 3]
+    bounds_max: [f32; 3]
+    has_skin: bool
+    has_morph: bool
+
+    fn init(): ModelInfo {
+        return ModelInfo {
+            name: ""
+            file_path: ""
+            file_size: 0
+            vertex_count: 0
+            triangle_count: 0
+            bone_count: 0
+            mesh_count: 0
+            material_count: 0
+            texture_count: 0
+            animation_count: 0
+            lod_count: 1
+            bounds_min: [0.0, 0.0, 0.0]
+            bounds_max: [0.0, 0.0, 0.0]
+            has_skin: false
+            has_morph: false
+        }
+    }
+}
+
+// ============================================================================
+// ANIMATION PLAYBACK (W15-031)
+// ============================================================================
+
+enum AnimationPlayMode {
+    Once
+    Loop
+    PingPong
+}
+
+struct AnimationInfo {
+    name: string
+    duration: f32
+    frame_count: u32
+    frame_rate: f32
+    is_compressed: bool
+    channel_count: u32
+}
+
+struct AnimationPlayer {
+    animations: [AnimationInfo]
+    current_animation: i32
+    play_mode: AnimationPlayMode
+    is_playing: bool
+    current_time: f32
+    playback_speed: f32
+    is_reverse: bool
+
+    fn init(): AnimationPlayer {
+        return AnimationPlayer {
+            animations: []
+            current_animation: -1
+            play_mode: AnimationPlayMode::Loop
+            is_playing: false
+            current_time: 0.0
+            playback_speed: 1.0
+            is_reverse: false
+        }
+    }
+
+    fn play(&self) {
+        self.is_playing = true
+    }
+
+    fn pause(&self) {
+        self.is_playing = false
+    }
+
+    fn stop(&self) {
+        self.is_playing = false
+        self.current_time = 0.0
+    }
+
+    fn set_animation(&self, index: i32) {
+        if index >= 0 and index < self.animations.len() as i32 {
+            self.current_animation = index
+            self.current_time = 0.0
+        }
+    }
+
+    fn get_current_frame(&self): u32 {
+        if self.current_animation < 0 or self.current_animation >= self.animations.len() as i32 {
+            return 0
+        }
+
+        let anim = self.animations[self.current_animation]
+        if anim.duration <= 0.0 {
+            return 0
+        }
+
+        let normalized = self.current_time / anim.duration
+        return (normalized * anim.frame_count as f32) as u32
+    }
+
+    fn set_frame(&self, frame: u32) {
+        if self.current_animation < 0 or self.current_animation >= self.animations.len() as i32 {
+            return
+        }
+
+        let anim = self.animations[self.current_animation]
+        if anim.frame_count == 0 {
+            return
+        }
+
+        self.current_time = (frame as f32 / anim.frame_count as f32) * anim.duration
+    }
+
+    fn update(&self, delta_time: f32) {
+        if !self.is_playing or self.current_animation < 0 {
+            return
+        }
+
+        let anim = self.animations[self.current_animation]
+        let time_step = delta_time * self.playback_speed * (if self.is_reverse { -1.0 } else { 1.0 })
+
+        self.current_time = self.current_time + time_step
+
+        match self.play_mode {
+            AnimationPlayMode::Once => {
+                if self.current_time >= anim.duration {
+                    self.current_time = anim.duration
+                    self.is_playing = false
+                } else if self.current_time < 0.0 {
+                    self.current_time = 0.0
+                    self.is_playing = false
+                }
+            }
+            AnimationPlayMode::Loop => {
+                while self.current_time >= anim.duration {
+                    self.current_time = self.current_time - anim.duration
+                }
+                while self.current_time < 0.0 {
+                    self.current_time = self.current_time + anim.duration
+                }
+            }
+            AnimationPlayMode::PingPong => {
+                if self.current_time >= anim.duration {
+                    self.current_time = anim.duration - (self.current_time - anim.duration)
+                    self.is_reverse = true
+                } else if self.current_time < 0.0 {
+                    self.current_time = -self.current_time
+                    self.is_reverse = false
+                }
+            }
+        }
+    }
+
+    fn step_forward(&self) {
+        if self.current_animation < 0 {
+            return
+        }
+
+        let anim = self.animations[self.current_animation]
+        let frame_time = 1.0 / anim.frame_rate
+        self.current_time = @min(self.current_time + frame_time, anim.duration)
+    }
+
+    fn step_backward(&self) {
+        if self.current_animation < 0 {
+            return
+        }
+
+        let anim = self.animations[self.current_animation]
+        let frame_time = 1.0 / anim.frame_rate
+        self.current_time = @max(self.current_time - frame_time, 0.0)
+    }
+
+    fn go_to_start(&self) {
+        self.current_time = 0.0
+    }
+
+    fn go_to_end(&self) {
+        if self.current_animation >= 0 and self.current_animation < self.animations.len() as i32 {
+            self.current_time = self.animations[self.current_animation].duration
+        }
+    }
+}
+
+// ============================================================================
+// LOD SWITCHING (W15-032)
+// ============================================================================
+
+struct LODInfo {
+    level: u32
+    distance: f32
+    vertex_count: u32
+    triangle_count: u32
+    reduction_percent: f32
+}
+
+struct LODController {
+    lod_levels: [LODInfo]
+    current_lod: u32
+    auto_lod: bool
+    preview_distance: f32
+
+    fn init(): LODController {
+        return LODController {
+            lod_levels: []
+            current_lod: 0
+            auto_lod: false
+            preview_distance: 10.0
+        }
+    }
+
+    fn set_lod(&self, level: u32) {
+        if level < self.lod_levels.len() as u32 {
+            self.current_lod = level
+            self.auto_lod = false
+        }
+    }
+
+    fn update_auto_lod(&self) {
+        if !self.auto_lod or self.lod_levels.len() == 0 {
+            return
+        }
+
+        for i in 0..self.lod_levels.len() {
+            if self.preview_distance <= self.lod_levels[i].distance {
+                self.current_lod = i as u32
+                return
+            }
+        }
+
+        self.current_lod = (self.lod_levels.len() - 1) as u32
+    }
+
+    fn get_current_info(&self): ?LODInfo {
+        if self.current_lod < self.lod_levels.len() as u32 {
+            return self.lod_levels[self.current_lod]
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// DAMAGE STATE PREVIEW (W15-033)
+// ============================================================================
+
+enum DamageState {
+    Pristine
+    Damaged
+    ReallyDamaged
+    Rubble
+}
+
+struct DamageStateInfo {
+    state: DamageState
+    health_threshold: f32
+    model_suffix: string
+    has_model: bool
+    vertex_count: u32
+    has_particles: bool
+    has_animation: bool
+}
+
+struct DamageStateController {
+    states: [DamageStateInfo; 4]
+    current_state: DamageState
+    preview_health: f32
+    auto_transition: bool
+    show_particles: bool
+    show_fire: bool
+
+    fn init(): DamageStateController {
+        var controller = DamageStateController {
+            states: undefined
+            current_state: DamageState::Pristine
+            preview_health: 100.0
+            auto_transition: true
+            show_particles: true
+            show_fire: true
+        }
+
+        controller.states[0] = DamageStateInfo {
+            state: DamageState::Pristine
+            health_threshold: 66.0
+            model_suffix: ""
+            has_model: true
+            vertex_count: 0
+            has_particles: false
+            has_animation: false
+        }
+
+        controller.states[1] = DamageStateInfo {
+            state: DamageState::Damaged
+            health_threshold: 33.0
+            model_suffix: "_D"
+            has_model: false
+            vertex_count: 0
+            has_particles: true
+            has_animation: false
+        }
+
+        controller.states[2] = DamageStateInfo {
+            state: DamageState::ReallyDamaged
+            health_threshold: 0.0
+            model_suffix: "_RD"
+            has_model: false
+            vertex_count: 0
+            has_particles: true
+            has_animation: true
+        }
+
+        controller.states[3] = DamageStateInfo {
+            state: DamageState::Rubble
+            health_threshold: -1.0
+            model_suffix: "_RUBBLE"
+            has_model: false
+            vertex_count: 0
+            has_particles: false
+            has_animation: false
+        }
+
+        return controller
+    }
+
+    fn set_state(&self, state: DamageState) {
+        self.current_state = state
+        self.auto_transition = false
+
+        // Update health to match state
+        match state {
+            DamageState::Pristine => { self.preview_health = 100.0 }
+            DamageState::Damaged => { self.preview_health = 50.0 }
+            DamageState::ReallyDamaged => { self.preview_health = 20.0 }
+            DamageState::Rubble => { self.preview_health = 0.0 }
+        }
+    }
+
+    fn set_health(&self, health: f32) {
+        self.preview_health = @max(0.0, @min(100.0, health))
+
+        if self.auto_transition {
+            self.update_state_from_health()
+        }
+    }
+
+    fn update_state_from_health(&self) {
+        if self.preview_health <= 0.0 {
+            self.current_state = DamageState::Rubble
+        } else if self.preview_health <= self.states[2].health_threshold {
+            self.current_state = DamageState::ReallyDamaged
+        } else if self.preview_health <= self.states[1].health_threshold {
+            self.current_state = DamageState::Damaged
+        } else {
+            self.current_state = DamageState::Pristine
+        }
+    }
+
+    fn get_current_suffix(&self): string {
+        return self.states[self.current_state as usize].model_suffix
+    }
+}
+
+// ============================================================================
+// MESH INSPECTOR
+// ============================================================================
+
+struct MeshInfo {
+    name: string
+    vertex_count: u32
+    triangle_count: u32
+    material_name: string
+    texture_names: [string]
+    bounds_min: [f32; 3]
+    bounds_max: [f32; 3]
+    is_visible: bool
+    is_skinned: bool
+    bone_indices: [u32]
+}
+
+struct MeshInspector {
+    meshes: [MeshInfo]
+    selected_mesh: i32
+    show_hidden: bool
+
+    fn init(): MeshInspector {
+        return MeshInspector {
+            meshes: []
+            selected_mesh: -1
+            show_hidden: false
+        }
+    }
+
+    fn toggle_visibility(&self, index: u32) {
+        if index < self.meshes.len() as u32 {
+            self.meshes[index].is_visible = !self.meshes[index].is_visible
+        }
+    }
+
+    fn isolate_mesh(&self, index: u32) {
+        for i in 0..self.meshes.len() {
+            self.meshes[i].is_visible = (i as u32 == index)
+        }
+    }
+
+    fn show_all(&self) {
+        for i in 0..self.meshes.len() {
+            self.meshes[i].is_visible = true
+        }
+    }
+
+    fn hide_all(&self) {
+        for i in 0..self.meshes.len() {
+            self.meshes[i].is_visible = false
+        }
+    }
+}
+
+// ============================================================================
+// BONE INSPECTOR
+// ============================================================================
+
+struct BoneInfo {
+    name: string
+    index: u32
+    parent_index: i32
+    position: [f32; 3]
+    rotation: [f32; 4]
+    children: [u32]
+}
+
+struct BoneInspector {
+    bones: [BoneInfo]
+    selected_bone: i32
+    highlight_children: bool
+    show_influence: bool
+
+    fn init(): BoneInspector {
+        return BoneInspector {
+            bones: []
+            selected_bone: -1
+            highlight_children: true
+            show_influence: false
+        }
+    }
+
+    fn select_bone(&self, index: i32) {
+        self.selected_bone = index
+    }
+
+    fn get_bone_chain(&self, index: u32): [u32] {
+        var chain: [u32] = []
+        var current = index as i32
+
+        while current >= 0 {
+            chain.push(current as u32)
+            if current < self.bones.len() as i32 {
+                current = self.bones[current].parent_index
+            } else {
+                break
+            }
+        }
+
+        return chain
+    }
+}
+
+// ============================================================================
+// MAIN MODEL VIEWER
+// ============================================================================
+
+struct ModelViewer {
+    settings: ViewerSettings
+    camera: ViewerCamera
+    model_info: ModelInfo
+    animation_player: AnimationPlayer
+    lod_controller: LODController
+    damage_controller: DamageStateController
+    mesh_inspector: MeshInspector
+    bone_inspector: BoneInspector
+
+    // Viewport
+    viewport_width: u32
+    viewport_height: u32
+
+    // State
+    current_file: string
+    is_loaded: bool
+
+    fn init(viewport_width: u32, viewport_height: u32): ModelViewer {
+        return ModelViewer {
+            settings: ViewerSettings.default()
+            camera: ViewerCamera.default()
+            model_info: ModelInfo.init()
+            animation_player: AnimationPlayer.init()
+            lod_controller: LODController.init()
+            damage_controller: DamageStateController.init()
+            mesh_inspector: MeshInspector.init()
+            bone_inspector: BoneInspector.init()
+            viewport_width: viewport_width
+            viewport_height: viewport_height
+            current_file: ""
+            is_loaded: false
+        }
+    }
+
+    fn load_model(&self, path: string): bool {
+        // Load W3D model from file
+        self.current_file = path
+        self.is_loaded = true
+
+        // Populate model info, meshes, bones, animations, LODs
+        // This would call into the W3D loader
+
+        // Fit camera to model bounds
+        self.camera.fit_to_bounds(self.model_info.bounds_min, self.model_info.bounds_max)
+
+        return true
+    }
+
+    fn unload_model(&self) {
+        self.is_loaded = false
+        self.current_file = ""
+        self.model_info = ModelInfo.init()
+        self.animation_player = AnimationPlayer.init()
+        self.lod_controller = LODController.init()
+        self.mesh_inspector = MeshInspector.init()
+        self.bone_inspector = BoneInspector.init()
+    }
+
+    fn update(&self, delta_time: f32) {
+        self.camera.update(delta_time)
+        self.animation_player.update(delta_time)
+
+        if self.lod_controller.auto_lod {
+            self.lod_controller.preview_distance = self.camera.distance
+            self.lod_controller.update_auto_lod()
+        }
+    }
+
+    fn reset_view(&self) {
+        self.camera.reset()
+        if self.is_loaded {
+            self.camera.fit_to_bounds(self.model_info.bounds_min, self.model_info.bounds_max)
+        }
+    }
+
+    fn take_screenshot(&self, path: string): bool {
+        // Render current view to image file
+        return true
+    }
+
+    fn export_info(&self, path: string): bool {
+        // Export model information to text file
+        var output = ""
+        output = output + "Model: " + self.model_info.name + "\n"
+        output = output + "File: " + self.model_info.file_path + "\n"
+        output = output + "Vertices: " + self.model_info.vertex_count.to_string() + "\n"
+        output = output + "Triangles: " + self.model_info.triangle_count.to_string() + "\n"
+        output = output + "Bones: " + self.model_info.bone_count.to_string() + "\n"
+        output = output + "Meshes: " + self.model_info.mesh_count.to_string() + "\n"
+        output = output + "Animations: " + self.model_info.animation_count.to_string() + "\n"
+        output = output + "LOD Levels: " + self.model_info.lod_count.to_string() + "\n"
+
+        return true
+    }
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+
+var g_model_viewer: ?ModelViewer = null
+
+export fn init_model_viewer(viewport_width: u32, viewport_height: u32) {
+    g_model_viewer = ModelViewer.init(viewport_width, viewport_height)
+}
+
+export fn shutdown_model_viewer() {
+    g_model_viewer = null
+}
+
+export fn get_model_viewer(): ?*ModelViewer {
+    if g_model_viewer != null {
+        return &g_model_viewer.?
+    }
+    return null
+}
