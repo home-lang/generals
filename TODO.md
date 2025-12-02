@@ -324,13 +324,13 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `R4-113` Implement LOD transitions (no popping) - DONE: `lod.home` LODTransitionData with smooth crossfade, transition_duration, blend_factor
 
 ### 4.12 Radar/Minimap
-- [~] `R4-120` Implement W3DRadar terrain texture generation - PARTIAL: `minimap.home`
-- [ ] `R4-121` Implement radar overlay rendering
-- [ ] `R4-122` Implement shroud texture on radar
-- [ ] `R4-123` Implement unit icon rendering on radar
-- [ ] `R4-124` Implement event beacon rendering
-- [ ] `R4-125` Implement hero icon display
-- [ ] `R4-126` Implement view box tracking
+- [x] `R4-120` Implement W3DRadar terrain texture generation - DONE: `graphics/radar.home` with build_terrain_texture, height-based color interpolation
+- [x] `R4-121` Implement radar overlay rendering - DONE: `graphics/radar.home` overlay_texture, update_object_texture, render_object
+- [x] `R4-122` Implement shroud texture on radar - DONE: `graphics/radar.home` shroud_texture, set_shroud_level, clear_shroud
+- [x] `R4-123` Implement unit icon rendering on radar - DONE: `graphics/radar.home` RadarObject, hero_objects, stealthed unit blinking
+- [x] `R4-124` Implement event beacon rendering - DONE: `graphics/radar.home` RadarEvent, add_event(), update_events() with fade/die frames
+- [x] `R4-125` Implement hero icon display - DONE: `graphics/radar.home` hero_objects list, add_hero_object()
+- [x] `R4-126` Implement view box tracking - DONE: `graphics/radar.home` view_box array, reconstruct_view_box() from camera corners
 
 ---
 

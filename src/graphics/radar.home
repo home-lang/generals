@@ -1,0 +1,949 @@
+// Radar/Minimap System for C&C Generals
+// Based on W3DRadar from original Westwood code
+// Implements terrain texture generation, unit overlays, shroud, and events
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+let RADAR_CELL_WIDTH: i32 = 128
+let RADAR_CELL_HEIGHT: i32 = 128
+let MAX_RADAR_EVENTS: i32 = 16
+let OVERLAY_REFRESH_RATE: i32 = 6
+let LOGICFRAMES_PER_SECOND: i32 = 30
+
+let PI: f32 = 3.14159265358979
+
+// ============================================================================
+// BASIC TYPES
+// ============================================================================
+
+struct ICoord2D {
+    x: i32,
+    y: i32,
+}
+
+impl ICoord2D {
+    fn new(x: i32, y: i32): ICoord2D {
+        return ICoord2D { x: x, y: y }
+    }
+
+    fn zero(): ICoord2D {
+        return ICoord2D { x: 0, y: 0 }
+    }
+}
+
+struct Coord3D {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Coord3D {
+    fn new(x: f32, y: f32, z: f32): Coord3D {
+        return Coord3D { x: x, y: y, z: z }
+    }
+
+    fn zero(): Coord3D {
+        return Coord3D { x: 0.0, y: 0.0, z: 0.0 }
+    }
+}
+
+struct Region2D {
+    lo_x: f32,
+    lo_y: f32,
+    hi_x: f32,
+    hi_y: f32,
+}
+
+impl Region2D {
+    fn new(lo_x: f32, lo_y: f32, hi_x: f32, hi_y: f32): Region2D {
+        return Region2D { lo_x: lo_x, lo_y: lo_y, hi_x: hi_x, hi_y: hi_y }
+    }
+
+    fn width(&self): f32 {
+        return self.hi_x - self.lo_x
+    }
+
+    fn height(&self): f32 {
+        return self.hi_y - self.lo_y
+    }
+}
+
+struct RGBColor {
+    r: f32,
+    g: f32,
+    b: f32,
+}
+
+impl RGBColor {
+    fn new(r: f32, g: f32, b: f32): RGBColor {
+        return RGBColor { r: r, g: g, b: b }
+    }
+
+    fn white(): RGBColor {
+        return RGBColor { r: 1.0, g: 1.0, b: 1.0 }
+    }
+
+    fn to_argb(&self, alpha: i32): i32 {
+        let r = cast(i32, self.r * 255.0) & 255
+        let g = cast(i32, self.g * 255.0) & 255
+        let b = cast(i32, self.b * 255.0) & 255
+        let a = alpha & 255
+        return (a << 24) | (r << 16) | (g << 8) | b
+    }
+}
+
+struct RGBAColor {
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+}
+
+impl RGBAColor {
+    fn new(r: i32, g: i32, b: i32, a: i32): RGBAColor {
+        return RGBAColor { r: r, g: g, b: b, a: a }
+    }
+
+    fn white(): RGBAColor {
+        return RGBAColor { r: 255, g: 255, b: 255, a: 255 }
+    }
+
+    fn to_argb(&self): i32 {
+        return (self.a << 24) | (self.r << 16) | (self.g << 8) | self.b
+    }
+
+    fn from_argb(argb: i32): RGBAColor {
+        return RGBAColor {
+            r: (argb >> 16) & 255,
+            g: (argb >> 8) & 255,
+            b: argb & 255,
+            a: (argb >> 24) & 255,
+        }
+    }
+}
+
+// ============================================================================
+// RADAR PRIORITY
+// ============================================================================
+
+enum RadarPriority {
+    NotOnRadar,       // Never show on radar
+    Unimportant,      // Small/background objects
+    Unit,             // Normal units
+    Structure,        // Buildings
+    LocalUnitOnly,    // Only visible to controlling player (stealth)
+    Critical,         // Always show (heroes, superweapons)
+}
+
+// ============================================================================
+// SHROUD STATUS
+// ============================================================================
+
+enum CellShroudStatus {
+    Clear,            // Fully visible
+    PartialClear,     // Edge of vision
+    Fogged,           // Previously seen but not currently
+    Shrouded,         // Never seen
+}
+
+// ============================================================================
+// RADAR EVENT TYPES
+// ============================================================================
+
+enum RadarEventType {
+    None,
+    Invalid,
+    Construction,      // Building placed
+    Upgrade,           // Upgrade complete
+    UnderAttack,       // Base under attack
+    InfiltrationStart, // Enemy infiltrating
+    InfiltrationEnd,
+    BeaconPulse,       // Beacon placed
+    Fake,              // Decoy event
+}
+
+struct RadarEvent {
+    event_type: RadarEventType,
+    active: bool,
+    create_frame: i32,
+    fade_frame: i32,
+    die_frame: i32,
+    radar_loc: ICoord2D,
+    world_pos: Coord3D,
+    color1: RGBAColor,
+    color2: RGBAColor,
+    sound_played: bool,
+}
+
+impl RadarEvent {
+    fn init(): RadarEvent {
+        return RadarEvent {
+            event_type: RadarEventType::None,
+            active: false,
+            create_frame: 0,
+            fade_frame: 0,
+            die_frame: 0,
+            radar_loc: ICoord2D::zero(),
+            world_pos: Coord3D::zero(),
+            color1: RGBAColor::new(255, 255, 0, 255),
+            color2: RGBAColor::new(255, 128, 0, 255),
+            sound_played: false,
+        }
+    }
+}
+
+// ============================================================================
+// RADAR OBJECT - Representation of a game object on the radar
+// ============================================================================
+
+struct RadarObject {
+    object_id: i32,
+    position: Coord3D,
+    color: i32,         // ARGB
+    priority: RadarPriority,
+    is_stealthed: bool,
+    is_detected: bool,
+    is_disguised: bool,
+    is_temporarily_hidden: bool,
+    player_index: i32,
+}
+
+impl RadarObject {
+    fn init(): RadarObject {
+        return RadarObject {
+            object_id: -1,
+            position: Coord3D::zero(),
+            color: 0xFFFFFFFF,
+            priority: RadarPriority::Unit,
+            is_stealthed: false,
+            is_detected: false,
+            is_disguised: false,
+            is_temporarily_hidden: false,
+            player_index: 0,
+        }
+    }
+}
+
+// ============================================================================
+// RADAR TEXTURE - Holds texture data for radar layers
+// ============================================================================
+
+struct RadarTexture {
+    pixels: [i32],      // ARGB pixel data
+    width: i32,
+    height: i32,
+    is_dirty: bool,
+}
+
+impl RadarTexture {
+    fn init(width: i32, height: i32): RadarTexture {
+        let pixels: [i32] = []
+        for i in 0..(width * height) {
+            pixels = pixels + [0]
+        }
+        return RadarTexture {
+            pixels: pixels,
+            width: width,
+            height: height,
+            is_dirty: true,
+        }
+    }
+
+    fn clear(&self) {
+        for i in 0..(self.width * self.height) {
+            self.pixels[i] = 0
+        }
+        self.is_dirty = true
+    }
+
+    fn clear_with_color(&self, color: i32) {
+        for i in 0..(self.width * self.height) {
+            self.pixels[i] = color
+        }
+        self.is_dirty = true
+    }
+
+    fn set_pixel(&self, x: i32, y: i32, color: i32) {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            self.pixels[y * self.width + x] = color
+            self.is_dirty = true
+        }
+    }
+
+    fn get_pixel(&self, x: i32, y: i32): i32 {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            return self.pixels[y * self.width + x]
+        }
+        return 0
+    }
+
+    fn draw_hline(&self, y: i32, x_start: i32, x_end: i32, color: i32) {
+        if y < 0 || y >= self.height {
+            return
+        }
+        let xs = if x_start < 0 { 0 } else { x_start }
+        let xe = if x_end >= self.width { self.width - 1 } else { x_end }
+        for x in xs..xe {
+            self.pixels[y * self.width + x] = color
+        }
+        self.is_dirty = true
+    }
+}
+
+// ============================================================================
+// RADAR - Main radar/minimap implementation
+// ============================================================================
+
+struct Radar {
+    // Map extent
+    map_extent: Region2D,
+    terrain_average_z: f32,
+
+    // Texture layers
+    terrain_texture: RadarTexture,
+    overlay_texture: RadarTexture,
+    shroud_texture: RadarTexture,
+
+    texture_width: i32,
+    texture_height: i32,
+
+    // View box (camera frustum on radar)
+    view_box: [ICoord2D],  // 4 corners
+    view_angle: f32,
+    view_zoom: f32,
+    reconstruct_view_box: bool,
+
+    // Radar events
+    events: [RadarEvent],
+    event_count: i32,
+
+    // Object lists
+    objects: [RadarObject],
+    object_count: i32,
+    max_objects: i32,
+
+    // Hero icons (special units)
+    hero_objects: [RadarObject],
+    hero_count: i32,
+
+    // Water color for terrain
+    water_color: RGBColor,
+
+    // Frame counter for overlay refresh
+    frame_count: i32,
+}
+
+impl Radar {
+    fn init(): Radar {
+        let view_box: [ICoord2D] = []
+        for i in 0..4 {
+            view_box = view_box + [ICoord2D::zero()]
+        }
+
+        let events: [RadarEvent] = []
+        for i in 0..MAX_RADAR_EVENTS {
+            events = events + [RadarEvent::init()]
+        }
+
+        let objects: [RadarObject] = []
+        let hero_objects: [RadarObject] = []
+
+        return Radar {
+            map_extent: Region2D::new(0.0, 0.0, 1000.0, 1000.0),
+            terrain_average_z: 0.0,
+            terrain_texture: RadarTexture::init(RADAR_CELL_WIDTH, RADAR_CELL_HEIGHT),
+            overlay_texture: RadarTexture::init(RADAR_CELL_WIDTH, RADAR_CELL_HEIGHT),
+            shroud_texture: RadarTexture::init(RADAR_CELL_WIDTH, RADAR_CELL_HEIGHT),
+            texture_width: RADAR_CELL_WIDTH,
+            texture_height: RADAR_CELL_HEIGHT,
+            view_box: view_box,
+            view_angle: 0.0,
+            view_zoom: 1.0,
+            reconstruct_view_box: true,
+            events: events,
+            event_count: 0,
+            objects: objects,
+            object_count: 0,
+            max_objects: 1024,
+            hero_objects: hero_objects,
+            hero_count: 0,
+            water_color: RGBColor::new(0.1, 0.3, 0.6),
+            frame_count: 0,
+        }
+    }
+
+    // ========================================================================
+    // COORDINATE CONVERSION
+    // ========================================================================
+
+    /// Convert radar cell coordinate to world position
+    fn radar_to_world(&self, radar: ICoord2D): Coord3D {
+        let x = cast(f32, radar.x) * (self.map_extent.width() / cast(f32, RADAR_CELL_WIDTH))
+        let y = cast(f32, radar.y) * (self.map_extent.height() / cast(f32, RADAR_CELL_HEIGHT))
+        return Coord3D::new(x + self.map_extent.lo_x, y + self.map_extent.lo_y, 0.0)
+    }
+
+    /// Convert world position to radar cell coordinate
+    fn world_to_radar(&self, world: Coord3D): ICoord2D {
+        let x = cast(i32, (world.x - self.map_extent.lo_x) / (self.map_extent.width() / cast(f32, RADAR_CELL_WIDTH)))
+        let y = cast(i32, (world.y - self.map_extent.lo_y) / (self.map_extent.height() / cast(f32, RADAR_CELL_HEIGHT)))
+        return ICoord2D::new(x, y)
+    }
+
+    /// Convert radar cell to screen pixel
+    fn radar_to_pixel(&self, radar: ICoord2D, radar_ul_x: i32, radar_ul_y: i32, radar_width: i32, radar_height: i32): ICoord2D {
+        let x = (radar.x * radar_width / RADAR_CELL_WIDTH) + radar_ul_x
+        // Note: Y is inverted for screen orientation
+        let y = ((RADAR_CELL_HEIGHT - 1 - radar.y) * radar_height / RADAR_CELL_HEIGHT) + radar_ul_y
+        return ICoord2D::new(x, y)
+    }
+
+    /// Check if a radar point is within valid bounds
+    fn is_legal_point(&self, x: i32, y: i32): bool {
+        return x >= 0 && y >= 0 && x < RADAR_CELL_WIDTH && y < RADAR_CELL_HEIGHT
+    }
+
+    // ========================================================================
+    // MAP SETUP
+    // ========================================================================
+
+    /// Initialize radar for a new map
+    fn new_map(&self, extent: Region2D, average_z: f32) {
+        self.map_extent = extent
+        self.terrain_average_z = average_z
+        self.reconstruct_view_box = true
+
+        // Clear all textures
+        self.terrain_texture.clear()
+        self.overlay_texture.clear()
+        self.shroud_texture.clear()
+
+        // Reset events
+        for i in 0..MAX_RADAR_EVENTS {
+            self.events[i].active = false
+        }
+        self.event_count = 0
+
+        // Clear objects
+        self.objects = []
+        self.object_count = 0
+        self.hero_objects = []
+        self.hero_count = 0
+    }
+
+    /// Reset radar state
+    fn reset(&self) {
+        self.terrain_texture.clear()
+        self.overlay_texture.clear()
+        self.clear_shroud()
+
+        for i in 0..MAX_RADAR_EVENTS {
+            self.events[i].active = false
+        }
+        self.event_count = 0
+    }
+
+    // ========================================================================
+    // TERRAIN TEXTURE GENERATION
+    // ========================================================================
+
+    /// Build terrain texture from height and color data
+    fn build_terrain_texture(&self, get_height: fn(f32, f32): f32, get_color: fn(f32, f32): RGBColor, get_is_underwater: fn(f32, f32): bool) {
+        self.reconstruct_view_box = true
+
+        let hi_z = self.map_extent.hi_y  // Use hi/lo from extent
+        let lo_z = 0.0
+        let mid_z = self.terrain_average_z
+
+        for y in 0..self.texture_height {
+            for x in 0..self.texture_width {
+                // Get world position for this radar cell
+                let radar_point = ICoord2D::new(x, y)
+                let world_point = self.radar_to_world(radar_point)
+
+                let color: RGBColor
+
+                // Check if underwater
+                if get_is_underwater(world_point.x, world_point.y) {
+                    // Use water color with height-based shading
+                    color = self.water_color
+                    let height = get_height(world_point.x, world_point.y)
+                    color = self.interpolate_color_for_height(color, height, hi_z, mid_z, lo_z)
+                } else {
+                    // Get terrain color
+                    color = get_color(world_point.x, world_point.y)
+                    let height = get_height(world_point.x, world_point.y)
+                    color = self.interpolate_color_for_height(color, height, hi_z, mid_z, lo_z)
+                }
+
+                // Set pixel
+                self.terrain_texture.set_pixel(x, y, color.to_argb(255))
+            }
+        }
+    }
+
+    /// Shade color based on height (higher = lighter, lower = darker)
+    fn interpolate_color_for_height(&self, color: RGBColor, height: f32, hi_z: f32, mid_z: f32, lo_z: f32): RGBColor {
+        let how_bright: f32 = 0.95
+        let how_dark: f32 = 0.60
+
+        // Prevent divide by zero on flat maps
+        let hi = if hi_z == mid_z { mid_z + 0.1 } else { hi_z }
+        let lo = if mid_z == lo_z { mid_z - 0.1 } else { lo_z }
+
+        let t: f32
+        let target: RGBColor
+
+        if height >= mid_z {
+            // Above middle - interpolate lighter
+            t = (height - mid_z) / (hi - mid_z)
+            target = RGBColor::new(
+                color.r + (1.0 - color.r) * how_bright,
+                color.g + (1.0 - color.g) * how_bright,
+                color.b + (1.0 - color.b) * how_bright
+            )
+        } else {
+            // Below middle - interpolate darker
+            t = (mid_z - height) / (mid_z - lo)
+            target = RGBColor::new(
+                color.r * (1.0 - how_dark),
+                color.g * (1.0 - how_dark),
+                color.b * (1.0 - how_dark)
+            )
+        }
+
+        // Clamp t to 0-1
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+
+        // Interpolate toward target
+        return RGBColor::new(
+            clamp_f32(color.r + (target.r - color.r) * t, 0.0, 1.0),
+            clamp_f32(color.g + (target.g - color.g) * t, 0.0, 1.0),
+            clamp_f32(color.b + (target.b - color.b) * t, 0.0, 1.0)
+        )
+    }
+
+    // ========================================================================
+    // SHROUD MANAGEMENT
+    // ========================================================================
+
+    /// Clear shroud (make all visible)
+    fn clear_shroud(&self) {
+        // Clear to transparent (0 alpha = visible)
+        self.shroud_texture.clear_with_color(0x00000000)
+    }
+
+    /// Set shroud level at a specific cell
+    fn set_shroud_level(&self, shroud_x: i32, shroud_y: i32, status: CellShroudStatus, cell_width: i32, cell_height: i32) {
+        // Calculate radar coordinates from shroud coordinates
+        let map_min_x = shroud_x * cell_width
+        let map_min_y = shroud_y * cell_height
+        let map_max_x = (shroud_x + 1) * cell_width
+        let map_max_y = (shroud_y + 1) * cell_height
+
+        let world_min = Coord3D::new(cast(f32, map_min_x), cast(f32, map_min_y), 0.0)
+        let world_max = Coord3D::new(cast(f32, map_max_x), cast(f32, map_max_y), 0.0)
+
+        let radar_min = self.world_to_radar(world_min)
+        let radar_max = self.world_to_radar(world_max)
+
+        // Determine alpha based on shroud status
+        let alpha = if status == CellShroudStatus::Shrouded {
+            255  // Full black
+        } else if status == CellShroudStatus::Fogged {
+            127  // Half transparent
+        } else {
+            0    // Fully visible
+        }
+
+        let color = (alpha << 24) | 0x00000000  // Black with alpha
+
+        // Fill the affected area
+        for y in radar_min.y..radar_max.y {
+            for x in radar_min.x..radar_max.x {
+                if self.is_legal_point(x, y) {
+                    self.shroud_texture.set_pixel(x, y, color)
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // OBJECT RENDERING
+    // ========================================================================
+
+    /// Add an object to the radar
+    fn add_object(&self, obj: RadarObject) {
+        if self.object_count < self.max_objects {
+            self.objects = self.objects + [obj]
+            self.object_count = self.object_count + 1
+        }
+    }
+
+    /// Add a hero object (shown with special icon)
+    fn add_hero_object(&self, obj: RadarObject) {
+        self.hero_objects = self.hero_objects + [obj]
+        self.hero_count = self.hero_count + 1
+    }
+
+    /// Clear all objects
+    fn clear_objects(&self) {
+        self.objects = []
+        self.object_count = 0
+        self.hero_objects = []
+        self.hero_count = 0
+    }
+
+    /// Update object overlay texture
+    fn update_object_texture(&self, local_player_index: i32, current_frame: i32) {
+        // Clear overlay
+        self.overlay_texture.clear()
+
+        // Render all objects
+        for i in 0..self.object_count {
+            let obj = self.objects[i]
+            self.render_object(obj, local_player_index, current_frame)
+        }
+
+        // Render hero objects
+        for i in 0..self.hero_count {
+            let obj = self.hero_objects[i]
+            self.render_object(obj, local_player_index, current_frame)
+        }
+    }
+
+    /// Render a single object to the overlay
+    fn render_object(&self, obj: RadarObject, local_player_index: i32, current_frame: i32) {
+        // Skip hidden objects
+        if obj.is_temporarily_hidden {
+            return
+        }
+
+        // Convert position to radar coordinates
+        let radar_point = self.world_to_radar(obj.position)
+
+        // Get base color
+        let color = obj.color
+
+        // Handle stealthed units - make them blink
+        if obj.is_stealthed && !obj.is_detected && !obj.is_disguised {
+            // Only show to owning player
+            if obj.player_index != local_player_index {
+                return
+            }
+
+            // Blink effect
+            let frames_for_transition = LOGICFRAMES_PER_SECOND
+            let min_alpha = 32
+
+            let alpha_scale = cast(f32, current_frame % frames_for_transition) / (cast(f32, frames_for_transition) / 2.0)
+            let new_alpha: i32
+            if alpha_scale > 1.0 {
+                new_alpha = cast(i32, ((2.0 - alpha_scale) * cast(f32, 255 - min_alpha)) + cast(f32, min_alpha))
+            } else {
+                new_alpha = cast(i32, (alpha_scale * cast(f32, 255 - min_alpha)) + cast(f32, min_alpha))
+            }
+
+            // Modify color with new alpha
+            let rgba = RGBAColor::from_argb(color)
+            rgba.a = new_alpha
+            color = rgba.to_argb()
+        }
+
+        // Draw 2x2 pixel blip
+        if self.is_legal_point(radar_point.x, radar_point.y) {
+            self.overlay_texture.set_pixel(radar_point.x, radar_point.y, color)
+        }
+        if self.is_legal_point(radar_point.x + 1, radar_point.y) {
+            self.overlay_texture.set_pixel(radar_point.x + 1, radar_point.y, color)
+        }
+        if self.is_legal_point(radar_point.x, radar_point.y + 1) {
+            self.overlay_texture.set_pixel(radar_point.x, radar_point.y + 1, color)
+        }
+        if self.is_legal_point(radar_point.x + 1, radar_point.y + 1) {
+            self.overlay_texture.set_pixel(radar_point.x + 1, radar_point.y + 1, color)
+        }
+    }
+
+    // ========================================================================
+    // VIEW BOX
+    // ========================================================================
+
+    /// Reconstruct view box from camera corners
+    fn reconstruct_view_box(&self, corners: [Coord3D]) {
+        // corners: [upper-left, upper-right, lower-right, lower-left]
+        if len(corners) < 4 {
+            return
+        }
+
+        for i in 0..4 {
+            let radar = self.world_to_radar(corners[i])
+
+            if i == 0 {
+                self.view_box[0] = ICoord2D::zero()
+            } else {
+                // Store as offset from previous point
+                let prev_radar = self.world_to_radar(corners[i - 1])
+                self.view_box[i] = ICoord2D::new(
+                    radar.x - prev_radar.x,
+                    radar.y - prev_radar.y
+                )
+            }
+        }
+
+        self.reconstruct_view_box = false
+    }
+
+    // ========================================================================
+    // RADAR EVENTS
+    // ========================================================================
+
+    /// Add a radar event (attack, construction, etc.)
+    fn add_event(&self, event_type: RadarEventType, world_pos: Coord3D, color1: RGBAColor, color2: RGBAColor, lifetime_frames: i32, current_frame: i32): bool {
+        // Find a free slot
+        for i in 0..MAX_RADAR_EVENTS {
+            if !self.events[i].active {
+                self.events[i].event_type = event_type
+                self.events[i].active = true
+                self.events[i].create_frame = current_frame
+                self.events[i].fade_frame = current_frame + (lifetime_frames * 3 / 4)
+                self.events[i].die_frame = current_frame + lifetime_frames
+                self.events[i].world_pos = world_pos
+                self.events[i].radar_loc = self.world_to_radar(world_pos)
+                self.events[i].color1 = color1
+                self.events[i].color2 = color2
+                self.events[i].sound_played = false
+
+                self.event_count = self.event_count + 1
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Update events (remove expired)
+    fn update_events(&self, current_frame: i32) {
+        for i in 0..MAX_RADAR_EVENTS {
+            if self.events[i].active {
+                if current_frame >= self.events[i].die_frame {
+                    self.events[i].active = false
+                    self.event_count = self.event_count - 1
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // RENDERING
+    // ========================================================================
+
+    /// Update the radar (call once per frame)
+    fn update(&self, current_frame: i32, local_player_index: i32) {
+        self.frame_count = self.frame_count + 1
+
+        // Update events
+        self.update_events(current_frame)
+
+        // Refresh overlay periodically
+        if self.frame_count % OVERLAY_REFRESH_RATE == 0 {
+            self.update_object_texture(local_player_index, current_frame)
+        }
+    }
+
+    /// Get render data for the radar
+    fn get_render_data(&self): RadarRenderData {
+        return RadarRenderData {
+            terrain_texture: self.terrain_texture,
+            overlay_texture: self.overlay_texture,
+            shroud_texture: self.shroud_texture,
+            view_box: self.view_box,
+            events: self.events,
+            event_count: self.event_count,
+            hero_objects: self.hero_objects,
+            hero_count: self.hero_count,
+        }
+    }
+
+    /// Calculate draw positions accounting for map aspect ratio
+    fn find_draw_positions(&self, pixel_x: i32, pixel_y: i32, width: i32, height: i32): RadarDrawPositions {
+        let map_ratio = self.map_extent.width() / self.map_extent.height()
+        let draw_ratio = cast(f32, width) / cast(f32, height)
+
+        let ul: ICoord2D
+        let lr: ICoord2D
+
+        if map_ratio >= draw_ratio {
+            // Map is wider - add vertical bars
+            let scaled_height = cast(i32, cast(f32, width) / map_ratio)
+            let offset = (height - scaled_height) / 2
+            ul = ICoord2D::new(pixel_x, pixel_y + offset)
+            lr = ICoord2D::new(pixel_x + width, pixel_y + offset + scaled_height)
+        } else {
+            // Map is taller - add horizontal bars
+            let scaled_width = cast(i32, cast(f32, height) * map_ratio)
+            let offset = (width - scaled_width) / 2
+            ul = ICoord2D::new(pixel_x + offset, pixel_y)
+            lr = ICoord2D::new(pixel_x + offset + scaled_width, pixel_y + height)
+        }
+
+        return RadarDrawPositions {
+            upper_left: ul,
+            lower_right: lr,
+            needs_horizontal_bars: map_ratio >= draw_ratio,
+        }
+    }
+}
+
+struct RadarRenderData {
+    terrain_texture: RadarTexture,
+    overlay_texture: RadarTexture,
+    shroud_texture: RadarTexture,
+    view_box: [ICoord2D],
+    events: [RadarEvent],
+    event_count: i32,
+    hero_objects: [RadarObject],
+    hero_count: i32,
+}
+
+struct RadarDrawPositions {
+    upper_left: ICoord2D,
+    lower_right: ICoord2D,
+    needs_horizontal_bars: bool,
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn clamp_f32(x: f32, min: f32, max: f32): f32 {
+    if x < min { return min }
+    if x > max { return max }
+    return x
+}
+
+fn sin(x: f32): f32 {
+    let x_norm = x
+    while x_norm > PI {
+        x_norm = x_norm - PI * 2.0
+    }
+    while x_norm < -PI {
+        x_norm = x_norm + PI * 2.0
+    }
+    let x2 = x_norm * x_norm
+    let x3 = x2 * x_norm
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    return x_norm - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0
+}
+
+fn cos(x: f32): f32 {
+    return sin(x + PI / 2.0)
+}
+
+fn len<T>(arr: [T]): i32 {
+    return 0  // Placeholder
+}
+
+fn cast<T>(target_type: type, value: any): T {
+    return value  // Placeholder
+}
+
+// ============================================================================
+// GLOBAL RADAR
+// ============================================================================
+
+let g_radar: Radar? = null
+
+fn init_radar(): Radar {
+    let radar = Radar::init()
+    g_radar = radar
+    return radar
+}
+
+fn get_radar(): Radar? {
+    return g_radar
+}
+
+fn shutdown_radar() {
+    g_radar = null
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_radar() {
+    print("Testing Radar System...")
+
+    let radar = init_radar()
+    print("Radar initialized")
+
+    // Set up map
+    radar.new_map(Region2D::new(0.0, 0.0, 500.0, 400.0), 50.0)
+    print("Map set: 500x400 units")
+
+    // Test coordinate conversion
+    let world_pos = Coord3D::new(250.0, 200.0, 0.0)
+    let radar_pos = radar.world_to_radar(world_pos)
+    print("World (250, 200) -> Radar (" + str(radar_pos.x) + ", " + str(radar_pos.y) + ")")
+
+    let back_to_world = radar.radar_to_world(radar_pos)
+    print("Back to World: (" + str(back_to_world.x) + ", " + str(back_to_world.y) + ")")
+
+    // Test adding objects
+    let obj1 = RadarObject::init()
+    obj1.object_id = 1
+    obj1.position = Coord3D::new(100.0, 100.0, 0.0)
+    obj1.color = 0xFF00FF00  // Green
+    obj1.priority = RadarPriority::Unit
+    radar.add_object(obj1)
+
+    let obj2 = RadarObject::init()
+    obj2.object_id = 2
+    obj2.position = Coord3D::new(400.0, 300.0, 0.0)
+    obj2.color = 0xFFFF0000  // Red
+    obj2.priority = RadarPriority::Structure
+    radar.add_object(obj2)
+
+    print("Objects added: " + str(radar.object_count))
+
+    // Test hero
+    let hero = RadarObject::init()
+    hero.object_id = 100
+    hero.position = Coord3D::new(250.0, 200.0, 0.0)
+    hero.color = 0xFFFFFF00  // Yellow
+    hero.priority = RadarPriority::Critical
+    radar.add_hero_object(hero)
+    print("Hero added: " + str(radar.hero_count))
+
+    // Test radar event
+    radar.add_event(
+        RadarEventType::UnderAttack,
+        Coord3D::new(150.0, 150.0, 0.0),
+        RGBAColor::new(255, 0, 0, 255),
+        RGBAColor::new(255, 128, 0, 255),
+        90,  // 3 seconds at 30fps
+        0
+    )
+    print("Events: " + str(radar.event_count))
+
+    // Test update
+    radar.update(0, 0)
+    print("Radar updated")
+
+    // Test shroud
+    radar.set_shroud_level(0, 0, CellShroudStatus::Shrouded, 32, 32)
+    radar.set_shroud_level(1, 0, CellShroudStatus::Fogged, 32, 32)
+    print("Shroud set")
+
+    // Test draw positions
+    let positions = radar.find_draw_positions(100, 50, 200, 200)
+    print("Draw UL: (" + str(positions.upper_left.x) + ", " + str(positions.upper_left.y) + ")")
+    print("Draw LR: (" + str(positions.lower_right.x) + ", " + str(positions.lower_right.y) + ")")
+
+    shutdown_radar()
+    print("Radar tests complete!")
+}
