@@ -1,0 +1,901 @@
+// Post-Processing Effects System - Advanced visual effects for C&C Generals Zero Hour
+// Implements bloom, tone mapping, color grading, and other screen-space effects
+
+const std = @import("std")
+const math = @import("math")
+
+// ============================================================================
+// Post-Processing Effect Types
+// ============================================================================
+
+pub const PostProcessEffect = enum {
+    BLOOM,
+    TONE_MAPPING,
+    COLOR_GRADING,
+    VIGNETTE,
+    CHROMATIC_ABERRATION,
+    FILM_GRAIN,
+    MOTION_BLUR,
+    DEPTH_OF_FIELD,
+    AMBIENT_OCCLUSION,
+    ANTI_ALIASING,
+    SHARPEN,
+    FOG,
+    HEAT_DISTORTION,
+    NUCLEAR_FLASH,
+    SCREEN_SHAKE,
+}
+
+pub const ToneMappingOperator = enum {
+    REINHARD,
+    REINHARD_EXTENDED,
+    ACES,
+    UNCHARTED2,
+    EXPOSURE,
+    LINEAR,
+}
+
+pub const AntiAliasingMode = enum {
+    NONE,
+    FXAA,
+    SMAA,
+    MSAA_2X,
+    MSAA_4X,
+    MSAA_8X,
+    TAA,
+}
+
+// ============================================================================
+// Effect Parameters
+// ============================================================================
+
+pub const BloomParams = struct {
+    enabled: bool,
+    threshold: f32,
+    intensity: f32,
+    radius: f32,
+    soft_threshold: f32,
+    mip_levels: u8,
+
+    pub fn default() BloomParams {
+        return BloomParams{
+            .enabled = true,
+            .threshold = 1.0,
+            .intensity = 0.8,
+            .radius = 4.0,
+            .soft_threshold = 0.5,
+            .mip_levels = 5,
+        }
+    }
+}
+
+pub const ToneMappingParams = struct {
+    enabled: bool,
+    operator: ToneMappingOperator,
+    exposure: f32,
+    gamma: f32,
+    white_point: f32,
+
+    pub fn default() ToneMappingParams {
+        return ToneMappingParams{
+            .enabled = true,
+            .operator = .ACES,
+            .exposure = 1.0,
+            .gamma = 2.2,
+            .white_point = 4.0,
+        }
+    }
+}
+
+pub const ColorGradingParams = struct {
+    enabled: bool,
+    saturation: f32,
+    contrast: f32,
+    brightness: f32,
+    hue_shift: f32,
+    temperature: f32,  // Color temperature adjustment
+    tint: f32,         // Green-magenta tint
+    shadows: [3]f32,   // RGB multiplier for shadows
+    midtones: [3]f32,  // RGB multiplier for midtones
+    highlights: [3]f32, // RGB multiplier for highlights
+    lut_texture: ?u32,  // Optional LUT texture for color grading
+
+    pub fn default() ColorGradingParams {
+        return ColorGradingParams{
+            .enabled = false,
+            .saturation = 1.0,
+            .contrast = 1.0,
+            .brightness = 0.0,
+            .hue_shift = 0.0,
+            .temperature = 0.0,
+            .tint = 0.0,
+            .shadows = .{ 1.0, 1.0, 1.0 },
+            .midtones = .{ 1.0, 1.0, 1.0 },
+            .highlights = .{ 1.0, 1.0, 1.0 },
+            .lut_texture = null,
+        }
+    }
+}
+
+pub const VignetteParams = struct {
+    enabled: bool,
+    intensity: f32,
+    smoothness: f32,
+    roundness: f32,
+    color: [3]f32,
+
+    pub fn default() VignetteParams {
+        return VignetteParams{
+            .enabled = false,
+            .intensity = 0.3,
+            .smoothness = 0.5,
+            .roundness = 1.0,
+            .color = .{ 0.0, 0.0, 0.0 },
+        }
+    }
+}
+
+pub const ChromaticAberrationParams = struct {
+    enabled: bool,
+    intensity: f32,
+    radial: bool,
+
+    pub fn default() ChromaticAberrationParams {
+        return ChromaticAberrationParams{
+            .enabled = false,
+            .intensity = 0.01,
+            .radial = true,
+        }
+    }
+}
+
+pub const FilmGrainParams = struct {
+    enabled: bool,
+    intensity: f32,
+    response: f32,
+    luminance_contribution: f32,
+
+    pub fn default() FilmGrainParams {
+        return FilmGrainParams{
+            .enabled = false,
+            .intensity = 0.1,
+            .response = 0.8,
+            .luminance_contribution = 0.5,
+        }
+    }
+}
+
+pub const MotionBlurParams = struct {
+    enabled: bool,
+    intensity: f32,
+    sample_count: u8,
+    camera_rotation_blur: bool,
+    per_object_blur: bool,
+
+    pub fn default() MotionBlurParams {
+        return MotionBlurParams{
+            .enabled = false,
+            .intensity = 0.5,
+            .sample_count = 8,
+            .camera_rotation_blur = true,
+            .per_object_blur = false,
+        }
+    }
+}
+
+pub const DepthOfFieldParams = struct {
+    enabled: bool,
+    focus_distance: f32,
+    aperture: f32,
+    focal_length: f32,
+    blade_count: u8,
+    max_blur_size: f32,
+    use_camera_focus: bool,
+
+    pub fn default() DepthOfFieldParams {
+        return DepthOfFieldParams{
+            .enabled = false,
+            .focus_distance = 10.0,
+            .aperture = 5.6,
+            .focal_length = 50.0,
+            .blade_count = 6,
+            .max_blur_size = 8.0,
+            .use_camera_focus = true,
+        }
+    }
+}
+
+pub const AmbientOcclusionParams = struct {
+    enabled: bool,
+    intensity: f32,
+    radius: f32,
+    bias: f32,
+    sample_count: u8,
+    blur_passes: u8,
+    temporal_filtering: bool,
+
+    pub fn default() AmbientOcclusionParams {
+        return AmbientOcclusionParams{
+            .enabled = false,
+            .intensity = 1.0,
+            .radius = 0.5,
+            .bias = 0.025,
+            .sample_count = 16,
+            .blur_passes = 2,
+            .temporal_filtering = true,
+        }
+    }
+}
+
+pub const SharpenParams = struct {
+    enabled: bool,
+    intensity: f32,
+    threshold: f32,
+
+    pub fn default() SharpenParams {
+        return SharpenParams{
+            .enabled = false,
+            .intensity = 0.5,
+            .threshold = 0.0,
+        }
+    }
+}
+
+pub const FogParams = struct {
+    enabled: bool,
+    mode: FogMode,
+    color: [3]f32,
+    density: f32,
+    start: f32,
+    end: f32,
+    height_falloff: f32,
+    max_opacity: f32,
+
+    pub fn default() FogParams {
+        return FogParams{
+            .enabled = false,
+            .mode = .LINEAR,
+            .color = .{ 0.7, 0.7, 0.8 },
+            .density = 0.01,
+            .start = 100.0,
+            .end = 1000.0,
+            .height_falloff = 0.0,
+            .max_opacity = 1.0,
+        }
+    }
+}
+
+pub const FogMode = enum {
+    LINEAR,
+    EXPONENTIAL,
+    EXPONENTIAL_SQUARED,
+    HEIGHT_FOG,
+}
+
+pub const HeatDistortionParams = struct {
+    enabled: bool,
+    intensity: f32,
+    speed: f32,
+    scale: f32,
+    // Used for explosions, fire, nuclear effects
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    falloff: f32,
+
+    pub fn default() HeatDistortionParams {
+        return HeatDistortionParams{
+            .enabled = false,
+            .intensity = 0.02,
+            .speed = 1.0,
+            .scale = 10.0,
+            .center_x = 0.5,
+            .center_y = 0.5,
+            .radius = 0.3,
+            .falloff = 2.0,
+        }
+    }
+}
+
+pub const NuclearFlashParams = struct {
+    enabled: bool,
+    intensity: f32,
+    duration: f32,
+    color: [3]f32,
+    elapsed_time: f32,
+    center_x: f32,
+    center_y: f32,
+
+    pub fn default() NuclearFlashParams {
+        return NuclearFlashParams{
+            .enabled = false,
+            .intensity = 1.0,
+            .duration = 3.0,
+            .color = .{ 1.0, 1.0, 0.9 },
+            .elapsed_time = 0.0,
+            .center_x = 0.5,
+            .center_y = 0.5,
+        }
+    }
+}
+
+pub const ScreenShakeParams = struct {
+    enabled: bool,
+    intensity: f32,
+    frequency: f32,
+    duration: f32,
+    elapsed_time: f32,
+    decay_rate: f32,
+
+    pub fn default() ScreenShakeParams {
+        return ScreenShakeParams{
+            .enabled = false,
+            .intensity = 10.0,
+            .frequency = 20.0,
+            .duration = 0.5,
+            .elapsed_time = 0.0,
+            .decay_rate = 5.0,
+        }
+    }
+}
+
+// ============================================================================
+// Post-Processing Stack
+// ============================================================================
+
+pub const PostProcessStack = struct {
+    // Effect parameters
+    bloom: BloomParams,
+    tone_mapping: ToneMappingParams,
+    color_grading: ColorGradingParams,
+    vignette: VignetteParams,
+    chromatic_aberration: ChromaticAberrationParams,
+    film_grain: FilmGrainParams,
+    motion_blur: MotionBlurParams,
+    depth_of_field: DepthOfFieldParams,
+    ambient_occlusion: AmbientOcclusionParams,
+    sharpen: SharpenParams,
+    fog: FogParams,
+    heat_distortion: HeatDistortionParams,
+    nuclear_flash: NuclearFlashParams,
+    screen_shake: ScreenShakeParams,
+    anti_aliasing_mode: AntiAliasingMode,
+
+    // Effect order
+    effect_order: [16]PostProcessEffect,
+    effect_count: u8,
+
+    // Render targets
+    scene_color: u32,
+    scene_depth: u32,
+    velocity_buffer: u32,
+    bloom_chain: [8]u32,
+    ao_buffer: u32,
+    temp_buffer_a: u32,
+    temp_buffer_b: u32,
+
+    // Time and random
+    time: f32,
+    random_seed: u32,
+
+    // Previous frame data for temporal effects
+    prev_view_proj: [16]f32,
+    jitter_offset: [2]f32,
+    frame_index: u32,
+
+    pub fn init() PostProcessStack {
+        var stack = PostProcessStack{
+            .bloom = BloomParams.default(),
+            .tone_mapping = ToneMappingParams.default(),
+            .color_grading = ColorGradingParams.default(),
+            .vignette = VignetteParams.default(),
+            .chromatic_aberration = ChromaticAberrationParams.default(),
+            .film_grain = FilmGrainParams.default(),
+            .motion_blur = MotionBlurParams.default(),
+            .depth_of_field = DepthOfFieldParams.default(),
+            .ambient_occlusion = AmbientOcclusionParams.default(),
+            .sharpen = SharpenParams.default(),
+            .fog = FogParams.default(),
+            .heat_distortion = HeatDistortionParams.default(),
+            .nuclear_flash = NuclearFlashParams.default(),
+            .screen_shake = ScreenShakeParams.default(),
+            .anti_aliasing_mode = .FXAA,
+            .effect_order = undefined,
+            .effect_count = 0,
+            .scene_color = 0,
+            .scene_depth = 0,
+            .velocity_buffer = 0,
+            .bloom_chain = std.mem.zeroes([8]u32),
+            .ao_buffer = 0,
+            .temp_buffer_a = 0,
+            .temp_buffer_b = 0,
+            .time = 0.0,
+            .random_seed = 12345,
+            .prev_view_proj = std.mem.zeroes([16]f32),
+            .jitter_offset = .{ 0.0, 0.0 },
+            .frame_index = 0,
+        }
+
+        // Set default effect order
+        stack.setDefaultEffectOrder()
+
+        return stack
+    }
+
+    pub fn setDefaultEffectOrder(self: *PostProcessStack) void {
+        // Effects are processed in this order
+        self.effect_order[0] = .AMBIENT_OCCLUSION
+        self.effect_order[1] = .DEPTH_OF_FIELD
+        self.effect_order[2] = .MOTION_BLUR
+        self.effect_order[3] = .FOG
+        self.effect_order[4] = .BLOOM
+        self.effect_order[5] = .HEAT_DISTORTION
+        self.effect_order[6] = .NUCLEAR_FLASH
+        self.effect_order[7] = .TONE_MAPPING
+        self.effect_order[8] = .COLOR_GRADING
+        self.effect_order[9] = .CHROMATIC_ABERRATION
+        self.effect_order[10] = .SHARPEN
+        self.effect_order[11] = .ANTI_ALIASING
+        self.effect_order[12] = .FILM_GRAIN
+        self.effect_order[13] = .VIGNETTE
+        self.effect_order[14] = .SCREEN_SHAKE
+        self.effect_count = 15
+    }
+
+    pub fn update(self: *PostProcessStack, delta_time: f32) void {
+        self.time += delta_time
+        self.frame_index += 1
+
+        // Update timed effects
+        if (self.nuclear_flash.enabled) {
+            self.nuclear_flash.elapsed_time += delta_time
+            if (self.nuclear_flash.elapsed_time >= self.nuclear_flash.duration) {
+                self.nuclear_flash.enabled = false
+                self.nuclear_flash.elapsed_time = 0.0
+            }
+        }
+
+        if (self.screen_shake.enabled) {
+            self.screen_shake.elapsed_time += delta_time
+            if (self.screen_shake.elapsed_time >= self.screen_shake.duration) {
+                self.screen_shake.enabled = false
+                self.screen_shake.elapsed_time = 0.0
+            }
+        }
+
+        // Update random seed for grain
+        self.random_seed = self.random_seed *% 1103515245 +% 12345
+    }
+
+    pub fn triggerNuclearFlash(self: *PostProcessStack, x: f32, y: f32, intensity: f32, duration: f32) void {
+        self.nuclear_flash.enabled = true
+        self.nuclear_flash.center_x = x
+        self.nuclear_flash.center_y = y
+        self.nuclear_flash.intensity = intensity
+        self.nuclear_flash.duration = duration
+        self.nuclear_flash.elapsed_time = 0.0
+
+        // Also trigger heat distortion
+        self.heat_distortion.enabled = true
+        self.heat_distortion.center_x = x
+        self.heat_distortion.center_y = y
+        self.heat_distortion.intensity = intensity * 0.1
+        self.heat_distortion.radius = 0.5
+
+        // And screen shake
+        self.triggerScreenShake(intensity * 20.0, duration * 0.5)
+    }
+
+    pub fn triggerScreenShake(self: *PostProcessStack, intensity: f32, duration: f32) void {
+        self.screen_shake.enabled = true
+        self.screen_shake.intensity = intensity
+        self.screen_shake.duration = duration
+        self.screen_shake.elapsed_time = 0.0
+    }
+
+    pub fn triggerExplosion(self: *PostProcessStack, x: f32, y: f32, size: f32) void {
+        // Small screen shake for explosions
+        self.triggerScreenShake(size * 5.0, 0.2)
+
+        // Heat distortion at explosion location
+        self.heat_distortion.enabled = true
+        self.heat_distortion.center_x = x
+        self.heat_distortion.center_y = y
+        self.heat_distortion.intensity = size * 0.02
+        self.heat_distortion.radius = size * 0.1
+    }
+
+    pub fn getShakeOffset(self: *const PostProcessStack) [2]f32 {
+        if (!self.screen_shake.enabled) {
+            return .{ 0.0, 0.0 }
+        }
+
+        const t = self.screen_shake.elapsed_time
+        const decay = @exp(-self.screen_shake.decay_rate * t)
+        const intensity = self.screen_shake.intensity * decay
+
+        // Generate shake using pseudo-random based on time
+        const freq = self.screen_shake.frequency
+        const x = @sin(t * freq * 6.28318) * intensity
+        const y = @cos(t * freq * 6.28318 * 1.3) * intensity
+
+        return .{ x, y }
+    }
+
+    pub fn getNuclearFlashIntensity(self: *const PostProcessStack) f32 {
+        if (!self.nuclear_flash.enabled) {
+            return 0.0
+        }
+
+        const t = self.nuclear_flash.elapsed_time / self.nuclear_flash.duration
+
+        // Flash curve: quick rise, slow decay
+        if (t < 0.1) {
+            return t / 0.1 * self.nuclear_flash.intensity
+        } else {
+            return (1.0 - (t - 0.1) / 0.9) * self.nuclear_flash.intensity
+        }
+    }
+
+    pub fn setPreset(self: *PostProcessStack, preset: Preset) void {
+        switch (preset) {
+            .DEFAULT => {
+                self.bloom = BloomParams.default()
+                self.tone_mapping = ToneMappingParams.default()
+                self.color_grading = ColorGradingParams.default()
+                self.vignette = VignetteParams.default()
+            },
+            .CINEMATIC => {
+                self.bloom.enabled = true
+                self.bloom.intensity = 0.5
+                self.tone_mapping.operator = .ACES
+                self.color_grading.enabled = true
+                self.color_grading.contrast = 1.1
+                self.color_grading.saturation = 0.9
+                self.vignette.enabled = true
+                self.vignette.intensity = 0.4
+            },
+            .HIGH_CONTRAST => {
+                self.bloom.enabled = true
+                self.bloom.intensity = 1.2
+                self.bloom.threshold = 0.8
+                self.tone_mapping.operator = .REINHARD_EXTENDED
+                self.color_grading.enabled = true
+                self.color_grading.contrast = 1.3
+            },
+            .WARM => {
+                self.color_grading.enabled = true
+                self.color_grading.temperature = 0.2
+                self.color_grading.shadows = .{ 1.0, 0.9, 0.85 }
+            },
+            .COLD => {
+                self.color_grading.enabled = true
+                self.color_grading.temperature = -0.2
+                self.color_grading.highlights = .{ 0.9, 0.95, 1.1 }
+            },
+            .DESERT => {
+                self.fog.enabled = true
+                self.fog.color = .{ 0.9, 0.85, 0.7 }
+                self.fog.density = 0.002
+                self.color_grading.enabled = true
+                self.color_grading.temperature = 0.15
+                self.color_grading.saturation = 0.85
+            },
+            .NIGHT => {
+                self.tone_mapping.exposure = 0.5
+                self.color_grading.enabled = true
+                self.color_grading.temperature = -0.3
+                self.color_grading.brightness = -0.1
+                self.vignette.enabled = true
+                self.vignette.intensity = 0.5
+            },
+            .NUCLEAR => {
+                self.bloom.enabled = true
+                self.bloom.intensity = 1.5
+                self.bloom.threshold = 0.5
+                self.color_grading.enabled = true
+                self.color_grading.saturation = 0.6
+                self.color_grading.highlights = .{ 1.2, 1.1, 0.8 }
+            },
+        }
+    }
+
+    pub const Preset = enum {
+        DEFAULT,
+        CINEMATIC,
+        HIGH_CONTRAST,
+        WARM,
+        COLD,
+        DESERT,
+        NIGHT,
+        NUCLEAR,
+    }
+}
+
+// ============================================================================
+// Shader Code Generation (Metal Shading Language style)
+// ============================================================================
+
+pub const PostProcessShaders = struct {
+    // Bloom threshold and downscale
+    pub const bloom_threshold_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\struct VertexOut {
+        \\    float4 position [[position]];
+        \\    float2 texcoord;
+        \\};
+        \\
+        \\fragment float4 bloom_threshold(VertexOut in [[stage_in]],
+        \\                                 texture2d<float> scene [[texture(0)]],
+        \\                                 constant float2& params [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    float4 color = scene.sample(s, in.texcoord);
+        \\    float brightness = max(max(color.r, color.g), color.b);
+        \\    float soft = brightness - params.x + params.y;
+        \\    soft = clamp(soft, 0.0, params.y * 2.0);
+        \\    soft = soft * soft / (params.y * 4.0 + 0.00001);
+        \\    float contribution = max(soft, brightness - params.x) / max(brightness, 0.00001);
+        \\    return color * contribution;
+        \\}
+    ;
+
+    // Gaussian blur pass
+    pub const blur_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\struct VertexOut {
+        \\    float4 position [[position]];
+        \\    float2 texcoord;
+        \\};
+        \\
+        \\fragment float4 gaussian_blur(VertexOut in [[stage_in]],
+        \\                               texture2d<float> tex [[texture(0)]],
+        \\                               constant float2& direction [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    const float weights[5] = {0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216};
+        \\
+        \\    float4 result = tex.sample(s, in.texcoord) * weights[0];
+        \\    for (int i = 1; i < 5; i++) {
+        \\        result += tex.sample(s, in.texcoord + direction * float(i)) * weights[i];
+        \\        result += tex.sample(s, in.texcoord - direction * float(i)) * weights[i];
+        \\    }
+        \\    return result;
+        \\}
+    ;
+
+    // ACES tone mapping
+    pub const tone_mapping_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\float3 ACESFilm(float3 x) {
+        \\    float a = 2.51;
+        \\    float b = 0.03;
+        \\    float c = 2.43;
+        \\    float d = 0.59;
+        \\    float e = 0.14;
+        \\    return saturate((x*(a*x+b))/(x*(c*x+d)+e));
+        \\}
+        \\
+        \\fragment float4 tone_map(VertexOut in [[stage_in]],
+        \\                          texture2d<float> scene [[texture(0)]],
+        \\                          texture2d<float> bloom [[texture(1)]],
+        \\                          constant float4& params [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    float4 color = scene.sample(s, in.texcoord);
+        \\    float4 bloomColor = bloom.sample(s, in.texcoord);
+        \\
+        \\    color.rgb += bloomColor.rgb * params.z; // Bloom intensity
+        \\    color.rgb *= params.x; // Exposure
+        \\    color.rgb = ACESFilm(color.rgb);
+        \\    color.rgb = pow(color.rgb, float3(1.0/params.y)); // Gamma
+        \\
+        \\    return color;
+        \\}
+    ;
+
+    // FXAA anti-aliasing
+    pub const fxaa_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\#define FXAA_SPAN_MAX 8.0
+        \\#define FXAA_REDUCE_MUL (1.0/8.0)
+        \\#define FXAA_REDUCE_MIN (1.0/128.0)
+        \\
+        \\fragment float4 fxaa(VertexOut in [[stage_in]],
+        \\                      texture2d<float> tex [[texture(0)]],
+        \\                      constant float2& texelSize [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\
+        \\    float3 rgbNW = tex.sample(s, in.texcoord + float2(-1,-1) * texelSize).rgb;
+        \\    float3 rgbNE = tex.sample(s, in.texcoord + float2(1,-1) * texelSize).rgb;
+        \\    float3 rgbSW = tex.sample(s, in.texcoord + float2(-1,1) * texelSize).rgb;
+        \\    float3 rgbSE = tex.sample(s, in.texcoord + float2(1,1) * texelSize).rgb;
+        \\    float3 rgbM = tex.sample(s, in.texcoord).rgb;
+        \\
+        \\    float3 luma = float3(0.299, 0.587, 0.114);
+        \\    float lumaNW = dot(rgbNW, luma);
+        \\    float lumaNE = dot(rgbNE, luma);
+        \\    float lumaSW = dot(rgbSW, luma);
+        \\    float lumaSE = dot(rgbSE, luma);
+        \\    float lumaM = dot(rgbM, luma);
+        \\
+        \\    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+        \\    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+        \\
+        \\    float2 dir;
+        \\    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+        \\    dir.y = ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+        \\
+        \\    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * FXAA_REDUCE_MUL, FXAA_REDUCE_MIN);
+        \\    float rcpDirMin = 1.0/(min(abs(dir.x), abs(dir.y)) + dirReduce);
+        \\    dir = min(float2(FXAA_SPAN_MAX), max(float2(-FXAA_SPAN_MAX), dir * rcpDirMin)) * texelSize;
+        \\
+        \\    float3 rgbA = 0.5 * (
+        \\        tex.sample(s, in.texcoord + dir * (1.0/3.0 - 0.5)).rgb +
+        \\        tex.sample(s, in.texcoord + dir * (2.0/3.0 - 0.5)).rgb);
+        \\    float3 rgbB = rgbA * 0.5 + 0.25 * (
+        \\        tex.sample(s, in.texcoord + dir * -0.5).rgb +
+        \\        tex.sample(s, in.texcoord + dir * 0.5).rgb);
+        \\
+        \\    float lumaB = dot(rgbB, luma);
+        \\    if (lumaB < lumaMin || lumaB > lumaMax) {
+        \\        return float4(rgbA, 1.0);
+        \\    }
+        \\    return float4(rgbB, 1.0);
+        \\}
+    ;
+
+    // Vignette effect
+    pub const vignette_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\fragment float4 vignette(VertexOut in [[stage_in]],
+        \\                          texture2d<float> tex [[texture(0)]],
+        \\                          constant float4& params [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    float4 color = tex.sample(s, in.texcoord);
+        \\
+        \\    float2 uv = in.texcoord * 2.0 - 1.0;
+        \\    uv.x *= params.w; // Roundness
+        \\    float dist = length(uv);
+        \\    float vignette = smoothstep(1.0, 1.0 - params.y, dist * params.x);
+        \\
+        \\    color.rgb = mix(float3(params.z), color.rgb, vignette);
+        \\    return color;
+        \\}
+    ;
+
+    // Film grain
+    pub const film_grain_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\float rand(float2 co, float seed) {
+        \\    return fract(sin(dot(co + seed, float2(12.9898, 78.233))) * 43758.5453);
+        \\}
+        \\
+        \\fragment float4 film_grain(VertexOut in [[stage_in]],
+        \\                            texture2d<float> tex [[texture(0)]],
+        \\                            constant float4& params [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    float4 color = tex.sample(s, in.texcoord);
+        \\
+        \\    float luminance = dot(color.rgb, float3(0.299, 0.587, 0.114));
+        \\    float grainStrength = mix(params.x, params.x * params.y, luminance);
+        \\
+        \\    float noise = (rand(in.texcoord, params.z) - 0.5) * grainStrength;
+        \\    color.rgb += noise * mix(float3(1.0), color.rgb, params.w);
+        \\
+        \\    return color;
+        \\}
+    ;
+
+    // Heat distortion
+    pub const heat_distortion_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\fragment float4 heat_distortion(VertexOut in [[stage_in]],
+        \\                                 texture2d<float> tex [[texture(0)]],
+        \\                                 constant float4& center_params [[buffer(0)]],
+        \\                                 constant float4& distort_params [[buffer(1)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\
+        \\    float2 center = center_params.xy;
+        \\    float radius = center_params.z;
+        \\    float falloff = center_params.w;
+        \\
+        \\    float2 delta = in.texcoord - center;
+        \\    float dist = length(delta);
+        \\    float factor = 1.0 - smoothstep(0.0, radius, dist);
+        \\    factor = pow(factor, falloff);
+        \\
+        \\    float time = distort_params.x;
+        \\    float intensity = distort_params.y;
+        \\    float scale = distort_params.z;
+        \\
+        \\    float2 offset;
+        \\    offset.x = sin(in.texcoord.y * scale + time * 5.0) * intensity * factor;
+        \\    offset.y = cos(in.texcoord.x * scale + time * 4.0) * intensity * factor;
+        \\
+        \\    return tex.sample(s, in.texcoord + offset);
+        \\}
+    ;
+
+    // Nuclear flash overlay
+    pub const nuclear_flash_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\fragment float4 nuclear_flash(VertexOut in [[stage_in]],
+        \\                               texture2d<float> tex [[texture(0)]],
+        \\                               constant float4& params [[buffer(0)]]) {
+        \\    constexpr sampler s(filter::linear);
+        \\    float4 color = tex.sample(s, in.texcoord);
+        \\
+        \\    float intensity = params.x;
+        \\    float3 flashColor = params.yzw;
+        \\
+        \\    // Radial gradient from center
+        \\    float2 uv = in.texcoord * 2.0 - 1.0;
+        \\    float dist = length(uv);
+        \\    float radial = 1.0 - smoothstep(0.0, 2.0, dist);
+        \\
+        \\    color.rgb = mix(color.rgb, flashColor, intensity * radial);
+        \\
+        \\    return color;
+        \\}
+    ;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "PostProcessStack initialization" {
+    var stack = PostProcessStack.init()
+
+    try std.testing.expect(stack.bloom.enabled == true)
+    try std.testing.expect(stack.tone_mapping.enabled == true)
+    try std.testing.expect(stack.effect_count > 0)
+}
+
+test "Nuclear flash trigger" {
+    var stack = PostProcessStack.init()
+
+    stack.triggerNuclearFlash(0.5, 0.5, 1.0, 3.0)
+
+    try std.testing.expect(stack.nuclear_flash.enabled == true)
+    try std.testing.expect(stack.nuclear_flash.center_x == 0.5)
+    try std.testing.expect(stack.heat_distortion.enabled == true)
+    try std.testing.expect(stack.screen_shake.enabled == true)
+}
+
+test "Screen shake decay" {
+    var stack = PostProcessStack.init()
+
+    stack.triggerScreenShake(10.0, 1.0)
+    const offset1 = stack.getShakeOffset()
+
+    stack.update(0.5)
+    const offset2 = stack.getShakeOffset()
+
+    // Shake should decay over time
+    try std.testing.expect(@abs(offset1[0]) >= @abs(offset2[0]) or @abs(offset1[1]) >= @abs(offset2[1]))
+}
+
+test "Preset application" {
+    var stack = PostProcessStack.init()
+
+    stack.setPreset(.DESERT)
+
+    try std.testing.expect(stack.fog.enabled == true)
+    try std.testing.expect(stack.color_grading.enabled == true)
+    try std.testing.expect(stack.color_grading.temperature > 0.0)
+}

@@ -1,0 +1,1646 @@
+// Weapon Templates - Complete weapon definitions for C&C Generals Zero Hour
+// Based on original INI files and Thyme source code
+// Implements all weapons for infantry, vehicles, aircraft, and buildings
+
+const std = @import("std")
+const math = @import("math")
+
+import engine/combat_system {DamageType, ArmorType}
+
+// ============================================================================
+// Weapon System Types
+// ============================================================================
+
+pub const WeaponCategory = enum {
+    SMALL_ARMS,        // Rifles, pistols, SMGs
+    HEAVY_ARMS,        // Machine guns, gatling
+    ANTI_ARMOR,        // Rockets, tank guns
+    ARTILLERY,         // Mortars, howitzers
+    MISSILE,           // Guided missiles
+    FLAME,             // Flamethrowers
+    LASER,             // Laser weapons
+    TOXIN,             // Chemical weapons
+    RADIATION,         // Nuclear weapons
+    EXPLOSIVE,         // Bombs, C4
+    MELEE,             // Close combat
+    SPECIAL,           // Unique abilities
+}
+
+pub const ProjectileType = enum {
+    INSTANT,           // Hitscan
+    BULLET,            // Fast projectile
+    ROCKET,            // Guided/unguided rockets
+    MISSILE,           // Smart missiles
+    SHELL,             // Artillery shells
+    GRENADE,           // Arcing grenades
+    FLAME,             // Flame stream
+    LASER_BEAM,        // Continuous laser
+    BOMB,              // Dropped bombs
+    TOXIN_STREAM,      // Toxin spray
+    RADIATION,         // Radiation effect
+    NONE,              // No projectile (melee)
+}
+
+pub const DamageDelivery = enum {
+    SINGLE_TARGET,     // Hits one unit
+    AREA_OF_EFFECT,    // Splash damage
+    LINE,              // Damages units in a line
+    CONE,              // Cone-shaped damage
+    CONTINUOUS,        // Damage over time
+}
+
+pub const TargetType = enum {
+    GROUND,
+    AIR,
+    GROUND_AND_AIR,
+    STRUCTURE_ONLY,
+    INFANTRY_ONLY,
+    VEHICLE_ONLY,
+}
+
+pub const WeaponDefinition = struct {
+    name: []const u8,
+    display_name: []const u8,
+    category: WeaponCategory,
+    projectile_type: ProjectileType,
+    damage_delivery: DamageDelivery,
+    target_type: TargetType,
+
+    // Damage stats
+    damage: f32,
+    damage_type: DamageType,
+    damage_radius: f32,  // For AOE weapons
+    damage_scalar_vs_infantry: f32,
+    damage_scalar_vs_vehicle: f32,
+    damage_scalar_vs_structure: f32,
+    damage_scalar_vs_aircraft: f32,
+
+    // Range and accuracy
+    min_range: f32,
+    max_range: f32,
+    accuracy: f32,  // 0-1, affects scatter
+
+    // Rate of fire
+    rate_of_fire: f32,  // Shots per second
+    clip_size: u16,
+    reload_time: f32,
+    pre_attack_delay: f32,
+    firing_duration: f32,  // For continuous weapons
+
+    // Projectile properties
+    projectile_speed: f32,
+    projectile_arc: f32,  // For arcing projectiles
+    projectile_model: []const u8,
+    impact_fx: []const u8,
+    muzzle_fx: []const u8,
+
+    // Special effects
+    leaves_residue: bool,
+    residue_type: []const u8,
+    residue_duration: f32,
+    can_scatter: bool,
+    scatter_radius: f32,
+
+    // Audio
+    fire_sound: []const u8,
+    impact_sound: []const u8,
+}
+
+pub fn create_weapon_definition(name: []const u8, category: WeaponCategory) WeaponDefinition {
+    return WeaponDefinition{
+        .name = name,
+        .display_name = "",
+        .category = category,
+        .projectile_type = .BULLET,
+        .damage_delivery = .SINGLE_TARGET,
+        .target_type = .GROUND,
+
+        .damage = 10.0,
+        .damage_type = .SMALL_ARMS,
+        .damage_radius = 0.0,
+        .damage_scalar_vs_infantry = 1.0,
+        .damage_scalar_vs_vehicle = 1.0,
+        .damage_scalar_vs_structure = 1.0,
+        .damage_scalar_vs_aircraft = 1.0,
+
+        .min_range = 0.0,
+        .max_range = 100.0,
+        .accuracy = 1.0,
+
+        .rate_of_fire = 1.0,
+        .clip_size = 0,
+        .reload_time = 0.0,
+        .pre_attack_delay = 0.0,
+        .firing_duration = 0.0,
+
+        .projectile_speed = 999999.0,  // Instant by default
+        .projectile_arc = 0.0,
+        .projectile_model = "",
+        .impact_fx = "",
+        .muzzle_fx = "",
+
+        .leaves_residue = false,
+        .residue_type = "",
+        .residue_duration = 0.0,
+        .can_scatter = false,
+        .scatter_radius = 0.0,
+
+        .fire_sound = "",
+        .impact_sound = "",
+    }
+}
+
+// ============================================================================
+// USA Small Arms Weapons
+// ============================================================================
+
+pub const RANGER_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RangerGun", .SMALL_ARMS)
+    wpn.display_name = "M16 Rifle"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 8.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.25
+    wpn.damage_scalar_vs_structure = 0.1
+
+    wpn.max_range = 120.0
+    wpn.rate_of_fire = 4.0
+    wpn.clip_size = 30
+    wpn.reload_time = 2.5
+
+    wpn.fire_sound = "RangerGunFire"
+    wpn.impact_sound = "BulletImpact"
+    wpn.muzzle_fx = "MuzzleFlashSmall"
+
+    break :blk wpn
+}
+
+pub const RANGER_FLASHBANG: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RangerFlashbang", .EXPLOSIVE)
+    wpn.display_name = "Flashbang Grenade"
+    wpn.projectile_type = .GRENADE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 0.0  // Stun effect, no damage
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 30.0
+
+    wpn.max_range = 80.0
+    wpn.rate_of_fire = 0.1  // Slow
+    wpn.pre_attack_delay = 0.5
+
+    wpn.projectile_speed = 200.0
+    wpn.projectile_arc = 0.3
+    wpn.projectile_model = "PFlashbang"
+
+    wpn.fire_sound = "GrenadeThrow"
+    wpn.impact_sound = "FlashbangExplosion"
+    wpn.impact_fx = "FlashbangFX"
+
+    break :blk wpn
+}
+
+pub const MISSILE_DEFENDER_ROCKET: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("MissileDefenderRocket", .ANTI_ARMOR)
+    wpn.display_name = "Stinger Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 60.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_infantry = 0.5
+    wpn.damage_scalar_vs_vehicle = 1.0
+    wpn.damage_scalar_vs_aircraft = 1.5
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 3.0
+
+    wpn.projectile_speed = 400.0
+    wpn.projectile_model = "PStingerMissile"
+
+    wpn.fire_sound = "StingerLaunch"
+    wpn.impact_sound = "MissileImpact"
+    wpn.impact_fx = "MissileExplosionSmall"
+    wpn.muzzle_fx = "MissileLaunchSmoke"
+
+    break :blk wpn
+}
+
+pub const PATHFINDER_SNIPER: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("PathfinderSniper", .SMALL_ARMS)
+    wpn.display_name = "Sniper Rifle"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 500.0  // One-shot kill infantry
+    wpn.damage_type = .SNIPER
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.0  // Cannot damage vehicles
+    wpn.damage_scalar_vs_structure = 0.0
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 0.25  // Very slow
+    wpn.reload_time = 4.0
+    wpn.pre_attack_delay = 0.5
+
+    wpn.fire_sound = "SniperRifleFire"
+    wpn.impact_sound = "SniperHit"
+    wpn.muzzle_fx = "MuzzleFlashSniper"
+
+    break :blk wpn
+}
+
+pub const COLONEL_BURTON_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ColonelBurtonGun", .SMALL_ARMS)
+    wpn.display_name = "Assault Rifle"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 15.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.4
+    wpn.damage_scalar_vs_structure = 0.2
+
+    wpn.max_range = 150.0
+    wpn.rate_of_fire = 6.0
+    wpn.clip_size = 50
+    wpn.reload_time = 2.0
+
+    wpn.fire_sound = "BurtonGunFire"
+    wpn.impact_sound = "BulletImpact"
+    wpn.muzzle_fx = "MuzzleFlashMedium"
+
+    break :blk wpn
+}
+
+pub const COLONEL_BURTON_KNIFE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ColonelBurtonKnife", .MELEE)
+    wpn.display_name = "Combat Knife"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 1000.0  // Instant kill
+    wpn.damage_type = .MELEE
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.0
+
+    wpn.max_range = 5.0  // Melee range
+    wpn.rate_of_fire = 0.5
+
+    wpn.fire_sound = "KnifeStab"
+    wpn.impact_sound = "KnifeHit"
+
+    break :blk wpn
+}
+
+pub const REMOTE_DEMO_CHARGE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RemoteDemoCharge", .EXPLOSIVE)
+    wpn.display_name = "Remote Demo Charge"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .STRUCTURE_ONLY
+
+    wpn.damage = 500.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 20.0
+    wpn.damage_scalar_vs_structure = 2.0
+
+    wpn.max_range = 5.0  // Must be placed
+    wpn.rate_of_fire = 0.1
+    wpn.pre_attack_delay = 2.0  // Planting time
+
+    wpn.fire_sound = "DemoChargePlant"
+    wpn.impact_sound = "ExplosionLarge"
+    wpn.impact_fx = "DemoExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// USA Vehicle Weapons
+// ============================================================================
+
+pub const HUMVEE_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("HumveeGun", .HEAVY_ARMS)
+    wpn.display_name = ".50 Cal Machine Gun"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 12.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.5
+    wpn.damage_scalar_vs_aircraft = 0.8
+
+    wpn.max_range = 175.0
+    wpn.rate_of_fire = 8.0
+    wpn.clip_size = 200
+    wpn.reload_time = 3.0
+
+    wpn.fire_sound = "HeavyMachineGunFire"
+    wpn.impact_sound = "BulletImpact"
+    wpn.muzzle_fx = "MuzzleFlashHeavy"
+
+    break :blk wpn
+}
+
+pub const TOW_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TOWMissile", .MISSILE)
+    wpn.display_name = "TOW Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 100.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_vehicle = 1.5
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 0.25
+    wpn.reload_time = 6.0
+
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PTOWMissile"
+
+    wpn.fire_sound = "TOWLaunch"
+    wpn.impact_sound = "MissileImpactHeavy"
+    wpn.impact_fx = "MissileExplosionMedium"
+
+    break :blk wpn
+}
+
+pub const CRUSADER_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("CrusaderCannon", .ANTI_ARMOR)
+    wpn.display_name = "120mm Cannon"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 80.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 5.0
+    wpn.damage_scalar_vs_vehicle = 1.0
+    wpn.damage_scalar_vs_structure = 0.8
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 2.0
+
+    wpn.projectile_speed = 600.0
+    wpn.projectile_model = "PTankShell"
+
+    wpn.fire_sound = "TankCannonFire"
+    wpn.impact_sound = "ShellImpact"
+    wpn.impact_fx = "TankShellExplosion"
+    wpn.muzzle_fx = "TankMuzzleFlash"
+
+    break :blk wpn
+}
+
+pub const PALADIN_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("PaladinCannon", .ANTI_ARMOR)
+    wpn.display_name = "120mm Cannon"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 100.0  // More damage than Crusader
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 5.0
+    wpn.damage_scalar_vs_vehicle = 1.0
+    wpn.damage_scalar_vs_structure = 0.8
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.4
+    wpn.reload_time = 2.5
+
+    wpn.projectile_speed = 600.0
+    wpn.projectile_model = "PTankShell"
+
+    wpn.fire_sound = "TankCannonFire"
+    wpn.impact_sound = "ShellImpact"
+    wpn.impact_fx = "TankShellExplosion"
+    wpn.muzzle_fx = "TankMuzzleFlash"
+
+    break :blk wpn
+}
+
+pub const PALADIN_LASER: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("PaladinLaser", .LASER)
+    wpn.display_name = "Point Defense Laser"
+    wpn.projectile_type = .LASER_BEAM
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .AIR
+
+    wpn.damage = 200.0  // Destroys incoming missiles
+    wpn.damage_type = .LASER
+    wpn.damage_scalar_vs_aircraft = 0.5
+
+    wpn.max_range = 150.0
+    wpn.rate_of_fire = 2.0
+
+    wpn.fire_sound = "LaserFire"
+    wpn.impact_sound = "LaserImpact"
+    wpn.impact_fx = "LaserHit"
+
+    break :blk wpn
+}
+
+pub const TOMAHAWK_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TomahawkMissile", .MISSILE)
+    wpn.display_name = "Tomahawk Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 200.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 30.0
+    wpn.damage_scalar_vs_structure = 1.5
+
+    wpn.min_range = 100.0  // Minimum range
+    wpn.max_range = 400.0
+    wpn.rate_of_fire = 0.15
+    wpn.reload_time = 8.0
+
+    wpn.projectile_speed = 250.0
+    wpn.projectile_model = "PTomahawkMissile"
+
+    wpn.fire_sound = "TomahawkLaunch"
+    wpn.impact_sound = "ExplosionLarge"
+    wpn.impact_fx = "TomahawkExplosion"
+    wpn.muzzle_fx = "MissileLaunchSmokeLarge"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// USA Aircraft Weapons
+// ============================================================================
+
+pub const COMANCHE_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ComancheGun", .HEAVY_ARMS)
+    wpn.display_name = "20mm Gatling Gun"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 10.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.5
+    wpn.damage_scalar_vs_aircraft = 1.0
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 15.0  // Very high
+    wpn.clip_size = 500
+    wpn.reload_time = 3.0
+
+    wpn.fire_sound = "GatlingGunFire"
+    wpn.muzzle_fx = "GatlingMuzzleFlash"
+
+    break :blk wpn
+}
+
+pub const COMANCHE_ROCKET: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ComancheRocket", .MISSILE)
+    wpn.display_name = "Rocket Pods"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 40.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 15.0
+
+    wpn.max_range = 250.0
+    wpn.rate_of_fire = 3.0
+    wpn.clip_size = 8
+    wpn.reload_time = 5.0
+
+    wpn.projectile_speed = 400.0
+    wpn.projectile_model = "PRocketPod"
+
+    wpn.fire_sound = "RocketPodLaunch"
+    wpn.impact_sound = "ExplosionMedium"
+    wpn.impact_fx = "RocketExplosion"
+
+    break :blk wpn
+}
+
+pub const RAPTOR_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RaptorMissile", .MISSILE)
+    wpn.display_name = "Air-to-Air Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 80.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_aircraft = 1.5
+
+    wpn.max_range = 350.0
+    wpn.rate_of_fire = 1.0
+    wpn.clip_size = 4
+    wpn.reload_time = 0.0  // Returns to base to reload
+
+    wpn.projectile_speed = 500.0
+    wpn.projectile_model = "PAAMissile"
+
+    wpn.fire_sound = "AAMissileLaunch"
+    wpn.impact_sound = "MissileImpact"
+    wpn.impact_fx = "MissileExplosionMedium"
+
+    break :blk wpn
+}
+
+pub const AURORA_BOMB: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("AuroraBomb", .EXPLOSIVE)
+    wpn.display_name = "Fuel Air Bomb"
+    wpn.projectile_type = .BOMB
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 500.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 50.0
+    wpn.damage_scalar_vs_structure = 1.5
+
+    wpn.max_range = 0.0  // Dropped
+    wpn.rate_of_fire = 0.0  // One shot per run
+
+    wpn.projectile_speed = 200.0
+    wpn.projectile_model = "PFuelAirBomb"
+
+    wpn.fire_sound = "BombDrop"
+    wpn.impact_sound = "ExplosionHuge"
+    wpn.impact_fx = "FuelAirExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// USA Defense Weapons
+// ============================================================================
+
+pub const PATRIOT_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("PatriotMissile", .MISSILE)
+    wpn.display_name = "Patriot Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 80.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_aircraft = 2.0
+    wpn.damage_scalar_vs_vehicle = 1.0
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 2.0
+
+    wpn.projectile_speed = 500.0
+    wpn.projectile_model = "PPatriotMissile"
+
+    wpn.fire_sound = "PatriotLaunch"
+    wpn.impact_sound = "MissileImpact"
+    wpn.impact_fx = "MissileExplosionMedium"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// China Infantry Weapons
+// ============================================================================
+
+pub const RED_GUARD_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RedGuardGun", .SMALL_ARMS)
+    wpn.display_name = "Type 56 Rifle"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 6.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.2
+    wpn.damage_scalar_vs_structure = 0.05
+
+    wpn.max_range = 100.0
+    wpn.rate_of_fire = 5.0
+    wpn.clip_size = 30
+    wpn.reload_time = 2.0
+
+    wpn.fire_sound = "RedGuardGunFire"
+    wpn.impact_sound = "BulletImpact"
+    wpn.muzzle_fx = "MuzzleFlashSmall"
+
+    break :blk wpn
+}
+
+pub const TANK_HUNTER_ROCKET: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TankHunterRocket", .ANTI_ARMOR)
+    wpn.display_name = "RPG-7"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 70.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_infantry = 0.4
+    wpn.damage_scalar_vs_vehicle = 1.2
+    wpn.damage_scalar_vs_structure = 0.8
+
+    wpn.max_range = 175.0
+    wpn.rate_of_fire = 0.4
+    wpn.reload_time = 3.0
+
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PRPG7Rocket"
+
+    wpn.fire_sound = "RPGLaunch"
+    wpn.impact_sound = "RocketImpact"
+    wpn.impact_fx = "RPGExplosion"
+    wpn.muzzle_fx = "RPGBackblast"
+
+    break :blk wpn
+}
+
+pub const TANK_HUNTER_TNT: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TankHunterTNT", .EXPLOSIVE)
+    wpn.display_name = "TNT Attack"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 300.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 10.0
+    wpn.damage_scalar_vs_vehicle = 1.5
+    wpn.damage_scalar_vs_structure = 2.0
+
+    wpn.max_range = 5.0  // Must get close
+    wpn.rate_of_fire = 0.1
+    wpn.pre_attack_delay = 1.5
+
+    wpn.fire_sound = "TNTPlace"
+    wpn.impact_sound = "ExplosionMedium"
+    wpn.impact_fx = "TNTExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// China Vehicle Weapons
+// ============================================================================
+
+pub const BATTLEMASTER_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("BattlemasterTankGun", .ANTI_ARMOR)
+    wpn.display_name = "125mm Cannon"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 70.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 5.0
+
+    wpn.max_range = 175.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 2.0
+
+    wpn.projectile_speed = 550.0
+    wpn.projectile_model = "PTankShell"
+
+    wpn.fire_sound = "TankCannonFire"
+    wpn.impact_sound = "ShellImpact"
+    wpn.impact_fx = "TankShellExplosion"
+    wpn.muzzle_fx = "TankMuzzleFlash"
+
+    break :blk wpn
+}
+
+pub const DRAGON_TANK_FLAME: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("DragonTankFlame", .FLAME)
+    wpn.display_name = "Flamethrower"
+    wpn.projectile_type = .FLAME
+    wpn.damage_delivery = .CONE
+    wpn.target_type = .GROUND
+
+    wpn.damage = 15.0
+    wpn.damage_type = .FLAME
+    wpn.damage_radius = 20.0
+    wpn.damage_scalar_vs_infantry = 2.0
+    wpn.damage_scalar_vs_structure = 1.5
+    wpn.damage_scalar_vs_vehicle = 0.5
+
+    wpn.max_range = 100.0
+    wpn.rate_of_fire = 10.0  // Continuous
+    wpn.firing_duration = 3.0
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "FirePool"
+    wpn.residue_duration = 5.0
+
+    wpn.fire_sound = "FlamethrowerLoop"
+    wpn.impact_fx = "FlameHit"
+
+    break :blk wpn
+}
+
+pub const DRAGON_TANK_FIREWALL: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("DragonTankFirewall", .FLAME)
+    wpn.display_name = "Fire Wall"
+    wpn.projectile_type = .FLAME
+    wpn.damage_delivery = .LINE
+    wpn.target_type = .GROUND
+
+    wpn.damage = 25.0
+    wpn.damage_type = .FLAME
+    wpn.damage_radius = 30.0
+
+    wpn.max_range = 150.0
+    wpn.rate_of_fire = 0.2
+    wpn.reload_time = 10.0
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "FireWall"
+    wpn.residue_duration = 15.0
+
+    wpn.fire_sound = "FirewallCreate"
+    wpn.impact_fx = "FirewallFX"
+
+    break :blk wpn
+}
+
+pub const OVERLORD_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("OverlordTankGun", .ANTI_ARMOR)
+    wpn.display_name = "Dual 125mm Cannons"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 120.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 8.0
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.4
+    wpn.reload_time = 2.5
+
+    wpn.projectile_speed = 550.0
+    wpn.projectile_model = "PTankShellLarge"
+
+    wpn.fire_sound = "OverlordCannonFire"
+    wpn.impact_sound = "ShellImpactHeavy"
+    wpn.impact_fx = "TankShellExplosionLarge"
+    wpn.muzzle_fx = "TankMuzzleFlashLarge"
+
+    break :blk wpn
+}
+
+pub const INFERNO_CANNON_SHELL: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("InfernoCannonShell", .ARTILLERY)
+    wpn.display_name = "Incendiary Shell"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 50.0
+    wpn.damage_type = .FLAME
+    wpn.damage_radius = 40.0
+    wpn.damage_scalar_vs_infantry = 1.5
+    wpn.damage_scalar_vs_structure = 1.2
+
+    wpn.min_range = 75.0
+    wpn.max_range = 350.0
+    wpn.rate_of_fire = 0.2
+    wpn.reload_time = 5.0
+
+    wpn.projectile_speed = 200.0
+    wpn.projectile_arc = 0.6
+    wpn.projectile_model = "PInfernoShell"
+    wpn.can_scatter = true
+    wpn.scatter_radius = 20.0
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "FirePool"
+    wpn.residue_duration = 8.0
+
+    wpn.fire_sound = "ArtilleryFire"
+    wpn.impact_sound = "FireExplosion"
+    wpn.impact_fx = "InfernoExplosion"
+
+    break :blk wpn
+}
+
+pub const NUKE_CANNON_SHELL: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("NukeCannonShell", .ARTILLERY)
+    wpn.display_name = "Nuclear Shell"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 300.0
+    wpn.damage_type = .RADIATION
+    wpn.damage_radius = 60.0
+    wpn.damage_scalar_vs_infantry = 2.0
+
+    wpn.min_range = 100.0
+    wpn.max_range = 400.0
+    wpn.rate_of_fire = 0.1
+    wpn.reload_time = 15.0
+    wpn.pre_attack_delay = 3.0  // Deployment time
+
+    wpn.projectile_speed = 150.0
+    wpn.projectile_arc = 0.7
+    wpn.projectile_model = "PNukeShell"
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "RadiationField"
+    wpn.residue_duration = 30.0
+
+    wpn.fire_sound = "NukeCannonFire"
+    wpn.impact_sound = "NukeExplosion"
+    wpn.impact_fx = "TacticalNukeExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// China Aircraft Weapons
+// ============================================================================
+
+pub const MIG_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("MiGMissile", .MISSILE)
+    wpn.display_name = "Air-to-Air Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 60.0
+    wpn.damage_type = .ARMOR_PIERCING
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 1.5
+    wpn.clip_size = 4
+
+    wpn.projectile_speed = 500.0
+    wpn.projectile_model = "PMiGMissile"
+
+    wpn.fire_sound = "MiGMissileLaunch"
+    wpn.impact_sound = "MissileImpact"
+    wpn.impact_fx = "MissileExplosionMedium"
+
+    break :blk wpn
+}
+
+pub const MIG_NAPALM: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("MiGNapalmBomb", .EXPLOSIVE)
+    wpn.display_name = "Napalm Bomb"
+    wpn.projectile_type = .BOMB
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 100.0
+    wpn.damage_type = .FLAME
+    wpn.damage_radius = 40.0
+    wpn.damage_scalar_vs_infantry = 2.0
+    wpn.damage_scalar_vs_structure = 1.5
+
+    wpn.max_range = 0.0
+    wpn.projectile_speed = 200.0
+    wpn.projectile_model = "PNapalmBomb"
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "NapalmPool"
+    wpn.residue_duration = 10.0
+
+    wpn.fire_sound = "BombDrop"
+    wpn.impact_sound = "NapalmExplosion"
+    wpn.impact_fx = "NapalmFire"
+
+    break :blk wpn
+}
+
+pub const HELIX_NAPALM: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("HelixNapalmBomb", .EXPLOSIVE)
+    wpn.display_name = "Napalm Bomb"
+    wpn.projectile_type = .BOMB
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 75.0
+    wpn.damage_type = .FLAME
+    wpn.damage_radius = 35.0
+
+    wpn.max_range = 0.0
+    wpn.rate_of_fire = 0.5
+    wpn.clip_size = 4
+    wpn.projectile_speed = 150.0
+    wpn.projectile_model = "PNapalmBomb"
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "NapalmPool"
+    wpn.residue_duration = 8.0
+
+    wpn.fire_sound = "BombDrop"
+    wpn.impact_sound = "NapalmExplosion"
+    wpn.impact_fx = "NapalmFire"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// China Defense Weapons
+// ============================================================================
+
+pub const GATTLING_CANNON_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("GattlingCannonGun", .HEAVY_ARMS)
+    wpn.display_name = "Gatling Cannon"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 8.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.5
+    wpn.damage_scalar_vs_aircraft = 1.5
+    wpn.damage_scalar_vs_vehicle = 0.3
+
+    wpn.max_range = 250.0
+    wpn.rate_of_fire = 20.0  // Very high, increases over time
+
+    wpn.fire_sound = "GattlingCannonFire"
+    wpn.muzzle_fx = "GattlingMuzzleFlash"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// GLA Infantry Weapons
+// ============================================================================
+
+pub const REBEL_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RebelGun", .SMALL_ARMS)
+    wpn.display_name = "AK-47"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 7.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.2
+
+    wpn.max_range = 100.0
+    wpn.rate_of_fire = 4.0
+    wpn.clip_size = 30
+    wpn.reload_time = 2.0
+
+    wpn.fire_sound = "AK47Fire"
+    wpn.impact_sound = "BulletImpact"
+    wpn.muzzle_fx = "MuzzleFlashSmall"
+
+    break :blk wpn
+}
+
+pub const RPG_TROOPER_ROCKET: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RPGTrooperRocket", .ANTI_ARMOR)
+    wpn.display_name = "RPG Launcher"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 50.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 10.0
+    wpn.damage_scalar_vs_vehicle = 1.0
+    wpn.damage_scalar_vs_aircraft = 1.2
+
+    wpn.max_range = 175.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 2.5
+
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PRPGRocket"
+
+    wpn.fire_sound = "RPGLaunch"
+    wpn.impact_sound = "RocketImpact"
+    wpn.impact_fx = "RPGExplosion"
+
+    break :blk wpn
+}
+
+pub const TERRORIST_BOMB: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TerroristBomb", .EXPLOSIVE)
+    wpn.display_name = "Suicide Bomb"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 300.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 25.0
+    wpn.damage_scalar_vs_structure = 1.5
+
+    wpn.max_range = 0.0  // Must touch target
+    wpn.rate_of_fire = 0.0  // One-time use
+
+    wpn.fire_sound = "TerroristScream"
+    wpn.impact_sound = "ExplosionLarge"
+    wpn.impact_fx = "TerroristExplosion"
+
+    break :blk wpn
+}
+
+pub const JARMEN_KELL_SNIPER: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("JarmenKellSniper", .SMALL_ARMS)
+    wpn.display_name = "Sniper Rifle"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 500.0
+    wpn.damage_type = .SNIPER
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.0
+
+    wpn.max_range = 350.0
+    wpn.rate_of_fire = 0.2
+    wpn.reload_time = 5.0
+    wpn.pre_attack_delay = 1.0
+
+    wpn.fire_sound = "SniperRifleFire"
+    wpn.impact_sound = "SniperHit"
+
+    break :blk wpn
+}
+
+pub const JARMEN_KELL_VEHICLE_SNIPE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("JarmenKellVehicleSnipe", .SPECIAL)
+    wpn.display_name = "Vehicle Snipe"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .VEHICLE_ONLY
+
+    wpn.damage = 0.0  // Kills driver, doesn't damage vehicle
+    wpn.damage_type = .SNIPER
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 0.1
+    wpn.reload_time = 15.0
+    wpn.pre_attack_delay = 2.0
+
+    wpn.fire_sound = "VehicleSnipe"
+    wpn.impact_sound = "DriverKilled"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// GLA Vehicle Weapons
+// ============================================================================
+
+pub const TECHNICAL_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TechnicalGun", .HEAVY_ARMS)
+    wpn.display_name = "Mounted Machine Gun"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 10.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.0
+    wpn.damage_scalar_vs_vehicle = 0.4
+    wpn.damage_scalar_vs_aircraft = 0.7
+
+    wpn.max_range = 150.0
+    wpn.rate_of_fire = 8.0
+    wpn.clip_size = 100
+    wpn.reload_time = 2.0
+
+    wpn.fire_sound = "MachineGunFire"
+    wpn.muzzle_fx = "MuzzleFlashMedium"
+
+    break :blk wpn
+}
+
+pub const SCORPION_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ScorpionTankGun", .ANTI_ARMOR)
+    wpn.display_name = "76mm Cannon"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 50.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 5.0
+
+    wpn.max_range = 150.0
+    wpn.rate_of_fire = 0.6
+    wpn.reload_time = 1.5
+
+    wpn.projectile_speed = 500.0
+    wpn.projectile_model = "PTankShell"
+
+    wpn.fire_sound = "ScorpionCannonFire"
+    wpn.impact_sound = "ShellImpact"
+    wpn.impact_fx = "TankShellExplosion"
+
+    break :blk wpn
+}
+
+pub const SCORPION_ROCKET: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ScorpionRocket", .MISSILE)
+    wpn.display_name = "Scorpion Rocket"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 40.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 15.0
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.3
+    wpn.reload_time = 4.0
+
+    wpn.projectile_speed = 350.0
+    wpn.projectile_model = "PScorpionRocket"
+
+    wpn.fire_sound = "RocketLaunch"
+    wpn.impact_sound = "RocketImpact"
+    wpn.impact_fx = "RocketExplosion"
+
+    break :blk wpn
+}
+
+pub const MARAUDER_CANNON: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("MarauderTankGun", .ANTI_ARMOR)
+    wpn.display_name = "Dual Cannons"
+    wpn.projectile_type = .SHELL
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 80.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 8.0
+
+    wpn.max_range = 175.0
+    wpn.rate_of_fire = 0.5
+    wpn.reload_time = 2.0
+
+    wpn.projectile_speed = 500.0
+    wpn.projectile_model = "PTankShell"
+
+    wpn.fire_sound = "MarauderCannonFire"
+    wpn.impact_sound = "ShellImpact"
+    wpn.impact_fx = "TankShellExplosionMedium"
+
+    break :blk wpn
+}
+
+pub const QUAD_CANNON_GUN: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("QuadCannonGun", .HEAVY_ARMS)
+    wpn.display_name = "Quad AA Guns"
+    wpn.projectile_type = .INSTANT
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 6.0
+    wpn.damage_type = .SMALL_ARMS
+    wpn.damage_scalar_vs_infantry = 1.5
+    wpn.damage_scalar_vs_aircraft = 2.0
+    wpn.damage_scalar_vs_vehicle = 0.25
+
+    wpn.max_range = 250.0
+    wpn.rate_of_fire = 12.0
+
+    wpn.fire_sound = "QuadCannonFire"
+    wpn.muzzle_fx = "QuadMuzzleFlash"
+
+    break :blk wpn
+}
+
+pub const ROCKET_BUGGY_ROCKETS: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("RocketBuggyRockets", .MISSILE)
+    wpn.display_name = "Rocket Barrage"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 30.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 20.0
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 4.0
+    wpn.clip_size = 6
+    wpn.reload_time = 6.0
+
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PRocketBuggyRocket"
+    wpn.can_scatter = true
+    wpn.scatter_radius = 30.0
+
+    wpn.fire_sound = "RocketBarrageLaunch"
+    wpn.impact_sound = "RocketImpact"
+    wpn.impact_fx = "RocketExplosionSmall"
+
+    break :blk wpn
+}
+
+pub const SCUD_LAUNCHER_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ScudLauncherMissile", .MISSILE)
+    wpn.display_name = "Scud Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 250.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 50.0
+
+    wpn.min_range = 150.0
+    wpn.max_range = 500.0
+    wpn.rate_of_fire = 0.1
+    wpn.reload_time = 20.0
+    wpn.pre_attack_delay = 3.0
+
+    wpn.projectile_speed = 200.0
+    wpn.projectile_arc = 0.5
+    wpn.projectile_model = "PScudMissile"
+
+    wpn.fire_sound = "ScudLaunch"
+    wpn.impact_sound = "ExplosionHuge"
+    wpn.impact_fx = "ScudExplosion"
+
+    break :blk wpn
+}
+
+pub const SCUD_ANTHRAX_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ScudAnthraxMissile", .TOXIN)
+    wpn.display_name = "Anthrax Scud"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 100.0
+    wpn.damage_type = .POISON
+    wpn.damage_radius = 60.0
+    wpn.damage_scalar_vs_infantry = 3.0
+    wpn.damage_scalar_vs_vehicle = 0.5
+
+    wpn.min_range = 150.0
+    wpn.max_range = 500.0
+    wpn.rate_of_fire = 0.1
+    wpn.reload_time = 20.0
+    wpn.pre_attack_delay = 3.0
+
+    wpn.projectile_speed = 200.0
+    wpn.projectile_arc = 0.5
+    wpn.projectile_model = "PAnthraxScud"
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "AnthraxField"
+    wpn.residue_duration = 20.0
+
+    wpn.fire_sound = "ScudLaunch"
+    wpn.impact_sound = "AnthraxRelease"
+    wpn.impact_fx = "AnthraxCloud"
+
+    break :blk wpn
+}
+
+pub const BOMB_TRUCK_BOMB: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("BombTruckBomb", .EXPLOSIVE)
+    wpn.display_name = "Vehicle Bomb"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 800.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 50.0
+    wpn.damage_scalar_vs_structure = 2.0
+
+    wpn.max_range = 0.0
+
+    wpn.fire_sound = "BombTruckHorn"
+    wpn.impact_sound = "ExplosionHuge"
+    wpn.impact_fx = "BombTruckExplosion"
+
+    break :blk wpn
+}
+
+pub const BOMB_TRUCK_BIO_BOMB: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("BombTruckBioBomb", .TOXIN)
+    wpn.display_name = "Bio Bomb"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 400.0
+    wpn.damage_type = .POISON
+    wpn.damage_radius = 60.0
+    wpn.damage_scalar_vs_infantry = 3.0
+
+    wpn.max_range = 0.0
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "AnthraxFieldLarge"
+    wpn.residue_duration = 30.0
+
+    wpn.fire_sound = "BombTruckHorn"
+    wpn.impact_sound = "AnthraxRelease"
+    wpn.impact_fx = "AnthraxCloudLarge"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// GLA Defense Weapons
+// ============================================================================
+
+pub const STINGER_MISSILE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("StingerMissile", .MISSILE)
+    wpn.display_name = "Stinger Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND_AND_AIR
+
+    wpn.damage = 40.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_scalar_vs_aircraft = 2.0
+    wpn.damage_scalar_vs_vehicle = 0.8
+
+    wpn.max_range = 300.0
+    wpn.rate_of_fire = 1.0
+
+    wpn.projectile_speed = 450.0
+    wpn.projectile_model = "PStingerMissile"
+
+    wpn.fire_sound = "StingerLaunch"
+    wpn.impact_sound = "MissileImpact"
+    wpn.impact_fx = "MissileExplosionSmall"
+
+    break :blk wpn
+}
+
+pub const TUNNEL_RPG: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("TunnelRPG", .ANTI_ARMOR)
+    wpn.display_name = "Tunnel RPG"
+    wpn.projectile_type = .ROCKET
+    wpn.damage_delivery = .SINGLE_TARGET
+    wpn.target_type = .GROUND
+
+    wpn.damage = 45.0
+    wpn.damage_type = .ARMOR_PIERCING
+    wpn.damage_radius = 8.0
+
+    wpn.max_range = 200.0
+    wpn.rate_of_fire = 0.5
+
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PRPGRocket"
+
+    wpn.fire_sound = "RPGLaunch"
+    wpn.impact_sound = "RocketImpact"
+    wpn.impact_fx = "RPGExplosion"
+
+    break :blk wpn
+}
+
+pub const DEMO_TRAP_EXPLOSION: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("DemoTrapExplosion", .EXPLOSIVE)
+    wpn.display_name = "Demo Trap"
+    wpn.projectile_type = .NONE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 400.0
+    wpn.damage_type = .EXPLOSIVE
+    wpn.damage_radius = 30.0
+
+    wpn.max_range = 0.0
+
+    wpn.fire_sound = "DemoTrapTrigger"
+    wpn.impact_sound = "ExplosionLarge"
+    wpn.impact_fx = "DemoTrapExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// Superweapon Weapons
+// ============================================================================
+
+pub const PARTICLE_CANNON_BEAM: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ParticleCannonBeam", .LASER)
+    wpn.display_name = "Particle Cannon"
+    wpn.projectile_type = .LASER_BEAM
+    wpn.damage_delivery = .LINE
+    wpn.target_type = .GROUND
+
+    wpn.damage = 500.0  // Per second
+    wpn.damage_type = .LASER
+    wpn.damage_radius = 20.0
+
+    wpn.max_range = 99999.0  // Global
+    wpn.firing_duration = 5.0
+
+    wpn.fire_sound = "ParticleCannonCharge"
+    wpn.impact_sound = "ParticleCannonBeamLoop"
+    wpn.impact_fx = "ParticleCannonBeamFX"
+
+    break :blk wpn
+}
+
+pub const NUCLEAR_MISSILE_STRIKE: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("NuclearMissileStrike", .RADIATION)
+    wpn.display_name = "Nuclear Missile"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 2000.0
+    wpn.damage_type = .RADIATION
+    wpn.damage_radius = 150.0
+
+    wpn.max_range = 99999.0
+    wpn.projectile_speed = 300.0
+    wpn.projectile_model = "PNuclearMissile"
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "RadiationFieldLarge"
+    wpn.residue_duration = 60.0
+
+    wpn.fire_sound = "NukeLaunch"
+    wpn.impact_sound = "NukeExplosion"
+    wpn.impact_fx = "NuclearMushroom"
+
+    break :blk wpn
+}
+
+pub const SCUD_STORM_MISSILES: WeaponDefinition = blk: {
+    var wpn = create_weapon_definition("ScudStormMissiles", .TOXIN)
+    wpn.display_name = "Scud Storm"
+    wpn.projectile_type = .MISSILE
+    wpn.damage_delivery = .AREA_OF_EFFECT
+    wpn.target_type = .GROUND
+
+    wpn.damage = 400.0
+    wpn.damage_type = .POISON
+    wpn.damage_radius = 80.0
+
+    wpn.max_range = 99999.0
+    wpn.projectile_speed = 200.0
+    wpn.projectile_model = "PScudStormMissile"
+    wpn.can_scatter = true
+    wpn.scatter_radius = 100.0
+
+    wpn.leaves_residue = true
+    wpn.residue_type = "AnthraxFieldMassive"
+    wpn.residue_duration = 45.0
+
+    wpn.fire_sound = "ScudStormLaunch"
+    wpn.impact_sound = "ScudStormImpact"
+    wpn.impact_fx = "ScudStormExplosion"
+
+    break :blk wpn
+}
+
+// ============================================================================
+// Weapon Registry
+// ============================================================================
+
+pub const WEAPON_COUNT: usize = 54
+
+pub const ALL_WEAPONS: [WEAPON_COUNT]*const WeaponDefinition = .{
+    // USA Small Arms
+    &RANGER_GUN,
+    &RANGER_FLASHBANG,
+    &MISSILE_DEFENDER_ROCKET,
+    &PATHFINDER_SNIPER,
+    &COLONEL_BURTON_GUN,
+    &COLONEL_BURTON_KNIFE,
+    &REMOTE_DEMO_CHARGE,
+    // USA Vehicle
+    &HUMVEE_GUN,
+    &TOW_MISSILE,
+    &CRUSADER_CANNON,
+    &PALADIN_CANNON,
+    &PALADIN_LASER,
+    &TOMAHAWK_MISSILE,
+    // USA Aircraft
+    &COMANCHE_GUN,
+    &COMANCHE_ROCKET,
+    &RAPTOR_MISSILE,
+    &AURORA_BOMB,
+    // USA Defense
+    &PATRIOT_MISSILE,
+    // China Infantry
+    &RED_GUARD_GUN,
+    &TANK_HUNTER_ROCKET,
+    &TANK_HUNTER_TNT,
+    // China Vehicle
+    &BATTLEMASTER_CANNON,
+    &DRAGON_TANK_FLAME,
+    &DRAGON_TANK_FIREWALL,
+    &OVERLORD_CANNON,
+    &INFERNO_CANNON_SHELL,
+    &NUKE_CANNON_SHELL,
+    // China Aircraft
+    &MIG_MISSILE,
+    &MIG_NAPALM,
+    &HELIX_NAPALM,
+    // China Defense
+    &GATTLING_CANNON_GUN,
+    // GLA Infantry
+    &REBEL_GUN,
+    &RPG_TROOPER_ROCKET,
+    &TERRORIST_BOMB,
+    &JARMEN_KELL_SNIPER,
+    &JARMEN_KELL_VEHICLE_SNIPE,
+    // GLA Vehicle
+    &TECHNICAL_GUN,
+    &SCORPION_CANNON,
+    &SCORPION_ROCKET,
+    &MARAUDER_CANNON,
+    &QUAD_CANNON_GUN,
+    &ROCKET_BUGGY_ROCKETS,
+    &SCUD_LAUNCHER_MISSILE,
+    &SCUD_ANTHRAX_MISSILE,
+    &BOMB_TRUCK_BOMB,
+    &BOMB_TRUCK_BIO_BOMB,
+    // GLA Defense
+    &STINGER_MISSILE,
+    &TUNNEL_RPG,
+    &DEMO_TRAP_EXPLOSION,
+    // Superweapons
+    &PARTICLE_CANNON_BEAM,
+    &NUCLEAR_MISSILE_STRIKE,
+    &SCUD_STORM_MISSILES,
+}
+
+pub fn getWeapon(name: []const u8) ?*const WeaponDefinition {
+    for (ALL_WEAPONS) |wpn| {
+        if (std.mem.eql(u8, wpn.name, name)) {
+            return wpn
+        }
+    }
+    return null
+}
+
+pub fn getWeaponsByCategory(category: WeaponCategory) []*const WeaponDefinition {
+    var result: [64]*const WeaponDefinition = undefined
+    var count: usize = 0
+
+    for (ALL_WEAPONS) |wpn| {
+        if (wpn.category == category) {
+            result[count] = wpn
+            count += 1
+        }
+    }
+
+    return result[0..count]
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Weapon definitions" {
+    // Test damage values
+    try std.testing.expect(RANGER_GUN.damage == 8.0)
+    try std.testing.expect(PATHFINDER_SNIPER.damage == 500.0)
+    try std.testing.expect(NUCLEAR_MISSILE_STRIKE.damage == 2000.0)
+
+    // Test weapon categories
+    try std.testing.expect(RANGER_GUN.category == .SMALL_ARMS)
+    try std.testing.expect(DRAGON_TANK_FLAME.category == .FLAME)
+    try std.testing.expect(SCUD_STORM_MISSILES.category == .TOXIN)
+
+    // Test range values
+    try std.testing.expect(PATHFINDER_SNIPER.max_range == 300.0)
+    try std.testing.expect(TOMAHAWK_MISSILE.min_range == 100.0)
+}
+
+test "Weapon lookup" {
+    const wpn = getWeapon("RangerGun")
+    try std.testing.expect(wpn != null)
+    try std.testing.expect(wpn.?.damage == 8.0)
+}

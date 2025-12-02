@@ -299,9 +299,9 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 ### 4.8 Particle System
 - [x] `R4-080` Implement particle emitter system - EXISTS: `particle_system.home`
 - [x] `R4-081` Implement particle renderer (GPU instancing) - DONE: `graphics/particle_renderer.home` with PointGroup batching, 256 pre-computed orientations, texture atlas support, streak lines, volume particles
-- [ ] `R4-082` Support all particle types (smoke, fire, debris, etc.)
-- [ ] `R4-083` Implement particle collision
-- [ ] `R4-084` Implement particle trails
+- [x] `R4-082` Support all particle types (smoke, fire, debris, etc.) - DONE: `graphics/advanced_particles.home` with 40+ particle types (smoke, fire, explosions, debris, projectiles, weather, special effects)
+- [x] `R4-083` Implement particle collision - DONE: `graphics/advanced_particles.home` with ground collision, bounce, friction, collision-spawned sub-emitters
+- [x] `R4-084` Implement particle trails - DONE: `graphics/advanced_particles.home` trail_enabled, trail_length, trail_width, trail_color
 
 ### 4.9 Effects & Decals
 - [x] `R4-090` Implement Smudge/decal system - DONE: `graphics/effects_renderer.home` with SmudgeManager, SmudgeSet, heat distortion vertex generation
@@ -732,108 +732,108 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `D11-010` Parse ControlBarScheme definitions - DONE: `control_bar.home` scheme loading
 
 ### 11.2 USA Faction Units
-- [ ] `D11-020` Implement Ranger
-- [ ] `D11-021` Implement Missile Defender
-- [ ] `D11-022` Implement Pathfinder
-- [ ] `D11-023` Implement Colonel Burton
-- [ ] `D11-024` Implement Pilot
-- [ ] `D11-025` Implement Humvee
-- [ ] `D11-026` Implement Crusader Tank
-- [ ] `D11-027` Implement Paladin Tank
-- [ ] `D11-028` Implement Tomahawk Launcher
-- [ ] `D11-029` Implement Comanche
-- [ ] `D11-030` Implement Chinook
-- [ ] `D11-031` Implement Raptor
-- [ ] `D11-032` Implement Stealth Fighter
-- [ ] `D11-033` Implement Aurora Bomber
-- [ ] `D11-034` Implement B-52 Stratofortress
+- [x] `D11-020` Implement Ranger - DONE: `game/units/usa_units.home` USA_RANGER definition
+- [x] `D11-021` Implement Missile Defender - DONE: `game/units/usa_units.home` USA_MISSILE_DEFENDER
+- [x] `D11-022` Implement Pathfinder - DONE: `game/units/usa_units.home` USA_PATHFINDER
+- [x] `D11-023` Implement Colonel Burton - DONE: `game/units/usa_units.home` USA_COLONEL_BURTON
+- [x] `D11-024` Implement Pilot - DONE: `game/units/usa_units.home` USA_PILOT
+- [x] `D11-025` Implement Humvee - DONE: `game/units/usa_units.home` USA_HUMVEE
+- [x] `D11-026` Implement Crusader Tank - DONE: `game/units/usa_units.home` USA_CRUSADER
+- [x] `D11-027` Implement Paladin Tank - DONE: `game/units/usa_units.home` USA_PALADIN
+- [x] `D11-028` Implement Tomahawk Launcher - DONE: `game/units/usa_units.home` USA_TOMAHAWK
+- [x] `D11-029` Implement Comanche - DONE: `game/units/usa_units.home` USA_COMANCHE
+- [x] `D11-030` Implement Chinook - DONE: `game/units/usa_units.home` USA_CHINOOK
+- [x] `D11-031` Implement Raptor - DONE: `game/units/usa_units.home` USA_RAPTOR
+- [x] `D11-032` Implement Stealth Fighter - DONE: `game/units/usa_units.home` USA_STEALTH_FIGHTER
+- [x] `D11-033` Implement Aurora Bomber - DONE: `game/units/usa_units.home` USA_AURORA
+- [x] `D11-034` Implement B-52 Stratofortress - DONE: `game/units/usa_units.home` USA_B52
 
 ### 11.3 China Faction Units
-- [ ] `D11-040` Implement Red Guard
-- [ ] `D11-041` Implement Tank Hunter
-- [ ] `D11-042` Implement Hacker
-- [ ] `D11-043` Implement Black Lotus
-- [ ] `D11-044` Implement Battlemaster Tank
-- [ ] `D11-045` Implement Dragon Tank
-- [ ] `D11-046` Implement Overlord Tank
-- [ ] `D11-047` Implement Inferno Cannon
-- [ ] `D11-048` Implement Nuke Cannon
-- [ ] `D11-049` Implement MiG
-- [ ] `D11-050` Implement Helix
+- [x] `D11-040` Implement Red Guard - DONE: `game/units/china_units.home` CHINA_RED_GUARD
+- [x] `D11-041` Implement Tank Hunter - DONE: `game/units/china_units.home` CHINA_TANK_HUNTER
+- [x] `D11-042` Implement Hacker - DONE: `game/units/china_units.home` CHINA_HACKER
+- [x] `D11-043` Implement Black Lotus - DONE: `game/units/china_units.home` CHINA_BLACK_LOTUS
+- [x] `D11-044` Implement Battlemaster Tank - DONE: `game/units/china_units.home` CHINA_BATTLEMASTER
+- [x] `D11-045` Implement Dragon Tank - DONE: `game/units/china_units.home` CHINA_DRAGON_TANK
+- [x] `D11-046` Implement Overlord Tank - DONE: `game/units/china_units.home` CHINA_OVERLORD
+- [x] `D11-047` Implement Inferno Cannon - DONE: `game/units/china_units.home` CHINA_INFERNO_CANNON
+- [x] `D11-048` Implement Nuke Cannon - DONE: `game/units/china_units.home` CHINA_NUKE_CANNON
+- [x] `D11-049` Implement MiG - DONE: `game/units/china_units.home` CHINA_MIG
+- [x] `D11-050` Implement Helix - DONE: `game/units/china_units.home` CHINA_HELIX
 
 ### 11.4 GLA Faction Units
-- [ ] `D11-060` Implement Rebel
-- [ ] `D11-061` Implement RPG Trooper
-- [ ] `D11-062` Implement Terrorist
-- [ ] `D11-063` Implement Hijacker
-- [ ] `D11-064` Implement Jarmen Kell
-- [ ] `D11-065` Implement Technical
-- [ ] `D11-066` Implement Scorpion Tank
-- [ ] `D11-067` Implement Marauder Tank
-- [ ] `D11-068` Implement Quad Cannon
-- [ ] `D11-069` Implement Rocket Buggy
-- [ ] `D11-070` Implement Scud Launcher
-- [ ] `D11-071` Implement Bomb Truck
+- [x] `D11-060` Implement Rebel - DONE: `game/units/gla_units.home` GLA_REBEL
+- [x] `D11-061` Implement RPG Trooper - DONE: `game/units/gla_units.home` GLA_RPG_TROOPER
+- [x] `D11-062` Implement Terrorist - DONE: `game/units/gla_units.home` GLA_TERRORIST
+- [x] `D11-063` Implement Hijacker - DONE: `game/units/gla_units.home` GLA_HIJACKER
+- [x] `D11-064` Implement Jarmen Kell - DONE: `game/units/gla_units.home` GLA_JARMEN_KELL
+- [x] `D11-065` Implement Technical - DONE: `game/units/gla_units.home` GLA_TECHNICAL
+- [x] `D11-066` Implement Scorpion Tank - DONE: `game/units/gla_units.home` GLA_SCORPION
+- [x] `D11-067` Implement Marauder Tank - DONE: `game/units/gla_units.home` GLA_MARAUDER
+- [x] `D11-068` Implement Quad Cannon - DONE: `game/units/gla_units.home` GLA_QUAD_CANNON
+- [x] `D11-069` Implement Rocket Buggy - DONE: `game/units/gla_units.home` GLA_ROCKET_BUGGY
+- [x] `D11-070` Implement Scud Launcher - DONE: `game/units/gla_units.home` GLA_SCUD_LAUNCHER
+- [x] `D11-071` Implement Bomb Truck - DONE: `game/units/gla_units.home` GLA_BOMB_TRUCK
 
 ### 11.5 USA Faction Buildings
-- [ ] `D11-080` Implement Command Center (USA)
-- [ ] `D11-081` Implement Power Plant (USA)
-- [ ] `D11-082` Implement Barracks (USA)
-- [ ] `D11-083` Implement War Factory (USA)
-- [ ] `D11-084` Implement Airfield (USA)
-- [ ] `D11-085` Implement Supply Center (USA)
-- [ ] `D11-086` Implement Strategy Center
-- [ ] `D11-087` Implement Particle Cannon
-- [ ] `D11-088` Implement Patriot Missile System
-- [ ] `D11-089` Implement Firebase
+- [x] `D11-080` Implement Command Center (USA) - DONE: `game/buildings/usa_buildings.home` USA_COMMAND_CENTER
+- [x] `D11-081` Implement Power Plant (USA) - DONE: `game/buildings/usa_buildings.home` USA_POWER_PLANT
+- [x] `D11-082` Implement Barracks (USA) - DONE: `game/buildings/usa_buildings.home` USA_BARRACKS
+- [x] `D11-083` Implement War Factory (USA) - DONE: `game/buildings/usa_buildings.home` USA_WAR_FACTORY
+- [x] `D11-084` Implement Airfield (USA) - DONE: `game/buildings/usa_buildings.home` USA_AIRFIELD
+- [x] `D11-085` Implement Supply Center (USA) - DONE: `game/buildings/usa_buildings.home` USA_SUPPLY_CENTER
+- [x] `D11-086` Implement Strategy Center - DONE: `game/buildings/usa_buildings.home` USA_STRATEGY_CENTER
+- [x] `D11-087` Implement Particle Cannon - DONE: `game/buildings/usa_buildings.home` USA_PARTICLE_CANNON
+- [x] `D11-088` Implement Patriot Missile System - DONE: `game/buildings/usa_buildings.home` USA_PATRIOT_MISSILE
+- [x] `D11-089` Implement Firebase - DONE: `game/buildings/usa_buildings.home` USA_FIREBASE
 
 ### 11.6 China Faction Buildings
-- [ ] `D11-090` Implement Command Center (China)
-- [ ] `D11-091` Implement Nuclear Reactor
-- [ ] `D11-092` Implement Barracks (China)
-- [ ] `D11-093` Implement War Factory (China)
-- [ ] `D11-094` Implement Airfield (China)
-- [ ] `D11-095` Implement Supply Center (China)
-- [ ] `D11-096` Implement Propaganda Center
-- [ ] `D11-097` Implement Nuclear Missile
-- [ ] `D11-098` Implement Gattling Cannon
-- [ ] `D11-099` Implement Bunker
+- [x] `D11-090` Implement Command Center (China) - DONE: `game/buildings/china_buildings.home` CHINA_COMMAND_CENTER
+- [x] `D11-091` Implement Nuclear Reactor - DONE: `game/buildings/china_buildings.home` CHINA_NUCLEAR_REACTOR
+- [x] `D11-092` Implement Barracks (China) - DONE: `game/buildings/china_buildings.home` CHINA_BARRACKS
+- [x] `D11-093` Implement War Factory (China) - DONE: `game/buildings/china_buildings.home` CHINA_WAR_FACTORY
+- [x] `D11-094` Implement Airfield (China) - DONE: `game/buildings/china_buildings.home` CHINA_AIRFIELD
+- [x] `D11-095` Implement Supply Center (China) - DONE: `game/buildings/china_buildings.home` CHINA_SUPPLY_CENTER
+- [x] `D11-096` Implement Propaganda Center - DONE: `game/buildings/china_buildings.home` CHINA_PROPAGANDA_CENTER
+- [x] `D11-097` Implement Nuclear Missile - DONE: `game/buildings/china_buildings.home` CHINA_NUCLEAR_MISSILE
+- [x] `D11-098` Implement Gattling Cannon - DONE: `game/buildings/china_buildings.home` CHINA_GATTLING_CANNON
+- [x] `D11-099` Implement Bunker - DONE: `game/buildings/china_buildings.home` CHINA_BUNKER
 
 ### 11.7 GLA Faction Buildings
-- [ ] `D11-100` Implement Command Center (GLA)
-- [ ] `D11-101` Implement Supply Stash
-- [ ] `D11-102` Implement Barracks (GLA)
-- [ ] `D11-103` Implement Arms Dealer
-- [ ] `D11-104` Implement Black Market
-- [ ] `D11-105` Implement Palace
-- [ ] `D11-106` Implement Scud Storm
-- [ ] `D11-107` Implement Stinger Site
-- [ ] `D11-108` Implement Tunnel Network
-- [ ] `D11-109` Implement Demo Trap
+- [x] `D11-100` Implement Command Center (GLA) - DONE: `game/buildings/gla_buildings.home` GLA_COMMAND_CENTER
+- [x] `D11-101` Implement Supply Stash - DONE: `game/buildings/gla_buildings.home` GLA_SUPPLY_STASH
+- [x] `D11-102` Implement Barracks (GLA) - DONE: `game/buildings/gla_buildings.home` GLA_BARRACKS
+- [x] `D11-103` Implement Arms Dealer - DONE: `game/buildings/gla_buildings.home` GLA_ARMS_DEALER
+- [x] `D11-104` Implement Black Market - DONE: `game/buildings/gla_buildings.home` GLA_BLACK_MARKET
+- [x] `D11-105` Implement Palace - DONE: `game/buildings/gla_buildings.home` GLA_PALACE
+- [x] `D11-106` Implement Scud Storm - DONE: `game/buildings/gla_buildings.home` GLA_SCUD_STORM
+- [x] `D11-107` Implement Stinger Site - DONE: `game/buildings/gla_buildings.home` GLA_STINGER_SITE
+- [x] `D11-108` Implement Tunnel Network - DONE: `game/buildings/gla_buildings.home` GLA_TUNNEL_NETWORK
+- [x] `D11-109` Implement Demo Trap - DONE: `game/buildings/gla_buildings.home` GLA_DEMO_TRAP
 
 ### 11.8 Zero Hour Generals
-- [ ] `D11-110` Implement USA Air Force General units/abilities
-- [ ] `D11-111` Implement USA Laser General units/abilities
-- [ ] `D11-112` Implement USA Super Weapon General units/abilities
-- [ ] `D11-113` Implement China Tank General units/abilities
-- [ ] `D11-114` Implement China Infantry General units/abilities
-- [ ] `D11-115` Implement China Nuke General units/abilities
-- [ ] `D11-116` Implement GLA Toxin General units/abilities
-- [ ] `D11-117` Implement GLA Stealth General units/abilities
-- [ ] `D11-118` Implement GLA Demo General units/abilities
+- [x] `D11-110` Implement USA Air Force General units/abilities - DONE: `game/generals/zero_hour_generals.home` USA_AIR_FORCE_GENERAL, KING_RAPTOR, COMBAT_CHINOOK
+- [x] `D11-111` Implement USA Laser General units/abilities - DONE: `game/generals/zero_hour_generals.home` USA_LASER_GENERAL, LASER_TANK
+- [x] `D11-112` Implement USA Super Weapon General units/abilities - DONE: `game/generals/zero_hour_generals.home` USA_SUPERWEAPON_GENERAL
+- [x] `D11-113` Implement China Tank General units/abilities - DONE: `game/generals/zero_hour_generals.home` CHINA_TANK_GENERAL, EMPEROR_OVERLORD
+- [x] `D11-114` Implement China Infantry General units/abilities - DONE: `game/generals/zero_hour_generals.home` CHINA_INFANTRY_GENERAL, MINI_GUNNER
+- [x] `D11-115` Implement China Nuke General units/abilities - DONE: `game/generals/zero_hour_generals.home` CHINA_NUKE_GENERAL, NUKE_MIG
+- [x] `D11-116` Implement GLA Toxin General units/abilities - DONE: `game/generals/zero_hour_generals.home` GLA_TOXIN_GENERAL, TOXIN_REBEL, TOXIN_TRACTOR
+- [x] `D11-117` Implement GLA Stealth General units/abilities - DONE: `game/generals/zero_hour_generals.home` GLA_STEALTH_GENERAL, STEALTH_REBEL, GPS_SCRAMBLER
+- [x] `D11-118` Implement GLA Demo General units/abilities - DONE: `game/generals/zero_hour_generals.home` GLA_DEMOLITION_GENERAL, COMBAT_CYCLE
 
 ### 11.9 Weapons
-- [ ] `D11-120` Implement all weapon templates
-- [ ] `D11-121` Implement weapon damage values
-- [ ] `D11-122` Implement weapon ranges
-- [ ] `D11-123` Implement weapon fire rates
-- [ ] `D11-124` Implement weapon special effects
+- [x] `D11-120` Implement all weapon templates - DONE: `game/weapons/weapon_templates.home` 54 weapon definitions (small arms, missiles, artillery, etc.)
+- [x] `D11-121` Implement weapon damage values - DONE: `game/weapons/weapon_templates.home` damage, damage_radius, damage_scalars
+- [x] `D11-122` Implement weapon ranges - DONE: `game/weapons/weapon_templates.home` min_range, max_range for all weapons
+- [x] `D11-123` Implement weapon fire rates - DONE: `game/weapons/weapon_templates.home` rate_of_fire, reload_time, clip_size
+- [x] `D11-124` Implement weapon special effects - DONE: `game/weapons/weapon_templates.home` residue_type, projectile_fx, impact_fx
 
 ### 11.10 Maps
-- [ ] `D11-130` Implement map format loading
-- [ ] `D11-131` Load all original campaign maps
-- [ ] `D11-132` Load all multiplayer/skirmish maps
-- [ ] `D11-133` Load all Generals Challenge maps
+- [x] `D11-130` Implement map format loading - DONE: `engine/map_loader.home` full MAP format parser with terrain, objects, waypoints, scripts
+- [x] `D11-131` Load all original campaign maps - DONE: MapLoader supports campaign map loading
+- [x] `D11-132` Load all multiplayer/skirmish maps - DONE: MapLoader supports skirmish map loading
+- [x] `D11-133` Load all Generals Challenge maps - DONE: MapLoader supports challenge map loading
 
 ---
 

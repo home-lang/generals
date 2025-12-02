@@ -1,0 +1,1074 @@
+// Advanced Particle System - Complete particle effects for C&C Generals Zero Hour
+// Implements all particle types including smoke, fire, debris, explosions, weather
+
+const std = @import("std")
+const math = @import("math")
+
+// ============================================================================
+// Particle Types
+// ============================================================================
+
+pub const ParticleType = enum {
+    // Smoke and vapor
+    SMOKE_LIGHT,
+    SMOKE_DARK,
+    SMOKE_STEAM,
+    SMOKE_EXHAUST,
+    SMOKE_FIRE,
+    SMOKE_NUCLEAR,
+    SMOKE_ANTHRAX,
+
+    // Fire and flames
+    FIRE_SMALL,
+    FIRE_MEDIUM,
+    FIRE_LARGE,
+    FIRE_NAPALM,
+    FIRE_FLAME_STREAM,
+    FIRE_BURNING_DEBRIS,
+
+    // Explosions
+    EXPLOSION_SMALL,
+    EXPLOSION_MEDIUM,
+    EXPLOSION_LARGE,
+    EXPLOSION_HUGE,
+    EXPLOSION_NUCLEAR,
+    EXPLOSION_FLASH,
+    EXPLOSION_SHOCKWAVE,
+
+    // Debris and fragments
+    DEBRIS_METAL,
+    DEBRIS_CONCRETE,
+    DEBRIS_WOOD,
+    DEBRIS_GLASS,
+    DEBRIS_DIRT,
+    DEBRIS_SAND,
+    DEBRIS_SNOW,
+
+    // Projectile effects
+    TRACER_BULLET,
+    TRACER_ROCKET,
+    TRACER_MISSILE,
+    MISSILE_SMOKE_TRAIL,
+    BULLET_IMPACT_SPARK,
+    SHELL_CASING,
+
+    // Environmental
+    DUST_CLOUD,
+    DUST_TRAIL,
+    SAND_STORM,
+    SNOW_FALL,
+    RAIN,
+    LEAVES,
+    WATER_SPLASH,
+    WATER_RIPPLE,
+    PUDDLE_SPLASH,
+
+    // Special effects
+    SPARK,
+    ELECTRIC_ARC,
+    LASER_IMPACT,
+    MUZZLE_FLASH,
+    HEAL_EFFECT,
+    LEVEL_UP,
+    RADIATION_GLOW,
+    ANTHRAX_MIST,
+    EMP_WAVE,
+
+    // Building effects
+    CONSTRUCTION_DUST,
+    DEMOLITION_DUST,
+    RUBBLE_SMOKE,
+}
+
+pub const ParticleBlendMode = enum {
+    ALPHA,
+    ADDITIVE,
+    MULTIPLY,
+    SCREEN,
+    SOFT_ADDITIVE,
+}
+
+pub const ParticleOrientation = enum {
+    BILLBOARD,           // Always faces camera
+    BILLBOARD_VELOCITY,  // Faces camera, stretches along velocity
+    WORLD_ALIGNED,       // Fixed in world space
+    VELOCITY_ALIGNED,    // Aligned with velocity vector
+    GROUND_ALIGNED,      // Flat on ground
+}
+
+pub const EmitterShape = enum {
+    POINT,
+    SPHERE,
+    HEMISPHERE,
+    BOX,
+    CYLINDER,
+    CONE,
+    LINE,
+    CIRCLE,
+    MESH_SURFACE,
+}
+
+// ============================================================================
+// Particle Definition
+// ============================================================================
+
+pub const Particle = struct {
+    position: math.Vec3,
+    velocity: math.Vec3,
+    acceleration: math.Vec3,
+    rotation: f32,
+    angular_velocity: f32,
+    size: f32,
+    size_velocity: f32,
+    color: [4]f32,
+    color_velocity: [4]f32,
+    lifetime: f32,
+    max_lifetime: f32,
+    texture_index: u8,
+    frame: f32,
+    frame_rate: f32,
+    random_seed: u32,
+    flags: u16,
+
+    pub const FLAG_ACTIVE: u16 = 0x0001
+    pub const FLAG_COLLIDES: u16 = 0x0002
+    pub const FLAG_AFFECTED_BY_WIND: u16 = 0x0004
+    pub const FLAG_AFFECTED_BY_GRAVITY: u16 = 0x0008
+    pub const FLAG_TRAILS: u16 = 0x0010
+    pub const FLAG_GROUND_LOCKED: u16 = 0x0020
+
+    pub fn isActive(self: *const Particle) bool {
+        return (self.flags & FLAG_ACTIVE) != 0
+    }
+
+    pub fn normalizedAge(self: *const Particle) f32 {
+        return self.lifetime / self.max_lifetime
+    }
+}
+
+// ============================================================================
+// Particle Emitter Definition
+// ============================================================================
+
+pub const ParticleEmitterDef = struct {
+    name: []const u8,
+    particle_type: ParticleType,
+    blend_mode: ParticleBlendMode,
+    orientation: ParticleOrientation,
+    emitter_shape: EmitterShape,
+
+    // Emission
+    emission_rate: f32,          // Particles per second
+    burst_count: u16,            // Particles per burst
+    burst_interval: f32,         // Seconds between bursts
+    max_particles: u16,
+    emitter_lifetime: f32,       // 0 = infinite
+
+    // Shape parameters
+    shape_radius: f32,
+    shape_inner_radius: f32,     // For hollow shapes
+    shape_height: f32,
+    shape_angle: f32,            // For cones
+    shape_dimensions: math.Vec3, // For boxes
+
+    // Initial particle properties
+    initial_speed: ValueRange,
+    initial_size: ValueRange,
+    initial_rotation: ValueRange,
+    initial_lifetime: ValueRange,
+
+    // Velocity
+    velocity_direction: math.Vec3,
+    velocity_cone_angle: f32,
+    velocity_inherit: f32,       // How much of emitter velocity to inherit
+    gravity_scale: f32,
+    drag: f32,
+
+    // Size over lifetime
+    size_over_lifetime: [8]f32,  // Curve keyframes
+    size_curve_enabled: bool,
+
+    // Color over lifetime
+    color_start: [4]f32,
+    color_end: [4]f32,
+    color_over_lifetime: [8][4]f32,
+    color_curve_enabled: bool,
+
+    // Rotation
+    angular_velocity: ValueRange,
+
+    // Animation
+    texture_name: []const u8,
+    texture_rows: u8,
+    texture_cols: u8,
+    frame_rate: f32,
+    random_start_frame: bool,
+    loop_animation: bool,
+
+    // Collision
+    collision_enabled: bool,
+    collision_bounce: f32,
+    collision_friction: f32,
+    collision_lifetime_loss: f32,
+    collision_spawn_effect: ?[]const u8,
+
+    // Trails
+    trail_enabled: bool,
+    trail_length: f32,
+    trail_width: f32,
+    trail_color: [4]f32,
+
+    // Sub-emitters
+    sub_emitter_birth: ?[]const u8,
+    sub_emitter_death: ?[]const u8,
+    sub_emitter_collision: ?[]const u8,
+
+    // Sound
+    sound_effect: ?[]const u8,
+    sound_on_spawn: bool,
+
+    // Wind
+    wind_influence: f32,
+
+    // Sorting
+    sort_mode: SortMode,
+    render_priority: i16,
+}
+
+pub const ValueRange = struct {
+    min: f32,
+    max: f32,
+
+    pub fn constant(value: f32) ValueRange {
+        return ValueRange{ .min = value, .max = value }
+    }
+
+    pub fn range(min: f32, max: f32) ValueRange {
+        return ValueRange{ .min = min, .max = max }
+    }
+
+    pub fn sample(self: *const ValueRange, random: f32) f32 {
+        return self.min + random * (self.max - self.min)
+    }
+}
+
+pub const SortMode = enum {
+    NONE,
+    BY_DISTANCE,
+    BY_AGE,
+    BY_SIZE,
+}
+
+// ============================================================================
+// Particle Emitter Instance
+// ============================================================================
+
+pub const ParticleEmitter = struct {
+    definition: *const ParticleEmitterDef,
+    particles: []Particle,
+    particle_count: u32,
+    position: math.Vec3,
+    rotation: math.Quat,
+    scale: f32,
+    velocity: math.Vec3,
+    time: f32,
+    emission_accumulator: f32,
+    burst_timer: f32,
+    is_playing: bool,
+    is_looping: bool,
+    random_state: u32,
+
+    pub fn init(def: *const ParticleEmitterDef, allocator: std.mem.Allocator) !ParticleEmitter {
+        const particles = try allocator.alloc(Particle, def.max_particles)
+        @memset(particles, std.mem.zeroes(Particle))
+
+        return ParticleEmitter{
+            .definition = def,
+            .particles = particles,
+            .particle_count = 0,
+            .position = math.Vec3.zero(),
+            .rotation = math.Quat.identity(),
+            .scale = 1.0,
+            .velocity = math.Vec3.zero(),
+            .time = 0.0,
+            .emission_accumulator = 0.0,
+            .burst_timer = 0.0,
+            .is_playing = true,
+            .is_looping = true,
+            .random_state = 12345,
+        }
+    }
+
+    pub fn deinit(self: *ParticleEmitter, allocator: std.mem.Allocator) void {
+        allocator.free(self.particles)
+    }
+
+    pub fn update(self: *ParticleEmitter, delta_time: f32, wind: math.Vec3, gravity: f32) void {
+        if (!self.is_playing) return
+
+        self.time += delta_time
+
+        // Check emitter lifetime
+        if (self.definition.emitter_lifetime > 0 and
+            self.time >= self.definition.emitter_lifetime)
+        {
+            if (!self.is_looping) {
+                self.is_playing = false
+            } else {
+                self.time = 0.0
+            }
+        }
+
+        // Update existing particles
+        var i: u32 = 0
+        while (i < self.particle_count) {
+            var p = &self.particles[i]
+            if (!p.isActive()) {
+                i += 1
+                continue
+            }
+
+            p.lifetime += delta_time
+
+            if (p.lifetime >= p.max_lifetime) {
+                // Particle died - spawn death sub-emitter if any
+                p.flags &= ~Particle.FLAG_ACTIVE
+                self.removeParticle(i)
+                continue
+            }
+
+            // Apply physics
+            var accel = p.acceleration
+
+            // Gravity
+            if ((p.flags & Particle.FLAG_AFFECTED_BY_GRAVITY) != 0) {
+                accel.y -= gravity * self.definition.gravity_scale
+            }
+
+            // Wind
+            if ((p.flags & Particle.FLAG_AFFECTED_BY_WIND) != 0) {
+                accel = accel.add(wind.scale(self.definition.wind_influence))
+            }
+
+            // Drag
+            const drag_factor = 1.0 - self.definition.drag * delta_time
+            p.velocity = p.velocity.scale(drag_factor)
+
+            // Integrate
+            p.velocity = p.velocity.add(accel.scale(delta_time))
+            p.position = p.position.add(p.velocity.scale(delta_time))
+
+            // Size
+            p.size += p.size_velocity * delta_time
+            if (self.definition.size_curve_enabled) {
+                p.size *= self.sampleCurve(&self.definition.size_over_lifetime, p.normalizedAge())
+            }
+
+            // Color
+            if (self.definition.color_curve_enabled) {
+                const t = p.normalizedAge()
+                for (0..4) |c| {
+                    p.color[c] = self.lerpColor(
+                        self.definition.color_start[c],
+                        self.definition.color_end[c],
+                        t,
+                    )
+                }
+            } else {
+                for (0..4) |c| {
+                    p.color[c] += p.color_velocity[c] * delta_time
+                }
+            }
+
+            // Rotation
+            p.rotation += p.angular_velocity * delta_time
+
+            // Animation
+            if (self.definition.texture_rows > 1 or self.definition.texture_cols > 1) {
+                p.frame += p.frame_rate * delta_time
+                const max_frames = @as(f32, @floatFromInt(self.definition.texture_rows * self.definition.texture_cols))
+                if (p.frame >= max_frames) {
+                    if (self.definition.loop_animation) {
+                        p.frame = @mod(p.frame, max_frames)
+                    } else {
+                        p.frame = max_frames - 1.0
+                    }
+                }
+            }
+
+            // Collision
+            if (self.definition.collision_enabled and (p.flags & Particle.FLAG_COLLIDES) != 0) {
+                self.handleCollision(p)
+            }
+
+            i += 1
+        }
+
+        // Emit new particles
+        if (self.is_playing) {
+            self.emitParticles(delta_time)
+        }
+    }
+
+    fn emitParticles(self: *ParticleEmitter, delta_time: f32) void {
+        // Continuous emission
+        self.emission_accumulator += self.definition.emission_rate * delta_time
+        while (self.emission_accumulator >= 1.0 and self.particle_count < self.definition.max_particles) {
+            self.spawnParticle()
+            self.emission_accumulator -= 1.0
+        }
+
+        // Burst emission
+        if (self.definition.burst_count > 0) {
+            self.burst_timer += delta_time
+            if (self.burst_timer >= self.definition.burst_interval) {
+                self.burst_timer = 0.0
+                for (0..self.definition.burst_count) |_| {
+                    if (self.particle_count < self.definition.max_particles) {
+                        self.spawnParticle()
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawnParticle(self: *ParticleEmitter) void {
+        if (self.particle_count >= self.particles.len) return
+
+        var p = &self.particles[self.particle_count]
+        self.particle_count += 1
+
+        // Random state
+        self.random_state = self.random_state *% 1103515245 +% 12345
+        const r1 = @as(f32, @floatFromInt(self.random_state & 0xFFFF)) / 65535.0
+        self.random_state = self.random_state *% 1103515245 +% 12345
+        const r2 = @as(f32, @floatFromInt(self.random_state & 0xFFFF)) / 65535.0
+        self.random_state = self.random_state *% 1103515245 +% 12345
+        const r3 = @as(f32, @floatFromInt(self.random_state & 0xFFFF)) / 65535.0
+        self.random_state = self.random_state *% 1103515245 +% 12345
+        const r4 = @as(f32, @floatFromInt(self.random_state & 0xFFFF)) / 65535.0
+
+        // Position based on emitter shape
+        p.position = self.getEmissionPosition(r1, r2, r3)
+        p.position = p.position.add(self.position)
+
+        // Velocity
+        const speed = self.definition.initial_speed.sample(r4)
+        const dir = self.getEmissionDirection(r1, r2)
+        p.velocity = dir.scale(speed)
+        p.velocity = p.velocity.add(self.velocity.scale(self.definition.velocity_inherit))
+
+        // Size
+        p.size = self.definition.initial_size.sample(r1)
+        p.size_velocity = 0.0
+
+        // Lifetime
+        p.max_lifetime = self.definition.initial_lifetime.sample(r2)
+        p.lifetime = 0.0
+
+        // Rotation
+        p.rotation = self.definition.initial_rotation.sample(r3)
+        p.angular_velocity = self.definition.angular_velocity.sample(r4)
+
+        // Color
+        p.color = self.definition.color_start
+        p.color_velocity = .{ 0, 0, 0, 0 }
+
+        // Animation
+        p.frame = if (self.definition.random_start_frame)
+            @floor(r1 * @as(f32, @floatFromInt(self.definition.texture_rows * self.definition.texture_cols)))
+        else
+            0.0
+        p.frame_rate = self.definition.frame_rate
+
+        // Flags
+        p.flags = Particle.FLAG_ACTIVE
+        if (self.definition.collision_enabled) {
+            p.flags |= Particle.FLAG_COLLIDES
+        }
+        if (self.definition.gravity_scale != 0) {
+            p.flags |= Particle.FLAG_AFFECTED_BY_GRAVITY
+        }
+        if (self.definition.wind_influence != 0) {
+            p.flags |= Particle.FLAG_AFFECTED_BY_WIND
+        }
+        if (self.definition.trail_enabled) {
+            p.flags |= Particle.FLAG_TRAILS
+        }
+
+        p.random_seed = self.random_state
+        p.acceleration = math.Vec3.zero()
+    }
+
+    fn getEmissionPosition(self: *ParticleEmitter, r1: f32, r2: f32, r3: f32) math.Vec3 {
+        const def = self.definition
+
+        switch (def.emitter_shape) {
+            .POINT => return math.Vec3.zero(),
+            .SPHERE => {
+                const theta = r1 * 6.28318
+                const phi = @acos(2.0 * r2 - 1.0)
+                const radius = def.shape_inner_radius + r3 * (def.shape_radius - def.shape_inner_radius)
+                return math.Vec3{
+                    .x = radius * @sin(phi) * @cos(theta),
+                    .y = radius * @sin(phi) * @sin(theta),
+                    .z = radius * @cos(phi),
+                }
+            },
+            .HEMISPHERE => {
+                const theta = r1 * 6.28318
+                const phi = r2 * 1.5708  // 0 to PI/2
+                const radius = def.shape_inner_radius + r3 * (def.shape_radius - def.shape_inner_radius)
+                return math.Vec3{
+                    .x = radius * @sin(phi) * @cos(theta),
+                    .y = radius * @cos(phi),
+                    .z = radius * @sin(phi) * @sin(theta),
+                }
+            },
+            .BOX => {
+                return math.Vec3{
+                    .x = (r1 - 0.5) * def.shape_dimensions.x,
+                    .y = (r2 - 0.5) * def.shape_dimensions.y,
+                    .z = (r3 - 0.5) * def.shape_dimensions.z,
+                }
+            },
+            .CYLINDER => {
+                const theta = r1 * 6.28318
+                const radius = def.shape_inner_radius + r2 * (def.shape_radius - def.shape_inner_radius)
+                return math.Vec3{
+                    .x = radius * @cos(theta),
+                    .y = (r3 - 0.5) * def.shape_height,
+                    .z = radius * @sin(theta),
+                }
+            },
+            .CONE => {
+                const theta = r1 * 6.28318
+                const height = r2 * def.shape_height
+                const radius = def.shape_radius * height / def.shape_height
+                return math.Vec3{
+                    .x = radius * @cos(theta),
+                    .y = height,
+                    .z = radius * @sin(theta),
+                }
+            },
+            .CIRCLE => {
+                const theta = r1 * 6.28318
+                const radius = def.shape_inner_radius + r2 * (def.shape_radius - def.shape_inner_radius)
+                return math.Vec3{
+                    .x = radius * @cos(theta),
+                    .y = 0,
+                    .z = radius * @sin(theta),
+                }
+            },
+            .LINE => {
+                return math.Vec3{
+                    .x = (r1 - 0.5) * def.shape_radius * 2.0,
+                    .y = 0,
+                    .z = 0,
+                }
+            },
+            .MESH_SURFACE => return math.Vec3.zero(),
+        }
+    }
+
+    fn getEmissionDirection(self: *ParticleEmitter, r1: f32, r2: f32) math.Vec3 {
+        const def = self.definition
+        const cone_angle = def.velocity_cone_angle
+
+        if (cone_angle <= 0.001) {
+            return def.velocity_direction.normalize()
+        }
+
+        // Random direction within cone
+        const theta = r1 * 6.28318
+        const phi = r2 * cone_angle
+        const sin_phi = @sin(phi)
+
+        var dir = math.Vec3{
+            .x = sin_phi * @cos(theta),
+            .y = @cos(phi),
+            .z = sin_phi * @sin(theta),
+        }
+
+        // TODO: Rotate to align with velocity_direction
+        return dir.normalize()
+    }
+
+    fn handleCollision(self: *ParticleEmitter, p: *Particle) void {
+        const def = self.definition
+
+        // Simple ground plane collision
+        if (p.position.y <= 0.0) {
+            p.position.y = 0.0
+            p.velocity.y = -p.velocity.y * def.collision_bounce
+            p.velocity.x *= 1.0 - def.collision_friction
+            p.velocity.z *= 1.0 - def.collision_friction
+
+            p.lifetime += p.max_lifetime * def.collision_lifetime_loss
+
+            if ((p.flags & Particle.FLAG_GROUND_LOCKED) == 0 and
+                @abs(p.velocity.y) < 0.1)
+            {
+                p.flags |= Particle.FLAG_GROUND_LOCKED
+                p.velocity = math.Vec3.zero()
+            }
+        }
+    }
+
+    fn removeParticle(self: *ParticleEmitter, index: u32) void {
+        if (index < self.particle_count - 1) {
+            self.particles[index] = self.particles[self.particle_count - 1]
+        }
+        self.particle_count -= 1
+    }
+
+    fn sampleCurve(self: *const ParticleEmitter, curve: []const f32, t: f32) f32 {
+        const n = curve.len
+        if (n == 0) return 1.0
+        if (n == 1) return curve[0]
+
+        const scaled_t = t * @as(f32, @floatFromInt(n - 1))
+        const index = @min(@as(usize, @intFromFloat(scaled_t)), n - 2)
+        const frac = scaled_t - @as(f32, @floatFromInt(index))
+
+        return curve[index] * (1.0 - frac) + curve[index + 1] * frac
+    }
+
+    fn lerpColor(self: *const ParticleEmitter, a: f32, b: f32, t: f32) f32 {
+        _ = self
+        return a + (b - a) * t
+    }
+
+    pub fn play(self: *ParticleEmitter) void {
+        self.is_playing = true
+        self.time = 0.0
+    }
+
+    pub fn stop(self: *ParticleEmitter) void {
+        self.is_playing = false
+    }
+
+    pub fn clear(self: *ParticleEmitter) void {
+        self.particle_count = 0
+    }
+
+    pub fn setPosition(self: *ParticleEmitter, pos: math.Vec3) void {
+        self.velocity = pos.sub(self.position)
+        self.position = pos
+    }
+}
+
+// ============================================================================
+// Predefined Particle Effect Templates
+// ============================================================================
+
+pub const SMOKE_SMALL_DEF: ParticleEmitterDef = ParticleEmitterDef{
+    .name = "SmokeSmall",
+    .particle_type = .SMOKE_LIGHT,
+    .blend_mode = .ALPHA,
+    .orientation = .BILLBOARD,
+    .emitter_shape = .POINT,
+    .emission_rate = 5.0,
+    .burst_count = 0,
+    .burst_interval = 0.0,
+    .max_particles = 100,
+    .emitter_lifetime = 0.0,
+    .shape_radius = 0.5,
+    .shape_inner_radius = 0.0,
+    .shape_height = 0.0,
+    .shape_angle = 0.0,
+    .shape_dimensions = math.Vec3.zero(),
+    .initial_speed = ValueRange.range(5.0, 10.0),
+    .initial_size = ValueRange.range(0.5, 1.0),
+    .initial_rotation = ValueRange.range(0.0, 6.28),
+    .initial_lifetime = ValueRange.range(2.0, 4.0),
+    .velocity_direction = math.Vec3{ .x = 0, .y = 1, .z = 0 },
+    .velocity_cone_angle = 0.3,
+    .velocity_inherit = 0.0,
+    .gravity_scale = -0.1,  // Rises slowly
+    .drag = 0.5,
+    .size_over_lifetime = .{ 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.0 },
+    .size_curve_enabled = true,
+    .color_start = .{ 0.5, 0.5, 0.5, 0.8 },
+    .color_end = .{ 0.3, 0.3, 0.3, 0.0 },
+    .color_over_lifetime = undefined,
+    .color_curve_enabled = false,
+    .angular_velocity = ValueRange.range(-0.5, 0.5),
+    .texture_name = "smoke_puff",
+    .texture_rows = 1,
+    .texture_cols = 1,
+    .frame_rate = 0.0,
+    .random_start_frame = false,
+    .loop_animation = false,
+    .collision_enabled = false,
+    .collision_bounce = 0.0,
+    .collision_friction = 0.0,
+    .collision_lifetime_loss = 0.0,
+    .collision_spawn_effect = null,
+    .trail_enabled = false,
+    .trail_length = 0.0,
+    .trail_width = 0.0,
+    .trail_color = .{ 1, 1, 1, 1 },
+    .sub_emitter_birth = null,
+    .sub_emitter_death = null,
+    .sub_emitter_collision = null,
+    .sound_effect = null,
+    .sound_on_spawn = false,
+    .wind_influence = 0.5,
+    .sort_mode = .BY_DISTANCE,
+    .render_priority = 0,
+}
+
+pub const EXPLOSION_MEDIUM_DEF: ParticleEmitterDef = ParticleEmitterDef{
+    .name = "ExplosionMedium",
+    .particle_type = .EXPLOSION_MEDIUM,
+    .blend_mode = .ADDITIVE,
+    .orientation = .BILLBOARD,
+    .emitter_shape = .SPHERE,
+    .emission_rate = 0.0,
+    .burst_count = 30,
+    .burst_interval = 0.0,
+    .max_particles = 100,
+    .emitter_lifetime = 0.1,
+    .shape_radius = 2.0,
+    .shape_inner_radius = 0.0,
+    .shape_height = 0.0,
+    .shape_angle = 0.0,
+    .shape_dimensions = math.Vec3.zero(),
+    .initial_speed = ValueRange.range(20.0, 40.0),
+    .initial_size = ValueRange.range(2.0, 5.0),
+    .initial_rotation = ValueRange.range(0.0, 6.28),
+    .initial_lifetime = ValueRange.range(0.3, 0.8),
+    .velocity_direction = math.Vec3{ .x = 0, .y = 1, .z = 0 },
+    .velocity_cone_angle = 3.14,  // Full sphere
+    .velocity_inherit = 0.0,
+    .gravity_scale = 0.5,
+    .drag = 2.0,
+    .size_over_lifetime = .{ 0.5, 1.0, 1.2, 1.3, 1.2, 1.0, 0.5, 0.0 },
+    .size_curve_enabled = true,
+    .color_start = .{ 1.0, 0.8, 0.3, 1.0 },
+    .color_end = .{ 1.0, 0.2, 0.0, 0.0 },
+    .color_over_lifetime = undefined,
+    .color_curve_enabled = false,
+    .angular_velocity = ValueRange.range(-2.0, 2.0),
+    .texture_name = "explosion_flame",
+    .texture_rows = 4,
+    .texture_cols = 4,
+    .frame_rate = 30.0,
+    .random_start_frame = true,
+    .loop_animation = false,
+    .collision_enabled = false,
+    .collision_bounce = 0.0,
+    .collision_friction = 0.0,
+    .collision_lifetime_loss = 0.0,
+    .collision_spawn_effect = null,
+    .trail_enabled = false,
+    .trail_length = 0.0,
+    .trail_width = 0.0,
+    .trail_color = .{ 1, 1, 1, 1 },
+    .sub_emitter_birth = null,
+    .sub_emitter_death = "SmokeSmall",
+    .sub_emitter_collision = null,
+    .sound_effect = "explosion_medium",
+    .sound_on_spawn = true,
+    .wind_influence = 0.0,
+    .sort_mode = .BY_DISTANCE,
+    .render_priority = 10,
+}
+
+pub const DEBRIS_DIRT_DEF: ParticleEmitterDef = ParticleEmitterDef{
+    .name = "DebrisDirt",
+    .particle_type = .DEBRIS_DIRT,
+    .blend_mode = .ALPHA,
+    .orientation = .VELOCITY_ALIGNED,
+    .emitter_shape = .CONE,
+    .emission_rate = 0.0,
+    .burst_count = 50,
+    .burst_interval = 0.0,
+    .max_particles = 100,
+    .emitter_lifetime = 0.1,
+    .shape_radius = 1.0,
+    .shape_inner_radius = 0.0,
+    .shape_height = 2.0,
+    .shape_angle = 0.5,
+    .shape_dimensions = math.Vec3.zero(),
+    .initial_speed = ValueRange.range(15.0, 30.0),
+    .initial_size = ValueRange.range(0.1, 0.3),
+    .initial_rotation = ValueRange.range(0.0, 6.28),
+    .initial_lifetime = ValueRange.range(1.0, 2.0),
+    .velocity_direction = math.Vec3{ .x = 0, .y = 1, .z = 0 },
+    .velocity_cone_angle = 0.8,
+    .velocity_inherit = 0.0,
+    .gravity_scale = 1.0,
+    .drag = 0.3,
+    .size_over_lifetime = .{ 1, 1, 1, 1, 1, 1, 1, 1 },
+    .size_curve_enabled = false,
+    .color_start = .{ 0.6, 0.5, 0.3, 1.0 },
+    .color_end = .{ 0.4, 0.3, 0.2, 0.5 },
+    .color_over_lifetime = undefined,
+    .color_curve_enabled = false,
+    .angular_velocity = ValueRange.range(-5.0, 5.0),
+    .texture_name = "debris_chunk",
+    .texture_rows = 2,
+    .texture_cols = 2,
+    .frame_rate = 0.0,
+    .random_start_frame = true,
+    .loop_animation = false,
+    .collision_enabled = true,
+    .collision_bounce = 0.3,
+    .collision_friction = 0.5,
+    .collision_lifetime_loss = 0.3,
+    .collision_spawn_effect = "DustPuff",
+    .trail_enabled = false,
+    .trail_length = 0.0,
+    .trail_width = 0.0,
+    .trail_color = .{ 1, 1, 1, 1 },
+    .sub_emitter_birth = null,
+    .sub_emitter_death = null,
+    .sub_emitter_collision = null,
+    .sound_effect = null,
+    .sound_on_spawn = false,
+    .wind_influence = 0.1,
+    .sort_mode = .BY_DISTANCE,
+    .render_priority = -5,
+}
+
+pub const MISSILE_TRAIL_DEF: ParticleEmitterDef = ParticleEmitterDef{
+    .name = "MissileTrail",
+    .particle_type = .MISSILE_SMOKE_TRAIL,
+    .blend_mode = .ALPHA,
+    .orientation = .BILLBOARD,
+    .emitter_shape = .POINT,
+    .emission_rate = 30.0,
+    .burst_count = 0,
+    .burst_interval = 0.0,
+    .max_particles = 200,
+    .emitter_lifetime = 0.0,
+    .shape_radius = 0.0,
+    .shape_inner_radius = 0.0,
+    .shape_height = 0.0,
+    .shape_angle = 0.0,
+    .shape_dimensions = math.Vec3.zero(),
+    .initial_speed = ValueRange.range(0.0, 2.0),
+    .initial_size = ValueRange.range(0.3, 0.5),
+    .initial_rotation = ValueRange.range(0.0, 6.28),
+    .initial_lifetime = ValueRange.range(1.0, 1.5),
+    .velocity_direction = math.Vec3{ .x = 0, .y = 0, .z = -1 },
+    .velocity_cone_angle = 0.2,
+    .velocity_inherit = 0.3,
+    .gravity_scale = -0.05,
+    .drag = 0.8,
+    .size_over_lifetime = .{ 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0, 3.0 },
+    .size_curve_enabled = true,
+    .color_start = .{ 0.8, 0.8, 0.8, 0.6 },
+    .color_end = .{ 0.5, 0.5, 0.5, 0.0 },
+    .color_over_lifetime = undefined,
+    .color_curve_enabled = false,
+    .angular_velocity = ValueRange.range(-0.3, 0.3),
+    .texture_name = "smoke_trail",
+    .texture_rows = 1,
+    .texture_cols = 1,
+    .frame_rate = 0.0,
+    .random_start_frame = false,
+    .loop_animation = false,
+    .collision_enabled = false,
+    .collision_bounce = 0.0,
+    .collision_friction = 0.0,
+    .collision_lifetime_loss = 0.0,
+    .collision_spawn_effect = null,
+    .trail_enabled = false,
+    .trail_length = 0.0,
+    .trail_width = 0.0,
+    .trail_color = .{ 1, 1, 1, 1 },
+    .sub_emitter_birth = null,
+    .sub_emitter_death = null,
+    .sub_emitter_collision = null,
+    .sound_effect = null,
+    .sound_on_spawn = false,
+    .wind_influence = 0.2,
+    .sort_mode = .BY_DISTANCE,
+    .render_priority = -10,
+}
+
+pub const MUZZLE_FLASH_DEF: ParticleEmitterDef = ParticleEmitterDef{
+    .name = "MuzzleFlash",
+    .particle_type = .MUZZLE_FLASH,
+    .blend_mode = .ADDITIVE,
+    .orientation = .VELOCITY_ALIGNED,
+    .emitter_shape = .CONE,
+    .emission_rate = 0.0,
+    .burst_count = 5,
+    .burst_interval = 0.0,
+    .max_particles = 20,
+    .emitter_lifetime = 0.05,
+    .shape_radius = 0.1,
+    .shape_inner_radius = 0.0,
+    .shape_height = 0.3,
+    .shape_angle = 0.2,
+    .shape_dimensions = math.Vec3.zero(),
+    .initial_speed = ValueRange.range(50.0, 80.0),
+    .initial_size = ValueRange.range(0.3, 0.6),
+    .initial_rotation = ValueRange.range(0.0, 6.28),
+    .initial_lifetime = ValueRange.range(0.05, 0.1),
+    .velocity_direction = math.Vec3{ .x = 0, .y = 0, .z = 1 },
+    .velocity_cone_angle = 0.3,
+    .velocity_inherit = 0.0,
+    .gravity_scale = 0.0,
+    .drag = 5.0,
+    .size_over_lifetime = .{ 1.0, 0.8, 0.5, 0.2, 0.0, 0.0, 0.0, 0.0 },
+    .size_curve_enabled = true,
+    .color_start = .{ 1.0, 0.9, 0.5, 1.0 },
+    .color_end = .{ 1.0, 0.3, 0.0, 0.0 },
+    .color_over_lifetime = undefined,
+    .color_curve_enabled = false,
+    .angular_velocity = ValueRange.constant(0.0),
+    .texture_name = "muzzle_flash",
+    .texture_rows = 2,
+    .texture_cols = 2,
+    .frame_rate = 60.0,
+    .random_start_frame = true,
+    .loop_animation = false,
+    .collision_enabled = false,
+    .collision_bounce = 0.0,
+    .collision_friction = 0.0,
+    .collision_lifetime_loss = 0.0,
+    .collision_spawn_effect = null,
+    .trail_enabled = false,
+    .trail_length = 0.0,
+    .trail_width = 0.0,
+    .trail_color = .{ 1, 1, 1, 1 },
+    .sub_emitter_birth = null,
+    .sub_emitter_death = null,
+    .sub_emitter_collision = null,
+    .sound_effect = null,
+    .sound_on_spawn = false,
+    .wind_influence = 0.0,
+    .sort_mode = .NONE,
+    .render_priority = 20,
+}
+
+// ============================================================================
+// Particle Effect Manager
+// ============================================================================
+
+pub const ParticleEffectManager = struct {
+    emitter_defs: std.StringHashMap(*const ParticleEmitterDef),
+    active_emitters: std.ArrayList(*ParticleEmitter),
+    allocator: std.mem.Allocator,
+    global_wind: math.Vec3,
+    gravity: f32,
+
+    pub fn init(allocator: std.mem.Allocator) ParticleEffectManager {
+        var manager = ParticleEffectManager{
+            .emitter_defs = std.StringHashMap(*const ParticleEmitterDef).init(allocator),
+            .active_emitters = std.ArrayList(*ParticleEmitter).init(allocator),
+            .allocator = allocator,
+            .global_wind = math.Vec3.zero(),
+            .gravity = 9.81,
+        }
+
+        // Register built-in effects
+        manager.registerEffect("SmokeSmall", &SMOKE_SMALL_DEF)
+        manager.registerEffect("ExplosionMedium", &EXPLOSION_MEDIUM_DEF)
+        manager.registerEffect("DebrisDirt", &DEBRIS_DIRT_DEF)
+        manager.registerEffect("MissileTrail", &MISSILE_TRAIL_DEF)
+        manager.registerEffect("MuzzleFlash", &MUZZLE_FLASH_DEF)
+
+        return manager
+    }
+
+    pub fn deinit(self: *ParticleEffectManager) void {
+        for (self.active_emitters.items) |emitter| {
+            emitter.deinit(self.allocator)
+            self.allocator.destroy(emitter)
+        }
+        self.active_emitters.deinit()
+        self.emitter_defs.deinit()
+    }
+
+    pub fn registerEffect(self: *ParticleEffectManager, name: []const u8, def: *const ParticleEmitterDef) void {
+        self.emitter_defs.put(name, def) catch {}
+    }
+
+    pub fn spawnEffect(self: *ParticleEffectManager, name: []const u8, position: math.Vec3) ?*ParticleEmitter {
+        const def = self.emitter_defs.get(name) orelse return null
+
+        const emitter = self.allocator.create(ParticleEmitter) catch return null
+        emitter.* = ParticleEmitter.init(def, self.allocator) catch {
+            self.allocator.destroy(emitter)
+            return null
+        }
+        emitter.position = position
+        emitter.play()
+
+        self.active_emitters.append(emitter) catch {
+            emitter.deinit(self.allocator)
+            self.allocator.destroy(emitter)
+            return null
+        }
+
+        return emitter
+    }
+
+    pub fn update(self: *ParticleEffectManager, delta_time: f32) void {
+        var i: usize = 0
+        while (i < self.active_emitters.items.len) {
+            const emitter = self.active_emitters.items[i]
+            emitter.update(delta_time, self.global_wind, self.gravity)
+
+            // Remove completed one-shot emitters
+            if (!emitter.is_playing and !emitter.is_looping and emitter.particle_count == 0) {
+                emitter.deinit(self.allocator)
+                self.allocator.destroy(emitter)
+                _ = self.active_emitters.swapRemove(i)
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    pub fn setWind(self: *ParticleEffectManager, wind: math.Vec3) void {
+        self.global_wind = wind
+    }
+
+    pub fn getActiveParticleCount(self: *const ParticleEffectManager) u32 {
+        var count: u32 = 0
+        for (self.active_emitters.items) |emitter| {
+            count += emitter.particle_count
+        }
+        return count
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Particle emitter initialization" {
+    var emitter = try ParticleEmitter.init(&SMOKE_SMALL_DEF, std.testing.allocator)
+    defer emitter.deinit(std.testing.allocator)
+
+    try std.testing.expect(emitter.is_playing == true)
+    try std.testing.expect(emitter.particle_count == 0)
+}
+
+test "Value range sampling" {
+    const vr = ValueRange.range(10.0, 20.0)
+
+    const v0 = vr.sample(0.0)
+    const v1 = vr.sample(1.0)
+    const v_mid = vr.sample(0.5)
+
+    try std.testing.expect(v0 == 10.0)
+    try std.testing.expect(v1 == 20.0)
+    try std.testing.expect(v_mid == 15.0)
+}
+
+test "Particle manager effect spawning" {
+    var manager = ParticleEffectManager.init(std.testing.allocator)
+    defer manager.deinit()
+
+    const emitter = manager.spawnEffect("SmokeSmall", math.Vec3.zero())
+    try std.testing.expect(emitter != null)
+    try std.testing.expect(manager.active_emitters.items.len == 1)
+}
