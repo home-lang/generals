@@ -304,24 +304,24 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [ ] `R4-084` Implement particle trails
 
 ### 4.9 Effects & Decals
-- [ ] `R4-090` Implement Smudge/decal system
-- [ ] `R4-091` Implement scorch marks
-- [ ] `R4-092` Implement explosion effects
-- [ ] `R4-093` Implement weapon trails
-- [ ] `R4-094` Implement muzzle flashes
-- [ ] `R4-095` Implement laser/beam rendering
+- [x] `R4-090` Implement Smudge/decal system - DONE: `graphics/effects_renderer.home` with SmudgeManager, SmudgeSet, heat distortion vertex generation
+- [x] `R4-091` Implement scorch marks - DONE: `graphics/effects_renderer.home` DecalManager with spawn_scorch(), fade system
+- [x] `R4-092` Implement explosion effects - DONE: `graphics/effects_renderer.home` DecalManager spawn_crater(), Smudge for heat distortion
+- [x] `R4-093` Implement weapon trails - DONE: `graphics/effects_renderer.home` WeaponTrailManager with fade, multi-point trails
+- [x] `R4-094` Implement muzzle flashes - DONE: `graphics/effects_renderer.home` MuzzleFlashManager with billboard quads, intensity falloff
+- [x] `R4-095` Implement laser/beam rendering - DONE: `graphics/effects_renderer.home` LaserBeam with segments, arc height, multi-beam support
 
 ### 4.10 Shadow System
-- [ ] `R4-100` Implement shadow mapping
-- [ ] `R4-101` Implement projected shadows
-- [ ] `R4-102` Implement volumetric shadows
-- [ ] `R4-103` Implement shadow quality levels
+- [x] `R4-100` Implement shadow mapping - DONE: `graphics/shadow_system.home` with ShadowManager, stencil volume rendering
+- [x] `R4-101` Implement projected shadows - DONE: `graphics/shadow_system.home` ProjectedShadowManager with texture-based shadows, decal shadows
+- [x] `R4-102` Implement volumetric shadows - DONE: `graphics/shadow_system.home` VolumetricShadowManager with silhouette detection, shadow volume extrusion
+- [x] `R4-103` Implement shadow quality levels - DONE: `graphics/shadow_system.home` ShadowQuality enum (Off/Low/Medium/High/Ultra) with automatic type downgrade
 
 ### 4.11 LOD System
 - [x] `R4-110` Implement level-of-detail switching - EXISTS: `lod.home`
-- [ ] `R4-111` Implement distance-based LOD
-- [ ] `R4-112` Implement screen-size based LOD
-- [ ] `R4-113` Implement LOD transitions (no popping)
+- [x] `R4-111` Implement distance-based LOD - DONE: `lod.home` ModelLODSelector with select_by_distance(), configurable thresholds
+- [x] `R4-112` Implement screen-size based LOD - DONE: `lod.home` ModelLODSelector with calculate_screen_size(), select_by_screen_size()
+- [x] `R4-113` Implement LOD transitions (no popping) - DONE: `lod.home` LODTransitionData with smooth crossfade, transition_duration, blend_factor
 
 ### 4.12 Radar/Minimap
 - [~] `R4-120` Implement W3DRadar terrain texture generation - PARTIAL: `minimap.home`

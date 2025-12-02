@@ -531,6 +531,363 @@ fn shutdown_lod_manager() {
 }
 
 // ============================================================================
+// MODEL LOD SYSTEM
+// Distance-based and screen-size based LOD for 3D models
+// Based on W3D HLOD system from original Westwood code
+// ============================================================================
+
+// Maximum LOD levels per model
+let MAX_MODEL_LOD_LEVELS: i32 = 5
+
+// Model LOD level descriptor
+struct ModelLODLevel {
+    level_index: i32,
+    distance_min: f32,           // Minimum distance for this level
+    distance_max: f32,           // Maximum distance for this level
+    screen_size_min: f32,        // Minimum screen size (pixels) for this level
+    screen_size_max: f32,        // Maximum screen size (pixels)
+    model_name: string,          // Model asset name for this level
+    is_active: bool,
+}
+
+impl ModelLODLevel {
+    fn init(index: i32): ModelLODLevel {
+        return ModelLODLevel {
+            level_index: index,
+            distance_min: 0.0,
+            distance_max: 10000.0,
+            screen_size_min: 0.0,
+            screen_size_max: 10000.0,
+            model_name: "",
+            is_active: false,
+        }
+    }
+
+    fn set_distance_range(&self, min: f32, max: f32) {
+        self.distance_min = min
+        self.distance_max = max
+    }
+
+    fn set_screen_size_range(&self, min: f32, max: f32) {
+        self.screen_size_min = min
+        self.screen_size_max = max
+    }
+}
+
+// LOD selector mode
+enum LODSelectorMode {
+    DistanceBased,     // Select LOD based on camera distance
+    ScreenSizeBased,   // Select LOD based on projected screen size
+    Combined,          // Use both distance and screen size
+}
+
+// Model LOD configuration
+struct ModelLODConfig {
+    levels: [ModelLODLevel],
+    level_count: i32,
+    selector_mode: LODSelectorMode,
+
+    // Transition settings
+    use_smooth_transitions: bool,
+    transition_duration: f32,    // Seconds for crossfade
+
+    // Distance thresholds (for distance-based)
+    lod0_max_distance: f32,      // Highest detail
+    lod1_max_distance: f32,
+    lod2_max_distance: f32,
+    lod3_max_distance: f32,
+    lod4_max_distance: f32,      // Lowest detail
+
+    // Screen size thresholds (for screen-size based)
+    lod0_min_screen_size: f32,   // Highest detail needs largest screen size
+    lod1_min_screen_size: f32,
+    lod2_min_screen_size: f32,
+    lod3_min_screen_size: f32,
+    lod4_min_screen_size: f32,   // Lowest detail
+}
+
+impl ModelLODConfig {
+    fn init(): ModelLODConfig {
+        let levels: [ModelLODLevel] = []
+        for i in 0..MAX_MODEL_LOD_LEVELS {
+            levels = levels + [ModelLODLevel::init(i)]
+        }
+
+        return ModelLODConfig {
+            levels: levels,
+            level_count: 0,
+            selector_mode: LODSelectorMode::Combined,
+            use_smooth_transitions: true,
+            transition_duration: 0.25,
+
+            // Default distance thresholds
+            lod0_max_distance: 100.0,
+            lod1_max_distance: 200.0,
+            lod2_max_distance: 400.0,
+            lod3_max_distance: 800.0,
+            lod4_max_distance: 10000.0,
+
+            // Default screen size thresholds (in pixels)
+            lod0_min_screen_size: 100.0,
+            lod1_min_screen_size: 50.0,
+            lod2_min_screen_size: 25.0,
+            lod3_min_screen_size: 10.0,
+            lod4_min_screen_size: 0.0,
+        }
+    }
+
+    fn add_level(&self, model_name: string): ModelLODLevel? {
+        if self.level_count >= MAX_MODEL_LOD_LEVELS {
+            return null
+        }
+
+        let level = self.levels[self.level_count]
+        level.model_name = model_name
+        level.is_active = true
+
+        // Set default distance based on index
+        if self.level_count == 0 {
+            level.distance_min = 0.0
+            level.distance_max = self.lod0_max_distance
+            level.screen_size_min = self.lod0_min_screen_size
+            level.screen_size_max = 10000.0
+        } else if self.level_count == 1 {
+            level.distance_min = self.lod0_max_distance
+            level.distance_max = self.lod1_max_distance
+            level.screen_size_min = self.lod1_min_screen_size
+            level.screen_size_max = self.lod0_min_screen_size
+        } else if self.level_count == 2 {
+            level.distance_min = self.lod1_max_distance
+            level.distance_max = self.lod2_max_distance
+            level.screen_size_min = self.lod2_min_screen_size
+            level.screen_size_max = self.lod1_min_screen_size
+        } else if self.level_count == 3 {
+            level.distance_min = self.lod2_max_distance
+            level.distance_max = self.lod3_max_distance
+            level.screen_size_min = self.lod3_min_screen_size
+            level.screen_size_max = self.lod2_min_screen_size
+        } else {
+            level.distance_min = self.lod3_max_distance
+            level.distance_max = self.lod4_max_distance
+            level.screen_size_min = self.lod4_min_screen_size
+            level.screen_size_max = self.lod3_min_screen_size
+        }
+
+        self.level_count = self.level_count + 1
+        return level
+    }
+}
+
+// Model LOD selector - determines which LOD to use
+struct ModelLODSelector {
+    config: ModelLODConfig,
+    current_level: i32,
+    target_level: i32,
+    transition_progress: f32,    // 0.0 = current, 1.0 = target
+    is_transitioning: bool,
+}
+
+impl ModelLODSelector {
+    fn init(config: ModelLODConfig): ModelLODSelector {
+        return ModelLODSelector {
+            config: config,
+            current_level: 0,
+            target_level: 0,
+            transition_progress: 0.0,
+            is_transitioning: false,
+        }
+    }
+
+    /// Calculate screen size based on world size and distance
+    fn calculate_screen_size(&self, world_radius: f32, distance: f32, fov: f32, screen_height: f32): f32 {
+        if distance < 0.001 {
+            return screen_height  // Maximum size when very close
+        }
+
+        // Project world size to screen pixels
+        // screen_size = (world_radius / distance) * screen_height / tan(fov/2)
+        let half_fov = fov * 0.5
+        let tan_half_fov = tan_approx(half_fov)
+        if tan_half_fov < 0.001 {
+            tan_half_fov = 0.001
+        }
+
+        return (world_radius / distance) * screen_height / tan_half_fov
+    }
+
+    /// Select LOD based on distance only
+    fn select_by_distance(&self, distance: f32): i32 {
+        for i in 0..self.config.level_count {
+            let level = self.config.levels[i]
+            if level.is_active && distance >= level.distance_min && distance < level.distance_max {
+                return i
+            }
+        }
+        // Default to lowest detail if nothing matches
+        return self.config.level_count - 1
+    }
+
+    /// Select LOD based on screen size only
+    fn select_by_screen_size(&self, screen_size: f32): i32 {
+        for i in 0..self.config.level_count {
+            let level = self.config.levels[i]
+            if level.is_active && screen_size >= level.screen_size_min && screen_size < level.screen_size_max {
+                return i
+            }
+        }
+        // Default to lowest detail if nothing matches
+        return self.config.level_count - 1
+    }
+
+    /// Select LOD using combined criteria
+    fn select_combined(&self, distance: f32, screen_size: f32): i32 {
+        let distance_lod = self.select_by_distance(distance)
+        let screen_lod = self.select_by_screen_size(screen_size)
+
+        // Use the higher (lower quality) LOD level
+        if distance_lod > screen_lod {
+            return distance_lod
+        }
+        return screen_lod
+    }
+
+    /// Update LOD selection
+    fn update(&self, distance: f32, world_radius: f32, fov: f32, screen_height: f32, delta_time: f32) {
+        // Calculate screen size
+        let screen_size = self.calculate_screen_size(world_radius, distance, fov, screen_height)
+
+        // Select target LOD based on mode
+        if self.config.selector_mode == LODSelectorMode::DistanceBased {
+            self.target_level = self.select_by_distance(distance)
+        } else if self.config.selector_mode == LODSelectorMode::ScreenSizeBased {
+            self.target_level = self.select_by_screen_size(screen_size)
+        } else {
+            self.target_level = self.select_combined(distance, screen_size)
+        }
+
+        // Handle transitions
+        if self.target_level != self.current_level {
+            if self.config.use_smooth_transitions {
+                self.is_transitioning = true
+                self.transition_progress = self.transition_progress + delta_time / self.config.transition_duration
+
+                if self.transition_progress >= 1.0 {
+                    self.current_level = self.target_level
+                    self.transition_progress = 0.0
+                    self.is_transitioning = false
+                }
+            } else {
+                // Instant switch
+                self.current_level = self.target_level
+                self.transition_progress = 0.0
+                self.is_transitioning = false
+            }
+        }
+    }
+
+    /// Get current LOD level index
+    fn get_current_level(&self): i32 {
+        return self.current_level
+    }
+
+    /// Get target LOD level index (for crossfade)
+    fn get_target_level(&self): i32 {
+        return self.target_level
+    }
+
+    /// Get transition blend factor (0.0 = full current, 1.0 = full target)
+    fn get_transition_blend(&self): f32 {
+        if !self.is_transitioning {
+            return 0.0
+        }
+        return self.transition_progress
+    }
+
+    /// Get current LOD model name
+    fn get_current_model_name(&self): string {
+        if self.current_level >= 0 && self.current_level < self.config.level_count {
+            return self.config.levels[self.current_level].model_name
+        }
+        return ""
+    }
+}
+
+// LOD transition data for smooth crossfade
+struct LODTransitionData {
+    from_level: i32,
+    to_level: i32,
+    blend_factor: f32,      // 0.0 = from, 1.0 = to
+    from_alpha: f32,        // Fade out
+    to_alpha: f32,          // Fade in
+}
+
+impl LODTransitionData {
+    fn init(): LODTransitionData {
+        return LODTransitionData {
+            from_level: 0,
+            to_level: 0,
+            blend_factor: 0.0,
+            from_alpha: 1.0,
+            to_alpha: 0.0,
+        }
+    }
+
+    fn update(&self, from: i32, to: i32, blend: f32) {
+        self.from_level = from
+        self.to_level = to
+        self.blend_factor = blend
+
+        // Calculate alpha values for crossfade
+        self.from_alpha = 1.0 - blend
+        self.to_alpha = blend
+    }
+}
+
+// Helper function for tangent approximation
+fn tan_approx(x: f32): f32 {
+    let PI: f32 = 3.14159265358979
+    // Normalize to -PI/2 to PI/2
+    while x > PI / 2.0 {
+        x = x - PI
+    }
+    while x < -PI / 2.0 {
+        x = x + PI
+    }
+    // Taylor series approximation
+    let x2 = x * x
+    return x * (1.0 + x2 / 3.0 + x2 * x2 * 2.0 / 15.0)
+}
+
+// ============================================================================
+// GLOBAL MODEL LOD FUNCTIONS
+// ============================================================================
+
+/// Calculate recommended LOD level for a model
+fn calculate_model_lod(distance: f32, world_radius: f32, fov: f32, screen_height: f32): i32 {
+    // Quick distance-based calculation
+    if distance < 100.0 {
+        return 0  // LOD0 - highest detail
+    } else if distance < 200.0 {
+        return 1
+    } else if distance < 400.0 {
+        return 2
+    } else if distance < 800.0 {
+        return 3
+    }
+    return 4  // LOD4 - lowest detail
+}
+
+/// Check if a LOD transition should use dithering
+fn should_use_dither_transition(from_level: i32, to_level: i32): bool {
+    // Use dithering for larger LOD jumps
+    let diff = from_level - to_level
+    if diff < 0 {
+        diff = -diff
+    }
+    return diff > 1
+}
+
+// ============================================================================
 // TEST FUNCTIONS
 // ============================================================================
 

@@ -1,0 +1,1529 @@
+// Effects Renderer - Smudges, Decals, Lasers, Muzzle Flashes, Weapon Trails for C&C Generals
+// Based on W3DSmudge, W3DLaserDraw, and related systems from original Westwood code
+// Implements visual effects for combat and environmental elements
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+let MAX_SMUDGES_PER_SET: i32 = 512
+let SMUDGE_DRAW_SIZE: i32 = 500
+let MAX_LASER_LINES: i32 = 8
+let MAX_LASER_SEGMENTS: i32 = 16
+let MAX_DECALS: i32 = 256
+let MAX_MUZZLE_FLASHES: i32 = 64
+let MAX_WEAPON_TRAILS: i32 = 32
+
+let PI: f32 = 3.14159265358979
+let TWO_PI: f32 = 6.28318530717959
+
+// ============================================================================
+// VECTOR TYPES
+// ============================================================================
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn new(x: f32, y: f32): Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn zero(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+
+    fn set(&self, x: f32, y: f32) {
+        self.x = x
+        self.y = y
+    }
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3 {
+    fn new(x: f32, y: f32, z: f32): Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn zero(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn add(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }
+    }
+
+    fn sub(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }
+    }
+
+    fn scale(&self, s: f32): Vec3 {
+        return Vec3 { x: self.x * s, y: self.y * s, z: self.z * s }
+    }
+
+    fn length(&self): f32 {
+        return sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+    }
+
+    fn normalize(&self): Vec3 {
+        let len = self.length()
+        if len > 0.0001 {
+            return self.scale(1.0 / len)
+        }
+        return Vec3::zero()
+    }
+
+    fn lerp(&self, other: Vec3, t: f32): Vec3 {
+        return Vec3::new(
+            self.x + (other.x - self.x) * t,
+            self.y + (other.y - self.y) * t,
+            self.z + (other.z - self.z) * t
+        )
+    }
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+impl Vec4 {
+    fn new(x: f32, y: f32, z: f32, w: f32): Vec4 {
+        return Vec4 { x: x, y: y, z: z, w: w }
+    }
+
+    fn white(): Vec4 {
+        return Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 }
+    }
+
+    fn from_color(color: Color): Vec4 {
+        return Vec4 {
+            x: cast(f32, color.r) / 255.0,
+            y: cast(f32, color.g) / 255.0,
+            z: cast(f32, color.b) / 255.0,
+            w: cast(f32, color.a) / 255.0,
+        }
+    }
+}
+
+struct Color {
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+}
+
+impl Color {
+    fn new(r: i32, g: i32, b: i32, a: i32): Color {
+        return Color { r: r, g: g, b: b, a: a }
+    }
+
+    fn white(): Color {
+        return Color { r: 255, g: 255, b: 255, a: 255 }
+    }
+
+    fn lerp(&self, other: Color, t: f32): Color {
+        return Color {
+            r: cast(i32, cast(f32, self.r) + (cast(f32, other.r) - cast(f32, self.r)) * t),
+            g: cast(i32, cast(f32, self.g) + (cast(f32, other.g) - cast(f32, self.g)) * t),
+            b: cast(i32, cast(f32, self.b) + (cast(f32, other.b) - cast(f32, self.b)) * t),
+            a: cast(i32, cast(f32, self.a) + (cast(f32, other.a) - cast(f32, self.a)) * t),
+        }
+    }
+}
+
+// ============================================================================
+// SMUDGE VERTEX - Heat distortion effect vertex
+// ============================================================================
+
+struct SmudgeVertex {
+    pos: Vec3,      // World-space position
+    uv: Vec2,       // UV coordinates for background sampling
+}
+
+impl SmudgeVertex {
+    fn init(): SmudgeVertex {
+        return SmudgeVertex {
+            pos: Vec3::zero(),
+            uv: Vec2::zero(),
+        }
+    }
+}
+
+// ============================================================================
+// SMUDGE - Heat distortion/refraction effect (used for explosions, fire)
+// ============================================================================
+
+struct Smudge {
+    pos: Vec3,          // Position of smudge center
+    offset: Vec2,       // Difference in position between texture extraction and re-insertion
+    size: f32,          // Size in world space
+    opacity: f32,       // Alpha of center vertex (corners are 0)
+    vertices: [SmudgeVertex],  // 5 vertices: 4 corners + center
+    active: bool,
+}
+
+impl Smudge {
+    fn init(): Smudge {
+        let vertices: [SmudgeVertex] = []
+        for i in 0..5 {
+            vertices = vertices + [SmudgeVertex::init()]
+        }
+        return Smudge {
+            pos: Vec3::zero(),
+            offset: Vec2::zero(),
+            size: 1.0,
+            opacity: 1.0,
+            vertices: vertices,
+            active: false,
+        }
+    }
+
+    fn set_parameters(&self, pos: Vec3, offset: Vec2, size: f32, opacity: f32) {
+        self.pos = pos
+        self.offset = offset
+        self.size = size
+        self.opacity = opacity
+        self.active = true
+    }
+
+    /// Calculate view-space vertices for rendering
+    /// Creates a quad with 4 triangles meeting at center:
+    ///   0-----3
+    ///   |\   /|
+    ///   |  4  |
+    ///   |/   \|
+    ///   1-----2
+    fn calculate_vertices(&self, view_matrix: [f32], proj_matrix: [f32], tex_scale_x: f32, tex_scale_y: f32) {
+        let vertex_offsets: [Vec3] = [
+            Vec3::new(-0.5, 0.5, 0.0),   // Top-left
+            Vec3::new(-0.5, -0.5, 0.0),  // Bottom-left
+            Vec3::new(0.5, -0.5, 0.0),   // Bottom-right
+            Vec3::new(0.5, 0.5, 0.0),    // Top-right
+        ]
+
+        // Transform center to view space
+        let vs_center = transform_point(self.pos, view_matrix)
+
+        // Calculate corner vertices
+        for i in 0..4 {
+            let offset = vertex_offsets[i].scale(self.size)
+            self.vertices[i].pos = vs_center.add(offset)
+
+            // Project to screen space for UV calculation
+            let ss = project_point(self.vertices[i].pos, proj_matrix)
+            // Convert from clip space (-1,1) to UV space (0,1)
+            self.vertices[i].uv.x = (ss.x + 1.0) * tex_scale_x
+            self.vertices[i].uv.y = (1.0 - ss.y) * tex_scale_y
+
+            // Clamp UV if outside screen bounds
+            if self.vertices[i].uv.x > tex_scale_x * 2.0 || self.vertices[i].uv.x < 0.0 {
+                self.offset.x = 0.0
+            }
+            if self.vertices[i].uv.y > tex_scale_y * 2.0 || self.vertices[i].uv.y < 0.0 {
+                self.offset.y = 0.0
+            }
+        }
+
+        // Center vertex
+        self.vertices[4].pos = vs_center
+        let uv_span_x = self.vertices[3].uv.x - self.vertices[0].uv.x
+        let uv_span_y = self.vertices[1].uv.y - self.vertices[0].uv.y
+        self.vertices[4].uv.x = self.vertices[0].uv.x + uv_span_x * (0.5 + self.offset.x)
+        self.vertices[4].uv.y = self.vertices[0].uv.y + uv_span_y * (0.5 + self.offset.y)
+    }
+}
+
+// ============================================================================
+// SMUDGE SET - Collection of smudges for batch rendering
+// ============================================================================
+
+struct SmudgeSet {
+    smudges: [Smudge],
+    used_count: i32,
+    capacity: i32,
+}
+
+impl SmudgeSet {
+    fn init(capacity: i32): SmudgeSet {
+        let smudges: [Smudge] = []
+        for i in 0..capacity {
+            smudges = smudges + [Smudge::init()]
+        }
+        return SmudgeSet {
+            smudges: smudges,
+            used_count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn reset(&self) {
+        for i in 0..self.used_count {
+            self.smudges[i].active = false
+        }
+        self.used_count = 0
+    }
+
+    fn add_smudge(&self): Smudge? {
+        if self.used_count >= self.capacity {
+            return null
+        }
+        let smudge = self.smudges[self.used_count]
+        smudge.active = true
+        self.used_count = self.used_count + 1
+        return smudge
+    }
+}
+
+// ============================================================================
+// SMUDGE MANAGER - Manages all smudge rendering
+// ============================================================================
+
+enum SmudgeHardwareSupport {
+    Unknown,
+    No,
+    Yes,
+}
+
+struct SmudgeManager {
+    sets: [SmudgeSet],
+    set_count: i32,
+    max_sets: i32,
+
+    hardware_support: SmudgeHardwareSupport,
+    smudge_count_last_frame: i32,
+
+    // Index buffer for batched rendering
+    // 4 triangles per smudge, each with 3 indices
+    index_buffer: [i32],
+}
+
+impl SmudgeManager {
+    fn init(): SmudgeManager {
+        // Pre-generate index buffer
+        let index_buffer: [i32] = []
+        let vb_count = 0
+        for i in 0..SMUDGE_DRAW_SIZE {
+            // Top triangle: 0, 4, 3
+            index_buffer = index_buffer + [vb_count]
+            index_buffer = index_buffer + [vb_count + 4]
+            index_buffer = index_buffer + [vb_count + 3]
+            // Right triangle: 3, 4, 2
+            index_buffer = index_buffer + [vb_count + 3]
+            index_buffer = index_buffer + [vb_count + 4]
+            index_buffer = index_buffer + [vb_count + 2]
+            // Bottom triangle: 2, 4, 1
+            index_buffer = index_buffer + [vb_count + 2]
+            index_buffer = index_buffer + [vb_count + 4]
+            index_buffer = index_buffer + [vb_count + 1]
+            // Left triangle: 1, 4, 0
+            index_buffer = index_buffer + [vb_count + 1]
+            index_buffer = index_buffer + [vb_count + 4]
+            index_buffer = index_buffer + [vb_count + 0]
+            vb_count = vb_count + 5
+        }
+
+        return SmudgeManager {
+            sets: [],
+            set_count: 0,
+            max_sets: 16,
+            hardware_support: SmudgeHardwareSupport::Unknown,
+            smudge_count_last_frame: 0,
+            index_buffer: index_buffer,
+        }
+    }
+
+    fn add_smudge_set(&self): SmudgeSet {
+        let set = SmudgeSet::init(MAX_SMUDGES_PER_SET)
+        self.sets = self.sets + [set]
+        self.set_count = self.set_count + 1
+        return set
+    }
+
+    fn reset(&self) {
+        for i in 0..self.set_count {
+            self.sets[i].reset()
+        }
+        self.set_count = 0
+        self.sets = []
+    }
+
+    fn get_hardware_support(&self): bool {
+        return self.hardware_support == SmudgeHardwareSupport::Yes
+    }
+
+    fn set_hardware_support(&self, supported: bool) {
+        if supported {
+            self.hardware_support = SmudgeHardwareSupport::Yes
+        } else {
+            self.hardware_support = SmudgeHardwareSupport::No
+        }
+    }
+
+    /// Generate render data for all visible smudges
+    fn render(&self, view_matrix: [f32], proj_matrix: [f32], screen_width: i32, screen_height: i32): SmudgeRenderData {
+        let vertices: [SmudgeRenderVertex] = []
+        let total_count = 0
+
+        let tex_scale_x = 0.5
+        let tex_scale_y = 0.5
+
+        for set_idx in 0..self.set_count {
+            let set = self.sets[set_idx]
+            for smudge_idx in 0..set.used_count {
+                let smudge = set.smudges[smudge_idx]
+                if !smudge.active {
+                    continue
+                }
+
+                // Calculate vertices for this smudge
+                smudge.calculate_vertices(view_matrix, proj_matrix, tex_scale_x, tex_scale_y)
+
+                // Convert to render vertices
+                let center_alpha = cast(i32, smudge.opacity * 255.0)
+                let diffuse_corner = 0x00FFEEDD  // Corners are transparent
+                let diffuse_center = (center_alpha << 24) | 0x00FFEEDD
+
+                for v in 0..5 {
+                    let rv = SmudgeRenderVertex {
+                        position: smudge.vertices[v].pos,
+                        uv: smudge.vertices[v].uv,
+                        diffuse: if v == 4 { diffuse_center } else { diffuse_corner },
+                    }
+                    vertices = vertices + [rv]
+                }
+
+                total_count = total_count + 1
+            }
+        }
+
+        self.smudge_count_last_frame = total_count
+
+        return SmudgeRenderData {
+            vertices: vertices,
+            indices: self.index_buffer,
+            smudge_count: total_count,
+        }
+    }
+}
+
+struct SmudgeRenderVertex {
+    position: Vec3,
+    uv: Vec2,
+    diffuse: i32,
+}
+
+struct SmudgeRenderData {
+    vertices: [SmudgeRenderVertex],
+    indices: [i32],
+    smudge_count: i32,
+}
+
+// ============================================================================
+// LASER DRAW - Segmented line beam rendering
+// ============================================================================
+
+struct LaserDrawConfig {
+    inner_color: Color,
+    outer_color: Color,
+    inner_beam_width: f32,
+    outer_beam_width: f32,
+    scroll_rate: f32,
+    tile: bool,
+    num_beams: i32,
+    max_intensity_frames: i32,
+    fade_frames: i32,
+    texture_name: str,
+    segments: i32,
+    arc_height: f32,
+    segment_overlap_ratio: f32,
+    tiling_scalar: f32,
+}
+
+impl LaserDrawConfig {
+    fn default(): LaserDrawConfig {
+        return LaserDrawConfig {
+            inner_color: Color::new(255, 255, 255, 255),
+            outer_color: Color::new(255, 128, 128, 128),
+            inner_beam_width: 0.5,
+            outer_beam_width: 1.0,
+            scroll_rate: 0.0,
+            tile: false,
+            num_beams: 1,
+            max_intensity_frames: 0,
+            fade_frames: 0,
+            texture_name: "",
+            segments: 1,
+            arc_height: 0.0,
+            segment_overlap_ratio: 0.0,
+            tiling_scalar: 1.0,
+        }
+    }
+
+    fn particle_cannon(): LaserDrawConfig {
+        return LaserDrawConfig {
+            inner_color: Color::new(255, 200, 100, 255),
+            outer_color: Color::new(255, 100, 50, 128),
+            inner_beam_width: 2.0,
+            outer_beam_width: 6.0,
+            scroll_rate: 0.5,
+            tile: true,
+            num_beams: 3,
+            max_intensity_frames: 30,
+            fade_frames: 15,
+            texture_name: "FXLaser01",
+            segments: 8,
+            arc_height: 50.0,
+            segment_overlap_ratio: 0.05,
+            tiling_scalar: 1.5,
+        }
+    }
+
+    fn point_defense(): LaserDrawConfig {
+        return LaserDrawConfig {
+            inner_color: Color::new(255, 50, 50, 255),
+            outer_color: Color::new(255, 0, 0, 128),
+            inner_beam_width: 0.3,
+            outer_beam_width: 0.8,
+            scroll_rate: 0.0,
+            tile: false,
+            num_beams: 2,
+            max_intensity_frames: 5,
+            fade_frames: 3,
+            texture_name: "FXLaser02",
+            segments: 1,
+            arc_height: 0.0,
+            segment_overlap_ratio: 0.0,
+            tiling_scalar: 1.0,
+        }
+    }
+}
+
+struct LaserSegment {
+    start: Vec3,
+    end: Vec3,
+    width: f32,
+    color: Vec4,
+    uv_offset: f32,
+}
+
+struct LaserBeam {
+    config: LaserDrawConfig,
+    start_pos: Vec3,
+    end_pos: Vec3,
+    width_scale: f32,
+    intensity: f32,
+    frame_count: i32,
+    is_dirty: bool,
+    is_visible: bool,
+
+    // Generated segments
+    segments: [LaserSegment],
+    texture_aspect_ratio: f32,
+}
+
+impl LaserBeam {
+    fn init(config: LaserDrawConfig): LaserBeam {
+        return LaserBeam {
+            config: config,
+            start_pos: Vec3::zero(),
+            end_pos: Vec3::new(1.0, 0.0, 0.0),
+            width_scale: 1.0,
+            intensity: 1.0,
+            frame_count: 0,
+            is_dirty: true,
+            is_visible: false,
+            segments: [],
+            texture_aspect_ratio: 1.0,
+        }
+    }
+
+    fn set_position(&self, start: Vec3, end: Vec3) {
+        self.start_pos = start
+        self.end_pos = end
+        self.is_dirty = true
+    }
+
+    fn set_width_scale(&self, scale: f32) {
+        self.width_scale = scale
+        self.is_dirty = true
+    }
+
+    fn show(&self) {
+        self.is_visible = true
+        self.is_dirty = true
+    }
+
+    fn hide(&self) {
+        self.is_visible = false
+    }
+
+    /// Update laser beam - regenerates segments if dirty
+    fn update(&self) {
+        if !self.is_dirty || !self.is_visible {
+            return
+        }
+        self.is_dirty = false
+
+        self.segments = []
+
+        let config = self.config
+        let line_vector = self.end_pos.sub(self.start_pos)
+        let line_length = line_vector.length()
+        let line_middle = self.start_pos.lerp(self.end_pos, 0.5)
+        let half_length = line_length * 0.5
+
+        // Get color components
+        let inner_color = Vec4::from_color(config.inner_color)
+        let outer_color = Vec4::from_color(config.outer_color)
+
+        // Generate segments
+        for segment_idx in 0..config.segments {
+            let start_ratio = cast(f32, segment_idx) / cast(f32, config.segments)
+            let end_ratio = cast(f32, segment_idx + 1) / cast(f32, config.segments)
+
+            // Apply segment overlap
+            if segment_idx > 0 {
+                start_ratio = start_ratio - config.segment_overlap_ratio
+            }
+            if segment_idx < config.segments - 1 {
+                end_ratio = end_ratio + config.segment_overlap_ratio
+            }
+
+            // Calculate segment positions
+            let segment_start = self.start_pos.lerp(self.end_pos, start_ratio)
+            let segment_end = self.start_pos.lerp(self.end_pos, end_ratio)
+
+            // Apply arc height if configured
+            if config.arc_height > 0.0 && config.segments > 1 {
+                // Use cosine wave for arc
+                let dist_start = segment_start.sub(line_middle).length()
+                let dist_end = segment_end.sub(line_middle).length()
+
+                let radians_start = dist_start / half_length * PI * 0.5
+                let radians_end = dist_end / half_length * PI * 0.5
+
+                let height_start = cos(radians_start) * config.arc_height
+                let height_end = cos(radians_end) * config.arc_height
+
+                segment_start.z = segment_start.z + height_start
+                segment_end.z = segment_end.z + height_end
+            }
+
+            // Generate beams for this segment
+            for beam_idx in 0..config.num_beams {
+                let scale = if config.num_beams == 1 {
+                    0.0
+                } else {
+                    cast(f32, beam_idx) / cast(f32, config.num_beams - 1)
+                }
+
+                let width = config.inner_beam_width + scale * (config.outer_beam_width - config.inner_beam_width)
+                width = width * self.width_scale
+
+                let color = Vec4::new(
+                    inner_color.x + scale * (outer_color.x - inner_color.x),
+                    inner_color.y + scale * (outer_color.y - inner_color.y),
+                    inner_color.z + scale * (outer_color.z - inner_color.z),
+                    inner_color.w + scale * (outer_color.w - inner_color.w)
+                )
+
+                // Calculate tiling factor
+                let segment_length = segment_end.sub(segment_start).length()
+                let tile_factor = if config.tile {
+                    segment_length / width * self.texture_aspect_ratio * config.tiling_scalar
+                } else {
+                    1.0
+                }
+
+                let seg = LaserSegment {
+                    start: segment_start,
+                    end: segment_end,
+                    width: width,
+                    color: color,
+                    uv_offset: tile_factor,
+                }
+                self.segments = self.segments + [seg]
+            }
+        }
+
+        self.frame_count = self.frame_count + 1
+    }
+
+    /// Generate render data for the laser
+    fn render(&self, camera_pos: Vec3): [LaserVertex] {
+        if !self.is_visible {
+            return []
+        }
+
+        let vertices: [LaserVertex] = []
+
+        for seg in self.segments {
+            // Calculate perpendicular vector for quad width
+            let dir = seg.end.sub(seg.start).normalize()
+            let to_camera = camera_pos.sub(seg.start).normalize()
+            let perp = cross(dir, to_camera).normalize()
+
+            let half_width = seg.width * 0.5
+            let perp_offset = perp.scale(half_width)
+
+            // Generate quad vertices (2 triangles)
+            // Triangle 1: bottom-left, top-left, top-right
+            vertices = vertices + [LaserVertex {
+                position: seg.start.sub(perp_offset),
+                uv: Vec2::new(0.0, 0.0),
+                color: seg.color,
+            }]
+            vertices = vertices + [LaserVertex {
+                position: seg.end.sub(perp_offset),
+                uv: Vec2::new(0.0, seg.uv_offset),
+                color: seg.color,
+            }]
+            vertices = vertices + [LaserVertex {
+                position: seg.end.add(perp_offset),
+                uv: Vec2::new(1.0, seg.uv_offset),
+                color: seg.color,
+            }]
+
+            // Triangle 2: bottom-left, top-right, bottom-right
+            vertices = vertices + [LaserVertex {
+                position: seg.start.sub(perp_offset),
+                uv: Vec2::new(0.0, 0.0),
+                color: seg.color,
+            }]
+            vertices = vertices + [LaserVertex {
+                position: seg.end.add(perp_offset),
+                uv: Vec2::new(1.0, seg.uv_offset),
+                color: seg.color,
+            }]
+            vertices = vertices + [LaserVertex {
+                position: seg.start.add(perp_offset),
+                uv: Vec2::new(1.0, 0.0),
+                color: seg.color,
+            }]
+        }
+
+        return vertices
+    }
+}
+
+struct LaserVertex {
+    position: Vec3,
+    uv: Vec2,
+    color: Vec4,
+}
+
+// ============================================================================
+// DECAL SYSTEM - Ground marks (scorch, blood, craters)
+// ============================================================================
+
+enum DecalType {
+    Scorch,          // Explosion burn marks
+    Crater,          // Impact craters
+    Blood,           // Infantry blood splatter
+    TreadMark,       // Vehicle tracks
+    BuildingFootprint,  // Building placement area
+}
+
+struct Decal {
+    position: Vec3,
+    rotation: f32,
+    scale: Vec2,
+    decal_type: DecalType,
+    texture_id: i32,
+    color: Vec4,
+    alpha: f32,
+    lifetime: f32,
+    max_lifetime: f32,
+    is_active: bool,
+    is_permanent: bool,
+}
+
+impl Decal {
+    fn init(): Decal {
+        return Decal {
+            position: Vec3::zero(),
+            rotation: 0.0,
+            scale: Vec2::new(1.0, 1.0),
+            decal_type: DecalType::Scorch,
+            texture_id: 0,
+            color: Vec4::white(),
+            alpha: 1.0,
+            lifetime: 0.0,
+            max_lifetime: 30.0,
+            is_active: false,
+            is_permanent: false,
+        }
+    }
+
+    fn spawn_scorch(&self, position: Vec3, radius: f32, rotation: f32) {
+        self.position = position
+        self.rotation = rotation
+        self.scale = Vec2::new(radius * 2.0, radius * 2.0)
+        self.decal_type = DecalType::Scorch
+        self.color = Vec4::new(0.1, 0.1, 0.1, 1.0)
+        self.alpha = 1.0
+        self.lifetime = 0.0
+        self.max_lifetime = 60.0  // 60 seconds
+        self.is_active = true
+        self.is_permanent = false
+    }
+
+    fn spawn_crater(&self, position: Vec3, radius: f32) {
+        self.position = position
+        self.rotation = random_float() * TWO_PI
+        self.scale = Vec2::new(radius * 2.5, radius * 2.5)
+        self.decal_type = DecalType::Crater
+        self.color = Vec4::new(0.3, 0.25, 0.2, 1.0)
+        self.alpha = 1.0
+        self.lifetime = 0.0
+        self.max_lifetime = 120.0  // 2 minutes
+        self.is_active = true
+        self.is_permanent = false
+    }
+
+    fn spawn_blood(&self, position: Vec3) {
+        self.position = position
+        self.rotation = random_float() * TWO_PI
+        self.scale = Vec2::new(1.0 + random_float() * 0.5, 1.0 + random_float() * 0.5)
+        self.decal_type = DecalType::Blood
+        self.color = Vec4::new(0.5, 0.0, 0.0, 1.0)
+        self.alpha = 1.0
+        self.lifetime = 0.0
+        self.max_lifetime = 30.0
+        self.is_active = true
+        self.is_permanent = false
+    }
+
+    fn update(&self, delta_time: f32) {
+        if !self.is_active || self.is_permanent {
+            return
+        }
+
+        self.lifetime = self.lifetime + delta_time
+
+        // Fade out in last 20% of lifetime
+        let fade_start = self.max_lifetime * 0.8
+        if self.lifetime > fade_start {
+            let fade_progress = (self.lifetime - fade_start) / (self.max_lifetime - fade_start)
+            self.alpha = 1.0 - fade_progress
+        }
+
+        if self.lifetime >= self.max_lifetime {
+            self.is_active = false
+        }
+    }
+}
+
+struct DecalManager {
+    decals: [Decal],
+    active_count: i32,
+    capacity: i32,
+}
+
+impl DecalManager {
+    fn init(capacity: i32): DecalManager {
+        let decals: [Decal] = []
+        for i in 0..capacity {
+            decals = decals + [Decal::init()]
+        }
+        return DecalManager {
+            decals: decals,
+            active_count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn spawn_scorch(&self, position: Vec3, radius: f32): Decal? {
+        let decal = self.find_free_slot()
+        if decal != null {
+            decal.spawn_scorch(position, radius, random_float() * TWO_PI)
+            self.active_count = self.active_count + 1
+        }
+        return decal
+    }
+
+    fn spawn_crater(&self, position: Vec3, radius: f32): Decal? {
+        let decal = self.find_free_slot()
+        if decal != null {
+            decal.spawn_crater(position, radius)
+            self.active_count = self.active_count + 1
+        }
+        return decal
+    }
+
+    fn spawn_blood(&self, position: Vec3): Decal? {
+        let decal = self.find_free_slot()
+        if decal != null {
+            decal.spawn_blood(position)
+            self.active_count = self.active_count + 1
+        }
+        return decal
+    }
+
+    fn find_free_slot(&self): Decal? {
+        for i in 0..self.capacity {
+            if !self.decals[i].is_active {
+                return self.decals[i]
+            }
+        }
+        // If all slots used, recycle oldest non-permanent
+        for i in 0..self.capacity {
+            if !self.decals[i].is_permanent {
+                self.decals[i].is_active = false
+                return self.decals[i]
+            }
+        }
+        return null
+    }
+
+    fn update(&self, delta_time: f32) {
+        self.active_count = 0
+        for i in 0..self.capacity {
+            if self.decals[i].is_active {
+                self.decals[i].update(delta_time)
+                if self.decals[i].is_active {
+                    self.active_count = self.active_count + 1
+                }
+            }
+        }
+    }
+
+    fn render(&self): [DecalVertex] {
+        let vertices: [DecalVertex] = []
+
+        for i in 0..self.capacity {
+            let d = self.decals[i]
+            if !d.is_active {
+                continue
+            }
+
+            // Generate rotated quad
+            let cos_r = cos(d.rotation)
+            let sin_r = sin(d.rotation)
+            let hw = d.scale.x * 0.5
+            let hh = d.scale.y * 0.5
+
+            let corners: [Vec2] = [
+                Vec2::new(-hw, -hh),
+                Vec2::new(hw, -hh),
+                Vec2::new(hw, hh),
+                Vec2::new(-hw, hh),
+            ]
+
+            let world_corners: [Vec3] = []
+            for c in corners {
+                let rx = c.x * cos_r - c.y * sin_r
+                let ry = c.x * sin_r + c.y * cos_r
+                world_corners = world_corners + [Vec3::new(
+                    d.position.x + rx,
+                    d.position.y + ry,
+                    d.position.z + 0.1  // Slight offset above ground
+                )]
+            }
+
+            let color = Vec4::new(d.color.x, d.color.y, d.color.z, d.color.w * d.alpha)
+
+            // Triangle 1
+            vertices = vertices + [DecalVertex { position: world_corners[0], uv: Vec2::new(0.0, 0.0), color: color }]
+            vertices = vertices + [DecalVertex { position: world_corners[1], uv: Vec2::new(1.0, 0.0), color: color }]
+            vertices = vertices + [DecalVertex { position: world_corners[2], uv: Vec2::new(1.0, 1.0), color: color }]
+
+            // Triangle 2
+            vertices = vertices + [DecalVertex { position: world_corners[0], uv: Vec2::new(0.0, 0.0), color: color }]
+            vertices = vertices + [DecalVertex { position: world_corners[2], uv: Vec2::new(1.0, 1.0), color: color }]
+            vertices = vertices + [DecalVertex { position: world_corners[3], uv: Vec2::new(0.0, 1.0), color: color }]
+        }
+
+        return vertices
+    }
+}
+
+struct DecalVertex {
+    position: Vec3,
+    uv: Vec2,
+    color: Vec4,
+}
+
+// ============================================================================
+// MUZZLE FLASH - Weapon firing effects
+// ============================================================================
+
+struct MuzzleFlash {
+    position: Vec3,
+    direction: Vec3,
+    size: f32,
+    intensity: f32,
+    lifetime: f32,
+    max_lifetime: f32,
+    is_active: bool,
+    flash_type: i32,  // 0=small, 1=medium, 2=large
+}
+
+impl MuzzleFlash {
+    fn init(): MuzzleFlash {
+        return MuzzleFlash {
+            position: Vec3::zero(),
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            size: 1.0,
+            intensity: 1.0,
+            lifetime: 0.0,
+            max_lifetime: 0.1,
+            is_active: false,
+            flash_type: 0,
+        }
+    }
+
+    fn spawn(&self, position: Vec3, direction: Vec3, flash_type: i32) {
+        self.position = position
+        self.direction = direction.normalize()
+        self.flash_type = flash_type
+        self.lifetime = 0.0
+        self.is_active = true
+
+        // Set parameters based on type
+        if flash_type == 0 {
+            // Small (rifle, pistol)
+            self.size = 0.5
+            self.intensity = 1.0
+            self.max_lifetime = 0.05
+        } else if flash_type == 1 {
+            // Medium (tank cannon)
+            self.size = 2.0
+            self.intensity = 1.5
+            self.max_lifetime = 0.1
+        } else {
+            // Large (artillery)
+            self.size = 4.0
+            self.intensity = 2.0
+            self.max_lifetime = 0.15
+        }
+    }
+
+    fn update(&self, delta_time: f32) {
+        if !self.is_active {
+            return
+        }
+
+        self.lifetime = self.lifetime + delta_time
+
+        // Rapid falloff
+        let t = self.lifetime / self.max_lifetime
+        self.intensity = (1.0 - t) * (1.0 - t)  // Quadratic falloff
+
+        if self.lifetime >= self.max_lifetime {
+            self.is_active = false
+        }
+    }
+}
+
+struct MuzzleFlashManager {
+    flashes: [MuzzleFlash],
+    active_count: i32,
+    capacity: i32,
+}
+
+impl MuzzleFlashManager {
+    fn init(): MuzzleFlashManager {
+        let flashes: [MuzzleFlash] = []
+        for i in 0..MAX_MUZZLE_FLASHES {
+            flashes = flashes + [MuzzleFlash::init()]
+        }
+        return MuzzleFlashManager {
+            flashes: flashes,
+            active_count: 0,
+            capacity: MAX_MUZZLE_FLASHES,
+        }
+    }
+
+    fn spawn(&self, position: Vec3, direction: Vec3, flash_type: i32): MuzzleFlash? {
+        for i in 0..self.capacity {
+            if !self.flashes[i].is_active {
+                self.flashes[i].spawn(position, direction, flash_type)
+                return self.flashes[i]
+            }
+        }
+        return null
+    }
+
+    fn update(&self, delta_time: f32) {
+        self.active_count = 0
+        for i in 0..self.capacity {
+            self.flashes[i].update(delta_time)
+            if self.flashes[i].is_active {
+                self.active_count = self.active_count + 1
+            }
+        }
+    }
+
+    fn render(&self, camera_pos: Vec3): [MuzzleFlashVertex] {
+        let vertices: [MuzzleFlashVertex] = []
+
+        for i in 0..self.capacity {
+            let f = self.flashes[i]
+            if !f.is_active {
+                continue
+            }
+
+            // Billboard quad facing camera
+            let to_camera = camera_pos.sub(f.position).normalize()
+            let right = cross(f.direction, to_camera).normalize()
+            let up = cross(to_camera, right).normalize()
+
+            let half_size = f.size * 0.5
+            let color = Vec4::new(1.0, 0.9, 0.5, f.intensity)
+
+            let corners: [Vec3] = [
+                f.position.add(right.scale(-half_size)).add(up.scale(-half_size)),
+                f.position.add(right.scale(half_size)).add(up.scale(-half_size)),
+                f.position.add(right.scale(half_size)).add(up.scale(half_size)),
+                f.position.add(right.scale(-half_size)).add(up.scale(half_size)),
+            ]
+
+            // Triangle 1
+            vertices = vertices + [MuzzleFlashVertex { position: corners[0], uv: Vec2::new(0.0, 0.0), color: color }]
+            vertices = vertices + [MuzzleFlashVertex { position: corners[1], uv: Vec2::new(1.0, 0.0), color: color }]
+            vertices = vertices + [MuzzleFlashVertex { position: corners[2], uv: Vec2::new(1.0, 1.0), color: color }]
+
+            // Triangle 2
+            vertices = vertices + [MuzzleFlashVertex { position: corners[0], uv: Vec2::new(0.0, 0.0), color: color }]
+            vertices = vertices + [MuzzleFlashVertex { position: corners[2], uv: Vec2::new(1.0, 1.0), color: color }]
+            vertices = vertices + [MuzzleFlashVertex { position: corners[3], uv: Vec2::new(0.0, 1.0), color: color }]
+        }
+
+        return vertices
+    }
+}
+
+struct MuzzleFlashVertex {
+    position: Vec3,
+    uv: Vec2,
+    color: Vec4,
+}
+
+// ============================================================================
+// WEAPON TRAIL - Tracer and missile trails
+// ============================================================================
+
+struct WeaponTrailPoint {
+    position: Vec3,
+    time_added: f32,
+    width: f32,
+}
+
+struct WeaponTrail {
+    points: [WeaponTrailPoint],
+    point_count: i32,
+    max_points: i32,
+    fade_time: f32,
+    color: Vec4,
+    is_active: bool,
+    texture_id: i32,
+}
+
+impl WeaponTrail {
+    fn init(max_points: i32): WeaponTrail {
+        let points: [WeaponTrailPoint] = []
+        for i in 0..max_points {
+            points = points + [WeaponTrailPoint { position: Vec3::zero(), time_added: 0.0, width: 1.0 }]
+        }
+        return WeaponTrail {
+            points: points,
+            point_count: 0,
+            max_points: max_points,
+            fade_time: 0.5,
+            color: Vec4::new(1.0, 0.8, 0.3, 1.0),
+            is_active: false,
+            texture_id: 0,
+        }
+    }
+
+    fn start(&self, position: Vec3, width: f32, color: Vec4) {
+        self.point_count = 0
+        self.color = color
+        self.is_active = true
+        self.add_point(position, width)
+    }
+
+    fn add_point(&self, position: Vec3, width: f32) {
+        if self.point_count >= self.max_points {
+            // Shift points down
+            for i in 0..(self.max_points - 1) {
+                self.points[i] = self.points[i + 1]
+            }
+            self.point_count = self.max_points - 1
+        }
+
+        self.points[self.point_count].position = position
+        self.points[self.point_count].time_added = 0.0
+        self.points[self.point_count].width = width
+        self.point_count = self.point_count + 1
+    }
+
+    fn update(&self, delta_time: f32) {
+        if !self.is_active {
+            return
+        }
+
+        // Age all points
+        for i in 0..self.point_count {
+            self.points[i].time_added = self.points[i].time_added + delta_time
+        }
+
+        // Remove old points
+        let new_count = 0
+        for i in 0..self.point_count {
+            if self.points[i].time_added < self.fade_time {
+                if new_count != i {
+                    self.points[new_count] = self.points[i]
+                }
+                new_count = new_count + 1
+            }
+        }
+        self.point_count = new_count
+
+        if self.point_count == 0 {
+            self.is_active = false
+        }
+    }
+
+    fn stop(&self) {
+        self.is_active = false
+    }
+}
+
+struct WeaponTrailManager {
+    trails: [WeaponTrail],
+    active_count: i32,
+    capacity: i32,
+}
+
+impl WeaponTrailManager {
+    fn init(): WeaponTrailManager {
+        let trails: [WeaponTrail] = []
+        for i in 0..MAX_WEAPON_TRAILS {
+            trails = trails + [WeaponTrail::init(32)]
+        }
+        return WeaponTrailManager {
+            trails: trails,
+            active_count: 0,
+            capacity: MAX_WEAPON_TRAILS,
+        }
+    }
+
+    fn create_trail(&self): WeaponTrail? {
+        for i in 0..self.capacity {
+            if !self.trails[i].is_active {
+                return self.trails[i]
+            }
+        }
+        return null
+    }
+
+    fn update(&self, delta_time: f32) {
+        self.active_count = 0
+        for i in 0..self.capacity {
+            self.trails[i].update(delta_time)
+            if self.trails[i].is_active {
+                self.active_count = self.active_count + 1
+            }
+        }
+    }
+
+    fn render(&self, camera_pos: Vec3): [WeaponTrailVertex] {
+        let vertices: [WeaponTrailVertex] = []
+
+        for i in 0..self.capacity {
+            let trail = self.trails[i]
+            if !trail.is_active || trail.point_count < 2 {
+                continue
+            }
+
+            for j in 0..(trail.point_count - 1) {
+                let p0 = trail.points[j]
+                let p1 = trail.points[j + 1]
+
+                // Calculate alpha based on age
+                let alpha0 = 1.0 - (p0.time_added / trail.fade_time)
+                let alpha1 = 1.0 - (p1.time_added / trail.fade_time)
+
+                // Calculate perpendicular
+                let dir = p1.position.sub(p0.position).normalize()
+                let to_camera = camera_pos.sub(p0.position).normalize()
+                let perp = cross(dir, to_camera).normalize()
+
+                let half_w0 = p0.width * 0.5 * alpha0
+                let half_w1 = p1.width * 0.5 * alpha1
+
+                let color0 = Vec4::new(trail.color.x, trail.color.y, trail.color.z, trail.color.w * alpha0)
+                let color1 = Vec4::new(trail.color.x, trail.color.y, trail.color.z, trail.color.w * alpha1)
+
+                // Generate quad
+                let c0 = p0.position.add(perp.scale(half_w0))
+                let c1 = p0.position.sub(perp.scale(half_w0))
+                let c2 = p1.position.sub(perp.scale(half_w1))
+                let c3 = p1.position.add(perp.scale(half_w1))
+
+                let v = cast(f32, j) / cast(f32, trail.point_count)
+                let v_next = cast(f32, j + 1) / cast(f32, trail.point_count)
+
+                // Triangle 1
+                vertices = vertices + [WeaponTrailVertex { position: c0, uv: Vec2::new(0.0, v), color: color0 }]
+                vertices = vertices + [WeaponTrailVertex { position: c1, uv: Vec2::new(1.0, v), color: color0 }]
+                vertices = vertices + [WeaponTrailVertex { position: c2, uv: Vec2::new(1.0, v_next), color: color1 }]
+
+                // Triangle 2
+                vertices = vertices + [WeaponTrailVertex { position: c0, uv: Vec2::new(0.0, v), color: color0 }]
+                vertices = vertices + [WeaponTrailVertex { position: c2, uv: Vec2::new(1.0, v_next), color: color1 }]
+                vertices = vertices + [WeaponTrailVertex { position: c3, uv: Vec2::new(0.0, v_next), color: color1 }]
+            }
+        }
+
+        return vertices
+    }
+}
+
+struct WeaponTrailVertex {
+    position: Vec3,
+    uv: Vec2,
+    color: Vec4,
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32): f32 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin(x: f32): f32 {
+    let x_norm = x
+    while x_norm > PI {
+        x_norm = x_norm - TWO_PI
+    }
+    while x_norm < -PI {
+        x_norm = x_norm + TWO_PI
+    }
+    let x2 = x_norm * x_norm
+    let x3 = x2 * x_norm
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    return x_norm - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0
+}
+
+fn cos(x: f32): f32 {
+    return sin(x + PI / 2.0)
+}
+
+fn cross(a: Vec3, b: Vec3): Vec3 {
+    return Vec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    )
+}
+
+fn transform_point(p: Vec3, matrix: [f32]): Vec3 {
+    // Simplified 4x4 matrix transform
+    // matrix is row-major [m00, m01, m02, m03, m10, ...]
+    if len(matrix) < 16 {
+        return p
+    }
+    return Vec3::new(
+        matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
+        matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
+        matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11]
+    )
+}
+
+fn project_point(p: Vec3, proj_matrix: [f32]): Vec3 {
+    if len(proj_matrix) < 16 {
+        return p
+    }
+    let w = proj_matrix[12] * p.x + proj_matrix[13] * p.y + proj_matrix[14] * p.z + proj_matrix[15]
+    if abs(w) < 0.0001 {
+        w = 0.0001
+    }
+    return Vec3::new(
+        (proj_matrix[0] * p.x + proj_matrix[1] * p.y + proj_matrix[2] * p.z + proj_matrix[3]) / w,
+        (proj_matrix[4] * p.x + proj_matrix[5] * p.y + proj_matrix[6] * p.z + proj_matrix[7]) / w,
+        (proj_matrix[8] * p.x + proj_matrix[9] * p.y + proj_matrix[10] * p.z + proj_matrix[11]) / w
+    )
+}
+
+fn abs(x: f32): f32 {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+let g_random_seed: i32 = 12345
+
+fn random_float(): f32 {
+    g_random_seed = g_random_seed * 1103515245 + 12345
+    let val = g_random_seed
+    if val < 0 {
+        val = -val
+    }
+    return cast(f32, val % 10000) / 10000.0
+}
+
+fn len<T>(arr: [T]): i32 {
+    return 0  // Placeholder
+}
+
+// ============================================================================
+// GLOBAL EFFECTS MANAGER
+// ============================================================================
+
+struct EffectsManager {
+    smudge_manager: SmudgeManager,
+    decal_manager: DecalManager,
+    muzzle_flash_manager: MuzzleFlashManager,
+    weapon_trail_manager: WeaponTrailManager,
+    lasers: [LaserBeam],
+    laser_count: i32,
+}
+
+impl EffectsManager {
+    fn init(): EffectsManager {
+        return EffectsManager {
+            smudge_manager: SmudgeManager::init(),
+            decal_manager: DecalManager::init(MAX_DECALS),
+            muzzle_flash_manager: MuzzleFlashManager::init(),
+            weapon_trail_manager: WeaponTrailManager::init(),
+            lasers: [],
+            laser_count: 0,
+        }
+    }
+
+    fn create_laser(&self, config: LaserDrawConfig): LaserBeam {
+        let laser = LaserBeam::init(config)
+        self.lasers = self.lasers + [laser]
+        self.laser_count = self.laser_count + 1
+        return laser
+    }
+
+    fn update(&self, delta_time: f32) {
+        self.decal_manager.update(delta_time)
+        self.muzzle_flash_manager.update(delta_time)
+        self.weapon_trail_manager.update(delta_time)
+
+        for i in 0..self.laser_count {
+            self.lasers[i].update()
+        }
+    }
+
+    fn reset(&self) {
+        self.smudge_manager.reset()
+    }
+}
+
+let g_effects_manager: EffectsManager? = null
+
+fn init_effects_manager(): EffectsManager {
+    let manager = EffectsManager::init()
+    g_effects_manager = manager
+    return manager
+}
+
+fn get_effects_manager(): EffectsManager? {
+    return g_effects_manager
+}
+
+fn shutdown_effects_manager() {
+    g_effects_manager = null
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_effects_renderer() {
+    print("Testing Effects Renderer...")
+
+    let manager = init_effects_manager()
+    print("Effects manager initialized")
+
+    // Test smudges
+    let smudge_set = manager.smudge_manager.add_smudge_set()
+    let smudge = smudge_set.add_smudge()
+    if smudge != null {
+        smudge.set_parameters(
+            Vec3::new(10.0, 5.0, 0.0),
+            Vec2::new(0.05, 0.02),
+            3.0,
+            0.8
+        )
+        print("Smudge created at (10, 5)")
+    }
+
+    // Test decals
+    manager.decal_manager.spawn_scorch(Vec3::new(20.0, 10.0, 0.0), 5.0)
+    manager.decal_manager.spawn_crater(Vec3::new(30.0, 10.0, 0.0), 8.0)
+    manager.decal_manager.spawn_blood(Vec3::new(15.0, 5.0, 0.0))
+    print("Decals spawned: " + str(manager.decal_manager.active_count))
+
+    // Test laser
+    let laser = manager.create_laser(LaserDrawConfig::particle_cannon())
+    laser.set_position(Vec3::new(0.0, 0.0, 10.0), Vec3::new(100.0, 50.0, 10.0))
+    laser.show()
+    laser.update()
+    print("Laser created with " + str(len(laser.segments)) + " segments")
+
+    // Test muzzle flash
+    manager.muzzle_flash_manager.spawn(
+        Vec3::new(5.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        1  // Medium
+    )
+    print("Muzzle flash spawned")
+
+    // Test weapon trail
+    let trail = manager.weapon_trail_manager.create_trail()
+    if trail != null {
+        trail.start(Vec3::new(0.0, 0.0, 5.0), 0.5, Vec4::new(1.0, 0.5, 0.0, 1.0))
+        trail.add_point(Vec3::new(10.0, 5.0, 5.0), 0.4)
+        trail.add_point(Vec3::new(20.0, 10.0, 5.0), 0.3)
+        trail.add_point(Vec3::new(30.0, 15.0, 5.0), 0.2)
+        print("Weapon trail created with " + str(trail.point_count) + " points")
+    }
+
+    // Simulate update
+    for frame in 0..10 {
+        manager.update(0.016)
+    }
+    print("After 10 frames: " + str(manager.decal_manager.active_count) + " decals active")
+
+    // Test render output
+    let camera_pos = Vec3::new(50.0, 50.0, 30.0)
+    let laser_verts = laser.render(camera_pos)
+    print("Laser vertex count: " + str(len(laser_verts)))
+
+    let flash_verts = manager.muzzle_flash_manager.render(camera_pos)
+    print("Muzzle flash vertex count: " + str(len(flash_verts)))
+
+    let trail_verts = manager.weapon_trail_manager.render(camera_pos)
+    print("Weapon trail vertex count: " + str(len(trail_verts)))
+
+    shutdown_effects_manager()
+    print("Effects Renderer tests complete!")
+}

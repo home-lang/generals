@@ -1,0 +1,1325 @@
+// Shadow System - Real-time shadows for C&C Generals
+// Based on W3DShadow, W3DProjectedShadow, W3DVolumetricShadow from original Westwood code
+// Implements volumetric shadows, projected shadows, and decal/blob shadows
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+let MAX_SHADOW_LIGHTS: i32 = 1
+let MAX_SHADOW_CASTER_MESHES: i32 = 160
+let SUN_DISTANCE_FROM_GROUND: f32 = 10000.0
+let DEFAULT_RENDER_TARGET_WIDTH: i32 = 512
+let DEFAULT_RENDER_TARGET_HEIGHT: i32 = 512
+let SHADOW_VERTEX_SIZE: i32 = 32768
+let SHADOW_INDEX_SIZE: i32 = 65536
+let MAX_SILHOUETTE_EDGES: i32 = 4096
+let MAX_PROJECTED_SHADOWS: i32 = 256
+let MAX_VOLUMETRIC_SHADOWS: i32 = 128
+
+let PI: f32 = 3.14159265358979
+
+// ============================================================================
+// VECTOR & MATRIX TYPES
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3 {
+    fn new(x: f32, y: f32, z: f32): Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn zero(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn add(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }
+    }
+
+    fn sub(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }
+    }
+
+    fn scale(&self, s: f32): Vec3 {
+        return Vec3 { x: self.x * s, y: self.y * s, z: self.z * s }
+    }
+
+    fn length(&self): f32 {
+        return sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+    }
+
+    fn normalize(&self): Vec3 {
+        let len = self.length()
+        if len > 0.0001 {
+            return self.scale(1.0 / len)
+        }
+        return Vec3::zero()
+    }
+
+    fn dot(&self, other: Vec3): f32 {
+        return self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(&self, other: Vec3): Vec3 {
+        return Vec3::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x
+        )
+    }
+
+    fn negate(&self): Vec3 {
+        return Vec3::new(-self.x, -self.y, -self.z)
+    }
+}
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn new(x: f32, y: f32): Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn zero(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+}
+
+struct Matrix3x3 {
+    m: [[f32]],  // 3x3 matrix
+}
+
+impl Matrix3x3 {
+    fn identity(): Matrix3x3 {
+        return Matrix3x3 {
+            m: [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        }
+    }
+}
+
+struct Matrix4x4 {
+    m: [[f32]],  // 4x4 matrix
+}
+
+impl Matrix4x4 {
+    fn identity(): Matrix4x4 {
+        return Matrix4x4 {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    fn transform_point(&self, p: Vec3): Vec3 {
+        return Vec3::new(
+            self.m[0][0] * p.x + self.m[0][1] * p.y + self.m[0][2] * p.z + self.m[0][3],
+            self.m[1][0] * p.x + self.m[1][1] * p.y + self.m[1][2] * p.z + self.m[1][3],
+            self.m[2][0] * p.x + self.m[2][1] * p.y + self.m[2][2] * p.z + self.m[2][3]
+        )
+    }
+
+    fn transform_vector(&self, v: Vec3): Vec3 {
+        return Vec3::new(
+            self.m[0][0] * v.x + self.m[0][1] * v.y + self.m[0][2] * v.z,
+            self.m[1][0] * v.x + self.m[1][1] * v.y + self.m[1][2] * v.z,
+            self.m[2][0] * v.x + self.m[2][1] * v.y + self.m[2][2] * v.z
+        )
+    }
+}
+
+// ============================================================================
+// BOUNDING VOLUMES
+// ============================================================================
+
+struct AABox {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl AABox {
+    fn new(min: Vec3, max: Vec3): AABox {
+        return AABox { min: min, max: max }
+    }
+
+    fn center(&self): Vec3 {
+        return Vec3::new(
+            (self.min.x + self.max.x) * 0.5,
+            (self.min.y + self.max.y) * 0.5,
+            (self.min.z + self.max.z) * 0.5
+        )
+    }
+
+    fn extent(&self): Vec3 {
+        return Vec3::new(
+            (self.max.x - self.min.x) * 0.5,
+            (self.max.y - self.min.y) * 0.5,
+            (self.max.z - self.min.z) * 0.5
+        )
+    }
+}
+
+struct Sphere {
+    center: Vec3,
+    radius: f32,
+}
+
+impl Sphere {
+    fn new(center: Vec3, radius: f32): Sphere {
+        return Sphere { center: center, radius: radius }
+    }
+}
+
+// ============================================================================
+// SHADOW TYPE DEFINITIONS
+// ============================================================================
+
+enum ShadowType {
+    Volume,         // Stencil shadow volume (high quality)
+    Projection,     // Projected texture shadow (medium quality)
+    Decal,          // Simple blob/decal shadow (low quality)
+    None,           // No shadow
+}
+
+enum ShadowQuality {
+    Off,            // No shadows
+    Low,            // Decal shadows only
+    Medium,         // Projected shadows
+    High,           // Volumetric shadows
+    Ultra,          // Volumetric + soft edges
+}
+
+struct ShadowTypeInfo {
+    shadow_type: ShadowType,
+    shadow_size_x: f32,
+    shadow_size_y: f32,
+    shadow_offset_x: f32,
+    shadow_offset_y: f32,
+    shadow_texture_name: str,
+}
+
+impl ShadowTypeInfo {
+    fn default_volume(): ShadowTypeInfo {
+        return ShadowTypeInfo {
+            shadow_type: ShadowType::Volume,
+            shadow_size_x: 1.0,
+            shadow_size_y: 1.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            shadow_texture_name: "",
+        }
+    }
+
+    fn default_projection(): ShadowTypeInfo {
+        return ShadowTypeInfo {
+            shadow_type: ShadowType::Projection,
+            shadow_size_x: 2.0,
+            shadow_size_y: 2.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            shadow_texture_name: "Shadow01",
+        }
+    }
+
+    fn default_decal(): ShadowTypeInfo {
+        return ShadowTypeInfo {
+            shadow_type: ShadowType::Decal,
+            shadow_size_x: 1.5,
+            shadow_size_y: 1.5,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            shadow_texture_name: "ShadowBlob",
+        }
+    }
+}
+
+// ============================================================================
+// SHADOW GEOMETRY - Mesh data for shadow volume generation
+// ============================================================================
+
+struct PolyNeighbor {
+    vertex_indices: [i32],    // 3 vertex indices for this triangle
+    neighbor_indices: [i32],  // 3 neighbor polygon indices (-1 = no neighbor)
+    normal: Vec3,
+    is_facing_light: bool,
+}
+
+impl PolyNeighbor {
+    fn init(): PolyNeighbor {
+        return PolyNeighbor {
+            vertex_indices: [0, 0, 0],
+            neighbor_indices: [-1, -1, -1],
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            is_facing_light: false,
+        }
+    }
+}
+
+struct ShadowGeometry {
+    name: str,
+    vertices: [Vec3],
+    vertex_count: i32,
+    polygons: [PolyNeighbor],
+    polygon_count: i32,
+    bounding_box: AABox,
+    bounding_sphere: Sphere,
+}
+
+impl ShadowGeometry {
+    fn init(name: str): ShadowGeometry {
+        return ShadowGeometry {
+            name: name,
+            vertices: [],
+            vertex_count: 0,
+            polygons: [],
+            polygon_count: 0,
+            bounding_box: AABox::new(Vec3::zero(), Vec3::zero()),
+            bounding_sphere: Sphere::new(Vec3::zero(), 0.0),
+        }
+    }
+
+    /// Build polygon neighbor information for silhouette detection
+    fn build_neighbors(&self) {
+        // For each polygon, find its edge neighbors
+        for i in 0..self.polygon_count {
+            let poly_i = self.polygons[i]
+            for edge in 0..3 {
+                if poly_i.neighbor_indices[edge] >= 0 {
+                    continue  // Already has a neighbor
+                }
+
+                // Get edge vertices
+                let v0 = poly_i.vertex_indices[edge]
+                let v1 = poly_i.vertex_indices[(edge + 1) % 3]
+
+                // Search other polygons for matching edge
+                for j in (i + 1)..self.polygon_count {
+                    let poly_j = self.polygons[j]
+                    for other_edge in 0..3 {
+                        let ov0 = poly_j.vertex_indices[other_edge]
+                        let ov1 = poly_j.vertex_indices[(other_edge + 1) % 3]
+
+                        // Check if edges match (in opposite winding)
+                        if (v0 == ov1 && v1 == ov0) {
+                            poly_i.neighbor_indices[edge] = j
+                            poly_j.neighbor_indices[other_edge] = i
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update which polygons face the light
+    fn update_facing(&self, light_pos: Vec3) {
+        for i in 0..self.polygon_count {
+            let poly = self.polygons[i]
+            // Get center of polygon
+            let v0 = self.vertices[poly.vertex_indices[0]]
+            let v1 = self.vertices[poly.vertex_indices[1]]
+            let v2 = self.vertices[poly.vertex_indices[2]]
+            let center = Vec3::new(
+                (v0.x + v1.x + v2.x) / 3.0,
+                (v0.y + v1.y + v2.y) / 3.0,
+                (v0.z + v1.z + v2.z) / 3.0
+            )
+
+            // Vector to light
+            let to_light = light_pos.sub(center).normalize()
+
+            // Check if facing light
+            poly.is_facing_light = poly.normal.dot(to_light) > 0.0
+        }
+    }
+}
+
+// ============================================================================
+// SHADOW VOLUME - Extruded geometry for stencil shadows
+// ============================================================================
+
+struct ShadowVolume {
+    vertices: [Vec3],
+    vertex_count: i32,
+    indices: [i32],
+    index_count: i32,
+    is_valid: bool,
+}
+
+impl ShadowVolume {
+    fn init(): ShadowVolume {
+        return ShadowVolume {
+            vertices: [],
+            vertex_count: 0,
+            indices: [],
+            index_count: 0,
+            is_valid: false,
+        }
+    }
+
+    fn reset(&self) {
+        self.vertex_count = 0
+        self.index_count = 0
+        self.is_valid = false
+    }
+}
+
+// ============================================================================
+// VOLUMETRIC SHADOW - Stencil buffer shadow implementation
+// ============================================================================
+
+struct VolumetricShadow {
+    geometry: ShadowGeometry?,
+    render_object_id: i32,
+
+    // Shadow length/extrusion
+    shadow_length_scale: f32,
+    extra_extrusion_padding: f32,
+    robj_extent: f32,
+
+    // Silhouette edges for current frame
+    silhouette_indices: [i32],
+    silhouette_count: i32,
+
+    // Shadow volumes per light/mesh
+    shadow_volumes: [[ShadowVolume]],  // [light][mesh]
+
+    // History for caching
+    light_pos_history: [[Vec3]],
+    object_xform_history: [[Matrix4x4]],
+
+    // State
+    is_active: bool,
+    is_dynamic: bool,  // Animated mesh
+}
+
+impl VolumetricShadow {
+    fn init(): VolumetricShadow {
+        // Initialize empty arrays for lights and meshes
+        let shadow_volumes: [[ShadowVolume]] = []
+        let light_pos_history: [[Vec3]] = []
+        let object_xform_history: [[Matrix4x4]] = []
+
+        for light in 0..MAX_SHADOW_LIGHTS {
+            let mesh_volumes: [ShadowVolume] = []
+            let mesh_pos: [Vec3] = []
+            let mesh_xform: [Matrix4x4] = []
+            for mesh in 0..MAX_SHADOW_CASTER_MESHES {
+                mesh_volumes = mesh_volumes + [ShadowVolume::init()]
+                mesh_pos = mesh_pos + [Vec3::zero()]
+                mesh_xform = mesh_xform + [Matrix4x4::identity()]
+            }
+            shadow_volumes = shadow_volumes + [mesh_volumes]
+            light_pos_history = light_pos_history + [mesh_pos]
+            object_xform_history = object_xform_history + [mesh_xform]
+        }
+
+        return VolumetricShadow {
+            geometry: null,
+            render_object_id: -1,
+            shadow_length_scale: 1.0,
+            extra_extrusion_padding: 0.0,
+            robj_extent: 10.0,
+            silhouette_indices: [],
+            silhouette_count: 0,
+            shadow_volumes: shadow_volumes,
+            light_pos_history: light_pos_history,
+            object_xform_history: object_xform_history,
+            is_active: false,
+            is_dynamic: false,
+        }
+    }
+
+    /// Set the geometry for this shadow caster
+    fn set_geometry(&self, geometry: ShadowGeometry) {
+        self.geometry = geometry
+        self.is_active = true
+    }
+
+    /// Build silhouette edges from geometry facing info
+    fn build_silhouette(&self, light_pos: Vec3) {
+        if self.geometry == null {
+            return
+        }
+
+        let geo = self.geometry
+        geo.update_facing(light_pos)
+
+        self.silhouette_indices = []
+        self.silhouette_count = 0
+
+        // Find silhouette edges (edges between lit and unlit polygons)
+        for i in 0..geo.polygon_count {
+            let poly = geo.polygons[i]
+            if !poly.is_facing_light {
+                continue
+            }
+
+            // Check each edge
+            for edge in 0..3 {
+                let neighbor_idx = poly.neighbor_indices[edge]
+                let is_silhouette = false
+
+                if neighbor_idx < 0 {
+                    // No neighbor - edge is on boundary
+                    is_silhouette = true
+                } else {
+                    let neighbor = geo.polygons[neighbor_idx]
+                    if !neighbor.is_facing_light {
+                        // Neighbor faces away from light - silhouette edge
+                        is_silhouette = true
+                    }
+                }
+
+                if is_silhouette {
+                    let v0 = poly.vertex_indices[edge]
+                    let v1 = poly.vertex_indices[(edge + 1) % 3]
+                    self.silhouette_indices = self.silhouette_indices + [v0, v1]
+                    self.silhouette_count = self.silhouette_count + 1
+                }
+            }
+        }
+    }
+
+    /// Construct shadow volume from silhouette
+    fn construct_volume(&self, light_pos: Vec3, extrude_distance: f32, mesh_index: i32) {
+        if self.geometry == null || self.silhouette_count == 0 {
+            return
+        }
+
+        let geo = self.geometry
+        let volume = self.shadow_volumes[0][mesh_index]
+        volume.reset()
+
+        let light_dir = light_pos.normalize().negate()
+        let extrude = light_dir.scale(extrude_distance)
+
+        // Build quads for each silhouette edge
+        let vertices: [Vec3] = []
+        let indices: [i32] = []
+        let vert_idx = 0
+
+        for i in 0..self.silhouette_count {
+            let edge_idx = i * 2
+            let v0_idx = self.silhouette_indices[edge_idx]
+            let v1_idx = self.silhouette_indices[edge_idx + 1]
+
+            let v0 = geo.vertices[v0_idx]
+            let v1 = geo.vertices[v1_idx]
+            let v0_ext = v0.add(extrude)
+            let v1_ext = v1.add(extrude)
+
+            // Add 4 vertices for this edge quad
+            vertices = vertices + [v0, v1, v1_ext, v0_ext]
+
+            // Add 2 triangles (6 indices)
+            indices = indices + [vert_idx, vert_idx + 1, vert_idx + 2]
+            indices = indices + [vert_idx, vert_idx + 2, vert_idx + 3]
+
+            vert_idx = vert_idx + 4
+        }
+
+        // Add front and back caps
+        for i in 0..geo.polygon_count {
+            let poly = geo.polygons[i]
+            if poly.is_facing_light {
+                // Front cap (near cap)
+                let base = len(vertices)
+                for j in 0..3 {
+                    vertices = vertices + [geo.vertices[poly.vertex_indices[j]]]
+                }
+                indices = indices + [base, base + 1, base + 2]
+            } else {
+                // Back cap (far cap, extruded)
+                let base = len(vertices)
+                for j in 0..3 {
+                    vertices = vertices + [geo.vertices[poly.vertex_indices[j]].add(extrude)]
+                }
+                // Reverse winding for back cap
+                indices = indices + [base, base + 2, base + 1]
+            }
+        }
+
+        volume.vertices = vertices
+        volume.vertex_count = len(vertices)
+        volume.indices = indices
+        volume.index_count = len(indices)
+        volume.is_valid = true
+    }
+
+    /// Update shadow volume for current light position
+    fn update(&self, light_pos: Vec3, floor_z: f32) {
+        if !self.is_active || self.geometry == null {
+            return
+        }
+
+        // Check if light or object moved
+        let needs_update = true  // TODO: Add caching check
+
+        if needs_update {
+            self.build_silhouette(light_pos)
+
+            // Calculate extrusion distance
+            let obj_height = self.geometry.bounding_box.max.z
+            let extrude_dist = (obj_height - floor_z + self.extra_extrusion_padding) * self.shadow_length_scale
+
+            self.construct_volume(light_pos, extrude_dist, 0)
+        }
+    }
+
+    /// Generate render data for the shadow volume
+    fn render(&self, mesh_index: i32): ShadowVolumeRenderData {
+        let volume = self.shadow_volumes[0][mesh_index]
+
+        return ShadowVolumeRenderData {
+            vertices: volume.vertices,
+            vertex_count: volume.vertex_count,
+            indices: volume.indices,
+            index_count: volume.index_count,
+            is_valid: volume.is_valid,
+        }
+    }
+}
+
+struct ShadowVolumeRenderData {
+    vertices: [Vec3],
+    vertex_count: i32,
+    indices: [i32],
+    index_count: i32,
+    is_valid: bool,
+}
+
+// ============================================================================
+// PROJECTED SHADOW - Texture-based shadow
+// ============================================================================
+
+struct ShadowTexture {
+    name: str,
+    texture_id: i32,
+    last_light_position: Vec3,
+    last_object_orientation: Matrix3x3,
+    area_effect_box: AABox,
+    area_effect_sphere: Sphere,
+    shadow_uv: [Vec3],  // UV axis vectors
+}
+
+impl ShadowTexture {
+    fn init(name: str): ShadowTexture {
+        return ShadowTexture {
+            name: name,
+            texture_id: -1,
+            last_light_position: Vec3::zero(),
+            last_object_orientation: Matrix3x3::identity(),
+            area_effect_box: AABox::new(Vec3::zero(), Vec3::zero()),
+            area_effect_sphere: Sphere::new(Vec3::zero(), 0.0),
+            shadow_uv: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)],
+        }
+    }
+}
+
+struct ProjectedShadow {
+    render_object_id: i32,
+    shadow_texture: ShadowTexture?,
+
+    position: Vec3,
+    rotation: f32,
+    size: Vec2,
+    offset: Vec2,
+    opacity: f32,
+
+    // Projection matrix
+    projection_matrix: Matrix4x4,
+
+    // State
+    is_active: bool,
+    is_decal: bool,  // Simple decal vs full projection
+}
+
+impl ProjectedShadow {
+    fn init(): ProjectedShadow {
+        return ProjectedShadow {
+            render_object_id: -1,
+            shadow_texture: null,
+            position: Vec3::zero(),
+            rotation: 0.0,
+            size: Vec2::new(2.0, 2.0),
+            offset: Vec2::zero(),
+            opacity: 0.5,
+            projection_matrix: Matrix4x4::identity(),
+            is_active: false,
+            is_decal: false,
+        }
+    }
+
+    fn set_texture(&self, texture: ShadowTexture) {
+        self.shadow_texture = texture
+    }
+
+    fn set_position(&self, position: Vec3, rotation: f32) {
+        self.position = position
+        self.rotation = rotation
+    }
+
+    fn set_size(&self, width: f32, height: f32) {
+        self.size = Vec2::new(width, height)
+    }
+
+    fn set_offset(&self, x: f32, y: f32) {
+        self.offset = Vec2::new(x, y)
+    }
+
+    fn set_opacity(&self, opacity: f32) {
+        self.opacity = clamp(opacity, 0.0, 1.0)
+    }
+
+    /// Update projection matrix based on light position
+    fn update_projection(&self, light_pos: Vec3, terrain_height: f32) {
+        // Create projection from light onto terrain plane
+        let light_dir = light_pos.normalize().negate()
+
+        // TODO: Build proper projection matrix
+        // For now, use simple orthographic projection along light direction
+        self.projection_matrix = Matrix4x4::identity()
+    }
+
+    /// Generate render data for the projected shadow
+    fn render(&self): ProjectedShadowRenderData {
+        if !self.is_active {
+            return ProjectedShadowRenderData {
+                vertices: [],
+                vertex_count: 0,
+                indices: [],
+                index_count: 0,
+                texture_id: -1,
+                opacity: 0.0,
+            }
+        }
+
+        // Generate quad on terrain at position
+        let half_w = self.size.x * 0.5
+        let half_h = self.size.y * 0.5
+
+        let cos_r = cos(self.rotation)
+        let sin_r = sin(self.rotation)
+
+        let corners: [Vec3] = []
+        let base_corners: [Vec2] = [
+            Vec2::new(-half_w, -half_h),
+            Vec2::new(half_w, -half_h),
+            Vec2::new(half_w, half_h),
+            Vec2::new(-half_w, half_h),
+        ]
+
+        for c in base_corners {
+            let rx = c.x * cos_r - c.y * sin_r + self.offset.x
+            let ry = c.x * sin_r + c.y * cos_r + self.offset.y
+            corners = corners + [Vec3::new(
+                self.position.x + rx,
+                self.position.y + ry,
+                self.position.z + 0.05  // Slight offset above ground
+            )]
+        }
+
+        let uvs: [Vec2] = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ]
+
+        let vertices: [ProjectedShadowVertex] = []
+        for i in 0..4 {
+            vertices = vertices + [ProjectedShadowVertex {
+                position: corners[i],
+                uv: uvs[i],
+            }]
+        }
+
+        let indices: [i32] = [0, 1, 2, 0, 2, 3]
+
+        let texture_id = if self.shadow_texture != null { self.shadow_texture.texture_id } else { -1 }
+
+        return ProjectedShadowRenderData {
+            vertices: vertices,
+            vertex_count: 4,
+            indices: indices,
+            index_count: 6,
+            texture_id: texture_id,
+            opacity: self.opacity,
+        }
+    }
+}
+
+struct ProjectedShadowVertex {
+    position: Vec3,
+    uv: Vec2,
+}
+
+struct ProjectedShadowRenderData {
+    vertices: [ProjectedShadowVertex],
+    vertex_count: i32,
+    indices: [i32],
+    index_count: i32,
+    texture_id: i32,
+    opacity: f32,
+}
+
+// ============================================================================
+// VOLUMETRIC SHADOW MANAGER
+// ============================================================================
+
+struct VolumetricShadowManager {
+    shadows: [VolumetricShadow],
+    shadow_count: i32,
+    capacity: i32,
+
+    // Render tasks for batch processing
+    dynamic_shadow_tasks: [VolumetricShadowRenderTask],
+    task_count: i32,
+}
+
+impl VolumetricShadowManager {
+    fn init(): VolumetricShadowManager {
+        let shadows: [VolumetricShadow] = []
+        for i in 0..MAX_VOLUMETRIC_SHADOWS {
+            shadows = shadows + [VolumetricShadow::init()]
+        }
+        return VolumetricShadowManager {
+            shadows: shadows,
+            shadow_count: 0,
+            capacity: MAX_VOLUMETRIC_SHADOWS,
+            dynamic_shadow_tasks: [],
+            task_count: 0,
+        }
+    }
+
+    fn add_shadow(&self, geometry: ShadowGeometry, render_object_id: i32): VolumetricShadow? {
+        for i in 0..self.capacity {
+            if !self.shadows[i].is_active {
+                self.shadows[i].set_geometry(geometry)
+                self.shadows[i].render_object_id = render_object_id
+                self.shadow_count = self.shadow_count + 1
+                return self.shadows[i]
+            }
+        }
+        return null
+    }
+
+    fn remove_shadow(&self, shadow: VolumetricShadow) {
+        shadow.is_active = false
+        shadow.geometry = null
+        self.shadow_count = self.shadow_count - 1
+    }
+
+    fn remove_all_shadows(&self) {
+        for i in 0..self.capacity {
+            self.shadows[i].is_active = false
+            self.shadows[i].geometry = null
+        }
+        self.shadow_count = 0
+    }
+
+    fn invalidate_cached_light_positions(&self) {
+        for i in 0..self.capacity {
+            if self.shadows[i].is_active {
+                for light in 0..MAX_SHADOW_LIGHTS {
+                    for mesh in 0..MAX_SHADOW_CASTER_MESHES {
+                        self.shadows[i].light_pos_history[light][mesh] = Vec3::zero()
+                    }
+                }
+            }
+        }
+    }
+
+    fn update(&self, light_pos: Vec3, floor_z: f32) {
+        for i in 0..self.capacity {
+            if self.shadows[i].is_active {
+                self.shadows[i].update(light_pos, floor_z)
+            }
+        }
+    }
+
+    fn render_shadows(&self, force_stencil_fill: bool): [ShadowVolumeRenderData] {
+        let render_data: [ShadowVolumeRenderData] = []
+
+        for i in 0..self.capacity {
+            let shadow = self.shadows[i]
+            if shadow.is_active {
+                let data = shadow.render(0)
+                if data.is_valid {
+                    render_data = render_data + [data]
+                }
+            }
+        }
+
+        return render_data
+    }
+}
+
+struct VolumetricShadowRenderTask {
+    parent_shadow_idx: i32,
+    mesh_index: i32,
+    light_index: i32,
+}
+
+// ============================================================================
+// PROJECTED SHADOW MANAGER
+// ============================================================================
+
+struct ProjectedShadowManager {
+    shadows: [ProjectedShadow],
+    shadow_count: i32,
+    capacity: i32,
+
+    // Decal shadows (simple blob shadows)
+    decal_shadows: [ProjectedShadow],
+    decal_count: i32,
+
+    // Render target for dynamic shadow generation
+    render_target_width: i32,
+    render_target_height: i32,
+    render_target_has_alpha: bool,
+}
+
+impl ProjectedShadowManager {
+    fn init(): ProjectedShadowManager {
+        let shadows: [ProjectedShadow] = []
+        let decal_shadows: [ProjectedShadow] = []
+        for i in 0..MAX_PROJECTED_SHADOWS {
+            shadows = shadows + [ProjectedShadow::init()]
+            decal_shadows = decal_shadows + [ProjectedShadow::init()]
+        }
+        return ProjectedShadowManager {
+            shadows: shadows,
+            shadow_count: 0,
+            capacity: MAX_PROJECTED_SHADOWS,
+            decal_shadows: decal_shadows,
+            decal_count: 0,
+            render_target_width: DEFAULT_RENDER_TARGET_WIDTH,
+            render_target_height: DEFAULT_RENDER_TARGET_HEIGHT,
+            render_target_has_alpha: true,
+        }
+    }
+
+    fn add_shadow(&self, shadow_info: ShadowTypeInfo, render_object_id: i32): ProjectedShadow? {
+        let list = if shadow_info.shadow_type == ShadowType::Decal {
+            self.decal_shadows
+        } else {
+            self.shadows
+        }
+
+        let count_ptr = if shadow_info.shadow_type == ShadowType::Decal {
+            self.decal_count
+        } else {
+            self.shadow_count
+        }
+
+        for i in 0..self.capacity {
+            if !list[i].is_active {
+                list[i].is_active = true
+                list[i].is_decal = shadow_info.shadow_type == ShadowType::Decal
+                list[i].render_object_id = render_object_id
+                list[i].set_size(shadow_info.shadow_size_x, shadow_info.shadow_size_y)
+                list[i].set_offset(shadow_info.shadow_offset_x, shadow_info.shadow_offset_y)
+
+                if shadow_info.shadow_type == ShadowType::Decal {
+                    self.decal_count = self.decal_count + 1
+                } else {
+                    self.shadow_count = self.shadow_count + 1
+                }
+
+                return list[i]
+            }
+        }
+        return null
+    }
+
+    fn remove_shadow(&self, shadow: ProjectedShadow) {
+        shadow.is_active = false
+        if shadow.is_decal {
+            self.decal_count = self.decal_count - 1
+        } else {
+            self.shadow_count = self.shadow_count - 1
+        }
+    }
+
+    fn remove_all_shadows(&self) {
+        for i in 0..self.capacity {
+            self.shadows[i].is_active = false
+            self.decal_shadows[i].is_active = false
+        }
+        self.shadow_count = 0
+        self.decal_count = 0
+    }
+
+    fn reset(&self) {
+        self.remove_all_shadows()
+    }
+
+    fn invalidate_cached_light_positions(&self) {
+        for i in 0..self.capacity {
+            if self.shadows[i].shadow_texture != null {
+                self.shadows[i].shadow_texture.last_light_position = Vec3::zero()
+            }
+        }
+    }
+
+    fn prepare_shadows(&self) {
+        // Called before rendering to prepare shadow data
+    }
+
+    fn render_shadows(&self, light_pos: Vec3): [ProjectedShadowRenderData] {
+        let render_data: [ProjectedShadowRenderData] = []
+
+        // Render projection shadows
+        for i in 0..self.capacity {
+            if self.shadows[i].is_active {
+                let data = self.shadows[i].render()
+                if data.vertex_count > 0 {
+                    render_data = render_data + [data]
+                }
+            }
+        }
+
+        // Render decal shadows
+        for i in 0..self.capacity {
+            if self.decal_shadows[i].is_active {
+                let data = self.decal_shadows[i].render()
+                if data.vertex_count > 0 {
+                    render_data = render_data + [data]
+                }
+            }
+        }
+
+        return render_data
+    }
+}
+
+// ============================================================================
+// MAIN SHADOW MANAGER - Coordinates all shadow types
+// ============================================================================
+
+struct ShadowManager {
+    volumetric_manager: VolumetricShadowManager,
+    projected_manager: ProjectedShadowManager,
+
+    // Global settings
+    shadow_color: i32,  // ARGB color for shadow
+    is_shadow_scene: bool,
+    stencil_shadow_mask: i32,
+
+    // Light positions
+    light_positions: [Vec3],
+
+    // Quality settings
+    shadow_quality: ShadowQuality,
+}
+
+impl ShadowManager {
+    fn init(): ShadowManager {
+        let light_positions: [Vec3] = []
+        for i in 0..MAX_SHADOW_LIGHTS {
+            light_positions = light_positions + [Vec3::new(94.0, 50.5, 200.0)]
+        }
+
+        return ShadowManager {
+            volumetric_manager: VolumetricShadowManager::init(),
+            projected_manager: ProjectedShadowManager::init(),
+            shadow_color: 0x7FA0A0A0,
+            is_shadow_scene: false,
+            stencil_shadow_mask: 0,
+            light_positions: light_positions,
+            shadow_quality: ShadowQuality::High,
+        }
+    }
+
+    fn set_quality(&self, quality: ShadowQuality) {
+        self.shadow_quality = quality
+    }
+
+    fn set_light_position(&self, light_index: i32, position: Vec3) {
+        if light_index >= 0 && light_index < MAX_SHADOW_LIGHTS {
+            self.light_positions[light_index] = position
+        }
+    }
+
+    fn set_time_of_day(&self, light_dir: Vec3) {
+        // Calculate light position from direction
+        let normalized = light_dir.negate().normalize()
+        let light_pos = normalized.scale(SUN_DISTANCE_FROM_GROUND)
+        self.set_light_position(0, light_pos)
+    }
+
+    fn get_light_pos_world(&self, light_index: i32): Vec3 {
+        if light_index >= 0 && light_index < MAX_SHADOW_LIGHTS {
+            return self.light_positions[light_index]
+        }
+        return Vec3::zero()
+    }
+
+    fn add_shadow(&self, shadow_info: ShadowTypeInfo, render_object_id: i32): i32 {
+        // Return a shadow handle (-1 on failure)
+        if self.shadow_quality == ShadowQuality::Off {
+            return -1
+        }
+
+        let actual_type = shadow_info.shadow_type
+
+        // Downgrade shadow type based on quality setting
+        if self.shadow_quality == ShadowQuality::Low {
+            actual_type = ShadowType::Decal
+        } else if self.shadow_quality == ShadowQuality::Medium && actual_type == ShadowType::Volume {
+            actual_type = ShadowType::Projection
+        }
+
+        if actual_type == ShadowType::Volume {
+            // Would need geometry here - for now return placeholder
+            return render_object_id  // Placeholder
+        } else {
+            let shadow = self.projected_manager.add_shadow(shadow_info, render_object_id)
+            if shadow != null {
+                return render_object_id
+            }
+        }
+
+        return -1
+    }
+
+    fn remove_all_shadows(&self) {
+        self.volumetric_manager.remove_all_shadows()
+        self.projected_manager.remove_all_shadows()
+    }
+
+    fn invalidate_cached_light_positions(&self) {
+        self.volumetric_manager.invalidate_cached_light_positions()
+        self.projected_manager.invalidate_cached_light_positions()
+    }
+
+    fn queue_shadows(&self, enabled: bool) {
+        self.is_shadow_scene = enabled
+    }
+
+    fn reset(&self) {
+        self.remove_all_shadows()
+        self.projected_manager.reset()
+    }
+
+    fn update(&self, floor_z: f32) {
+        if !self.is_shadow_scene {
+            return
+        }
+
+        let light_pos = self.light_positions[0]
+        self.volumetric_manager.update(light_pos, floor_z)
+    }
+
+    fn prepare_shadows(&self) {
+        self.projected_manager.prepare_shadows()
+    }
+
+    fn do_shadows(&self, stencil_pass: bool): ShadowRenderOutput {
+        if !self.is_shadow_scene {
+            return ShadowRenderOutput {
+                volume_data: [],
+                projected_data: [],
+            }
+        }
+
+        let volume_data: [ShadowVolumeRenderData] = []
+        let projected_data: [ProjectedShadowRenderData] = []
+
+        // Projected shadows render first (non-stencil pass)
+        if !stencil_pass {
+            projected_data = self.projected_manager.render_shadows(self.light_positions[0])
+        }
+
+        // Volumetric shadows render in stencil pass
+        if stencil_pass && self.shadow_quality >= ShadowQuality::High {
+            volume_data = self.volumetric_manager.render_shadows(false)
+        }
+
+        if stencil_pass {
+            self.queue_shadows(false)  // Reset for next frame
+        }
+
+        return ShadowRenderOutput {
+            volume_data: volume_data,
+            projected_data: projected_data,
+        }
+    }
+}
+
+struct ShadowRenderOutput {
+    volume_data: [ShadowVolumeRenderData],
+    projected_data: [ProjectedShadowRenderData],
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32): f32 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin(x: f32): f32 {
+    let x_norm = x
+    while x_norm > PI {
+        x_norm = x_norm - PI * 2.0
+    }
+    while x_norm < -PI {
+        x_norm = x_norm + PI * 2.0
+    }
+    let x2 = x_norm * x_norm
+    let x3 = x2 * x_norm
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    return x_norm - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0
+}
+
+fn cos(x: f32): f32 {
+    return sin(x + PI / 2.0)
+}
+
+fn clamp(x: f32, min: f32, max: f32): f32 {
+    if x < min {
+        return min
+    }
+    if x > max {
+        return max
+    }
+    return x
+}
+
+fn len<T>(arr: [T]): i32 {
+    return 0  // Placeholder
+}
+
+// ============================================================================
+// GLOBAL SHADOW MANAGER
+// ============================================================================
+
+let g_shadow_manager: ShadowManager? = null
+
+fn init_shadow_manager(): ShadowManager {
+    let manager = ShadowManager::init()
+    g_shadow_manager = manager
+    return manager
+}
+
+fn get_shadow_manager(): ShadowManager? {
+    return g_shadow_manager
+}
+
+fn shutdown_shadow_manager() {
+    g_shadow_manager = null
+}
+
+// Convenience functions matching original API
+fn prepare_shadows() {
+    if g_shadow_manager != null {
+        g_shadow_manager.prepare_shadows()
+    }
+}
+
+fn do_shadows(stencil_pass: bool): ShadowRenderOutput {
+    if g_shadow_manager != null {
+        return g_shadow_manager.do_shadows(stencil_pass)
+    }
+    return ShadowRenderOutput { volume_data: [], projected_data: [] }
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_shadow_system() {
+    print("Testing Shadow System...")
+
+    let manager = init_shadow_manager()
+    print("Shadow manager initialized")
+
+    // Test quality levels
+    manager.set_quality(ShadowQuality::High)
+    print("Shadow quality set to High")
+
+    // Test light position
+    manager.set_light_position(0, Vec3::new(100.0, 50.0, 200.0))
+    let light_pos = manager.get_light_pos_world(0)
+    print("Light position: " + str(light_pos.x) + ", " + str(light_pos.y) + ", " + str(light_pos.z))
+
+    // Test time of day
+    manager.set_time_of_day(Vec3::new(-0.5, -0.3, -1.0))
+    print("Time of day set")
+
+    // Test adding shadows
+    let decal_info = ShadowTypeInfo::default_decal()
+    let shadow_handle = manager.add_shadow(decal_info, 1)
+    print("Decal shadow added: " + str(shadow_handle))
+
+    let proj_info = ShadowTypeInfo::default_projection()
+    shadow_handle = manager.add_shadow(proj_info, 2)
+    print("Projection shadow added: " + str(shadow_handle))
+
+    // Test shadow geometry
+    let geo = ShadowGeometry::init("TestBox")
+    geo.vertices = [
+        Vec3::new(-1.0, -1.0, 0.0),
+        Vec3::new(1.0, -1.0, 0.0),
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(-1.0, 1.0, 0.0),
+        Vec3::new(-1.0, -1.0, 2.0),
+        Vec3::new(1.0, -1.0, 2.0),
+        Vec3::new(1.0, 1.0, 2.0),
+        Vec3::new(-1.0, 1.0, 2.0),
+    ]
+    geo.vertex_count = 8
+    print("Shadow geometry created with " + str(geo.vertex_count) + " vertices")
+
+    // Test volumetric shadow
+    let vol_shadow = manager.volumetric_manager.add_shadow(geo, 3)
+    if vol_shadow != null {
+        print("Volumetric shadow added")
+        vol_shadow.shadow_length_scale = 1.5
+    }
+
+    // Test rendering
+    manager.queue_shadows(true)
+    manager.update(0.0)
+
+    let output = manager.do_shadows(false)
+    print("Projected shadow batches: " + str(len(output.projected_data)))
+
+    output = manager.do_shadows(true)
+    print("Volume shadow batches: " + str(len(output.volume_data)))
+
+    // Test cleanup
+    manager.invalidate_cached_light_positions()
+    manager.reset()
+    print("Shadow manager reset")
+
+    shutdown_shadow_manager()
+    print("Shadow System tests complete!")
+}
