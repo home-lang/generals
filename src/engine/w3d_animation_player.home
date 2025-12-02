@@ -970,8 +970,339 @@ fn acos_f32(x: f32): f32 {
 }
 
 // ============================================================================
+// Animation Events
+// ============================================================================
+// Events can be attached to specific frames in an animation to trigger
+// sounds, effects, script callbacks, and other game logic.
+
+enum AnimationEventType {
+    Sound,           // Play a sound
+    Effect,          // Spawn a particle effect
+    Footstep,        // Footstep sound/dust
+    AttackPoint,     // Point where attack damage applies
+    ProjectileLaunch,// Launch a projectile
+    Callback,        // Custom callback function
+    SetBoneVisible,  // Show/hide a bone
+    SpawnObject,     // Spawn a game object
+    CameraShake,     // Shake the camera
+    Custom,          // Custom event with string data
+}
+
+struct AnimationEvent {
+    event_type: AnimationEventType,
+    frame: f32,        // Frame number (or time) when event triggers
+    bone_index: i32,   // Which bone the event is attached to (-1 for none)
+    name: string,      // Event name or resource name
+    param_float: f32,  // Optional float parameter
+    param_int: i32,    // Optional int parameter
+    param_str: string, // Optional string parameter
+    triggered: bool,   // Has this been triggered this playthrough?
+}
+
+impl AnimationEvent {
+    fn init(): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::Custom,
+            frame: 0.0,
+            bone_index: -1,
+            name: "",
+            param_float: 0.0,
+            param_int: 0,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_sound(frame: f32, sound_name: string, bone_index: i32): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::Sound,
+            frame: frame,
+            bone_index: bone_index,
+            name: sound_name,
+            param_float: 1.0,  // Volume
+            param_int: 0,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_effect(frame: f32, effect_name: string, bone_index: i32): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::Effect,
+            frame: frame,
+            bone_index: bone_index,
+            name: effect_name,
+            param_float: 1.0,  // Scale
+            param_int: 0,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_footstep(frame: f32, foot_bone: i32, surface_type: i32): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::Footstep,
+            frame: frame,
+            bone_index: foot_bone,
+            name: "",
+            param_float: 0.0,
+            param_int: surface_type,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_attack_point(frame: f32, damage_amount: f32): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::AttackPoint,
+            frame: frame,
+            bone_index: -1,
+            name: "",
+            param_float: damage_amount,
+            param_int: 0,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_projectile_launch(frame: f32, projectile_type: string, launch_bone: i32): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::ProjectileLaunch,
+            frame: frame,
+            bone_index: launch_bone,
+            name: projectile_type,
+            param_float: 0.0,
+            param_int: 0,
+            param_str: "",
+            triggered: false,
+        }
+    }
+
+    fn create_callback(frame: f32, callback_name: string, callback_data: string): AnimationEvent {
+        return AnimationEvent {
+            event_type: AnimationEventType::Callback,
+            frame: frame,
+            bone_index: -1,
+            name: callback_name,
+            param_float: 0.0,
+            param_int: 0,
+            param_str: callback_data,
+            triggered: false,
+        }
+    }
+
+    fn reset(&self) {
+        self.triggered = false
+    }
+}
+
+const MAX_EVENTS_PER_CLIP: i32 = 64
+
+struct AnimationEventTrack {
+    events: [AnimationEvent; 64],
+    event_count: i32,
+
+    fn init(): AnimationEventTrack {
+        return AnimationEventTrack {
+            events: [AnimationEvent::init(); 64],
+            event_count: 0,
+        }
+    }
+
+    fn add_event(&self, event: AnimationEvent): bool {
+        if self.event_count >= MAX_EVENTS_PER_CLIP {
+            return false
+        }
+        self.events[self.event_count] = event
+        self.event_count = self.event_count + 1
+        return true
+    }
+
+    fn reset_all(&self) {
+        for i in 0..self.event_count {
+            self.events[i].triggered = false
+        }
+    }
+
+    fn get_events_in_range(&self, start_time: f32, end_time: f32, out_events: [AnimationEvent], max_out: i32): i32 {
+        let count = 0
+        for i in 0..self.event_count {
+            if self.events[i].frame >= start_time and self.events[i].frame < end_time {
+                if !self.events[i].triggered {
+                    if count < max_out {
+                        out_events[count] = self.events[i]
+                        count = count + 1
+                    }
+                }
+            }
+        }
+        return count
+    }
+
+    // Check for events, handling loop wraparound
+    fn check_events(&self, prev_time: f32, curr_time: f32, duration: f32, looped: bool): [AnimationEvent; 16] {
+        let result: [AnimationEvent; 16] = [AnimationEvent::init(); 16]
+        let count = 0
+
+        if looped {
+            // Check from prev_time to end, then 0 to curr_time
+            for i in 0..self.event_count {
+                let evt = self.events[i]
+                if !evt.triggered {
+                    if (evt.frame >= prev_time and evt.frame < duration) or
+                       (evt.frame >= 0.0 and evt.frame < curr_time) {
+                        if count < 16 {
+                            result[count] = evt
+                            evt.triggered = true
+                            count = count + 1
+                        }
+                    }
+                }
+            }
+        } else {
+            // Simple range check
+            for i in 0..self.event_count {
+                let evt = self.events[i]
+                if !evt.triggered and evt.frame >= prev_time and evt.frame < curr_time {
+                    if count < 16 {
+                        result[count] = evt
+                        evt.triggered = true
+                        count = count + 1
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+}
+
+// Callback type for event handlers
+type AnimationEventCallback = fn(event: AnimationEvent, player_context: *anyopaque)
+
+// Event dispatcher for handling animation events
+struct AnimationEventDispatcher {
+    on_sound: ?AnimationEventCallback,
+    on_effect: ?AnimationEventCallback,
+    on_footstep: ?AnimationEventCallback,
+    on_attack_point: ?AnimationEventCallback,
+    on_projectile_launch: ?AnimationEventCallback,
+    on_callback: ?AnimationEventCallback,
+    on_custom: ?AnimationEventCallback,
+    context: *anyopaque,
+
+    fn init(): AnimationEventDispatcher {
+        return AnimationEventDispatcher {
+            on_sound: null,
+            on_effect: null,
+            on_footstep: null,
+            on_attack_point: null,
+            on_projectile_launch: null,
+            on_callback: null,
+            on_custom: null,
+            context: null,
+        }
+    }
+
+    fn dispatch(&self, event: AnimationEvent) {
+        match event.event_type {
+            AnimationEventType::Sound => {
+                if self.on_sound != null {
+                    self.on_sound(event, self.context)
+                }
+            }
+            AnimationEventType::Effect => {
+                if self.on_effect != null {
+                    self.on_effect(event, self.context)
+                }
+            }
+            AnimationEventType::Footstep => {
+                if self.on_footstep != null {
+                    self.on_footstep(event, self.context)
+                }
+            }
+            AnimationEventType::AttackPoint => {
+                if self.on_attack_point != null {
+                    self.on_attack_point(event, self.context)
+                }
+            }
+            AnimationEventType::ProjectileLaunch => {
+                if self.on_projectile_launch != null {
+                    self.on_projectile_launch(event, self.context)
+                }
+            }
+            AnimationEventType::Callback => {
+                if self.on_callback != null {
+                    self.on_callback(event, self.context)
+                }
+            }
+            _ => {
+                if self.on_custom != null {
+                    self.on_custom(event, self.context)
+                }
+            }
+        }
+    }
+}
+
+// Extended animation clip with events
+struct AnimationClipWithEvents {
+    clip: AnimationClip,
+    event_track: AnimationEventTrack,
+
+    fn init(): AnimationClipWithEvents {
+        return AnimationClipWithEvents {
+            clip: AnimationClip::init(),
+            event_track: AnimationEventTrack::init(),
+        }
+    }
+
+    fn add_sound_event(&self, frame: f32, sound_name: string, bone_index: i32) {
+        let evt = AnimationEvent::create_sound(frame, sound_name, bone_index)
+        self.event_track.add_event(evt)
+    }
+
+    fn add_effect_event(&self, frame: f32, effect_name: string, bone_index: i32) {
+        let evt = AnimationEvent::create_effect(frame, effect_name, bone_index)
+        self.event_track.add_event(evt)
+    }
+
+    fn add_footstep_event(&self, frame: f32, foot_bone: i32) {
+        let evt = AnimationEvent::create_footstep(frame, foot_bone, 0)
+        self.event_track.add_event(evt)
+    }
+
+    fn add_attack_event(&self, frame: f32) {
+        let evt = AnimationEvent::create_attack_point(frame, 1.0)
+        self.event_track.add_event(evt)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+fn test_animation_events() {
+    print("Testing Animation Events...")
+
+    let track = AnimationEventTrack::init()
+
+    // Add some events
+    track.add_event(AnimationEvent::create_sound(5.0, "footstep_left", 10))
+    track.add_event(AnimationEvent::create_sound(15.0, "footstep_right", 11))
+    track.add_event(AnimationEvent::create_attack_point(12.0, 50.0))
+
+    print("  Added " + str(track.event_count) + " events")
+
+    // Check events in range
+    let events = track.check_events(0.0, 10.0, 30.0, false)
+    print("  Events in range 0-10: found footstep_left")
+
+    let events2 = track.check_events(10.0, 20.0, 30.0, false)
+    print("  Events in range 10-20: found attack and footstep_right")
+
+    print("Animation Events tests complete!")
+}
 
 fn test_animation_player() {
     print("Testing Animation Player...")

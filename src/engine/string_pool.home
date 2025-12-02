@@ -1,0 +1,620 @@
+// C&C Generals Zero Hour - Home Port
+// String Pool / Interning System
+//
+// Original: NameKeyGenerator.h/cpp (Westwood Studios/EA)
+// Converts strings to unique integer keys for efficient comparison and storage
+//
+// The original game uses this extensively for:
+// - Object/unit type names
+// - Module tag names
+// - Weapon names
+// - Upgrade names
+// - Script identifiers
+// - INI field names
+// etc.
+//
+// Benefits:
+// - Fast string comparison (just compare integers)
+// - Reduced memory usage (each unique string stored once)
+// - Consistent hashing for network sync
+
+import basics/allocator
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+const NAMEKEY_INVALID: i32 = 0
+const NAMEKEY_MAX: i32 = 0x7FFFFF        // Max ordinal value (fits in 24 bits)
+
+// Hash table size - prime number not close to power of 2 for best distribution
+const SOCKET_COUNT: i32 = 45007
+
+// ============================================================================
+// NAME KEY TYPE
+// ============================================================================
+// A NameKey is a unique integer identifier for a string
+// Using a struct to enforce type safety (can't accidentally use a raw int)
+struct NameKey {
+    value: i32
+
+    fn invalid(): NameKey {
+        return NameKey { value: NAMEKEY_INVALID }
+    }
+
+    fn is_valid(&self): bool {
+        return self.value != NAMEKEY_INVALID
+    }
+
+    fn is_invalid(&self): bool {
+        return self.value == NAMEKEY_INVALID
+    }
+
+    fn equals(&self, other: NameKey): bool {
+        return self.value == other.value
+    }
+
+    fn hash(&self): u32 {
+        return self.value as u32
+    }
+}
+
+// ============================================================================
+// BUCKET - Entry in the hash table
+// ============================================================================
+struct Bucket {
+    key: NameKey                 // The unique key for this string
+    name_string: string          // The actual string
+    next_in_socket: i32          // Index of next bucket in chain (-1 if none)
+    is_used: bool                // Whether this bucket is in use
+}
+
+fn create_empty_bucket(): Bucket {
+    return Bucket {
+        key: NameKey.invalid()
+        name_string: ""
+        next_in_socket: -1
+        is_used: false
+    }
+}
+
+// ============================================================================
+// STRING POOL - Main interning system
+// ============================================================================
+struct StringPool {
+    // Hash table sockets - each socket can have a chain of buckets
+    sockets: [i32; SOCKET_COUNT]      // Index into buckets array, -1 if empty
+
+    // All buckets (pooled allocation)
+    buckets: [Bucket]
+    bucket_count: i32
+    max_buckets: i32
+
+    // Next available ID
+    next_id: i32
+
+    // Statistics
+    total_strings: i32
+    total_lookups: i64
+    cache_hits: i64
+    cache_misses: i64
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator, max_strings: i32): StringPool {
+        let mut pool = StringPool {
+            sockets: [-1; SOCKET_COUNT]
+            buckets: allocator.alloc(Bucket, max_strings)
+            bucket_count: 0
+            max_buckets: max_strings
+            next_id: 1  // 0 is reserved for INVALID
+            total_strings: 0
+            total_lookups: 0
+            cache_hits: 0
+            cache_misses: 0
+            allocator: allocator
+        }
+
+        // Initialize all sockets to empty
+        for i in 0..SOCKET_COUNT {
+            pool.sockets[i] = -1
+        }
+
+        // Initialize all buckets
+        for i in 0..max_strings {
+            pool.buckets[i] = create_empty_bucket()
+        }
+
+        return pool
+    }
+
+    // Hash a string to a socket index
+    fn hash_string(&self, name: string): i32 {
+        // djb2 hash algorithm
+        let mut hash: u32 = 5381
+        let len = name.len()
+
+        for i in 0..len {
+            let c = name.char_at(i) as u32
+            hash = ((hash << 5) + hash) + c  // hash * 33 + c
+        }
+
+        return (hash % SOCKET_COUNT as u32) as i32
+    }
+
+    // Hash a string to a socket index (case insensitive)
+    fn hash_string_lowercase(&self, name: string): i32 {
+        let mut hash: u32 = 5381
+        let len = name.len()
+
+        for i in 0..len {
+            let mut c = name.char_at(i) as u32
+
+            // Convert to lowercase
+            if c >= 65 and c <= 90 {  // 'A' to 'Z'
+                c = c + 32
+            }
+
+            hash = ((hash << 5) + hash) + c
+        }
+
+        return (hash % SOCKET_COUNT as u32) as i32
+    }
+
+    // Find or create a key for a string
+    fn name_to_key(&self, name: string): NameKey {
+        self.total_lookups += 1
+
+        if name.len() == 0 {
+            return NameKey.invalid()
+        }
+
+        let socket_index = self.hash_string(name)
+        let mut bucket_index = self.sockets[socket_index]
+
+        // Search the chain
+        while bucket_index >= 0 {
+            let bucket = &self.buckets[bucket_index]
+            if bucket.is_used and bucket.name_string == name {
+                self.cache_hits += 1
+                return bucket.key
+            }
+            bucket_index = bucket.next_in_socket
+        }
+
+        // Not found - create new entry
+        self.cache_misses += 1
+        return self.add_string(name, socket_index)
+    }
+
+    // Find or create a key for a string (case insensitive)
+    fn name_to_lowercase_key(&self, name: string): NameKey {
+        self.total_lookups += 1
+
+        if name.len() == 0 {
+            return NameKey.invalid()
+        }
+
+        // Convert to lowercase for lookup
+        let lowercase = name.to_lowercase()
+
+        let socket_index = self.hash_string_lowercase(name)
+        let mut bucket_index = self.sockets[socket_index]
+
+        // Search the chain
+        while bucket_index >= 0 {
+            let bucket = &self.buckets[bucket_index]
+            if bucket.is_used and bucket.name_string == lowercase {
+                self.cache_hits += 1
+                return bucket.key
+            }
+            bucket_index = bucket.next_in_socket
+        }
+
+        // Not found - create new entry with lowercase string
+        self.cache_misses += 1
+        return self.add_string(lowercase, socket_index)
+    }
+
+    // Add a new string to the pool
+    fn add_string(&self, name: string, socket_index: i32): NameKey {
+        if self.bucket_count >= self.max_buckets {
+            // Pool is full
+            return NameKey.invalid()
+        }
+
+        if self.next_id >= NAMEKEY_MAX {
+            // Key space exhausted
+            return NameKey.invalid()
+        }
+
+        // Allocate new bucket
+        let new_index = self.bucket_count
+        self.bucket_count += 1
+
+        // Create key
+        let key = NameKey { value: self.next_id }
+        self.next_id += 1
+
+        // Initialize bucket
+        self.buckets[new_index] = Bucket {
+            key: key
+            name_string: name
+            next_in_socket: self.sockets[socket_index]
+            is_used: true
+        }
+
+        // Link into socket chain
+        self.sockets[socket_index] = new_index
+
+        self.total_strings += 1
+
+        return key
+    }
+
+    // Look up string by key (slow - linear search)
+    fn key_to_name(&self, key: NameKey): string {
+        if key.is_invalid() {
+            return ""
+        }
+
+        for i in 0..self.bucket_count {
+            if self.buckets[i].is_used and self.buckets[i].key.equals(key) {
+                return self.buckets[i].name_string
+            }
+        }
+
+        return ""
+    }
+
+    // Check if a key exists
+    fn has_key(&self, key: NameKey): bool {
+        if key.is_invalid() {
+            return false
+        }
+
+        for i in 0..self.bucket_count {
+            if self.buckets[i].is_used and self.buckets[i].key.equals(key) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    // Check if a string exists
+    fn has_string(&self, name: string): bool {
+        if name.len() == 0 {
+            return false
+        }
+
+        let socket_index = self.hash_string(name)
+        let mut bucket_index = self.sockets[socket_index]
+
+        while bucket_index >= 0 {
+            let bucket = &self.buckets[bucket_index]
+            if bucket.is_used and bucket.name_string == name {
+                return true
+            }
+            bucket_index = bucket.next_in_socket
+        }
+
+        return false
+    }
+
+    // Get statistics
+    fn get_string_count(&self): i32 {
+        return self.total_strings
+    }
+
+    fn get_lookup_count(&self): i64 {
+        return self.total_lookups
+    }
+
+    fn get_cache_hit_rate(&self): f32 {
+        if self.total_lookups == 0 {
+            return 0.0
+        }
+        return self.cache_hits as f32 / self.total_lookups as f32
+    }
+
+    // Reset the pool
+    fn reset(&self) {
+        // Clear all sockets
+        for i in 0..SOCKET_COUNT {
+            self.sockets[i] = -1
+        }
+
+        // Clear all buckets
+        for i in 0..self.bucket_count {
+            self.buckets[i] = create_empty_bucket()
+        }
+
+        self.bucket_count = 0
+        self.next_id = 1
+        self.total_strings = 0
+        self.total_lookups = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+    }
+
+    fn deinit(&self) {
+        self.allocator.free(self.buckets)
+    }
+}
+
+// ============================================================================
+// STATIC NAME KEY - Lazy initialization helper
+// ============================================================================
+// For frequently used keys that are known at compile time
+struct StaticNameKey {
+    key: NameKey
+    name: string
+    is_initialized: bool
+
+    fn init(name: string): StaticNameKey {
+        return StaticNameKey {
+            key: NameKey.invalid()
+            name: name
+            is_initialized: false
+        }
+    }
+
+    fn get(&self): NameKey {
+        if !self.is_initialized {
+            // Would call global pool here
+            // self.key = g_name_key_generator.?.name_to_key(self.name)
+            self.is_initialized = true
+        }
+        return self.key
+    }
+}
+
+// ============================================================================
+// NAME KEY CACHE - For caching frequently used keys
+// ============================================================================
+struct NameKeyCache {
+    keys: [NameKey; 256]
+    names: [string; 256]
+    count: i32
+
+    fn init(): NameKeyCache {
+        return NameKeyCache {
+            keys: [NameKey.invalid(); 256]
+            names: [""; 256]
+            count: 0
+        }
+    }
+
+    fn add(&self, name: string, key: NameKey): bool {
+        if self.count >= 256 {
+            return false
+        }
+
+        self.names[self.count] = name
+        self.keys[self.count] = key
+        self.count += 1
+
+        return true
+    }
+
+    fn find(&self, name: string): ?NameKey {
+        for i in 0..self.count {
+            if self.names[i] == name {
+                return self.keys[i]
+            }
+        }
+        return null
+    }
+
+    fn find_by_key(&self, key: NameKey): ?string {
+        for i in 0..self.count {
+            if self.keys[i].equals(key) {
+                return self.names[i]
+            }
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// WELL KNOWN KEYS - Common keys used throughout the game
+// ============================================================================
+struct WellKnownKeys {
+    // Object types
+    key_infantry: NameKey
+    key_vehicle: NameKey
+    key_aircraft: NameKey
+    key_structure: NameKey
+    key_projectile: NameKey
+
+    // Modules
+    key_body_module: NameKey
+    key_draw_module: NameKey
+    key_update_module: NameKey
+    key_create_module: NameKey
+    key_destroy_module: NameKey
+
+    // Common states
+    key_idle: NameKey
+    key_moving: NameKey
+    key_attacking: NameKey
+    key_dying: NameKey
+    key_dead: NameKey
+
+    // Factions
+    key_america: NameKey
+    key_china: NameKey
+    key_gla: NameKey
+
+    is_initialized: bool
+
+    fn init(): WellKnownKeys {
+        return WellKnownKeys {
+            key_infantry: NameKey.invalid()
+            key_vehicle: NameKey.invalid()
+            key_aircraft: NameKey.invalid()
+            key_structure: NameKey.invalid()
+            key_projectile: NameKey.invalid()
+            key_body_module: NameKey.invalid()
+            key_draw_module: NameKey.invalid()
+            key_update_module: NameKey.invalid()
+            key_create_module: NameKey.invalid()
+            key_destroy_module: NameKey.invalid()
+            key_idle: NameKey.invalid()
+            key_moving: NameKey.invalid()
+            key_attacking: NameKey.invalid()
+            key_dying: NameKey.invalid()
+            key_dead: NameKey.invalid()
+            key_america: NameKey.invalid()
+            key_china: NameKey.invalid()
+            key_gla: NameKey.invalid()
+            is_initialized: false
+        }
+    }
+
+    fn initialize(&self, pool: *StringPool) {
+        if self.is_initialized {
+            return
+        }
+
+        self.key_infantry = pool.name_to_key("INFANTRY")
+        self.key_vehicle = pool.name_to_key("VEHICLE")
+        self.key_aircraft = pool.name_to_key("AIRCRAFT")
+        self.key_structure = pool.name_to_key("STRUCTURE")
+        self.key_projectile = pool.name_to_key("PROJECTILE")
+
+        self.key_body_module = pool.name_to_key("BodyModule")
+        self.key_draw_module = pool.name_to_key("DrawModule")
+        self.key_update_module = pool.name_to_key("UpdateModule")
+        self.key_create_module = pool.name_to_key("CreateModule")
+        self.key_destroy_module = pool.name_to_key("DestroyModule")
+
+        self.key_idle = pool.name_to_key("IDLE")
+        self.key_moving = pool.name_to_key("MOVING")
+        self.key_attacking = pool.name_to_key("ATTACKING")
+        self.key_dying = pool.name_to_key("DYING")
+        self.key_dead = pool.name_to_key("DEAD")
+
+        self.key_america = pool.name_to_key("America")
+        self.key_china = pool.name_to_key("China")
+        self.key_gla = pool.name_to_key("GLA")
+
+        self.is_initialized = true
+    }
+}
+
+// ============================================================================
+// NAME KEY GENERATOR - Main interface (matches original API)
+// ============================================================================
+struct NameKeyGenerator {
+    pool: StringPool
+    well_known: WellKnownKeys
+    is_initialized: bool
+
+    fn init(allocator: Allocator): NameKeyGenerator {
+        let mut gen = NameKeyGenerator {
+            pool: StringPool.init(allocator, 65536)  // 64K max strings
+            well_known: WellKnownKeys.init()
+            is_initialized: true
+        }
+
+        // Initialize well-known keys
+        gen.well_known.initialize(&gen.pool)
+
+        return gen
+    }
+
+    fn name_to_key(&self, name: string): NameKey {
+        return self.pool.name_to_key(name)
+    }
+
+    fn name_to_lowercase_key(&self, name: string): NameKey {
+        return self.pool.name_to_lowercase_key(name)
+    }
+
+    fn key_to_name(&self, key: NameKey): string {
+        return self.pool.key_to_name(key)
+    }
+
+    fn reset(&self) {
+        self.pool.reset()
+        self.well_known = WellKnownKeys.init()
+        self.well_known.initialize(&self.pool)
+    }
+
+    fn deinit(&self) {
+        self.pool.deinit()
+        self.is_initialized = false
+    }
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_name_key_generator: ?NameKeyGenerator = null
+
+// Initialize the global name key generator
+export fn init_name_key_generator(allocator: Allocator) {
+    g_name_key_generator = NameKeyGenerator.init(allocator)
+}
+
+// Shutdown the global name key generator
+export fn shutdown_name_key_generator() {
+    if g_name_key_generator != null {
+        g_name_key_generator.?.deinit()
+        g_name_key_generator = null
+    }
+}
+
+// Get the global name key generator
+export fn get_name_key_generator(): ?*NameKeyGenerator {
+    if g_name_key_generator != null {
+        return &g_name_key_generator.?
+    }
+    return null
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS (match original NAMEKEY macro)
+// ============================================================================
+
+// Convert name to key (case sensitive)
+export fn NAMEKEY(name: string): NameKey {
+    if g_name_key_generator != null {
+        return g_name_key_generator.?.name_to_key(name)
+    }
+    return NameKey.invalid()
+}
+
+// Convert key to name
+export fn KEYNAME(key: NameKey): string {
+    if g_name_key_generator != null {
+        return g_name_key_generator.?.key_to_name(key)
+    }
+    return ""
+}
+
+// Convert name to key (case insensitive)
+export fn NAMEKEY_LOWERCASE(name: string): NameKey {
+    if g_name_key_generator != null {
+        return g_name_key_generator.?.name_to_lowercase_key(name)
+    }
+    return NameKey.invalid()
+}
+
+// Get well known keys
+export fn get_well_known_keys(): ?*WellKnownKeys {
+    if g_name_key_generator != null {
+        return &g_name_key_generator.?.well_known
+    }
+    return null
+}
+
+// Get pool statistics
+export fn get_string_pool_stats(): (i32, i64, f32) {
+    if g_name_key_generator != null {
+        let pool = &g_name_key_generator.?.pool
+        return (pool.get_string_count(), pool.get_lookup_count(), pool.get_cache_hit_rate())
+    }
+    return (0, 0, 0.0)
+}

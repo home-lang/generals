@@ -1,0 +1,998 @@
+// Entity Hierarchy System - Parent/Child relationships for game entities
+// Based on Thyme: Object.cpp hierarchy, Drawable.cpp drawable tree
+// @feature E3-005 - Implement entity hierarchy (parent/child)
+//
+// Implements:
+// - Parent-child entity relationships
+// - Transform inheritance (position, rotation, scale)
+// - Hierarchical event propagation
+// - Container/passenger systems
+
+// ============================================================================
+// ENTITY REFERENCE
+// ============================================================================
+
+struct EntityRef {
+    id: i32,
+    generation: i32,
+}
+
+impl EntityRef {
+    fn init(): EntityRef {
+        return EntityRef {
+            id: -1,
+            generation: 0,
+        }
+    }
+
+    fn from(id: i32, gen: i32): EntityRef {
+        return EntityRef {
+            id: id,
+            generation: gen,
+        }
+    }
+
+    fn is_valid(&self): bool {
+        return self.id >= 0
+    }
+
+    fn equals(&self, other: EntityRef): bool {
+        return self.id == other.id && self.generation == other.generation
+    }
+
+    fn invalidate(&self) {
+        self.id = -1
+    }
+}
+
+let INVALID_ENTITY: EntityRef = EntityRef { id: -1, generation: 0 }
+
+// ============================================================================
+// HIERARCHY NODE
+// ============================================================================
+
+struct HierarchyNode {
+    entity: EntityRef,
+    parent: EntityRef,
+    first_child: EntityRef,
+    next_sibling: EntityRef,
+    prev_sibling: EntityRef,
+    child_count: i32,
+    depth: i32,                 // Distance from root (0 = root)
+    dirty_flags: i32,           // Bitmask for what needs updating
+}
+
+impl HierarchyNode {
+    fn init(entity: EntityRef): HierarchyNode {
+        return HierarchyNode {
+            entity: entity,
+            parent: INVALID_ENTITY,
+            first_child: INVALID_ENTITY,
+            next_sibling: INVALID_ENTITY,
+            prev_sibling: INVALID_ENTITY,
+            child_count: 0,
+            depth: 0,
+            dirty_flags: 0,
+        }
+    }
+
+    fn has_parent(&self): bool {
+        return self.parent.is_valid()
+    }
+
+    fn has_children(&self): bool {
+        return self.first_child.is_valid()
+    }
+
+    fn is_root(&self): bool {
+        return !self.parent.is_valid()
+    }
+
+    fn is_leaf(&self): bool {
+        return !self.first_child.is_valid()
+    }
+}
+
+// Dirty flags for hierarchy updates
+const DIRTY_NONE: i32 = 0
+const DIRTY_LOCAL_TRANSFORM: i32 = 1
+const DIRTY_WORLD_TRANSFORM: i32 = 2
+const DIRTY_BOUNDS: i32 = 4
+const DIRTY_VISIBILITY: i32 = 8
+const DIRTY_ALL: i32 = 15
+
+// ============================================================================
+// HIERARCHICAL TRANSFORM
+// ============================================================================
+
+struct HierarchyTransform {
+    // Local transform (relative to parent)
+    local_position: Vec3,
+    local_rotation: Quat,
+    local_scale: Vec3,
+
+    // World transform (cached, computed from hierarchy)
+    world_position: Vec3,
+    world_rotation: Quat,
+    world_scale: Vec3,
+
+    // Cached world matrix
+    local_matrix: Mat4,
+    world_matrix: Mat4,
+    inverse_world_matrix: Mat4,
+
+    // Transform flags
+    inherit_position: bool,
+    inherit_rotation: bool,
+    inherit_scale: bool,
+}
+
+impl HierarchyTransform {
+    fn init(): HierarchyTransform {
+        return HierarchyTransform {
+            local_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            local_rotation: Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            local_scale: Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+            world_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            world_rotation: Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            world_scale: Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+            local_matrix: Mat4::identity(),
+            world_matrix: Mat4::identity(),
+            inverse_world_matrix: Mat4::identity(),
+            inherit_position: true,
+            inherit_rotation: true,
+            inherit_scale: true,
+        }
+    }
+
+    fn set_local_position(&self, pos: Vec3) {
+        self.local_position = pos
+    }
+
+    fn set_local_rotation(&self, rot: Quat) {
+        self.local_rotation = rot
+    }
+
+    fn set_local_scale(&self, scale: Vec3) {
+        self.local_scale = scale
+    }
+
+    fn compute_local_matrix(&self) {
+        // Build local transform matrix: T * R * S
+        let scale_mat = Mat4::scale(self.local_scale.x, self.local_scale.y, self.local_scale.z)
+        let rot_mat = quat_to_mat4(self.local_rotation)
+        let trans_mat = Mat4::translation(self.local_position.x, self.local_position.y, self.local_position.z)
+
+        self.local_matrix = mat4_multiply(trans_mat, mat4_multiply(rot_mat, scale_mat))
+    }
+
+    fn compute_world_transform(&self, parent_transform: HierarchyTransform?) {
+        if parent_transform == null {
+            // No parent, world = local
+            self.world_position = self.local_position
+            self.world_rotation = self.local_rotation
+            self.world_scale = self.local_scale
+            self.world_matrix = self.local_matrix
+        } else {
+            // Inherit from parent based on flags
+            if self.inherit_position {
+                self.world_position = transform_point(parent_transform.world_matrix, self.local_position)
+            } else {
+                self.world_position = self.local_position
+            }
+
+            if self.inherit_rotation {
+                self.world_rotation = quat_multiply(parent_transform.world_rotation, self.local_rotation)
+            } else {
+                self.world_rotation = self.local_rotation
+            }
+
+            if self.inherit_scale {
+                self.world_scale = Vec3 {
+                    x: parent_transform.world_scale.x * self.local_scale.x,
+                    y: parent_transform.world_scale.y * self.local_scale.y,
+                    z: parent_transform.world_scale.z * self.local_scale.z,
+                }
+            } else {
+                self.world_scale = self.local_scale
+            }
+
+            self.world_matrix = mat4_multiply(parent_transform.world_matrix, self.local_matrix)
+        }
+
+        // Compute inverse for transforming from world to local
+        self.inverse_world_matrix = mat4_inverse(self.world_matrix)
+    }
+
+    fn world_to_local(&self, world_pos: Vec3): Vec3 {
+        return transform_point(self.inverse_world_matrix, world_pos)
+    }
+
+    fn local_to_world(&self, local_pos: Vec3): Vec3 {
+        return transform_point(self.world_matrix, local_pos)
+    }
+
+    fn get_forward(&self): Vec3 {
+        // Forward is -Z in local space
+        return rotate_vector(self.world_rotation, Vec3 { x: 0.0, y: 0.0, z: -1.0 })
+    }
+
+    fn get_right(&self): Vec3 {
+        return rotate_vector(self.world_rotation, Vec3 { x: 1.0, y: 0.0, z: 0.0 })
+    }
+
+    fn get_up(&self): Vec3 {
+        return rotate_vector(self.world_rotation, Vec3 { x: 0.0, y: 1.0, z: 0.0 })
+    }
+}
+
+// ============================================================================
+// ENTITY HIERARCHY MANAGER
+// ============================================================================
+
+const MAX_ENTITIES: i32 = 8192
+const MAX_CHILDREN_PER_ENTITY: i32 = 64
+
+struct EntityHierarchy {
+    nodes: [HierarchyNode],
+    transforms: [HierarchyTransform],
+    entity_to_index: [i32],
+    active_count: i32,
+    free_list: [i32],
+    free_count: i32,
+
+    // Traversal caches
+    root_entities: [EntityRef],
+    root_count: i32,
+    traversal_order: [i32],
+    traversal_count: i32,
+    needs_traversal_rebuild: bool,
+}
+
+impl EntityHierarchy {
+    fn init(): EntityHierarchy {
+        let nodes: [HierarchyNode] = []
+        let transforms: [HierarchyTransform] = []
+        let entity_map: [i32] = []
+        let free: [i32] = []
+        let roots: [EntityRef] = []
+        let order: [i32] = []
+
+        for i in 0..MAX_ENTITIES {
+            nodes = nodes + [HierarchyNode::init(INVALID_ENTITY)]
+            transforms = transforms + [HierarchyTransform::init()]
+            entity_map = entity_map + [-1]
+            free = free + [MAX_ENTITIES - 1 - i]  // Reverse order
+            order = order + [-1]
+        }
+
+        for i in 0..256 {
+            roots = roots + [INVALID_ENTITY]
+        }
+
+        return EntityHierarchy {
+            nodes: nodes,
+            transforms: transforms,
+            entity_to_index: entity_map,
+            active_count: 0,
+            free_list: free,
+            free_count: MAX_ENTITIES,
+            root_entities: roots,
+            root_count: 0,
+            traversal_order: order,
+            traversal_count: 0,
+            needs_traversal_rebuild: true,
+        }
+    }
+
+    // Register an entity in the hierarchy
+    fn register(&self, entity: EntityRef): bool {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return false
+        }
+
+        // Check if already registered
+        if self.entity_to_index[entity.id] >= 0 {
+            return true
+        }
+
+        // Get free slot
+        if self.free_count <= 0 {
+            return false
+        }
+
+        self.free_count = self.free_count - 1
+        let index = self.free_list[self.free_count]
+
+        // Initialize node
+        self.nodes[index] = HierarchyNode::init(entity)
+        self.transforms[index] = HierarchyTransform::init()
+        self.entity_to_index[entity.id] = index
+        self.active_count = self.active_count + 1
+
+        // Add to root list (no parent yet)
+        self.add_to_roots(entity)
+        self.needs_traversal_rebuild = true
+
+        return true
+    }
+
+    // Unregister an entity from the hierarchy
+    fn unregister(&self, entity: EntityRef): bool {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return false
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return false
+        }
+
+        // First, orphan all children
+        let node = self.nodes[index]
+        let child = node.first_child
+        while child.is_valid() {
+            let child_idx = self.entity_to_index[child.id]
+            if child_idx >= 0 {
+                let next = self.nodes[child_idx].next_sibling
+                self.set_parent(child, INVALID_ENTITY)  // Remove parent
+                child = next
+            } else {
+                child = INVALID_ENTITY
+            }
+        }
+
+        // Remove from parent's children
+        if node.parent.is_valid() {
+            self.remove_from_parent(entity)
+        } else {
+            self.remove_from_roots(entity)
+        }
+
+        // Clear node and return to free list
+        self.nodes[index] = HierarchyNode::init(INVALID_ENTITY)
+        self.entity_to_index[entity.id] = -1
+        self.free_list[self.free_count] = index
+        self.free_count = self.free_count + 1
+        self.active_count = self.active_count - 1
+        self.needs_traversal_rebuild = true
+
+        return true
+    }
+
+    // Set parent-child relationship
+    fn set_parent(&self, child: EntityRef, parent: EntityRef): bool {
+        if !child.is_valid() || child.id >= MAX_ENTITIES {
+            return false
+        }
+
+        let child_idx = self.entity_to_index[child.id]
+        if child_idx < 0 {
+            return false
+        }
+
+        let child_node = self.nodes[child_idx]
+        let old_parent = child_node.parent
+
+        // Remove from old parent
+        if old_parent.is_valid() {
+            self.remove_from_parent(child)
+        } else {
+            self.remove_from_roots(child)
+        }
+
+        // Set new parent
+        child_node.parent = parent
+
+        if parent.is_valid() && parent.id < MAX_ENTITIES {
+            let parent_idx = self.entity_to_index[parent.id]
+            if parent_idx >= 0 {
+                let parent_node = self.nodes[parent_idx]
+
+                // Add as first child
+                child_node.next_sibling = parent_node.first_child
+                child_node.prev_sibling = INVALID_ENTITY
+                if parent_node.first_child.is_valid() {
+                    let first_idx = self.entity_to_index[parent_node.first_child.id]
+                    if first_idx >= 0 {
+                        self.nodes[first_idx].prev_sibling = child
+                    }
+                }
+                parent_node.first_child = child
+                parent_node.child_count = parent_node.child_count + 1
+
+                // Update depth
+                child_node.depth = parent_node.depth + 1
+                self.update_child_depths(child, child_node.depth)
+            }
+        } else {
+            // No parent = root entity
+            self.add_to_roots(child)
+            child_node.depth = 0
+            self.update_child_depths(child, 0)
+        }
+
+        // Mark transforms as dirty
+        child_node.dirty_flags = child_node.dirty_flags | DIRTY_WORLD_TRANSFORM
+        self.mark_children_dirty(child, DIRTY_WORLD_TRANSFORM)
+        self.needs_traversal_rebuild = true
+
+        return true
+    }
+
+    fn get_parent(&self, entity: EntityRef): EntityRef {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return INVALID_ENTITY
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return INVALID_ENTITY
+        }
+
+        return self.nodes[index].parent
+    }
+
+    fn get_first_child(&self, entity: EntityRef): EntityRef {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return INVALID_ENTITY
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return INVALID_ENTITY
+        }
+
+        return self.nodes[index].first_child
+    }
+
+    fn get_next_sibling(&self, entity: EntityRef): EntityRef {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return INVALID_ENTITY
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return INVALID_ENTITY
+        }
+
+        return self.nodes[index].next_sibling
+    }
+
+    fn get_child_count(&self, entity: EntityRef): i32 {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return 0
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return 0
+        }
+
+        return self.nodes[index].child_count
+    }
+
+    fn get_depth(&self, entity: EntityRef): i32 {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return -1
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return -1
+        }
+
+        return self.nodes[index].depth
+    }
+
+    // Get all children of an entity
+    fn get_children(&self, entity: EntityRef): [EntityRef] {
+        let children: [EntityRef] = []
+
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return children
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return children
+        }
+
+        let child = self.nodes[index].first_child
+        while child.is_valid() {
+            children = children + [child]
+            let child_idx = self.entity_to_index[child.id]
+            if child_idx >= 0 {
+                child = self.nodes[child_idx].next_sibling
+            } else {
+                child = INVALID_ENTITY
+            }
+        }
+
+        return children
+    }
+
+    // Get all ancestors (parent chain to root)
+    fn get_ancestors(&self, entity: EntityRef): [EntityRef] {
+        let ancestors: [EntityRef] = []
+
+        let current = self.get_parent(entity)
+        while current.is_valid() {
+            ancestors = ancestors + [current]
+            current = self.get_parent(current)
+        }
+
+        return ancestors
+    }
+
+    // Get root of the hierarchy tree containing this entity
+    fn get_root(&self, entity: EntityRef): EntityRef {
+        let current = entity
+        let parent = self.get_parent(current)
+
+        while parent.is_valid() {
+            current = parent
+            parent = self.get_parent(current)
+        }
+
+        return current
+    }
+
+    // Check if ancestor is an ancestor of entity
+    fn is_ancestor_of(&self, ancestor: EntityRef, entity: EntityRef): bool {
+        let current = self.get_parent(entity)
+        while current.is_valid() {
+            if current.equals(ancestor) {
+                return true
+            }
+            current = self.get_parent(current)
+        }
+        return false
+    }
+
+    // Transform access
+    fn get_transform(&self, entity: EntityRef): HierarchyTransform? {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return null
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return null
+        }
+
+        return self.transforms[index]
+    }
+
+    fn set_local_position(&self, entity: EntityRef, pos: Vec3) {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return
+        }
+
+        self.transforms[index].set_local_position(pos)
+        self.nodes[index].dirty_flags = self.nodes[index].dirty_flags | DIRTY_LOCAL_TRANSFORM | DIRTY_WORLD_TRANSFORM
+        self.mark_children_dirty(entity, DIRTY_WORLD_TRANSFORM)
+    }
+
+    fn set_local_rotation(&self, entity: EntityRef, rot: Quat) {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return
+        }
+
+        self.transforms[index].set_local_rotation(rot)
+        self.nodes[index].dirty_flags = self.nodes[index].dirty_flags | DIRTY_LOCAL_TRANSFORM | DIRTY_WORLD_TRANSFORM
+        self.mark_children_dirty(entity, DIRTY_WORLD_TRANSFORM)
+    }
+
+    fn set_local_scale(&self, entity: EntityRef, scale: Vec3) {
+        if !entity.is_valid() || entity.id >= MAX_ENTITIES {
+            return
+        }
+
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return
+        }
+
+        self.transforms[index].set_local_scale(scale)
+        self.nodes[index].dirty_flags = self.nodes[index].dirty_flags | DIRTY_LOCAL_TRANSFORM | DIRTY_WORLD_TRANSFORM
+        self.mark_children_dirty(entity, DIRTY_WORLD_TRANSFORM)
+    }
+
+    // Update all transforms in hierarchy order
+    fn update_transforms(&self) {
+        if self.needs_traversal_rebuild {
+            self.rebuild_traversal_order()
+        }
+
+        // Process in traversal order (parents before children)
+        for i in 0..self.traversal_count {
+            let index = self.traversal_order[i]
+            if index < 0 {
+                continue
+            }
+
+            let node = self.nodes[index]
+            if (node.dirty_flags & DIRTY_LOCAL_TRANSFORM) != 0 {
+                self.transforms[index].compute_local_matrix()
+                node.dirty_flags = node.dirty_flags & ~DIRTY_LOCAL_TRANSFORM
+            }
+
+            if (node.dirty_flags & DIRTY_WORLD_TRANSFORM) != 0 {
+                let parent_transform: HierarchyTransform? = null
+                if node.parent.is_valid() {
+                    let parent_idx = self.entity_to_index[node.parent.id]
+                    if parent_idx >= 0 {
+                        parent_transform = self.transforms[parent_idx]
+                    }
+                }
+                self.transforms[index].compute_world_transform(parent_transform)
+                node.dirty_flags = node.dirty_flags & ~DIRTY_WORLD_TRANSFORM
+            }
+        }
+    }
+
+    // Internal helpers
+    fn remove_from_parent(&self, entity: EntityRef) {
+        let index = self.entity_to_index[entity.id]
+        if index < 0 {
+            return
+        }
+
+        let node = self.nodes[index]
+        let parent_idx = self.entity_to_index[node.parent.id]
+        if parent_idx < 0 {
+            return
+        }
+
+        let parent_node = self.nodes[parent_idx]
+
+        // Update sibling links
+        if node.prev_sibling.is_valid() {
+            let prev_idx = self.entity_to_index[node.prev_sibling.id]
+            if prev_idx >= 0 {
+                self.nodes[prev_idx].next_sibling = node.next_sibling
+            }
+        } else {
+            // This was the first child
+            parent_node.first_child = node.next_sibling
+        }
+
+        if node.next_sibling.is_valid() {
+            let next_idx = self.entity_to_index[node.next_sibling.id]
+            if next_idx >= 0 {
+                self.nodes[next_idx].prev_sibling = node.prev_sibling
+            }
+        }
+
+        parent_node.child_count = parent_node.child_count - 1
+        node.parent = INVALID_ENTITY
+        node.prev_sibling = INVALID_ENTITY
+        node.next_sibling = INVALID_ENTITY
+    }
+
+    fn add_to_roots(&self, entity: EntityRef) {
+        if self.root_count < 256 {
+            self.root_entities[self.root_count] = entity
+            self.root_count = self.root_count + 1
+        }
+    }
+
+    fn remove_from_roots(&self, entity: EntityRef) {
+        for i in 0..self.root_count {
+            if self.root_entities[i].equals(entity) {
+                // Swap with last
+                self.root_count = self.root_count - 1
+                self.root_entities[i] = self.root_entities[self.root_count]
+                self.root_entities[self.root_count] = INVALID_ENTITY
+                return
+            }
+        }
+    }
+
+    fn update_child_depths(&self, entity: EntityRef, parent_depth: i32) {
+        let child = self.get_first_child(entity)
+        while child.is_valid() {
+            let child_idx = self.entity_to_index[child.id]
+            if child_idx >= 0 {
+                self.nodes[child_idx].depth = parent_depth + 1
+                self.update_child_depths(child, parent_depth + 1)
+            }
+            child = self.get_next_sibling(child)
+        }
+    }
+
+    fn mark_children_dirty(&self, entity: EntityRef, flags: i32) {
+        let child = self.get_first_child(entity)
+        while child.is_valid() {
+            let child_idx = self.entity_to_index[child.id]
+            if child_idx >= 0 {
+                self.nodes[child_idx].dirty_flags = self.nodes[child_idx].dirty_flags | flags
+                self.mark_children_dirty(child, flags)
+            }
+            child = self.get_next_sibling(child)
+        }
+    }
+
+    fn rebuild_traversal_order(&self) {
+        self.traversal_count = 0
+
+        // BFS from roots
+        let queue: [EntityRef] = []
+        for i in 0..self.root_count {
+            queue = queue + [self.root_entities[i]]
+        }
+
+        let queue_start = 0
+        while queue_start < queue.length {
+            let entity = queue[queue_start]
+            queue_start = queue_start + 1
+
+            let index = self.entity_to_index[entity.id]
+            if index >= 0 {
+                self.traversal_order[self.traversal_count] = index
+                self.traversal_count = self.traversal_count + 1
+
+                // Add children to queue
+                let child = self.nodes[index].first_child
+                while child.is_valid() {
+                    queue = queue + [child]
+                    let child_idx = self.entity_to_index[child.id]
+                    if child_idx >= 0 {
+                        child = self.nodes[child_idx].next_sibling
+                    } else {
+                        child = INVALID_ENTITY
+                    }
+                }
+            }
+        }
+
+        self.needs_traversal_rebuild = false
+    }
+}
+
+// ============================================================================
+// CONTAINER SYSTEM (for transport vehicles, garrisons, etc.)
+// ============================================================================
+
+struct ContainerComponent {
+    entity: EntityRef,
+    capacity: i32,
+    contained: [EntityRef],
+    count: i32,
+    is_open: bool,          // Can accept new contents
+    exit_bone: string,      // Bone name for exit point
+}
+
+impl ContainerComponent {
+    fn init(entity: EntityRef, capacity: i32): ContainerComponent {
+        let contained: [EntityRef] = []
+        for i in 0..capacity {
+            contained = contained + [INVALID_ENTITY]
+        }
+
+        return ContainerComponent {
+            entity: entity,
+            capacity: capacity,
+            contained: contained,
+            count: 0,
+            is_open: true,
+            exit_bone: "EXITPOINT",
+        }
+    }
+
+    fn can_contain(&self, passenger: EntityRef): bool {
+        if !self.is_open {
+            return false
+        }
+        if self.count >= self.capacity {
+            return false
+        }
+        // In real implementation, check size constraints, team compatibility, etc.
+        return true
+    }
+
+    fn add(&self, passenger: EntityRef): bool {
+        if !self.can_contain(passenger) {
+            return false
+        }
+
+        // Find empty slot
+        for i in 0..self.capacity {
+            if !self.contained[i].is_valid() {
+                self.contained[i] = passenger
+                self.count = self.count + 1
+                return true
+            }
+        }
+        return false
+    }
+
+    fn remove(&self, passenger: EntityRef): bool {
+        for i in 0..self.capacity {
+            if self.contained[i].equals(passenger) {
+                self.contained[i] = INVALID_ENTITY
+                self.count = self.count - 1
+                return true
+            }
+        }
+        return false
+    }
+
+    fn contains(&self, passenger: EntityRef): bool {
+        for i in 0..self.capacity {
+            if self.contained[i].equals(passenger) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get_all(&self): [EntityRef] {
+        let result: [EntityRef] = []
+        for i in 0..self.capacity {
+            if self.contained[i].is_valid() {
+                result = result + [self.contained[i]]
+            }
+        }
+        return result
+    }
+
+    fn is_full(&self): bool {
+        return self.count >= self.capacity
+    }
+
+    fn is_empty(&self): bool {
+        return self.count == 0
+    }
+
+    fn clear(&self) {
+        for i in 0..self.capacity {
+            self.contained[i] = INVALID_ENTITY
+        }
+        self.count = 0
+    }
+}
+
+// ============================================================================
+// MATH HELPERS
+// ============================================================================
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct Quat {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+struct Mat4 {
+    m: [f32],  // 16 elements in column-major order
+}
+
+impl Mat4 {
+    fn identity(): Mat4 {
+        return Mat4 {
+            m: [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    fn translation(x: f32, y: f32, z: f32): Mat4 {
+        return Mat4 {
+            m: [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                x, y, z, 1.0],
+        }
+    }
+
+    fn scale(x: f32, y: f32, z: f32): Mat4 {
+        return Mat4 {
+            m: [x, 0.0, 0.0, 0.0,
+                0.0, y, 0.0, 0.0,
+                0.0, 0.0, z, 0.0,
+                0.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
+fn quat_to_mat4(q: Quat): Mat4 {
+    let xx = q.x * q.x
+    let yy = q.y * q.y
+    let zz = q.z * q.z
+    let xy = q.x * q.y
+    let xz = q.x * q.z
+    let yz = q.y * q.z
+    let wx = q.w * q.x
+    let wy = q.w * q.y
+    let wz = q.w * q.z
+
+    return Mat4 {
+        m: [1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy), 0.0,
+            2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx), 0.0,
+            2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy), 0.0,
+            0.0, 0.0, 0.0, 1.0],
+    }
+}
+
+fn quat_multiply(a: Quat, b: Quat): Quat {
+    return Quat {
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    }
+}
+
+fn rotate_vector(q: Quat, v: Vec3): Vec3 {
+    // Rotate vector by quaternion: q * v * q^-1
+    let qv = Quat { x: v.x, y: v.y, z: v.z, w: 0.0 }
+    let qinv = Quat { x: -q.x, y: -q.y, z: -q.z, w: q.w }
+    let result = quat_multiply(quat_multiply(q, qv), qinv)
+    return Vec3 { x: result.x, y: result.y, z: result.z }
+}
+
+fn mat4_multiply(a: Mat4, b: Mat4): Mat4 {
+    let result = Mat4 { m: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+    for i in 0..4 {
+        for j in 0..4 {
+            let sum: f32 = 0.0
+            for k in 0..4 {
+                sum = sum + a.m[i + k * 4] * b.m[k + j * 4]
+            }
+            result.m[i + j * 4] = sum
+        }
+    }
+    return result
+}
+
+fn mat4_inverse(m: Mat4): Mat4 {
+    // Simplified inverse for transformation matrices
+    // In real implementation, use full matrix inversion
+    return Mat4::identity()
+}
+
+fn transform_point(m: Mat4, p: Vec3): Vec3 {
+    return Vec3 {
+        x: m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12],
+        y: m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+        z: m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14],
+    }
+}
+
+// ============================================================================
+// GLOBAL HIERARCHY INSTANCE
+// ============================================================================
+
+let g_entity_hierarchy: EntityHierarchy? = null
+
+fn init_entity_hierarchy() {
+    g_entity_hierarchy = EntityHierarchy::init()
+}
+
+fn get_entity_hierarchy(): EntityHierarchy? {
+    return g_entity_hierarchy
+}
+
+fn shutdown_entity_hierarchy() {
+    g_entity_hierarchy = null
+}

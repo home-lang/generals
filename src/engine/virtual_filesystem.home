@@ -1,0 +1,1354 @@
+// C&C Generals Zero Hour - Home Port
+// Virtual File System Abstraction
+//
+// Provides unified access to:
+// - Regular filesystem files
+// - BIG archive entries
+// - Memory buffers
+// - Mod overlays
+//
+// Based on original FileSystem.h and file.h
+
+import basics/allocator
+import platform/mmap
+import platform/file_attributes
+
+// ============================================================================
+// FILE ACCESS FLAGS (matching original file.h)
+// ============================================================================
+const FILE_NONE: i32 = 0x00
+const FILE_READ: i32 = 0x01
+const FILE_WRITE: i32 = 0x02
+const FILE_READWRITE: i32 = 0x03
+const FILE_APPEND: i32 = 0x04
+const FILE_CREATE: i32 = 0x08
+const FILE_TRUNCATE: i32 = 0x10
+const FILE_TEXT: i32 = 0x20
+const FILE_BINARY: i32 = 0x40
+const FILE_ONLYNEW: i32 = 0x80
+const FILE_STREAMING: i32 = 0x100
+const FILE_LINEBUF: i32 = 0x200
+const FILE_FULLBUF: i32 = 0x400
+
+// Default buffer size
+const FILE_BUFFERSIZE: i64 = 65536
+
+// ============================================================================
+// FILE SOURCE TYPE
+// ============================================================================
+enum FileSourceType {
+    Unknown = 0
+    Regular = 1           // Regular filesystem file
+    BigArchive = 2        // Entry in a BIG archive
+    Memory = 3            // Memory buffer
+    Compressed = 4        // Compressed file (needs decompression)
+}
+
+// ============================================================================
+// FILE INFO - Metadata about a file
+// ============================================================================
+struct FileInfo {
+    exists: bool
+    size: i64
+    modified_time: i64        // Unix timestamp
+    source_type: FileSourceType
+    archive_path: string      // If from archive, path to archive
+    is_compressed: bool
+    uncompressed_size: i64    // Size after decompression
+
+    fn init(): FileInfo {
+        return FileInfo {
+            exists: false
+            size: 0
+            modified_time: 0
+            source_type: FileSourceType::Unknown
+            archive_path: ""
+            is_compressed: false
+            uncompressed_size: 0
+        }
+    }
+}
+
+// ============================================================================
+// VIRTUAL FILE - Abstract file handle
+// ============================================================================
+struct VirtualFile {
+    // File identity
+    path: string
+    source_type: FileSourceType
+    access_flags: i32
+    is_open: bool
+
+    // File state
+    position: i64
+    size: i64
+    eof_reached: bool
+
+    // Buffering
+    buffer: *u8
+    buffer_size: i64
+    buffer_pos: i64
+    buffer_valid: i64         // Bytes valid in buffer
+    buffer_dirty: bool        // Buffer has unwritten data
+
+    // Platform handle (for regular files)
+    file_handle: i64
+
+    // Memory mapping (for BIG entries and mmap'd files)
+    mapped_data: *u8
+    mapped_size: i64
+    owns_mapped_data: bool    // Should we free the data?
+
+    // Reference to source archive (for BIG entries)
+    archive_ref: *BigArchiveSource
+
+    fn init(): VirtualFile {
+        return VirtualFile {
+            path: ""
+            source_type: FileSourceType::Unknown
+            access_flags: FILE_NONE
+            is_open: false
+            position: 0
+            size: 0
+            eof_reached: false
+            buffer: null
+            buffer_size: 0
+            buffer_pos: 0
+            buffer_valid: 0
+            buffer_dirty: false
+            file_handle: -1
+            mapped_data: null
+            mapped_size: 0
+            owns_mapped_data: false
+            archive_ref: null
+        }
+    }
+
+    // ========================================
+    // READING
+    // ========================================
+
+    fn read(&self, dest: *u8, count: i64): i64 {
+        if !self.is_open or (self.access_flags & FILE_READ) == 0 {
+            return -1
+        }
+
+        if self.eof_reached {
+            return 0
+        }
+
+        let bytes_read: i64 = 0
+
+        // Memory-mapped or memory buffer source
+        if self.mapped_data != null {
+            let available = self.mapped_size - self.position
+            let to_read = if count < available { count } else { available }
+
+            if to_read <= 0 {
+                self.eof_reached = true
+                return 0
+            }
+
+            // Copy from mapped memory
+            let src = self.mapped_data + self.position
+            for i in 0..to_read {
+                dest[i] = src[i]
+            }
+
+            self.position = self.position + to_read
+            if self.position >= self.mapped_size {
+                self.eof_reached = true
+            }
+
+            return to_read
+        }
+
+        // Regular file - use buffered I/O
+        if self.file_handle >= 0 {
+            return self.read_buffered(dest, count)
+        }
+
+        return -1
+    }
+
+    fn read_buffered(&self, dest: *u8, count: i64): i64 {
+        let mut total_read: i64 = 0
+        let mut remaining = count
+
+        while remaining > 0 and !self.eof_reached {
+            // Check if we need to refill buffer
+            if self.buffer_pos >= self.buffer_valid {
+                self.fill_buffer()
+                if self.buffer_valid == 0 {
+                    self.eof_reached = true
+                    break
+                }
+            }
+
+            // Copy from buffer
+            let in_buffer = self.buffer_valid - self.buffer_pos
+            let to_copy = if remaining < in_buffer { remaining } else { in_buffer }
+
+            for i in 0..to_copy {
+                dest[total_read + i] = self.buffer[self.buffer_pos + i]
+            }
+
+            self.buffer_pos = self.buffer_pos + to_copy
+            self.position = self.position + to_copy
+            total_read = total_read + to_copy
+            remaining = remaining - to_copy
+        }
+
+        return total_read
+    }
+
+    fn fill_buffer(&self) {
+        if self.buffer == null or self.file_handle < 0 {
+            return
+        }
+
+        // Platform-specific read
+        let bytes = read_file_platform(self.file_handle, self.buffer, self.buffer_size)
+        if bytes <= 0 {
+            self.buffer_valid = 0
+        } else {
+            self.buffer_valid = bytes
+        }
+        self.buffer_pos = 0
+    }
+
+    // Read a single byte
+    fn read_byte(&self): i32 {
+        let mut byte: u8 = 0
+        if self.read(&byte, 1) == 1 {
+            return byte as i32
+        }
+        return -1
+    }
+
+    // Read little-endian integers
+    fn read_u16_le(&self): u16 {
+        let mut bytes: [u8; 2] = [0, 0]
+        if self.read(&bytes[0], 2) != 2 {
+            return 0
+        }
+        return bytes[0] as u16 | ((bytes[1] as u16) << 8)
+    }
+
+    fn read_u32_le(&self): u32 {
+        let mut bytes: [u8; 4] = [0, 0, 0, 0]
+        if self.read(&bytes[0], 4) != 4 {
+            return 0
+        }
+        return bytes[0] as u32 |
+               ((bytes[1] as u32) << 8) |
+               ((bytes[2] as u32) << 16) |
+               ((bytes[3] as u32) << 24)
+    }
+
+    fn read_i32_le(&self): i32 {
+        return self.read_u32_le() as i32
+    }
+
+    fn read_f32_le(&self): f32 {
+        let bits = self.read_u32_le()
+        // Bit-cast to float (platform-specific in real impl)
+        return reinterpret_u32_as_f32(bits)
+    }
+
+    // Read a line of text
+    fn read_line(&self, buffer: *u8, max_length: i64): i64 {
+        let mut count: i64 = 0
+        while count < max_length - 1 {
+            let ch = self.read_byte()
+            if ch < 0 {
+                break
+            }
+            if ch == 10 {  // '\n'
+                break
+            }
+            if ch == 13 {  // '\r'
+                // Check for \r\n
+                let next = self.read_byte()
+                if next >= 0 and next != 10 {
+                    // Put back non-\n character (would need proper ungetch)
+                    self.position = self.position - 1
+                }
+                break
+            }
+            buffer[count] = ch as u8
+            count = count + 1
+        }
+        buffer[count] = 0  // Null terminate
+        return count
+    }
+
+    // ========================================
+    // WRITING
+    // ========================================
+
+    fn write(&self, src: *u8, count: i64): i64 {
+        if !self.is_open or (self.access_flags & FILE_WRITE) == 0 {
+            return -1
+        }
+
+        // Can't write to memory-mapped read-only or archive sources
+        if self.source_type == FileSourceType::BigArchive {
+            return -1
+        }
+
+        if self.buffer != null {
+            return self.write_buffered(src, count)
+        }
+
+        // Direct write for unbuffered
+        if self.file_handle >= 0 {
+            let written = write_file_platform(self.file_handle, src, count)
+            if written > 0 {
+                self.position = self.position + written
+                if self.position > self.size {
+                    self.size = self.position
+                }
+            }
+            return written
+        }
+
+        return -1
+    }
+
+    fn write_buffered(&self, src: *u8, count: i64): i64 {
+        let mut total_written: i64 = 0
+        let mut remaining = count
+
+        while remaining > 0 {
+            let space = self.buffer_size - self.buffer_pos
+            let to_copy = if remaining < space { remaining } else { space }
+
+            for i in 0..to_copy {
+                self.buffer[self.buffer_pos + i] = src[total_written + i]
+            }
+
+            self.buffer_pos = self.buffer_pos + to_copy
+            self.buffer_dirty = true
+            total_written = total_written + to_copy
+            remaining = remaining - to_copy
+            self.position = self.position + to_copy
+
+            // Flush if buffer full
+            if self.buffer_pos >= self.buffer_size {
+                self.flush()
+            }
+        }
+
+        if self.position > self.size {
+            self.size = self.position
+        }
+
+        return total_written
+    }
+
+    fn flush(&self): bool {
+        if !self.buffer_dirty or self.buffer == null {
+            return true
+        }
+
+        if self.file_handle >= 0 {
+            let written = write_file_platform(self.file_handle, self.buffer, self.buffer_pos)
+            if written == self.buffer_pos {
+                self.buffer_pos = 0
+                self.buffer_dirty = false
+                return true
+            }
+        }
+
+        return false
+    }
+
+    // ========================================
+    // SEEKING
+    // ========================================
+
+    fn seek(& self, offset: i64, whence: i32): bool {
+        // whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END
+        let new_pos: i64 = 0
+
+        if whence == 0 {
+            new_pos = offset
+        } else if whence == 1 {
+            new_pos = self.position + offset
+        } else if whence == 2 {
+            new_pos = self.size + offset
+        } else {
+            return false
+        }
+
+        if new_pos < 0 {
+            return false
+        }
+
+        // Flush any pending writes
+        if self.buffer_dirty {
+            self.flush()
+        }
+
+        // For memory-mapped files, just update position
+        if self.mapped_data != null {
+            if new_pos > self.mapped_size {
+                new_pos = self.mapped_size
+            }
+            self.position = new_pos
+            self.eof_reached = (new_pos >= self.mapped_size)
+            return true
+        }
+
+        // For regular files, seek and invalidate buffer
+        if self.file_handle >= 0 {
+            if seek_file_platform(self.file_handle, new_pos, 0) {
+                self.position = new_pos
+                self.buffer_pos = 0
+                self.buffer_valid = 0
+                self.eof_reached = false
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn tell(&self): i64 {
+        return self.position
+    }
+
+    fn rewind(&self) {
+        self.seek(0, 0)
+    }
+
+    // ========================================
+    // UTILITY
+    // ========================================
+
+    fn get_size(&self): i64 {
+        return self.size
+    }
+
+    fn is_eof(&self): bool {
+        return self.eof_reached
+    }
+
+    fn close(&self) {
+        if !self.is_open {
+            return
+        }
+
+        // Flush pending writes
+        if self.buffer_dirty {
+            self.flush()
+        }
+
+        // Free buffer
+        if self.buffer != null {
+            // Would free buffer
+            self.buffer = null
+        }
+
+        // Close file handle
+        if self.file_handle >= 0 {
+            close_file_platform(self.file_handle)
+            self.file_handle = -1
+        }
+
+        // Free mapped data if we own it
+        if self.owns_mapped_data and self.mapped_data != null {
+            // Would free mapped data
+            self.mapped_data = null
+        }
+
+        self.is_open = false
+    }
+
+    fn deinit(&self) {
+        self.close()
+    }
+}
+
+// ============================================================================
+// BIG ARCHIVE ENTRY
+// ============================================================================
+struct BigArchiveEntry {
+    name: string
+    name_hash: u32           // For fast lookup
+    offset: i64              // Offset in archive file
+    size: i64                // Compressed/stored size
+    uncompressed_size: i64   // Uncompressed size (if compressed)
+    is_compressed: bool
+
+    fn init(): BigArchiveEntry {
+        return BigArchiveEntry {
+            name: ""
+            name_hash: 0
+            offset: 0
+            size: 0
+            uncompressed_size: 0
+            is_compressed: false
+        }
+    }
+}
+
+// ============================================================================
+// BIG ARCHIVE SOURCE
+// ============================================================================
+struct BigArchiveSource {
+    path: string
+    mmap_file: MemoryMappedFile
+    entries: [BigArchiveEntry; 65536]   // Fixed max for simplicity
+    entry_count: i32
+    is_open: bool
+
+    fn init(): BigArchiveSource {
+        return BigArchiveSource {
+            path: ""
+            mmap_file: MemoryMappedFile.init()
+            entries: undefined  // Will be zeroed
+            entry_count: 0
+            is_open: false
+        }
+    }
+
+    fn open(&self, archive_path: string): bool {
+        if self.is_open {
+            self.close()
+        }
+
+        self.path = archive_path
+
+        // Open and map the archive
+        if !self.mmap_file.open(archive_path, MMAP_READ | MMAP_PRIVATE) {
+            return false
+        }
+
+        if !self.mmap_file.map_all() {
+            self.mmap_file.close()
+            return false
+        }
+
+        // Parse BIG header
+        if !self.parse_header() {
+            self.mmap_file.close()
+            return false
+        }
+
+        self.is_open = true
+        return true
+    }
+
+    fn parse_header(&self): bool {
+        let data = self.mmap_file.data()
+        if data == null {
+            return false
+        }
+
+        let file_size = self.mmap_file.file_size
+
+        // Check magic: "BIGF" or "BIG4"
+        if file_size < 16 {
+            return false
+        }
+
+        let magic = read_u32_be(data)
+        if magic != 0x42494746 and magic != 0x42494734 {
+            // Not "BIGF" or "BIG4"
+            return false
+        }
+
+        // Read archive size (big-endian)
+        let archive_size = read_u32_be(data + 4)
+
+        // Read entry count and header size (big-endian)
+        let num_entries = read_u32_be(data + 8)
+        let first_entry_offset = read_u32_be(data + 12)
+
+        if num_entries > 65536 {
+            return false  // Too many entries
+        }
+
+        // Parse entry table
+        let mut offset: i64 = 16
+        for i in 0..num_entries {
+            if offset >= file_size {
+                break
+            }
+
+            // Entry format: offset (4 bytes BE), size (4 bytes BE), name (null-terminated)
+            let entry_offset = read_u32_be(data + offset) as i64
+            let entry_size = read_u32_be(data + offset + 4) as i64
+            offset = offset + 8
+
+            // Read name (null-terminated)
+            let name_start = offset
+            while offset < file_size and data[offset] != 0 {
+                offset = offset + 1
+            }
+            offset = offset + 1  // Skip null terminator
+
+            let name_length = offset - name_start - 1
+            let entry_name = read_string(data + name_start, name_length)
+
+            // Store entry
+            self.entries[i] = BigArchiveEntry {
+                name: entry_name
+                name_hash: hash_filename(entry_name)
+                offset: entry_offset
+                size: entry_size
+                uncompressed_size: entry_size
+                is_compressed: false
+            }
+        }
+
+        self.entry_count = num_entries as i32
+        return true
+    }
+
+    fn find_entry(&self, filename: string): ?*BigArchiveEntry {
+        let hash = hash_filename(filename)
+        let lower_name = to_lowercase(filename)
+
+        for i in 0..self.entry_count {
+            if self.entries[i].name_hash == hash {
+                if to_lowercase(self.entries[i].name) == lower_name {
+                    return &self.entries[i]
+                }
+            }
+        }
+
+        return null
+    }
+
+    fn get_entry_data(&self, entry: *BigArchiveEntry): ?*u8 {
+        if !self.is_open {
+            return null
+        }
+
+        let data = self.mmap_file.data()
+        if data == null {
+            return null
+        }
+
+        return data + entry.offset
+    }
+
+    fn close(&self) {
+        self.mmap_file.close()
+        self.entry_count = 0
+        self.is_open = false
+    }
+}
+
+// ============================================================================
+// FILE INSTANCE - Layered file sources (for mod support)
+// ============================================================================
+struct FileInstance {
+    name: string
+    priority: i32             // Higher = checked first
+    base_path: string         // Base filesystem path
+    archives: [*BigArchiveSource; 32]
+    archive_count: i32
+    is_active: bool
+
+    fn init(name: string, priority: i32): FileInstance {
+        return FileInstance {
+            name: name
+            priority: priority
+            base_path: ""
+            archives: undefined
+            archive_count: 0
+            is_active: true
+        }
+    }
+
+    fn set_base_path(&self, path: string) {
+        self.base_path = path
+    }
+
+    fn add_archive(&self, archive: *BigArchiveSource): bool {
+        if self.archive_count >= 32 {
+            return false
+        }
+        self.archives[self.archive_count] = archive
+        self.archive_count = self.archive_count + 1
+        return true
+    }
+}
+
+// ============================================================================
+// VIRTUAL FILE SYSTEM - Main interface
+// ============================================================================
+struct VirtualFileSystem {
+    // File instances (layered sources)
+    instances: [FileInstance; 16]
+    instance_count: i32
+
+    // BIG archives pool
+    archives: [BigArchiveSource; 64]
+    archive_count: i32
+
+    // File existence cache (for performance)
+    existence_cache: [FileExistenceEntry; 4096]
+    cache_size: i32
+    cache_enabled: bool
+
+    // Search paths
+    search_paths: [string; 32]
+    search_path_count: i32
+
+    // Write directory (where saves/replays go)
+    write_directory: string
+
+    // Statistics
+    files_opened: i64
+    cache_hits: i64
+    cache_misses: i64
+
+    fn init(): VirtualFileSystem {
+        return VirtualFileSystem {
+            instances: undefined
+            instance_count: 0
+            archives: undefined
+            archive_count: 0
+            existence_cache: undefined
+            cache_size: 0
+            cache_enabled: true
+            search_paths: undefined
+            search_path_count: 0
+            write_directory: ""
+            files_opened: 0
+            cache_hits: 0
+            cache_misses: 0
+        }
+    }
+
+    // ========================================
+    // INITIALIZATION
+    // ========================================
+
+    fn initialize(&self, game_data_path: string): bool {
+        // Set up default instance
+        self.instances[0] = FileInstance.init("base", 0)
+        self.instances[0].set_base_path(game_data_path)
+        self.instance_count = 1
+
+        // Add default search paths
+        self.add_search_path(game_data_path)
+        self.add_search_path(game_data_path + "/Data")
+        self.add_search_path(game_data_path + "/Data/INI")
+
+        return true
+    }
+
+    fn add_search_path(&self, path: string): bool {
+        if self.search_path_count >= 32 {
+            return false
+        }
+        self.search_paths[self.search_path_count] = path
+        self.search_path_count = self.search_path_count + 1
+        return true
+    }
+
+    fn set_write_directory(&self, path: string) {
+        self.write_directory = path
+    }
+
+    // ========================================
+    // ARCHIVE MANAGEMENT
+    // ========================================
+
+    fn load_archive(&self, archive_path: string, instance_index: i32): bool {
+        if self.archive_count >= 64 {
+            return false
+        }
+
+        let archive = &self.archives[self.archive_count]
+        if !archive.open(archive_path) {
+            return false
+        }
+
+        self.archive_count = self.archive_count + 1
+
+        // Add to instance if valid
+        if instance_index >= 0 and instance_index < self.instance_count {
+            self.instances[instance_index].add_archive(archive)
+        }
+
+        // Invalidate cache
+        self.invalidate_cache()
+
+        return true
+    }
+
+    fn unload_archive(&self, archive_path: string) {
+        for i in 0..self.archive_count {
+            if self.archives[i].path == archive_path {
+                self.archives[i].close()
+                // Would shift array elements
+                break
+            }
+        }
+        self.invalidate_cache()
+    }
+
+    // ========================================
+    // FILE INSTANCE MANAGEMENT
+    // ========================================
+
+    fn create_instance(&self, name: string, priority: i32): i32 {
+        if self.instance_count >= 16 {
+            return -1
+        }
+
+        let index = self.instance_count
+        self.instances[index] = FileInstance.init(name, priority)
+        self.instance_count = self.instance_count + 1
+
+        // Sort by priority (higher first)
+        self.sort_instances_by_priority()
+
+        return index
+    }
+
+    fn sort_instances_by_priority(&self) {
+        // Simple bubble sort (few instances)
+        for i in 0..self.instance_count {
+            for j in i + 1..self.instance_count {
+                if self.instances[j].priority > self.instances[i].priority {
+                    let temp = self.instances[i]
+                    self.instances[i] = self.instances[j]
+                    self.instances[j] = temp
+                }
+            }
+        }
+    }
+
+    // ========================================
+    // FILE ACCESS
+    // ========================================
+
+    fn open_file(&self, filename: string, access: i32, buffer_size: i64): ?VirtualFile {
+        self.files_opened = self.files_opened + 1
+
+        // For write access, use write directory
+        if (access & FILE_WRITE) != 0 {
+            return self.open_write_file(filename, access, buffer_size)
+        }
+
+        // Search through instances (highest priority first)
+        for i in 0..self.instance_count {
+            if !self.instances[i].is_active {
+                continue
+            }
+
+            // Check archives in this instance
+            for j in 0..self.instances[i].archive_count {
+                let archive = self.instances[i].archives[j]
+                let entry = archive.find_entry(filename)
+                if entry != null {
+                    return self.open_archive_file(archive, entry.?, access, buffer_size)
+                }
+            }
+
+            // Check filesystem in this instance
+            let full_path = self.resolve_path(filename, &self.instances[i])
+            if full_path != "" {
+                return self.open_regular_file(full_path, access, buffer_size)
+            }
+        }
+
+        // Try search paths
+        for i in 0..self.search_path_count {
+            let full_path = self.search_paths[i] + "/" + filename
+            if file_exists_platform(full_path) {
+                return self.open_regular_file(full_path, access, buffer_size)
+            }
+        }
+
+        return null
+    }
+
+    fn open_regular_file(&self, path: string, access: i32, buffer_size: i64): ?VirtualFile {
+        let handle = open_file_platform(path, access)
+        if handle < 0 {
+            return null
+        }
+
+        let file_size = get_file_size_platform(handle)
+
+        let mut file = VirtualFile.init()
+        file.path = path
+        file.source_type = FileSourceType::Regular
+        file.access_flags = access
+        file.is_open = true
+        file.file_handle = handle
+        file.size = file_size
+
+        // Allocate buffer if requested
+        if buffer_size > 0 {
+            file.buffer = allocate_buffer(buffer_size)
+            file.buffer_size = buffer_size
+        }
+
+        return file
+    }
+
+    fn open_archive_file(&self, archive: *BigArchiveSource, entry: *BigArchiveEntry, access: i32, buffer_size: i64): ?VirtualFile {
+        // Archives are read-only
+        if (access & FILE_WRITE) != 0 {
+            return null
+        }
+
+        let data = archive.get_entry_data(entry)
+        if data == null {
+            return null
+        }
+
+        let mut file = VirtualFile.init()
+        file.path = entry.name
+        file.source_type = FileSourceType::BigArchive
+        file.access_flags = FILE_READ
+        file.is_open = true
+        file.mapped_data = data
+        file.mapped_size = entry.size
+        file.size = entry.size
+        file.archive_ref = archive
+        file.owns_mapped_data = false  // Archive owns the data
+
+        // Check if compressed
+        if entry.is_compressed {
+            // Would decompress here
+            file.source_type = FileSourceType::Compressed
+        }
+
+        return file
+    }
+
+    fn open_write_file(&self, filename: string, access: i32, buffer_size: i64): ?VirtualFile {
+        if self.write_directory == "" {
+            return null
+        }
+
+        let full_path = self.write_directory + "/" + filename
+
+        // Create directories if needed
+        ensure_directory_exists(get_directory_part(full_path))
+
+        let handle = open_file_platform(full_path, access)
+        if handle < 0 {
+            return null
+        }
+
+        let mut file = VirtualFile.init()
+        file.path = full_path
+        file.source_type = FileSourceType::Regular
+        file.access_flags = access
+        file.is_open = true
+        file.file_handle = handle
+
+        if (access & FILE_APPEND) != 0 {
+            file.size = get_file_size_platform(handle)
+            file.position = file.size
+        }
+
+        if buffer_size > 0 {
+            file.buffer = allocate_buffer(buffer_size)
+            file.buffer_size = buffer_size
+        }
+
+        return file
+    }
+
+    fn resolve_path(&self, filename: string, instance: *FileInstance): string {
+        if instance.base_path == "" {
+            return ""
+        }
+
+        let full_path = instance.base_path + "/" + filename
+        if file_exists_platform(full_path) {
+            return full_path
+        }
+
+        return ""
+    }
+
+    // ========================================
+    // FILE QUERIES
+    // ========================================
+
+    fn does_file_exist(&self, filename: string): bool {
+        // Check cache first
+        if self.cache_enabled {
+            let cached = self.check_cache(filename)
+            if cached >= 0 {
+                self.cache_hits = self.cache_hits + 1
+                return cached == 1
+            }
+            self.cache_misses = self.cache_misses + 1
+        }
+
+        let exists = self.does_file_exist_uncached(filename)
+
+        // Update cache
+        if self.cache_enabled {
+            self.add_to_cache(filename, exists)
+        }
+
+        return exists
+    }
+
+    fn does_file_exist_uncached(&self, filename: string): bool {
+        // Check instances
+        for i in 0..self.instance_count {
+            if !self.instances[i].is_active {
+                continue
+            }
+
+            // Check archives
+            for j in 0..self.instances[i].archive_count {
+                if self.instances[i].archives[j].find_entry(filename) != null {
+                    return true
+                }
+            }
+
+            // Check filesystem
+            let full_path = self.resolve_path(filename, &self.instances[i])
+            if full_path != "" {
+                return true
+            }
+        }
+
+        // Check search paths
+        for i in 0..self.search_path_count {
+            let full_path = self.search_paths[i] + "/" + filename
+            if file_exists_platform(full_path) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn get_file_info(&self, filename: string): FileInfo {
+        let mut info = FileInfo.init()
+
+        // Search through sources
+        for i in 0..self.instance_count {
+            if !self.instances[i].is_active {
+                continue
+            }
+
+            // Check archives
+            for j in 0..self.instances[i].archive_count {
+                let entry = self.instances[i].archives[j].find_entry(filename)
+                if entry != null {
+                    info.exists = true
+                    info.size = entry.?.size
+                    info.source_type = FileSourceType::BigArchive
+                    info.archive_path = self.instances[i].archives[j].path
+                    info.is_compressed = entry.?.is_compressed
+                    info.uncompressed_size = entry.?.uncompressed_size
+                    return info
+                }
+            }
+
+            // Check filesystem
+            let full_path = self.resolve_path(filename, &self.instances[i])
+            if full_path != "" {
+                let attrs = get_file_attributes(full_path)
+                if attrs.is_valid {
+                    info.exists = true
+                    info.size = attrs.size
+                    info.modified_time = attrs.modified_time.seconds
+                    info.source_type = FileSourceType::Regular
+                    return info
+                }
+            }
+        }
+
+        return info
+    }
+
+    // ========================================
+    // DIRECTORY LISTING
+    // ========================================
+
+    fn get_file_list(&self, directory: string, pattern: string, filenames: *[string; 1024], max_count: i32, search_subdirs: bool): i32 {
+        let mut count: i32 = 0
+
+        // Search filesystem first
+        for i in 0..self.instance_count {
+            if !self.instances[i].is_active {
+                continue
+            }
+
+            let dir_path = self.instances[i].base_path + "/" + directory
+            count = count + list_directory_platform(dir_path, pattern, filenames, max_count - count, count, search_subdirs)
+        }
+
+        // Search archives
+        for i in 0..self.instance_count {
+            for j in 0..self.instances[i].archive_count {
+                let archive = self.instances[i].archives[j]
+                for k in 0..archive.entry_count {
+                    if count >= max_count {
+                        break
+                    }
+
+                    let entry_name = archive.entries[k].name
+                    if matches_directory_and_pattern(entry_name, directory, pattern) {
+                        // Check if already in list
+                        let mut already_listed = false
+                        for l in 0..count {
+                            if filenames.*[l] == entry_name {
+                                already_listed = true
+                                break
+                            }
+                        }
+
+                        if !already_listed {
+                            filenames.*[count] = entry_name
+                            count = count + 1
+                        }
+                    }
+                }
+            }
+        }
+
+        return count
+    }
+
+    // ========================================
+    // CACHE MANAGEMENT
+    // ========================================
+
+    fn check_cache(&self, filename: string): i32 {
+        let hash = hash_filename(filename) % 4096
+        if self.existence_cache[hash].path == filename {
+            return if self.existence_cache[hash].exists { 1 } else { 0 }
+        }
+        return -1
+    }
+
+    fn add_to_cache(&self, filename: string, exists: bool) {
+        let hash = hash_filename(filename) % 4096
+        self.existence_cache[hash].path = filename
+        self.existence_cache[hash].exists = exists
+    }
+
+    fn invalidate_cache(&self) {
+        for i in 0..4096 {
+            self.existence_cache[i].path = ""
+        }
+    }
+
+    fn enable_cache(&self, enabled: bool) {
+        self.cache_enabled = enabled
+        if !enabled {
+            self.invalidate_cache()
+        }
+    }
+
+    // ========================================
+    // CLEANUP
+    // ========================================
+
+    fn shutdown(&self) {
+        // Close all archives
+        for i in 0..self.archive_count {
+            self.archives[i].close()
+        }
+        self.archive_count = 0
+        self.instance_count = 0
+        self.invalidate_cache()
+    }
+}
+
+// ============================================================================
+// CACHE ENTRY
+// ============================================================================
+struct FileExistenceEntry {
+    path: string
+    exists: bool
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn hash_filename(name: string): u32 {
+    let mut hash: u32 = 5381
+    for i in 0..name.length() {
+        let c = name.char_at(i)
+        // Case-insensitive hash
+        let lower_c = if c >= 'A' and c <= 'Z' { c + 32 } else { c }
+        hash = ((hash << 5) + hash) + (lower_c as u32)
+    }
+    return hash
+}
+
+fn to_lowercase(s: string): string {
+    let mut result = ""
+    for i in 0..s.length() {
+        let c = s.char_at(i)
+        if c >= 'A' and c <= 'Z' {
+            result = result + (c + 32) as char
+        } else {
+            result = result + c as char
+        }
+    }
+    return result
+}
+
+fn read_u32_be(ptr: *u8): u32 {
+    return ((ptr[0] as u32) << 24) |
+           ((ptr[1] as u32) << 16) |
+           ((ptr[2] as u32) << 8) |
+           (ptr[3] as u32)
+}
+
+fn read_string(ptr: *u8, length: i64): string {
+    let mut result = ""
+    for i in 0..length {
+        result = result + (ptr[i] as char)
+    }
+    return result
+}
+
+fn get_directory_part(path: string): string {
+    let last_slash = path.last_index_of("/")
+    if last_slash < 0 {
+        return ""
+    }
+    return path.substring(0, last_slash)
+}
+
+fn matches_directory_and_pattern(filename: string, directory: string, pattern: string): bool {
+    // Check if filename is in directory
+    let lower_filename = to_lowercase(filename)
+    let lower_dir = to_lowercase(directory)
+
+    if !lower_filename.starts_with(lower_dir) {
+        return false
+    }
+
+    // Simple wildcard matching for pattern
+    if pattern == "*" or pattern == "*.*" {
+        return true
+    }
+
+    // Match extension
+    if pattern.starts_with("*.") {
+        let ext = pattern.substring(1, pattern.length())
+        return lower_filename.ends_with(to_lowercase(ext))
+    }
+
+    return true
+}
+
+fn reinterpret_u32_as_f32(bits: u32): f32 {
+    // Platform-specific bit-cast
+    // In real implementation, would use proper bit reinterpretation
+    return 0.0  // Placeholder
+}
+
+// ============================================================================
+// PLATFORM STUBS
+// ============================================================================
+
+fn open_file_platform(path: string, access: i32): i64 {
+    // Would call open()/CreateFile
+    return -1
+}
+
+fn close_file_platform(handle: i64) {
+    // Would call close()/CloseHandle
+}
+
+fn read_file_platform(handle: i64, buffer: *u8, count: i64): i64 {
+    // Would call read()/ReadFile
+    return -1
+}
+
+fn write_file_platform(handle: i64, buffer: *u8, count: i64): i64 {
+    // Would call write()/WriteFile
+    return -1
+}
+
+fn seek_file_platform(handle: i64, offset: i64, whence: i32): bool {
+    // Would call lseek()/SetFilePointer
+    return false
+}
+
+fn get_file_size_platform(handle: i64): i64 {
+    // Would call fstat()/GetFileSizeEx
+    return -1
+}
+
+fn file_exists_platform(path: string): bool {
+    // Would call access()/GetFileAttributes
+    return false
+}
+
+fn allocate_buffer(size: i64): *u8 {
+    // Would allocate memory
+    return null
+}
+
+fn ensure_directory_exists(path: string) {
+    // Would create directory recursively
+}
+
+fn list_directory_platform(dir_path: string, pattern: string, filenames: *[string; 1024], max_count: i32, start_index: i32, recursive: bool): i32 {
+    // Would call opendir()/readdir() or FindFirstFile/FindNextFile
+    return 0
+}
+
+// ============================================================================
+// GLOBAL FILE SYSTEM INSTANCE
+// ============================================================================
+let mut g_virtual_filesystem = VirtualFileSystem.init()
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+export fn vfs_initialize(game_data_path: string): bool {
+    return g_virtual_filesystem.initialize(game_data_path)
+}
+
+export fn vfs_shutdown() {
+    g_virtual_filesystem.shutdown()
+}
+
+export fn vfs_load_archive(archive_path: string): bool {
+    return g_virtual_filesystem.load_archive(archive_path, 0)
+}
+
+export fn vfs_open_file(filename: string, access: i32): ?VirtualFile {
+    return g_virtual_filesystem.open_file(filename, access, FILE_BUFFERSIZE)
+}
+
+export fn vfs_file_exists(filename: string): bool {
+    return g_virtual_filesystem.does_file_exist(filename)
+}
+
+export fn vfs_get_file_info(filename: string): FileInfo {
+    return g_virtual_filesystem.get_file_info(filename)
+}
+
+export fn vfs_add_search_path(path: string): bool {
+    return g_virtual_filesystem.add_search_path(path)
+}
+
+export fn vfs_set_write_directory(path: string) {
+    g_virtual_filesystem.set_write_directory(path)
+}
+
+export fn vfs_create_mod_instance(name: string, priority: i32): i32 {
+    return g_virtual_filesystem.create_instance(name, priority)
+}

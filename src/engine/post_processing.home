@@ -1,12 +1,55 @@
 // Post Processing - Post-Processing Filter System
-// Based on Thyme engine post-processing effects
+// Based on Thyme engine post-processing effects and original C&C Generals W3DShaderManager
 // Handles motion blur, crossfade, black & white, and other screen effects
 
 
 // ============================================================================
-// Post-Processing Types
+// Filter Types (from original CommandXlat.h)
 // ============================================================================
 
+enum FilterTypes {
+    FT_NULL_FILTER = 0,
+    FT_VIEW_BW_FILTER,              // Filter to apply a black & white filter to the screen
+    FT_VIEW_MOTION_BLUR_FILTER,     // Filter to apply motion blur filter to screen
+    FT_VIEW_CROSSFADE,              // Filter to apply a cross blend between previous/current views
+    FT_VIEW_DEFAULT,                // Default filter mode for default filter
+    FT_MAX,
+}
+
+enum FilterModes {
+    FM_NULL_MODE = 0,
+
+    // These apply to FT_VIEW_BW_FILTER
+    FM_VIEW_BW_BLACK_AND_WHITE,     // BW Filter to black & white
+    FM_VIEW_BW_RED_AND_WHITE,       // BW Filter to red & white
+    FM_VIEW_BW_GREEN_AND_WHITE,     // BW Filter to green & white
+
+    // These apply to FT_VIEW_CROSSFADE
+    FM_VIEW_CROSSFADE_CIRCLE,       // Fades from previous to current view using expanding circle
+    FM_VIEW_CROSSFADE_FB_MASK,      // Fades from previous to current using mask stored in framebuffer alpha
+
+    // These apply to FT_VIEW_MOTION_BLUR_FILTER
+    FM_VIEW_MB_IN_AND_OUT_ALPHA,    // Motion blur filter in and out alpha blur
+    FM_VIEW_MB_IN_AND_OUT_SATURATE, // Motion blur filter in and out saturated blur
+    FM_VIEW_MB_IN_ALPHA,            // Motion blur filter in alpha blur
+    FM_VIEW_MB_OUT_ALPHA,           // Motion blur filter out alpha blur
+    FM_VIEW_MB_IN_SATURATE,         // Motion blur filter in saturated blur
+    FM_VIEW_MB_OUT_SATURATE,        // Motion blur filter out saturated blur
+    FM_VIEW_MB_END_PAN_ALPHA,       // Motion blur on screen pan (for camera tracks object mode)
+
+    FM_VIEW_DEFAULT,                // Default filter that's enabled when all others are off
+
+    // NOTE: FM_VIEW_MB_PAN_ALPHA must be last - pan factor is (mode - FM_VIEW_MB_PAN_ALPHA)
+    FM_VIEW_MB_PAN_ALPHA,           // Motion blur on screen pan (for camera tracks object mode)
+}
+
+enum CustomScenePassModes {
+    SCENE_PASS_DEFAULT = 0,
+    SCENE_PASS_ALPHA,
+    SCENE_PASS_SHROUD,
+}
+
+// Legacy FilterType enum for compatibility
 enum FilterType {
     None,
     MotionBlur,
@@ -33,7 +76,328 @@ enum BlendMode {
 }
 
 // ============================================================================
-// Motion Blur Filter
+// W3DFilterInterface - Base interface for all screen filters
+// Matches original W3DShaderManager.h W3DFilterInterface
+// ============================================================================
+
+struct W3DFilterInterface {
+    filter_type: FilterTypes,
+    is_initialized: bool,
+}
+
+// ============================================================================
+// ScreenMotionBlurFilter - Accumulation buffer motion blur
+// Matches original W3DShaderManager.cpp ScreenMotionBlurFilter
+// Used for cinematic camera transitions (zoom to base, etc.)
+// ============================================================================
+
+const MOTION_BLUR_MAX_COUNT: i32 = 60
+const MOTION_BLUR_MAX_LIMIT: i32 = 30
+const MOTION_BLUR_COUNT_STEP: i32 = 5
+const MOTION_BLUR_DEFAULT_PAN_FACTOR: i32 = 30
+
+struct ScreenMotionBlurFilter {
+    // Base interface
+    base: W3DFilterInterface,
+
+    // Motion blur state (from original)
+    max_count: i32,             // Current blur intensity counter
+    last_frame: i32,            // Last frame processed
+    decrement: bool,            // Whether we're fading out
+    skip_render: bool,          // Skip scene render (use cached)
+    additive: bool,             // Use additive blending (saturated)
+    do_zoom_to: bool,           // Zoom to target position after blur peak
+    prior_delta_x: f64,         // Previous pan delta X
+    prior_delta_y: f64,         // Previous pan delta Y
+    pan_factor: i32,            // Pan motion blur factor
+
+    // Zoom target position
+    zoom_to_pos_x: f64,
+    zoom_to_pos_y: f64,
+    zoom_to_pos_z: f64,
+    zoom_to_valid: bool,
+
+    // Current mode
+    current_mode: FilterModes,
+
+    // Render-to-texture handle
+    render_texture_id: i32,
+    can_render_to_texture: bool,
+
+    // Viewport info
+    viewport_x: i32,
+    viewport_y: i32,
+    viewport_width: i32,
+    viewport_height: i32,
+    display_width: i32,
+    display_height: i32,
+}
+
+fn create_screen_motion_blur_filter(): ScreenMotionBlurFilter {
+    return ScreenMotionBlurFilter {
+        base: W3DFilterInterface {
+            filter_type: FilterTypes.FT_VIEW_MOTION_BLUR_FILTER,
+            is_initialized: false,
+        },
+        max_count: 0,
+        last_frame: 0,
+        decrement: false,
+        skip_render: false,
+        additive: false,
+        do_zoom_to: false,
+        prior_delta_x: 0.0,
+        prior_delta_y: 0.0,
+        pan_factor: MOTION_BLUR_DEFAULT_PAN_FACTOR,
+        zoom_to_pos_x: 0.0,
+        zoom_to_pos_y: 0.0,
+        zoom_to_pos_z: 0.0,
+        zoom_to_valid: false,
+        current_mode: FilterModes.FM_NULL_MODE,
+        render_texture_id: 0,
+        can_render_to_texture: true,
+        viewport_x: 0,
+        viewport_y: 0,
+        viewport_width: 800,
+        viewport_height: 600,
+        display_width: 800,
+        display_height: 600,
+    }
+}
+
+// Initialize the motion blur filter
+fn motion_blur_init(filter: ScreenMotionBlurFilter): bool {
+    if !filter.can_render_to_texture {
+        return false
+    }
+    filter.base.is_initialized = true
+    return true
+}
+
+// Set zoom target position (for camera movements)
+fn motion_blur_set_zoom_to_pos(filter: ScreenMotionBlurFilter, x: f64, y: f64, z: f64) {
+    filter.zoom_to_pos_x = x
+    filter.zoom_to_pos_y = y
+    filter.zoom_to_pos_z = z
+    filter.zoom_to_valid = true
+}
+
+// Set viewport dimensions
+fn motion_blur_set_viewport(filter: ScreenMotionBlurFilter, x: i32, y: i32, w: i32, h: i32, dw: i32, dh: i32) {
+    filter.viewport_x = x
+    filter.viewport_y = y
+    filter.viewport_width = w
+    filter.viewport_height = h
+    filter.display_width = dw
+    filter.display_height = dh
+}
+
+// Setup filter for a specific mode (called once when filter starts)
+fn motion_blur_setup(filter: ScreenMotionBlurFilter, mode: FilterModes): bool {
+    filter.current_mode = mode
+    filter.additive = false
+    filter.do_zoom_to = false
+
+    // Determine if additive (saturated) blending
+    if mode == FilterModes.FM_VIEW_MB_IN_AND_OUT_SATURATE ||
+       mode == FilterModes.FM_VIEW_MB_IN_SATURATE ||
+       mode == FilterModes.FM_VIEW_MB_OUT_SATURATE {
+        filter.additive = true
+    }
+
+    // Determine if we zoom to target after blur peak
+    if mode == FilterModes.FM_VIEW_MB_IN_AND_OUT_SATURATE ||
+       mode == FilterModes.FM_VIEW_MB_IN_AND_OUT_ALPHA {
+        filter.do_zoom_to = true
+    }
+
+    // Handle pan mode - pan factor is encoded in mode value
+    let mode_val = mode as i32
+    let pan_start = FilterModes.FM_VIEW_MB_PAN_ALPHA as i32
+    if mode_val >= pan_start {
+        filter.pan_factor = mode_val - pan_start
+        if filter.pan_factor < 1 {
+            filter.pan_factor = MOTION_BLUR_DEFAULT_PAN_FACTOR
+        }
+    }
+
+    filter.skip_render = false
+
+    // Don't reset count if ending a pan
+    if mode != FilterModes.FM_VIEW_MB_END_PAN_ALPHA {
+        filter.max_count = 0
+    }
+
+    filter.decrement = false
+
+    // For "out" modes, start at max and decrement
+    if mode == FilterModes.FM_VIEW_MB_OUT_SATURATE ||
+       mode == FilterModes.FM_VIEW_MB_OUT_ALPHA {
+        filter.max_count = MOTION_BLUR_MAX_COUNT
+        filter.decrement = true
+    }
+
+    return true
+}
+
+// Pre-render callback - returns whether to skip scene render
+fn motion_blur_pre_render(filter: ScreenMotionBlurFilter): (bool, CustomScenePassModes) {
+    let skip_render = filter.skip_render
+    // Start render-to-texture here
+    return (skip_render, CustomScenePassModes.SCENE_PASS_DEFAULT)
+}
+
+// Post-render callback - applies the motion blur effect
+// Returns true if effect should continue, false if complete
+fn motion_blur_post_render(filter: ScreenMotionBlurFilter, mode: FilterModes,
+                           scroll_delta_x: f64, scroll_delta_y: f64,
+                           current_frame: i32): (bool, bool) {
+    // Returns: (continue_effect, do_extra_render)
+    let continue_effect = true
+    let do_extra_render = false
+
+    let center_x: f64 = 0.5
+    let center_y: f64 = 0.5
+    let is_pan = false
+
+    // Handle pan modes
+    let mode_val = mode as i32
+    let pan_start = FilterModes.FM_VIEW_MB_PAN_ALPHA as i32
+
+    if mode_val >= pan_start {
+        // Active pan blur
+        let len = sqrt(scroll_delta_x * scroll_delta_x + scroll_delta_y * scroll_delta_y)
+        center_y = center_y - 0.5  // Offset center for pan effect
+
+        filter.decrement = false
+        filter.max_count = (len * 200.0 * (filter.pan_factor as f64) / (MOTION_BLUR_DEFAULT_PAN_FACTOR as f64)) as i32
+
+        if filter.max_count < filter.pan_factor / 2 {
+            filter.max_count = filter.pan_factor / 2
+        }
+        if filter.max_count > filter.pan_factor {
+            filter.max_count = filter.pan_factor
+        }
+
+        is_pan = true
+        filter.prior_delta_x = scroll_delta_x
+        filter.prior_delta_y = scroll_delta_y
+
+    } else if mode == FilterModes.FM_VIEW_MB_END_PAN_ALPHA {
+        // Ending pan blur
+        let len = sqrt(filter.prior_delta_x * filter.prior_delta_x +
+                      filter.prior_delta_y * filter.prior_delta_y)
+        if len > 0.0001 {
+            center_x = center_x + 0.5 * (filter.prior_delta_x / len)
+            center_y = center_y - 0.5 * (filter.prior_delta_y / len)
+        }
+
+        filter.decrement = false
+        filter.max_count = filter.max_count - 1
+        if filter.max_count < 2 {
+            continue_effect = false
+        }
+        is_pan = true
+    }
+
+    // Update blur intensity for non-pan modes
+    filter.skip_render = false
+    if !is_pan && filter.last_frame != current_frame {
+        if filter.decrement {
+            // Fading out
+            filter.max_count = filter.max_count - MOTION_BLUR_COUNT_STEP
+            if filter.max_count < 1 {
+                filter.decrement = false
+                continue_effect = false
+            } else {
+                filter.skip_render = true  // Reuse cached frame
+            }
+        } else {
+            // Fading in
+            filter.max_count = filter.max_count + MOTION_BLUR_COUNT_STEP
+            if filter.max_count >= MOTION_BLUR_MAX_COUNT {
+                filter.decrement = true
+                if filter.do_zoom_to && filter.zoom_to_valid {
+                    // Signal to look at zoom target
+                    do_extra_render = true
+                } else {
+                    continue_effect = false
+                }
+            } else {
+                filter.skip_render = true  // Reuse cached frame
+            }
+        }
+    }
+
+    filter.last_frame = current_frame
+    if is_pan {
+        filter.skip_render = false
+    }
+
+    if !continue_effect {
+        filter.zoom_to_valid = false
+    }
+
+    return (continue_effect, do_extra_render)
+}
+
+// Get UV scale factor for blur at current intensity
+fn motion_blur_get_uv_scale(filter: ScreenMotionBlurFilter): f64 {
+    let factor = 1.0 - ((filter.max_count as f64) / (MOTION_BLUR_MAX_COUNT as f64)) * 0.90
+    return sqrt(factor)
+}
+
+// Get blur pass info for multi-pass rendering
+// Returns: (alpha, uv_scale, num_passes)
+fn motion_blur_get_pass_info(filter: ScreenMotionBlurFilter): (i32, f64, i32) {
+    let limit = filter.max_count
+    if limit > MOTION_BLUR_MAX_LIMIT {
+        limit = MOTION_BLUR_MAX_LIMIT
+    }
+
+    let alpha: i32 = 0x15  // Base alpha for alpha blend
+    let uv_scale: f64 = 0.99
+
+    if filter.additive {
+        alpha = 0x09  // Lower alpha for additive
+        uv_scale = 0.98
+
+        if filter.max_count > limit {
+            alpha = alpha + (filter.max_count - limit) / 5
+        }
+        if filter.max_count == MOTION_BLUR_MAX_COUNT {
+            alpha = alpha + 60  // Bright flash at peak
+        }
+    }
+
+    return (alpha, uv_scale, limit)
+}
+
+// Check if blur should use additive blending
+fn motion_blur_is_additive(filter: ScreenMotionBlurFilter): bool {
+    return filter.additive
+}
+
+// Get the zoom target position
+fn motion_blur_get_zoom_pos(filter: ScreenMotionBlurFilter): (f64, f64, f64, bool) {
+    return (filter.zoom_to_pos_x, filter.zoom_to_pos_y, filter.zoom_to_pos_z, filter.zoom_to_valid)
+}
+
+// Reset filter state
+fn motion_blur_reset(filter: ScreenMotionBlurFilter) {
+    filter.max_count = 0
+    filter.decrement = false
+    filter.skip_render = false
+}
+
+// Shutdown filter
+fn motion_blur_shutdown(filter: ScreenMotionBlurFilter) {
+    filter.base.is_initialized = false
+}
+
+
+// ============================================================================
+// Legacy Motion Blur Filter (per-pixel velocity based)
+// For object motion blur (not camera transitions)
 // ============================================================================
 
 struct MotionBlurConfig {
@@ -278,7 +642,326 @@ fn get_fade_color(filter: CrossFadeFilter): (Float, Float, Float, Float) {
 }
 
 // ============================================================================
-// Black & White Filter
+// ScreenCrossFadeFilter - View Transition Filter
+// Matches original W3DShaderManager.cpp ScreenCrossFadeFilter
+// Used for scene transitions with pattern masks
+// ============================================================================
+
+struct ScreenCrossFadeFilter {
+    // Base interface
+    base: W3DFilterInterface,
+
+    // Fade state (from original)
+    fade_frames: i32,           // Total frames for fade transition
+    cur_fade_frame: i32,        // Current frame in transition
+    fade_direction: i32,        // 1 = fading to new, -1 = fading to old, 0 = static
+    cur_fade_value: f64,        // Current fade amount 0.0-1.0
+    skip_render: bool,          // Skip scene render
+
+    // Current mode
+    current_mode: FilterModes,
+
+    // Pattern mask texture for shaped transitions
+    pattern_texture_id: i32,
+    has_pattern: bool,
+
+    // Circle fade parameters
+    circle_center_x: f64,
+    circle_center_y: f64,
+    circle_radius: f64,
+}
+
+fn create_screen_crossfade_filter(): ScreenCrossFadeFilter {
+    return ScreenCrossFadeFilter {
+        base: W3DFilterInterface {
+            filter_type: FilterTypes.FT_VIEW_CROSSFADE,
+            is_initialized: false,
+        },
+        fade_frames: 0,
+        cur_fade_frame: 0,
+        fade_direction: 0,
+        cur_fade_value: 0.0,
+        skip_render: false,
+        current_mode: FilterModes.FM_NULL_MODE,
+        pattern_texture_id: 0,
+        has_pattern: false,
+        circle_center_x: 0.5,
+        circle_center_y: 0.5,
+        circle_radius: 0.0,
+    }
+}
+
+// Initialize crossfade filter
+fn crossfade_filter_init(filter: ScreenCrossFadeFilter): bool {
+    filter.base.is_initialized = true
+    return true
+}
+
+// Set fade parameters
+fn crossfade_filter_set_fade_parameters(filter: ScreenCrossFadeFilter, fade_frames: i32, direction: i32) {
+    filter.cur_fade_frame = 0
+    filter.fade_frames = fade_frames
+    filter.fade_direction = direction
+}
+
+// Setup filter for specific mode
+fn crossfade_filter_setup(filter: ScreenCrossFadeFilter, mode: FilterModes): bool {
+    filter.current_mode = mode
+
+    if mode == FilterModes.FM_VIEW_CROSSFADE_CIRCLE {
+        // Circle expansion transition
+        filter.circle_center_x = 0.5
+        filter.circle_center_y = 0.5
+        filter.circle_radius = 0.0
+    }
+
+    return true
+}
+
+// Pre-render callback
+fn crossfade_filter_pre_render(filter: ScreenCrossFadeFilter): (bool, CustomScenePassModes) {
+    return (filter.skip_render, CustomScenePassModes.SCENE_PASS_DEFAULT)
+}
+
+// Post-render callback - applies crossfade effect
+fn crossfade_filter_post_render(filter: ScreenCrossFadeFilter, mode: FilterModes): bool {
+    // Update fade state
+    let continue_effect = crossfade_filter_update_fade_level(filter)
+
+    if !continue_effect {
+        filter.skip_render = false
+    }
+
+    return continue_effect
+}
+
+// Update current fade level, return true if not finished
+fn crossfade_filter_update_fade_level(filter: ScreenCrossFadeFilter): bool {
+    if filter.fade_direction > 0 {
+        // Fading to new view
+        filter.cur_fade_frame = filter.cur_fade_frame + 1
+        if filter.cur_fade_frame < filter.fade_frames {
+            filter.cur_fade_value = (filter.cur_fade_frame as f64) / (filter.fade_frames as f64)
+            return true
+        } else {
+            filter.cur_fade_value = 1.0
+            filter.fade_direction = 0
+            return false
+        }
+    } else if filter.fade_direction < 0 {
+        // Fading to old view
+        filter.cur_fade_frame = filter.cur_fade_frame + 1
+        if filter.cur_fade_frame < filter.fade_frames {
+            filter.cur_fade_value = 1.0 - ((filter.cur_fade_frame as f64) / (filter.fade_frames as f64))
+            return true
+        } else {
+            filter.cur_fade_value = 0.0
+            filter.fade_direction = 0
+            return false
+        }
+    }
+
+    // Static state
+    return filter.cur_fade_value > 0.0 && filter.cur_fade_value < 1.0
+}
+
+// Get current fade value
+fn crossfade_filter_get_fade_value(filter: ScreenCrossFadeFilter): f64 {
+    return filter.cur_fade_value
+}
+
+// Get circle radius for circle mode
+fn crossfade_filter_get_circle_radius(filter: ScreenCrossFadeFilter): f64 {
+    // In circle mode, radius expands with fade value
+    if filter.current_mode == FilterModes.FM_VIEW_CROSSFADE_CIRCLE {
+        // Max radius should cover screen corners (diagonal ~= 1.414)
+        return filter.cur_fade_value * 1.5
+    }
+    return filter.circle_radius
+}
+
+// Check if pixel is visible in current transition state
+fn crossfade_filter_is_visible(filter: ScreenCrossFadeFilter, u: f64, v: f64): bool {
+    if filter.current_mode == FilterModes.FM_VIEW_CROSSFADE_CIRCLE {
+        // Distance from center
+        let dx = u - filter.circle_center_x
+        let dy = v - filter.circle_center_y
+        let dist = sqrt(dx * dx + dy * dy)
+        return dist < crossfade_filter_get_circle_radius(filter)
+    }
+
+    // For mask mode, defer to pattern texture lookup
+    return filter.cur_fade_value > 0.5
+}
+
+// Reset filter
+fn crossfade_filter_reset(filter: ScreenCrossFadeFilter) {
+    filter.cur_fade_value = 0.0
+    filter.cur_fade_frame = 0
+    filter.fade_direction = 0
+    filter.skip_render = false
+}
+
+// Shutdown filter
+fn crossfade_filter_shutdown(filter: ScreenCrossFadeFilter) {
+    filter.base.is_initialized = false
+}
+
+// ============================================================================
+// ScreenBWFilter - Black & White Filter
+// Matches original W3DShaderManager.cpp ScreenBWFilter
+// Used for death scenes, cinematics, etc.
+// ============================================================================
+
+struct ScreenBWFilter {
+    // Base interface
+    base: W3DFilterInterface,
+
+    // Fade state (from original)
+    fade_frames: i32,           // Total frames for fade transition
+    cur_fade_frame: i32,        // Current frame in transition
+    fade_direction: i32,        // 1 = fading in (to B&W), -1 = fading out (to color), 0 = static
+    cur_fade_value: f64,        // Current fade amount 0.0-1.0
+
+    // Current mode
+    current_mode: FilterModes,
+
+    // Tint colors for different modes
+    tint_r: f64,
+    tint_g: f64,
+    tint_b: f64,
+
+    // Pixel shader handle (for DOT3 variant)
+    pixel_shader_handle: i32,
+}
+
+fn create_screen_bw_filter(): ScreenBWFilter {
+    return ScreenBWFilter {
+        base: W3DFilterInterface {
+            filter_type: FilterTypes.FT_VIEW_BW_FILTER,
+            is_initialized: false,
+        },
+        fade_frames: 0,
+        cur_fade_frame: 0,
+        fade_direction: 0,
+        cur_fade_value: 0.0,
+        current_mode: FilterModes.FM_NULL_MODE,
+        tint_r: 1.0,
+        tint_g: 1.0,
+        tint_b: 1.0,
+        pixel_shader_handle: 0,
+    }
+}
+
+// Initialize the B&W filter
+fn bw_filter_init(filter: ScreenBWFilter): bool {
+    filter.base.is_initialized = true
+    return true
+}
+
+// Set fade parameters for animated B&W transition
+fn bw_filter_set_fade_parameters(filter: ScreenBWFilter, fade_frames: i32, direction: i32) {
+    filter.cur_fade_frame = 0
+    filter.fade_frames = fade_frames
+    filter.fade_direction = direction
+}
+
+// Setup filter for specific mode
+fn bw_filter_setup(filter: ScreenBWFilter, mode: FilterModes): bool {
+    filter.current_mode = mode
+
+    // Set tint colors based on mode
+    if mode == FilterModes.FM_VIEW_BW_BLACK_AND_WHITE {
+        filter.tint_r = 1.0
+        filter.tint_g = 1.0
+        filter.tint_b = 1.0
+    } else if mode == FilterModes.FM_VIEW_BW_RED_AND_WHITE {
+        filter.tint_r = 1.0
+        filter.tint_g = 0.0
+        filter.tint_b = 0.0
+    } else if mode == FilterModes.FM_VIEW_BW_GREEN_AND_WHITE {
+        filter.tint_r = 0.0
+        filter.tint_g = 1.0
+        filter.tint_b = 0.0
+    }
+
+    return true
+}
+
+// Pre-render callback
+fn bw_filter_pre_render(filter: ScreenBWFilter): (bool, CustomScenePassModes) {
+    // Start render-to-texture
+    return (false, CustomScenePassModes.SCENE_PASS_DEFAULT)
+}
+
+// Post-render callback - applies B&W effect
+fn bw_filter_post_render(filter: ScreenBWFilter, mode: FilterModes): bool {
+    // Update fade state
+    if filter.fade_direction > 0 {
+        // Turning effect on
+        filter.cur_fade_frame = filter.cur_fade_frame + 1
+        if filter.cur_fade_frame < filter.fade_frames {
+            filter.cur_fade_value = (filter.cur_fade_frame as f64) / (filter.fade_frames as f64)
+        } else {
+            filter.cur_fade_frame = 0
+            filter.cur_fade_value = 1.0
+            filter.fade_direction = 0
+        }
+    } else if filter.fade_direction < 0 {
+        // Turning effect off
+        filter.cur_fade_frame = filter.cur_fade_frame + 1
+        if filter.cur_fade_frame < filter.fade_frames {
+            filter.cur_fade_value = 1.0 - ((filter.cur_fade_frame as f64) / (filter.fade_frames as f64))
+        } else {
+            filter.cur_fade_frame = 0
+            filter.cur_fade_value = 0.0
+            filter.fade_direction = 0
+            return false  // Effect complete
+        }
+    }
+
+    return true  // Continue effect
+}
+
+// Get current fade value
+fn bw_filter_get_fade_value(filter: ScreenBWFilter): f64 {
+    return filter.cur_fade_value
+}
+
+// Get current tint color
+fn bw_filter_get_tint(filter: ScreenBWFilter): (f64, f64, f64) {
+    return (filter.tint_r, filter.tint_g, filter.tint_b)
+}
+
+// Apply B&W conversion to RGB color (for CPU-side processing or shader uniform)
+fn bw_filter_convert_color(filter: ScreenBWFilter, r: f64, g: f64, b: f64): (f64, f64, f64) {
+    // Standard luminance weights (matching original)
+    let lum = r * 0.299 + g * 0.587 + b * 0.114
+
+    // Interpolate between original and luminance based on fade value
+    let fade = filter.cur_fade_value
+    let out_r = r + (lum * filter.tint_r - r) * fade
+    let out_g = g + (lum * filter.tint_g - g) * fade
+    let out_b = b + (lum * filter.tint_b - b) * fade
+
+    return (out_r, out_g, out_b)
+}
+
+// Reset filter
+fn bw_filter_reset(filter: ScreenBWFilter) {
+    filter.cur_fade_value = 0.0
+    filter.cur_fade_frame = 0
+    filter.fade_direction = 0
+}
+
+// Shutdown filter
+fn bw_filter_shutdown(filter: ScreenBWFilter) {
+    filter.base.is_initialized = false
+}
+
+
+// ============================================================================
+// Legacy BWConfig/BWFilter (for backward compatibility)
 // ============================================================================
 
 struct BWConfig {
@@ -438,6 +1121,381 @@ fn apply_bw_color(filter: BWFilter, r: f64, g: f64, b: f64): (Float, Float, Floa
 }
 
 // ============================================================================
+// Bloom Effect
+// Modern enhancement for explosions, tracers, and bright effects
+// ============================================================================
+
+struct BloomConfig {
+    enabled: bool,
+    threshold: f64,             // Brightness threshold (0.0-1.0)
+    intensity: f64,             // Overall bloom strength
+    radius: f64,                // Blur radius in pixels
+    soft_threshold: f64,        // Soft knee for smooth transition
+    downsample_factor: i32,     // How much to downsample (2, 4, 8)
+    blur_passes: i32,           // Number of blur passes
+}
+
+fn default_bloom_config(): BloomConfig {
+    return BloomConfig {
+        enabled: false,
+        threshold: 0.8,
+        intensity: 1.0,
+        radius: 4.0,
+        soft_threshold: 0.5,
+        downsample_factor: 4,
+        blur_passes: 5,
+    }
+}
+
+struct BloomFilter {
+    config: BloomConfig,
+
+    // Intermediate buffers (represented as IDs)
+    bright_pass_buffer: i32,
+    blur_buffers: Vec<i32>,     // Mip chain for blur
+
+    // Buffer dimensions
+    full_width: i32,
+    full_height: i32,
+    downsample_width: i32,
+    downsample_height: i32,
+}
+
+fn create_bloom_filter(): BloomFilter {
+    return BloomFilter {
+        config: default_bloom_config(),
+        bright_pass_buffer: 0,
+        blur_buffers: Vec<i32>{},
+        full_width: 0,
+        full_height: 0,
+        downsample_width: 0,
+        downsample_height: 0,
+    }
+}
+
+// Initialize bloom buffers
+fn bloom_init(filter: BloomFilter, width: i32, height: i32) {
+    filter.full_width = width
+    filter.full_height = height
+    filter.downsample_width = width / filter.config.downsample_factor
+    filter.downsample_height = height / filter.config.downsample_factor
+
+    // Would allocate render targets here
+    filter.bright_pass_buffer = 1  // Placeholder ID
+    filter.blur_buffers = Vec<i32>{}
+    for i in 0..filter.config.blur_passes {
+        filter.blur_buffers.add(i + 2)  // Placeholder IDs
+    }
+}
+
+// Extract bright pixels above threshold
+fn bloom_bright_pass(filter: BloomFilter, r: f64, g: f64, b: f64): (f64, f64, f64) {
+    if !filter.config.enabled {
+        return (0.0, 0.0, 0.0)
+    }
+
+    // Calculate luminance
+    let lum = r * 0.2126 + g * 0.7152 + b * 0.0722
+
+    // Soft threshold curve
+    let soft = filter.config.soft_threshold
+    let threshold = filter.config.threshold
+
+    let knee = threshold * soft
+    let soft_threshold_min = threshold - knee
+    let soft_threshold_max = threshold + knee
+
+    let contribution: f64 = 0.0
+    if lum > soft_threshold_max {
+        contribution = 1.0
+    } else if lum > soft_threshold_min {
+        // Smooth interpolation in the knee region
+        let t = (lum - soft_threshold_min) / (soft_threshold_max - soft_threshold_min)
+        contribution = t * t  // Quadratic ease
+    }
+
+    return (r * contribution, g * contribution, b * contribution)
+}
+
+// Apply gaussian blur weight at given distance
+fn bloom_gaussian_weight(distance: f64, sigma: f64): f64 {
+    let two_sigma_sq = 2.0 * sigma * sigma
+    return (1.0 / sqrt(3.14159 * two_sigma_sq)) *
+           pow_approx(-distance * distance / two_sigma_sq)
+}
+
+fn pow_approx(x: f64): f64 {
+    // e^x approximation for small x
+    if x < -10.0 { return 0.0 }
+    let result = 1.0 + x + x * x / 2.0 + x * x * x / 6.0
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+// Get bloom contribution at UV with offset sampling
+fn bloom_sample(filter: BloomFilter, u: f64, v: f64, offset_x: f64, offset_y: f64): f64 {
+    // In a real implementation, this would sample the blur buffer
+    // For now, return a gaussian falloff
+    let dist = sqrt(offset_x * offset_x + offset_y * offset_y)
+    return bloom_gaussian_weight(dist, filter.config.radius)
+}
+
+// Combine bloom with scene
+fn bloom_apply(filter: BloomFilter, scene_r: f64, scene_g: f64, scene_b: f64,
+               bloom_r: f64, bloom_g: f64, bloom_b: f64): (f64, f64, f64) {
+    if !filter.config.enabled {
+        return (scene_r, scene_g, scene_b)
+    }
+
+    let intensity = filter.config.intensity
+    let out_r = scene_r + bloom_r * intensity
+    let out_g = scene_g + bloom_g * intensity
+    let out_b = scene_b + bloom_b * intensity
+
+    // HDR tone mapping (simple Reinhard)
+    out_r = out_r / (1.0 + out_r)
+    out_g = out_g / (1.0 + out_g)
+    out_b = out_b / (1.0 + out_b)
+
+    return (out_r, out_g, out_b)
+}
+
+// Enable bloom with quality preset
+fn bloom_enable(filter: BloomFilter, quality: i32) {
+    filter.config.enabled = true
+
+    if quality == 0 {
+        // Low quality - fast
+        filter.config.blur_passes = 3
+        filter.config.downsample_factor = 8
+        filter.config.radius = 2.0
+    } else if quality == 1 {
+        // Medium quality
+        filter.config.blur_passes = 5
+        filter.config.downsample_factor = 4
+        filter.config.radius = 4.0
+    } else {
+        // High quality
+        filter.config.blur_passes = 7
+        filter.config.downsample_factor = 2
+        filter.config.radius = 6.0
+    }
+}
+
+// Set bloom parameters
+fn bloom_set_params(filter: BloomFilter, threshold: f64, intensity: f64, radius: f64) {
+    filter.config.threshold = threshold
+    filter.config.intensity = intensity
+    filter.config.radius = radius
+}
+
+// Disable bloom
+fn bloom_disable(filter: BloomFilter) {
+    filter.config.enabled = false
+}
+
+
+// ============================================================================
+// Color Grading / LUT
+// For cinematic color adjustments
+// ============================================================================
+
+struct ColorGradingConfig {
+    enabled: bool,
+    brightness: f64,            // -1.0 to 1.0
+    contrast: f64,              // 0.0 to 2.0 (1.0 = normal)
+    saturation: f64,            // 0.0 to 2.0 (1.0 = normal)
+    gamma: f64,                 // 0.1 to 3.0 (1.0 = normal)
+
+    // Color balance
+    shadows_r: f64,
+    shadows_g: f64,
+    shadows_b: f64,
+    midtones_r: f64,
+    midtones_g: f64,
+    midtones_b: f64,
+    highlights_r: f64,
+    highlights_g: f64,
+    highlights_b: f64,
+
+    // LUT (3D color lookup table)
+    lut_enabled: bool,
+    lut_intensity: f64,         // 0.0 to 1.0
+    lut_texture_id: i32,        // LUT texture handle
+}
+
+fn default_color_grading_config(): ColorGradingConfig {
+    return ColorGradingConfig {
+        enabled: false,
+        brightness: 0.0,
+        contrast: 1.0,
+        saturation: 1.0,
+        gamma: 1.0,
+        shadows_r: 1.0, shadows_g: 1.0, shadows_b: 1.0,
+        midtones_r: 1.0, midtones_g: 1.0, midtones_b: 1.0,
+        highlights_r: 1.0, highlights_g: 1.0, highlights_b: 1.0,
+        lut_enabled: false,
+        lut_intensity: 1.0,
+        lut_texture_id: 0,
+    }
+}
+
+struct ColorGradingFilter {
+    config: ColorGradingConfig,
+}
+
+fn create_color_grading_filter(): ColorGradingFilter {
+    return ColorGradingFilter {
+        config: default_color_grading_config(),
+    }
+}
+
+// Apply color grading to a pixel
+fn color_grading_apply(filter: ColorGradingFilter, r: f64, g: f64, b: f64): (f64, f64, f64) {
+    if !filter.config.enabled {
+        return (r, g, b)
+    }
+
+    let out_r = r
+    let out_g = g
+    let out_b = b
+
+    // Apply brightness
+    out_r = out_r + filter.config.brightness
+    out_g = out_g + filter.config.brightness
+    out_b = out_b + filter.config.brightness
+
+    // Apply contrast
+    out_r = (out_r - 0.5) * filter.config.contrast + 0.5
+    out_g = (out_g - 0.5) * filter.config.contrast + 0.5
+    out_b = (out_b - 0.5) * filter.config.contrast + 0.5
+
+    // Apply saturation
+    let lum = out_r * 0.2126 + out_g * 0.7152 + out_b * 0.0722
+    out_r = lum + (out_r - lum) * filter.config.saturation
+    out_g = lum + (out_g - lum) * filter.config.saturation
+    out_b = lum + (out_b - lum) * filter.config.saturation
+
+    // Apply gamma
+    if filter.config.gamma != 1.0 {
+        let inv_gamma = 1.0 / filter.config.gamma
+        if out_r > 0.0 { out_r = pow_gamma(out_r, inv_gamma) }
+        if out_g > 0.0 { out_g = pow_gamma(out_g, inv_gamma) }
+        if out_b > 0.0 { out_b = pow_gamma(out_b, inv_gamma) }
+    }
+
+    // Apply color balance (simplified three-way)
+    // Shadows affect dark areas, highlights affect bright areas, midtones affect middle
+    let shadow_weight = 1.0 - lum
+    let highlight_weight = lum
+    let midtone_weight = 1.0 - abs_val(lum - 0.5) * 2.0
+
+    out_r = out_r * (filter.config.shadows_r * shadow_weight +
+                    filter.config.midtones_r * midtone_weight +
+                    filter.config.highlights_r * highlight_weight) / 3.0
+    out_g = out_g * (filter.config.shadows_g * shadow_weight +
+                    filter.config.midtones_g * midtone_weight +
+                    filter.config.highlights_g * highlight_weight) / 3.0
+    out_b = out_b * (filter.config.shadows_b * shadow_weight +
+                    filter.config.midtones_b * midtone_weight +
+                    filter.config.highlights_b * highlight_weight) / 3.0
+
+    // Clamp
+    if out_r < 0.0 { out_r = 0.0 }
+    if out_r > 1.0 { out_r = 1.0 }
+    if out_g < 0.0 { out_g = 0.0 }
+    if out_g > 1.0 { out_g = 1.0 }
+    if out_b < 0.0 { out_b = 0.0 }
+    if out_b > 1.0 { out_b = 1.0 }
+
+    return (out_r, out_g, out_b)
+}
+
+fn pow_gamma(x: f64, p: f64): f64 {
+    // Approximation for x^p when 0 < x < 1
+    if x <= 0.0 { return 0.0 }
+    if x >= 1.0 { return 1.0 }
+    // Use log approximation
+    let log_x = log_approx(x)
+    return pow_approx(log_x * p)
+}
+
+fn log_approx(x: f64): f64 {
+    // Simple log approximation for 0 < x <= 1
+    if x <= 0.0 { return -10.0 }
+    let y = x - 1.0
+    return y - y * y / 2.0 + y * y * y / 3.0
+}
+
+fn abs_val(x: f64): f64 {
+    if x < 0.0 { return -x }
+    return x
+}
+
+// Enable color grading
+fn color_grading_enable(filter: ColorGradingFilter) {
+    filter.config.enabled = true
+}
+
+// Disable color grading
+fn color_grading_disable(filter: ColorGradingFilter) {
+    filter.config.enabled = false
+}
+
+// Set color grading preset
+fn color_grading_set_preset(filter: ColorGradingFilter, preset: i32) {
+    filter.config.enabled = true
+
+    if preset == 0 {
+        // Neutral
+        filter.config.brightness = 0.0
+        filter.config.contrast = 1.0
+        filter.config.saturation = 1.0
+        filter.config.gamma = 1.0
+    } else if preset == 1 {
+        // Warm (desert maps)
+        filter.config.brightness = 0.02
+        filter.config.contrast = 1.05
+        filter.config.saturation = 1.1
+        filter.config.shadows_r = 1.0
+        filter.config.shadows_g = 0.95
+        filter.config.shadows_b = 0.9
+        filter.config.highlights_r = 1.1
+        filter.config.highlights_g = 1.05
+        filter.config.highlights_b = 0.95
+    } else if preset == 2 {
+        // Cold (winter/night)
+        filter.config.brightness = -0.02
+        filter.config.contrast = 1.1
+        filter.config.saturation = 0.9
+        filter.config.shadows_r = 0.9
+        filter.config.shadows_g = 0.95
+        filter.config.shadows_b = 1.1
+        filter.config.highlights_r = 0.95
+        filter.config.highlights_g = 1.0
+        filter.config.highlights_b = 1.1
+    } else if preset == 3 {
+        // Toxic (GLA toxin areas)
+        filter.config.brightness = 0.0
+        filter.config.contrast = 1.15
+        filter.config.saturation = 0.8
+        filter.config.shadows_r = 0.9
+        filter.config.shadows_g = 1.1
+        filter.config.shadows_b = 0.9
+        filter.config.midtones_r = 0.9
+        filter.config.midtones_g = 1.15
+        filter.config.midtones_b = 0.9
+    } else if preset == 4 {
+        // High contrast (battle intensity)
+        filter.config.brightness = 0.0
+        filter.config.contrast = 1.3
+        filter.config.saturation = 1.2
+        filter.config.gamma = 0.95
+    }
+}
+
+
+// ============================================================================
 // Post-Processing Manager
 // ============================================================================
 
@@ -446,6 +1504,15 @@ struct PostProcessManager {
     motion_blur: MotionBlurFilter,
     crossfade: CrossFadeFilter,
     bw: BWFilter,
+
+    // Westwood-style screen filters
+    screen_motion_blur: ScreenMotionBlurFilter,
+    screen_bw: ScreenBWFilter,
+    screen_crossfade: ScreenCrossFadeFilter,
+
+    // Modern effects
+    bloom: BloomFilter,
+    color_grading: ColorGradingFilter,
 
     // Screen shake
     shake_enabled: bool,
@@ -477,6 +1544,11 @@ fn create_post_process_manager(): PostProcessManager {
         motion_blur: create_motion_blur_filter(),
         crossfade: create_crossfade_filter(),
         bw: create_bw_filter(),
+        screen_motion_blur: create_screen_motion_blur_filter(),
+        screen_bw: create_screen_bw_filter(),
+        screen_crossfade: create_screen_crossfade_filter(),
+        bloom: create_bloom_filter(),
+        color_grading: create_color_grading_filter(),
         shake_enabled: false,
         shake_intensity: 0.0,
         shake_duration: 0.0,
@@ -741,6 +1813,192 @@ fn test_vignette(): bool {
     return true
 }
 
+// Test ScreenMotionBlurFilter (Westwood-style)
+fn test_screen_motion_blur_filter(): bool {
+    let filter = create_screen_motion_blur_filter()
+
+    // Initialize
+    assert(motion_blur_init(filter) == true, "Should initialize")
+
+    // Setup for in-and-out alpha mode
+    motion_blur_setup(filter, FilterModes.FM_VIEW_MB_IN_AND_OUT_ALPHA)
+    assert(filter.additive == false, "Should not be additive in alpha mode")
+    assert(filter.do_zoom_to == true, "Should zoom in in-and-out mode")
+
+    // Pre-render should not skip initially
+    let pre = motion_blur_pre_render(filter)
+    assert(pre.0 == false, "Should not skip render initially")
+
+    // Post-render should continue effect
+    let post = motion_blur_post_render(filter, FilterModes.FM_VIEW_MB_IN_ALPHA, 0.0, 0.0, 1)
+    assert(post.0 == true, "Effect should continue")
+
+    // Get UV scale
+    let uv_scale = motion_blur_get_uv_scale(filter)
+    assert(uv_scale > 0.0 && uv_scale <= 1.0, "UV scale should be valid")
+
+    return true
+}
+
+// Test ScreenMotionBlurFilter saturated mode
+fn test_screen_motion_blur_saturate(): bool {
+    let filter = create_screen_motion_blur_filter()
+    motion_blur_init(filter)
+
+    // Setup for saturated mode
+    motion_blur_setup(filter, FilterModes.FM_VIEW_MB_IN_SATURATE)
+    assert(filter.additive == true, "Should be additive in saturate mode")
+
+    // Get pass info
+    let pass_info = motion_blur_get_pass_info(filter)
+    assert(pass_info.0 > 0, "Should have alpha value")
+    assert(pass_info.1 > 0.0, "Should have UV scale")
+
+    return true
+}
+
+// Test ScreenBWFilter
+fn test_screen_bw_filter(): bool {
+    let filter = create_screen_bw_filter()
+
+    // Initialize
+    assert(bw_filter_init(filter) == true, "Should initialize")
+
+    // Setup for B&W mode
+    bw_filter_setup(filter, FilterModes.FM_VIEW_BW_BLACK_AND_WHITE)
+    assert(filter.tint_r == 1.0, "Tint should be white for B&W")
+
+    // Setup for red mode
+    bw_filter_setup(filter, FilterModes.FM_VIEW_BW_RED_AND_WHITE)
+    assert(filter.tint_r == 1.0 && filter.tint_g == 0.0, "Tint should be red")
+
+    // Set fade parameters
+    bw_filter_set_fade_parameters(filter, 30, 1)
+    assert(filter.fade_frames == 30, "Should have fade frames")
+    assert(filter.fade_direction == 1, "Should fade in")
+
+    // Simulate fade
+    for i in 0..35 {
+        bw_filter_post_render(filter, FilterModes.FM_VIEW_BW_BLACK_AND_WHITE)
+    }
+    assert(filter.cur_fade_value == 1.0, "Should be fully faded")
+
+    // Color conversion
+    let converted = bw_filter_convert_color(filter, 1.0, 0.5, 0.0)
+    assert(converted.0 > 0.0, "Should have converted color")
+
+    return true
+}
+
+// Test ScreenCrossFadeFilter
+fn test_screen_crossfade_filter(): bool {
+    let filter = create_screen_crossfade_filter()
+
+    // Initialize
+    assert(crossfade_filter_init(filter) == true, "Should initialize")
+
+    // Setup for circle mode
+    crossfade_filter_setup(filter, FilterModes.FM_VIEW_CROSSFADE_CIRCLE)
+    assert(filter.circle_center_x == 0.5, "Center should be 0.5")
+
+    // Set fade parameters
+    crossfade_filter_set_fade_parameters(filter, 30, 1)
+
+    // Pre-render
+    let pre = crossfade_filter_pre_render(filter)
+    assert(pre.0 == false, "Should not skip render")
+
+    // Simulate fade
+    for i in 0..35 {
+        crossfade_filter_post_render(filter, FilterModes.FM_VIEW_CROSSFADE_CIRCLE)
+    }
+    assert(filter.cur_fade_value == 1.0, "Should be fully faded")
+
+    // Circle radius should expand
+    let radius = crossfade_filter_get_circle_radius(filter)
+    assert(radius > 1.0, "Radius should cover screen")
+
+    // Visibility test
+    let center_visible = crossfade_filter_is_visible(filter, 0.5, 0.5)
+    assert(center_visible == true, "Center should be visible")
+
+    return true
+}
+
+// Test Bloom Filter
+fn test_bloom_filter(): bool {
+    let filter = create_bloom_filter()
+
+    // Initialize
+    bloom_init(filter, 1920, 1080)
+    assert(filter.full_width == 1920, "Should have width")
+    assert(filter.downsample_width == 1920 / 4, "Should have downsampled width")
+
+    // Enable bloom
+    bloom_enable(filter, 1)  // Medium quality
+    assert(filter.config.enabled == true, "Should be enabled")
+    assert(filter.config.blur_passes == 5, "Should have 5 passes for medium")
+
+    // Test bright pass
+    filter.config.threshold = 0.5
+    let bright = bloom_bright_pass(filter, 1.0, 1.0, 1.0)  // White
+    assert(bright.0 > 0.0, "Should have bright contribution")
+
+    let dark = bloom_bright_pass(filter, 0.2, 0.2, 0.2)  // Dark
+    assert(dark.0 == 0.0, "Should have no contribution for dark")
+
+    // Test bloom apply
+    let result = bloom_apply(filter, 0.5, 0.5, 0.5, 0.3, 0.3, 0.3)
+    assert(result.0 > 0.5, "Should be brighter with bloom")
+
+    // Set params
+    bloom_set_params(filter, 0.7, 1.5, 6.0)
+    assert(filter.config.threshold == 0.7, "Threshold should be set")
+    assert(filter.config.intensity == 1.5, "Intensity should be set")
+
+    return true
+}
+
+// Test Color Grading Filter
+fn test_color_grading_filter(): bool {
+    let filter = create_color_grading_filter()
+
+    // Not enabled initially
+    let unchanged = color_grading_apply(filter, 0.5, 0.5, 0.5)
+    assert(unchanged.0 == 0.5, "Should pass through when disabled")
+
+    // Enable and test brightness
+    color_grading_enable(filter)
+    filter.config.brightness = 0.1
+    let brighter = color_grading_apply(filter, 0.5, 0.5, 0.5)
+    assert(brighter.0 > 0.5, "Should be brighter")
+
+    // Test contrast
+    filter.config.brightness = 0.0
+    filter.config.contrast = 2.0
+    let high_contrast = color_grading_apply(filter, 0.7, 0.5, 0.3)
+    assert(high_contrast.0 > 0.7, "Should have more contrast in brights")
+
+    // Test saturation
+    filter.config.contrast = 1.0
+    filter.config.saturation = 0.0
+    let desaturated = color_grading_apply(filter, 1.0, 0.5, 0.0)
+    // Should be grayscale - all channels equal
+    assert(desaturated.0 == desaturated.1 && desaturated.1 == desaturated.2, "Should be grayscale")
+
+    // Test presets
+    color_grading_set_preset(filter, 1)  // Warm
+    assert(filter.config.highlights_r > 1.0, "Warm should boost red highlights")
+
+    color_grading_set_preset(filter, 2)  // Cold
+    assert(filter.config.shadows_b > 1.0, "Cold should boost blue shadows")
+
+    color_grading_set_preset(filter, 3)  // Toxic
+    assert(filter.config.midtones_g > 1.0, "Toxic should boost green midtones")
+
+    return true
+}
+
 fn run_all_tests(): bool {
     assert(test_motion_blur(), "Motion blur test failed")
     assert(test_crossfade(), "Crossfade test failed")
@@ -749,5 +2007,11 @@ fn run_all_tests(): bool {
     assert(test_bw_animation(), "B&W animation test failed")
     assert(test_screen_shake(), "Screen shake test failed")
     assert(test_vignette(), "Vignette test failed")
+    assert(test_screen_motion_blur_filter(), "ScreenMotionBlurFilter test failed")
+    assert(test_screen_motion_blur_saturate(), "ScreenMotionBlurFilter saturate test failed")
+    assert(test_screen_bw_filter(), "ScreenBWFilter test failed")
+    assert(test_screen_crossfade_filter(), "ScreenCrossFadeFilter test failed")
+    assert(test_bloom_filter(), "Bloom filter test failed")
+    assert(test_color_grading_filter(), "Color grading test failed")
     return true
 }

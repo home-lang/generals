@@ -1,0 +1,1051 @@
+// C&C Generals Zero Hour - Home Port
+// Profiler and Frame Metrics System
+//
+// Comprehensive profiling system for:
+// - Frame timing metrics with history
+// - Hierarchical profiling zones
+// - Flame graph data generation
+// - Performance counters (CPU, memory, GPU)
+// - Statistical analysis (min, max, avg, percentiles)
+//
+// Based on original performance monitoring systems
+
+import platform/timer
+
+// ============================================================================
+// FRAME METRICS - Detailed per-frame timing data
+// ============================================================================
+const FRAME_HISTORY_SIZE: i32 = 300  // 10 seconds at 30 FPS
+
+struct FrameMetrics {
+    // Raw timing
+    frame_time_ms: f64,
+    game_logic_ms: f64,
+    render_ms: f64,
+    present_ms: f64,
+    idle_ms: f64,
+
+    // Breakdown
+    ai_ms: f64,
+    physics_ms: f64,
+    animation_ms: f64,
+    audio_ms: f64,
+    network_ms: f64,
+    input_ms: f64,
+    ui_ms: f64,
+
+    // Counts
+    objects_updated: i32,
+    objects_rendered: i32,
+    draw_calls: i32,
+    triangles: i32,
+    particles: i32,
+
+    // Memory
+    memory_used_mb: f64,
+    memory_allocated_mb: f64,
+
+    fn init(): FrameMetrics {
+        return FrameMetrics {
+            frame_time_ms: 0.0,
+            game_logic_ms: 0.0,
+            render_ms: 0.0,
+            present_ms: 0.0,
+            idle_ms: 0.0,
+            ai_ms: 0.0,
+            physics_ms: 0.0,
+            animation_ms: 0.0,
+            audio_ms: 0.0,
+            network_ms: 0.0,
+            input_ms: 0.0,
+            ui_ms: 0.0,
+            objects_updated: 0,
+            objects_rendered: 0,
+            draw_calls: 0,
+            triangles: 0,
+            particles: 0,
+            memory_used_mb: 0.0,
+            memory_allocated_mb: 0.0,
+        }
+    }
+
+    fn clear(&self) {
+        self.frame_time_ms = 0.0
+        self.game_logic_ms = 0.0
+        self.render_ms = 0.0
+        self.present_ms = 0.0
+        self.idle_ms = 0.0
+        self.ai_ms = 0.0
+        self.physics_ms = 0.0
+        self.animation_ms = 0.0
+        self.audio_ms = 0.0
+        self.network_ms = 0.0
+        self.input_ms = 0.0
+        self.ui_ms = 0.0
+        self.objects_updated = 0
+        self.objects_rendered = 0
+        self.draw_calls = 0
+        self.triangles = 0
+        self.particles = 0
+    }
+}
+
+// ============================================================================
+// FRAME STATISTICS - Aggregated stats over time
+// ============================================================================
+struct FrameStatistics {
+    // FPS
+    current_fps: f64,
+    average_fps: f64,
+    min_fps: f64,
+    max_fps: f64,
+    fps_1_percent_low: f64,    // 1% percentile
+    fps_0_1_percent_low: f64,  // 0.1% percentile
+
+    // Frame time
+    current_ms: f64,
+    average_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    std_dev_ms: f64,
+
+    // Percentiles
+    p50_ms: f64,
+    p90_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+
+    // Frame budget
+    frame_budget_ms: f64,
+    frames_over_budget: i32,
+    frames_total: i32,
+    budget_hit_rate: f64,
+
+    fn init(): FrameStatistics {
+        return FrameStatistics {
+            current_fps: 0.0,
+            average_fps: 0.0,
+            min_fps: 9999.0,
+            max_fps: 0.0,
+            fps_1_percent_low: 0.0,
+            fps_0_1_percent_low: 0.0,
+            current_ms: 0.0,
+            average_ms: 0.0,
+            min_ms: 9999.0,
+            max_ms: 0.0,
+            std_dev_ms: 0.0,
+            p50_ms: 0.0,
+            p90_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            frame_budget_ms: 33.33,  // 30 FPS budget
+            frames_over_budget: 0,
+            frames_total: 0,
+            budget_hit_rate: 100.0,
+        }
+    }
+}
+
+// ============================================================================
+// FRAME METRICS COLLECTOR
+// ============================================================================
+struct FrameMetricsCollector {
+    // History ring buffer
+    history: [FrameMetrics; 300],
+    history_index: i32,
+    history_count: i32,
+
+    // Current frame being built
+    current_frame: FrameMetrics,
+    frame_start: timer::Timestamp,
+
+    // Aggregated statistics
+    statistics: FrameStatistics,
+
+    // Timing zones for current frame
+    zone_start_times: [timer::Timestamp; 16],
+
+    // Configuration
+    enabled: bool,
+    frame_budget_ms: f64,
+
+    fn init(): FrameMetricsCollector {
+        return FrameMetricsCollector {
+            history: [FrameMetrics::init(); 300],
+            history_index: 0,
+            history_count: 0,
+            current_frame: FrameMetrics::init(),
+            frame_start: timer::Timestamp::init(),
+            statistics: FrameStatistics::init(),
+            zone_start_times: [timer::Timestamp::init(); 16],
+            enabled: true,
+            frame_budget_ms: 33.33,
+        }
+    }
+
+    fn set_frame_budget(&self, budget_ms: f64) {
+        self.frame_budget_ms = budget_ms
+        self.statistics.frame_budget_ms = budget_ms
+    }
+
+    fn begin_frame(&self) {
+        if !self.enabled {
+            return
+        }
+        self.frame_start = timer::Timestamp::now()
+        self.current_frame.clear()
+    }
+
+    fn end_frame(&self) {
+        if !self.enabled {
+            return
+        }
+
+        let now = timer::Timestamp::now()
+        let elapsed = timer::Duration::from_ticks(now.diff(self.frame_start))
+        self.current_frame.frame_time_ms = elapsed.to_milliseconds()
+
+        // Store in history
+        self.history[self.history_index] = self.current_frame
+        self.history_index = (self.history_index + 1) % FRAME_HISTORY_SIZE
+        if self.history_count < FRAME_HISTORY_SIZE {
+            self.history_count = self.history_count + 1
+        }
+
+        // Update statistics
+        self.update_statistics()
+    }
+
+    // Zone timing
+    fn begin_zone(&self, zone_id: i32) {
+        if !self.enabled or zone_id >= 16 {
+            return
+        }
+        self.zone_start_times[zone_id] = timer::Timestamp::now()
+    }
+
+    fn end_zone(&self, zone_id: i32): f64 {
+        if !self.enabled or zone_id >= 16 {
+            return 0.0
+        }
+        let now = timer::Timestamp::now()
+        let elapsed = timer::Duration::from_ticks(now.diff(self.zone_start_times[zone_id]))
+        return elapsed.to_milliseconds()
+    }
+
+    // Predefined zones
+    fn begin_game_logic(&self) { self.begin_zone(0) }
+    fn end_game_logic(&self) { self.current_frame.game_logic_ms = self.end_zone(0) }
+
+    fn begin_render(&self) { self.begin_zone(1) }
+    fn end_render(&self) { self.current_frame.render_ms = self.end_zone(1) }
+
+    fn begin_present(&self) { self.begin_zone(2) }
+    fn end_present(&self) { self.current_frame.present_ms = self.end_zone(2) }
+
+    fn begin_ai(&self) { self.begin_zone(3) }
+    fn end_ai(&self) { self.current_frame.ai_ms = self.end_zone(3) }
+
+    fn begin_physics(&self) { self.begin_zone(4) }
+    fn end_physics(&self) { self.current_frame.physics_ms = self.end_zone(4) }
+
+    fn begin_animation(&self) { self.begin_zone(5) }
+    fn end_animation(&self) { self.current_frame.animation_ms = self.end_zone(5) }
+
+    fn begin_audio(&self) { self.begin_zone(6) }
+    fn end_audio(&self) { self.current_frame.audio_ms = self.end_zone(6) }
+
+    fn begin_network(&self) { self.begin_zone(7) }
+    fn end_network(&self) { self.current_frame.network_ms = self.end_zone(7) }
+
+    fn begin_input(&self) { self.begin_zone(8) }
+    fn end_input(&self) { self.current_frame.input_ms = self.end_zone(8) }
+
+    fn begin_ui(&self) { self.begin_zone(9) }
+    fn end_ui(&self) { self.current_frame.ui_ms = self.end_zone(9) }
+
+    // Count tracking
+    fn add_objects_updated(&self, count: i32) { self.current_frame.objects_updated = self.current_frame.objects_updated + count }
+    fn add_objects_rendered(&self, count: i32) { self.current_frame.objects_rendered = self.current_frame.objects_rendered + count }
+    fn add_draw_calls(&self, count: i32) { self.current_frame.draw_calls = self.current_frame.draw_calls + count }
+    fn add_triangles(&self, count: i32) { self.current_frame.triangles = self.current_frame.triangles + count }
+    fn add_particles(&self, count: i32) { self.current_frame.particles = self.current_frame.particles + count }
+
+    fn set_memory_used(&self, mb: f64) { self.current_frame.memory_used_mb = mb }
+    fn set_memory_allocated(&self, mb: f64) { self.current_frame.memory_allocated_mb = mb }
+
+    fn update_statistics(&self) {
+        if self.history_count == 0 {
+            return
+        }
+
+        // Calculate basic stats
+        let mut sum: f64 = 0.0
+        let mut min_time: f64 = 9999.0
+        let mut max_time: f64 = 0.0
+
+        for i in 0..self.history_count {
+            let ft = self.history[i].frame_time_ms
+            sum = sum + ft
+            if ft < min_time { min_time = ft }
+            if ft > max_time { max_time = ft }
+        }
+
+        let avg = sum / self.history_count as f64
+        self.statistics.average_ms = avg
+        self.statistics.min_ms = min_time
+        self.statistics.max_ms = max_time
+        self.statistics.current_ms = self.current_frame.frame_time_ms
+
+        // Calculate FPS
+        if avg > 0.0 {
+            self.statistics.average_fps = 1000.0 / avg
+        }
+        if self.statistics.current_ms > 0.0 {
+            self.statistics.current_fps = 1000.0 / self.statistics.current_ms
+        }
+        if min_time > 0.0 {
+            self.statistics.max_fps = 1000.0 / min_time
+        }
+        if max_time > 0.0 {
+            self.statistics.min_fps = 1000.0 / max_time
+        }
+
+        // Calculate standard deviation
+        let mut variance_sum: f64 = 0.0
+        for i in 0..self.history_count {
+            let diff = self.history[i].frame_time_ms - avg
+            variance_sum = variance_sum + diff * diff
+        }
+        self.statistics.std_dev_ms = sqrt(variance_sum / self.history_count as f64)
+
+        // Budget tracking
+        self.statistics.frames_total = self.statistics.frames_total + 1
+        if self.current_frame.frame_time_ms > self.frame_budget_ms {
+            self.statistics.frames_over_budget = self.statistics.frames_over_budget + 1
+        }
+        self.statistics.budget_hit_rate = 100.0 * (1.0 - (self.statistics.frames_over_budget as f64 / self.statistics.frames_total as f64))
+
+        // Calculate percentiles (simple approach - sort and pick)
+        self.calculate_percentiles()
+    }
+
+    fn calculate_percentiles(&self) {
+        if self.history_count < 10 {
+            return
+        }
+
+        // Copy frame times for sorting
+        let sorted: [f64; 300] = [0.0; 300]
+        for i in 0..self.history_count {
+            sorted[i] = self.history[i].frame_time_ms
+        }
+
+        // Simple bubble sort (history is small enough)
+        for i in 0..(self.history_count - 1) {
+            for j in 0..(self.history_count - i - 1) {
+                if sorted[j] > sorted[j + 1] {
+                    let temp = sorted[j]
+                    sorted[j] = sorted[j + 1]
+                    sorted[j + 1] = temp
+                }
+            }
+        }
+
+        // Pick percentile values
+        let p50_idx = (self.history_count * 50) / 100
+        let p90_idx = (self.history_count * 90) / 100
+        let p95_idx = (self.history_count * 95) / 100
+        let p99_idx = (self.history_count * 99) / 100
+
+        self.statistics.p50_ms = sorted[p50_idx]
+        self.statistics.p90_ms = sorted[p90_idx]
+        self.statistics.p95_ms = sorted[p95_idx]
+        self.statistics.p99_ms = sorted[p99_idx]
+
+        // 1% and 0.1% low (worst frame times -> lowest FPS)
+        let low_1_idx = (self.history_count * 99) / 100
+        let low_01_idx = (self.history_count * 999) / 1000
+        if low_01_idx >= self.history_count {
+            low_01_idx = self.history_count - 1
+        }
+
+        if sorted[low_1_idx] > 0.0 {
+            self.statistics.fps_1_percent_low = 1000.0 / sorted[low_1_idx]
+        }
+        if sorted[low_01_idx] > 0.0 {
+            self.statistics.fps_0_1_percent_low = 1000.0 / sorted[low_01_idx]
+        }
+    }
+
+    fn get_statistics(&self): FrameStatistics {
+        return self.statistics
+    }
+
+    fn get_current_frame(&self): FrameMetrics {
+        return self.current_frame
+    }
+
+    fn get_history_frame(&self, frames_ago: i32): FrameMetrics {
+        if frames_ago >= self.history_count or frames_ago < 0 {
+            return FrameMetrics::init()
+        }
+        let idx = (self.history_index - 1 - frames_ago + FRAME_HISTORY_SIZE) % FRAME_HISTORY_SIZE
+        return self.history[idx]
+    }
+
+    fn reset_statistics(&self) {
+        self.statistics = FrameStatistics::init()
+        self.statistics.frame_budget_ms = self.frame_budget_ms
+    }
+}
+
+// ============================================================================
+// PROFILING ZONE - Hierarchical timing zone
+// ============================================================================
+const MAX_ZONE_NAME_LEN: i32 = 64
+const MAX_PROFILE_DEPTH: i32 = 32
+const MAX_PROFILE_ZONES: i32 = 256
+
+struct ProfileZone {
+    name: string,
+    start_time: timer::Timestamp,
+    total_time: timer::Duration,
+    self_time: timer::Duration,  // Excluding children
+    call_count: i32,
+    parent_index: i32,
+    depth: i32,
+    color: i32,  // For visualization
+
+    fn init(): ProfileZone {
+        return ProfileZone {
+            name: "",
+            start_time: timer::Timestamp::init(),
+            total_time: timer::Duration::init(),
+            self_time: timer::Duration::init(),
+            call_count: 0,
+            parent_index: -1,
+            depth: 0,
+            color: 0,
+        }
+    }
+
+    fn reset(&self) {
+        self.total_time = timer::Duration::init()
+        self.self_time = timer::Duration::init()
+        self.call_count = 0
+    }
+}
+
+// ============================================================================
+// FLAME GRAPH DATA
+// ============================================================================
+struct FlameGraphSample {
+    zone_index: i32,
+    start_us: i64,
+    duration_us: i64,
+    depth: i32,
+
+    fn init(): FlameGraphSample {
+        return FlameGraphSample {
+            zone_index: 0,
+            start_us: 0,
+            duration_us: 0,
+            depth: 0,
+        }
+    }
+}
+
+const MAX_FLAME_SAMPLES: i32 = 4096
+
+struct FlameGraphData {
+    samples: [FlameGraphSample; 4096],
+    sample_count: i32,
+    frame_start_us: i64,
+
+    fn init(): FlameGraphData {
+        return FlameGraphData {
+            samples: [FlameGraphSample::init(); 4096],
+            sample_count: 0,
+            frame_start_us: 0,
+        }
+    }
+
+    fn clear(&self) {
+        self.sample_count = 0
+    }
+
+    fn add_sample(&self, zone_index: i32, start_us: i64, duration_us: i64, depth: i32) {
+        if self.sample_count < MAX_FLAME_SAMPLES {
+            self.samples[self.sample_count] = FlameGraphSample {
+                zone_index: zone_index,
+                start_us: start_us - self.frame_start_us,
+                duration_us: duration_us,
+                depth: depth,
+            }
+            self.sample_count = self.sample_count + 1
+        }
+    }
+}
+
+// ============================================================================
+// PROFILER - Main profiling system
+// ============================================================================
+struct Profiler {
+    // Zone definitions
+    zones: [ProfileZone; 256],
+    zone_count: i32,
+    zone_name_to_index: [i32; 256],  // Simple hash map
+
+    // Active zone stack
+    active_stack: [i32; 32],  // Zone indices
+    stack_depth: i32,
+
+    // Flame graph recording
+    flame_data: FlameGraphData,
+    record_flame_graph: bool,
+
+    // Frame tracking
+    frame_start: timer::Timestamp,
+    frame_count: i32,
+
+    // Configuration
+    enabled: bool,
+    paused: bool,
+
+    fn init(): Profiler {
+        return Profiler {
+            zones: [ProfileZone::init(); 256],
+            zone_count: 0,
+            zone_name_to_index: [-1; 256],
+            active_stack: [-1; 32],
+            stack_depth: 0,
+            flame_data: FlameGraphData::init(),
+            record_flame_graph: false,
+            frame_start: timer::Timestamp::init(),
+            frame_count: 0,
+            enabled: true,
+            paused: false,
+        }
+    }
+
+    fn enable(&self) { self.enabled = true }
+    fn disable(&self) { self.enabled = false }
+    fn pause(&self) { self.paused = true }
+    fn resume(&self) { self.paused = false }
+
+    fn enable_flame_graph(&self) { self.record_flame_graph = true }
+    fn disable_flame_graph(&self) { self.record_flame_graph = false }
+
+    fn begin_frame(&self) {
+        if !self.enabled or self.paused {
+            return
+        }
+
+        self.frame_start = timer::Timestamp::now()
+        self.frame_count = self.frame_count + 1
+
+        if self.record_flame_graph {
+            self.flame_data.clear()
+            self.flame_data.frame_start_us = self.frame_start.ticks / 1000  // Assume ns resolution
+        }
+
+        // Reset per-frame counters
+        for i in 0..self.zone_count {
+            self.zones[i].reset()
+        }
+
+        self.stack_depth = 0
+    }
+
+    fn end_frame(&self) {
+        // Close any unclosed zones
+        while self.stack_depth > 0 {
+            self.end_zone_internal()
+        }
+    }
+
+    // Get or create zone
+    fn get_zone_index(&self, name: string): i32 {
+        // Simple hash
+        let hash = hash_string(name) % 256
+        if hash < 0 { hash = -hash }
+
+        // Linear probe
+        for i in 0..256 {
+            let idx = (hash + i) % 256
+            if self.zone_name_to_index[idx] == -1 {
+                // Create new zone
+                if self.zone_count >= MAX_PROFILE_ZONES {
+                    return -1
+                }
+                let zone_idx = self.zone_count
+                self.zones[zone_idx].name = name
+                self.zones[zone_idx].color = hash * 0x010101  // Simple color from hash
+                self.zone_name_to_index[idx] = zone_idx
+                self.zone_count = self.zone_count + 1
+                return zone_idx
+            }
+            if self.zones[self.zone_name_to_index[idx]].name == name {
+                return self.zone_name_to_index[idx]
+            }
+        }
+        return -1
+    }
+
+    fn begin_zone(&self, name: string) {
+        if !self.enabled or self.paused {
+            return
+        }
+
+        let zone_idx = self.get_zone_index(name)
+        if zone_idx < 0 or self.stack_depth >= MAX_PROFILE_DEPTH {
+            return
+        }
+
+        let zone = self.zones[zone_idx]
+        zone.start_time = timer::Timestamp::now()
+        zone.call_count = zone.call_count + 1
+        zone.depth = self.stack_depth
+
+        // Set parent
+        if self.stack_depth > 0 {
+            zone.parent_index = self.active_stack[self.stack_depth - 1]
+        } else {
+            zone.parent_index = -1
+        }
+
+        // Push onto stack
+        self.active_stack[self.stack_depth] = zone_idx
+        self.stack_depth = self.stack_depth + 1
+    }
+
+    fn end_zone(&self) {
+        if !self.enabled or self.paused {
+            return
+        }
+        self.end_zone_internal()
+    }
+
+    fn end_zone_internal(&self) {
+        if self.stack_depth <= 0 {
+            return
+        }
+
+        self.stack_depth = self.stack_depth - 1
+        let zone_idx = self.active_stack[self.stack_depth]
+        if zone_idx < 0 {
+            return
+        }
+
+        let zone = self.zones[zone_idx]
+        let now = timer::Timestamp::now()
+        let elapsed = timer::Duration::from_ticks(now.diff(zone.start_time))
+
+        zone.total_time = zone.total_time.add(elapsed)
+        zone.self_time = zone.self_time.add(elapsed)  // Will subtract child time
+
+        // Subtract our time from parent's self time
+        if zone.parent_index >= 0 {
+            self.zones[zone.parent_index].self_time =
+                self.zones[zone.parent_index].self_time.sub(elapsed)
+        }
+
+        // Record flame graph sample
+        if self.record_flame_graph {
+            let start_us = zone.start_time.ticks / 1000
+            let duration_us = elapsed.to_microseconds() as i64
+            self.flame_data.add_sample(zone_idx, start_us, duration_us, zone.depth)
+        }
+    }
+
+    // Get zone statistics
+    fn get_zone_total_ms(&self, name: string): f64 {
+        let idx = self.get_zone_index(name)
+        if idx < 0 { return 0.0 }
+        return self.zones[idx].total_time.to_milliseconds()
+    }
+
+    fn get_zone_self_ms(&self, name: string): f64 {
+        let idx = self.get_zone_index(name)
+        if idx < 0 { return 0.0 }
+        return self.zones[idx].self_time.to_milliseconds()
+    }
+
+    fn get_zone_call_count(&self, name: string): i32 {
+        let idx = self.get_zone_index(name)
+        if idx < 0 { return 0 }
+        return self.zones[idx].call_count
+    }
+
+    fn get_zone_count(&self): i32 {
+        return self.zone_count
+    }
+
+    fn get_zone_by_index(&self, index: i32): ProfileZone {
+        if index >= 0 and index < self.zone_count {
+            return self.zones[index]
+        }
+        return ProfileZone::init()
+    }
+
+    fn get_flame_data(&self): FlameGraphData {
+        return self.flame_data
+    }
+}
+
+// ============================================================================
+// SCOPED PROFILER - RAII-style zone timing
+// ============================================================================
+struct ScopedProfile {
+    profiler: *Profiler,
+
+    fn init(profiler: *Profiler, name: string): ScopedProfile {
+        profiler.begin_zone(name)
+        return ScopedProfile { profiler: profiler }
+    }
+
+    fn deinit(&self) {
+        self.profiler.end_zone()
+    }
+}
+
+// ============================================================================
+// PERFORMANCE COUNTERS
+// ============================================================================
+enum CounterType {
+    Cumulative,   // Keeps adding up
+    Average,      // Rolling average
+    Maximum,      // Track max value
+    Minimum,      // Track min value
+    Gauge,        // Current value only
+}
+
+struct PerfCounter {
+    name: string,
+    counter_type: CounterType,
+    value: f64,
+    sum: f64,
+    count: i32,
+    min_value: f64,
+    max_value: f64,
+    history: [f64; 60],
+    history_index: i32,
+    history_count: i32,
+
+    fn init(name: string, counter_type: CounterType): PerfCounter {
+        return PerfCounter {
+            name: name,
+            counter_type: counter_type,
+            value: 0.0,
+            sum: 0.0,
+            count: 0,
+            min_value: 999999999.0,
+            max_value: -999999999.0,
+            history: [0.0; 60],
+            history_index: 0,
+            history_count: 0,
+        }
+    }
+
+    fn add(&self, val: f64) {
+        self.count = self.count + 1
+
+        match self.counter_type {
+            CounterType::Cumulative => {
+                self.value = self.value + val
+            }
+            CounterType::Average => {
+                self.sum = self.sum + val
+                self.value = self.sum / self.count as f64
+            }
+            CounterType::Maximum => {
+                if val > self.max_value {
+                    self.max_value = val
+                    self.value = val
+                }
+            }
+            CounterType::Minimum => {
+                if val < self.min_value {
+                    self.min_value = val
+                    self.value = val
+                }
+            }
+            CounterType::Gauge => {
+                self.value = val
+            }
+        }
+
+        // Track min/max regardless of type
+        if val < self.min_value { self.min_value = val }
+        if val > self.max_value { self.max_value = val }
+
+        // Add to history
+        self.history[self.history_index] = val
+        self.history_index = (self.history_index + 1) % 60
+        if self.history_count < 60 {
+            self.history_count = self.history_count + 1
+        }
+    }
+
+    fn set(&self, val: f64) {
+        self.value = val
+        self.add(val)
+    }
+
+    fn reset(&self) {
+        self.value = 0.0
+        self.sum = 0.0
+        self.count = 0
+        self.min_value = 999999999.0
+        self.max_value = -999999999.0
+        self.history_index = 0
+        self.history_count = 0
+    }
+
+    fn get_average(&self): f64 {
+        if self.history_count == 0 { return 0.0 }
+        let mut total: f64 = 0.0
+        for i in 0..self.history_count {
+            total = total + self.history[i]
+        }
+        return total / self.history_count as f64
+    }
+}
+
+// ============================================================================
+// PERFORMANCE COUNTER MANAGER
+// ============================================================================
+const MAX_PERF_COUNTERS: i32 = 128
+
+struct PerfCounterManager {
+    counters: [PerfCounter; 128],
+    counter_count: i32,
+
+    fn init(): PerfCounterManager {
+        return PerfCounterManager {
+            counters: [PerfCounter::init("", CounterType::Gauge); 128],
+            counter_count: 0,
+        }
+    }
+
+    fn get_or_create(&self, name: string, counter_type: CounterType): i32 {
+        // Find existing
+        for i in 0..self.counter_count {
+            if self.counters[i].name == name {
+                return i
+            }
+        }
+
+        // Create new
+        if self.counter_count < MAX_PERF_COUNTERS {
+            let idx = self.counter_count
+            self.counters[idx] = PerfCounter::init(name, counter_type)
+            self.counter_count = self.counter_count + 1
+            return idx
+        }
+
+        return -1
+    }
+
+    fn add(&self, name: string, value: f64, counter_type: CounterType) {
+        let idx = self.get_or_create(name, counter_type)
+        if idx >= 0 {
+            self.counters[idx].add(value)
+        }
+    }
+
+    fn set(&self, name: string, value: f64) {
+        let idx = self.get_or_create(name, CounterType::Gauge)
+        if idx >= 0 {
+            self.counters[idx].set(value)
+        }
+    }
+
+    fn get(&self, name: string): f64 {
+        for i in 0..self.counter_count {
+            if self.counters[i].name == name {
+                return self.counters[i].value
+            }
+        }
+        return 0.0
+    }
+
+    fn get_counter(&self, name: string): ?PerfCounter {
+        for i in 0..self.counter_count {
+            if self.counters[i].name == name {
+                return self.counters[i]
+            }
+        }
+        return null
+    }
+
+    fn reset_all(&self) {
+        for i in 0..self.counter_count {
+            self.counters[i].reset()
+        }
+    }
+
+    fn new_frame(&self) {
+        // Reset cumulative counters for new frame
+        for i in 0..self.counter_count {
+            if self.counters[i].counter_type == CounterType::Cumulative {
+                self.counters[i].value = 0.0
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+fn sqrt(x: f64): f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn hash_string(s: string): i32 {
+    let mut hash: i32 = 5381
+    for i in 0..s.len() {
+        let c = s.char_at(i)
+        hash = ((hash << 5) + hash) + c
+    }
+    return hash
+}
+
+// ============================================================================
+// GLOBAL INSTANCES
+// ============================================================================
+let TheFrameMetrics = FrameMetricsCollector::init()
+let TheProfiler = Profiler::init()
+let ThePerfCounters = PerfCounterManager::init()
+
+// ============================================================================
+// CONVENIENCE API
+// ============================================================================
+export fn profiler_begin_frame() {
+    TheFrameMetrics.begin_frame()
+    TheProfiler.begin_frame()
+    ThePerfCounters.new_frame()
+}
+
+export fn profiler_end_frame() {
+    TheProfiler.end_frame()
+    TheFrameMetrics.end_frame()
+}
+
+export fn profiler_begin_zone(name: string) {
+    TheProfiler.begin_zone(name)
+}
+
+export fn profiler_end_zone() {
+    TheProfiler.end_zone()
+}
+
+export fn profiler_get_fps(): f64 {
+    return TheFrameMetrics.statistics.current_fps
+}
+
+export fn profiler_get_frame_time_ms(): f64 {
+    return TheFrameMetrics.statistics.current_ms
+}
+
+export fn profiler_get_statistics(): FrameStatistics {
+    return TheFrameMetrics.statistics
+}
+
+export fn counter_add(name: string, value: f64) {
+    ThePerfCounters.add(name, value, CounterType::Cumulative)
+}
+
+export fn counter_set(name: string, value: f64) {
+    ThePerfCounters.set(name, value)
+}
+
+export fn counter_get(name: string): f64 {
+    return ThePerfCounters.get(name)
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+test "FrameMetrics: basic collection" {
+    let collector = FrameMetricsCollector::init()
+    collector.set_frame_budget(33.33)
+
+    collector.begin_frame()
+    collector.begin_game_logic()
+    // Simulate work
+    collector.end_game_logic()
+    collector.add_objects_updated(100)
+    collector.add_draw_calls(50)
+    collector.end_frame()
+
+    assert collector.current_frame.objects_updated == 100
+    assert collector.current_frame.draw_calls == 50
+    assert collector.history_count == 1
+}
+
+test "Profiler: zone timing" {
+    let profiler = Profiler::init()
+
+    profiler.begin_frame()
+    profiler.begin_zone("TestZone")
+    // Simulate work
+    profiler.end_zone()
+    profiler.end_frame()
+
+    assert profiler.get_zone_call_count("TestZone") == 1
+}
+
+test "Profiler: nested zones" {
+    let profiler = Profiler::init()
+
+    profiler.begin_frame()
+    profiler.begin_zone("Parent")
+        profiler.begin_zone("Child1")
+        profiler.end_zone()
+        profiler.begin_zone("Child2")
+        profiler.end_zone()
+    profiler.end_zone()
+    profiler.end_frame()
+
+    assert profiler.get_zone_call_count("Parent") == 1
+    assert profiler.get_zone_call_count("Child1") == 1
+    assert profiler.get_zone_call_count("Child2") == 1
+}
+
+test "PerfCounter: cumulative" {
+    let counter = PerfCounter::init("test", CounterType::Cumulative)
+
+    counter.add(10.0)
+    counter.add(20.0)
+    counter.add(30.0)
+
+    assert counter.value == 60.0
+    assert counter.count == 3
+}
+
+test "PerfCounter: average" {
+    let counter = PerfCounter::init("test", CounterType::Average)
+
+    counter.add(10.0)
+    counter.add(20.0)
+    counter.add(30.0)
+
+    assert counter.value == 20.0  // Average of 10, 20, 30
+}
+
+test "PerfCounterManager: management" {
+    let manager = PerfCounterManager::init()
+
+    manager.add("fps", 60.0, CounterType::Average)
+    manager.add("fps", 58.0, CounterType::Average)
+    manager.set("memory", 512.0)
+
+    assert manager.get("memory") == 512.0
+}

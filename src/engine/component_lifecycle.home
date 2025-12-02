@@ -1,0 +1,928 @@
+// C&C Generals Zero Hour - Home Port
+// Component Lifecycle System
+//
+// Original: Module.h, CreateModule.h, DestroyModule.h (Westwood Studios/EA)
+// Provides lifecycle hooks for ECS components matching original behavior
+//
+// Key callbacks from original:
+// - onCreate() - when component becomes active
+// - onBuildComplete() - when construction finishes (for buildings)
+// - onDestroy() - when component is about to be removed
+// - onDelete() - final cleanup before memory release
+// - onObjectCreated() - after all components for entity are created
+// - onDrawableBoundToObject() - when visual representation is bound
+// - onCapture() - when ownership changes
+// - onDisabledEdge() - when enabled/disabled state changes
+
+import basics/allocator
+
+// Lifecycle event types
+enum LifecycleEvent {
+    None = 0
+    Create = 1           // Component just added
+    BuildStart = 2       // Building construction started
+    BuildComplete = 3    // Building construction finished
+    ObjectCreated = 4    // All components added to entity
+    DrawableBound = 5    // Visual representation bound
+    Enable = 6           // Component enabled
+    Disable = 7          // Component disabled
+    Capture = 8          // Ownership changed
+    Destroy = 9          // Component about to be removed
+    Delete = 10          // Final cleanup before memory release
+}
+
+// Component interface mask (matches original ModuleInterfaceType)
+const INTERFACE_UPDATE: i32 = 0x00000001
+const INTERFACE_DIE: i32 = 0x00000002
+const INTERFACE_DAMAGE: i32 = 0x00000004
+const INTERFACE_CREATE: i32 = 0x00000008
+const INTERFACE_COLLIDE: i32 = 0x00000010
+const INTERFACE_BODY: i32 = 0x00000020
+const INTERFACE_CONTAIN: i32 = 0x00000040
+const INTERFACE_UPGRADE: i32 = 0x00000080
+const INTERFACE_SPECIAL_POWER: i32 = 0x00000100
+const INTERFACE_DESTROY: i32 = 0x00000200
+const INTERFACE_DRAW: i32 = 0x00000400
+const INTERFACE_CLIENT_UPDATE: i32 = 0x00000800
+
+// Component type for categorization
+enum ComponentCategory {
+    Behavior = 0
+    Draw = 1
+    ClientUpdate = 2
+}
+
+// Lifecycle callback function types
+type OnCreateFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnBuildCompleteFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnDestroyFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnDeleteFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnObjectCreatedFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnDrawableBoundFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnCaptureFn = fn(entity_id: i32, component_ptr: *anyopaque, old_owner: i32, new_owner: i32): void
+type OnDisabledEdgeFn = fn(entity_id: i32, component_ptr: *anyopaque, now_disabled: bool): void
+type OnEnableFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+type OnDisableFn = fn(entity_id: i32, component_ptr: *anyopaque): void
+
+// Lifecycle callbacks container
+struct LifecycleCallbacks {
+    on_create: ?OnCreateFn
+    on_build_complete: ?OnBuildCompleteFn
+    on_destroy: ?OnDestroyFn
+    on_delete: ?OnDeleteFn
+    on_object_created: ?OnObjectCreatedFn
+    on_drawable_bound: ?OnDrawableBoundFn
+    on_capture: ?OnCaptureFn
+    on_disabled_edge: ?OnDisabledEdgeFn
+    on_enable: ?OnEnableFn
+    on_disable: ?OnDisableFn
+
+    fn init(): LifecycleCallbacks {
+        return LifecycleCallbacks {
+            on_create: null
+            on_build_complete: null
+            on_destroy: null
+            on_delete: null
+            on_object_created: null
+            on_drawable_bound: null
+            on_capture: null
+            on_disabled_edge: null
+            on_enable: null
+            on_disable: null
+        }
+    }
+
+    fn has_create(&self): bool {
+        return self.on_create != null
+    }
+
+    fn has_destroy(&self): bool {
+        return self.on_destroy != null
+    }
+
+    fn has_any(&self): bool {
+        return self.on_create != null or
+               self.on_build_complete != null or
+               self.on_destroy != null or
+               self.on_delete != null or
+               self.on_object_created != null or
+               self.on_drawable_bound != null or
+               self.on_capture != null or
+               self.on_disabled_edge != null or
+               self.on_enable != null or
+               self.on_disable != null
+    }
+}
+
+// Component lifecycle registration entry
+struct LifecycleEntry {
+    component_type_id: i32           // Type identifier for the component
+    component_name: string           // Name for debugging
+    category: ComponentCategory      // Behavior, Draw, or ClientUpdate
+    interface_mask: i32              // Which interfaces this component implements
+    callbacks: LifecycleCallbacks    // Registered callbacks
+    is_active: bool                  // Whether entry is in use
+}
+
+// Pending lifecycle event for deferred processing
+struct PendingLifecycleEvent {
+    entity_id: i32
+    component_type_id: i32
+    component_ptr: *anyopaque
+    event_type: LifecycleEvent
+    param1: i32                      // old_owner for capture, etc.
+    param2: i32                      // new_owner for capture, etc.
+    is_pending: bool
+}
+
+// Component state tracking per entity
+struct EntityComponentState {
+    entity_id: i32
+    is_fully_created: bool           // All components added
+    is_drawable_bound: bool          // Drawable attached
+    is_enabled: bool                 // Entity enabled
+    is_pending_destroy: bool         // Marked for destruction
+    build_progress: f32              // 0.0 to 1.0 for buildings
+    need_build_complete: bool        // onBuildComplete not yet called
+}
+
+// Component lifecycle manager
+struct ComponentLifecycleManager {
+    // Registered component type callbacks
+    entries: [LifecycleEntry; 256]
+    entry_count: i32
+
+    // Entity state tracking
+    entity_states: [EntityComponentState; 4096]
+    entity_state_count: i32
+
+    // Deferred event queue
+    pending_events: [PendingLifecycleEvent; 1024]
+    pending_event_count: i32
+    pending_event_head: i32
+    pending_event_tail: i32
+
+    // Processing state
+    is_processing_events: bool
+    current_frame: i32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): ComponentLifecycleManager {
+        let mut manager = ComponentLifecycleManager {
+            entries: undefined
+            entry_count: 0
+            entity_states: undefined
+            entity_state_count: 0
+            pending_events: undefined
+            pending_event_count: 0
+            pending_event_head: 0
+            pending_event_tail: 0
+            is_processing_events: false
+            current_frame: 0
+            allocator: allocator
+        }
+
+        // Initialize arrays
+        for i in 0..256 {
+            manager.entries[i] = LifecycleEntry {
+                component_type_id: -1
+                component_name: ""
+                category: ComponentCategory::Behavior
+                interface_mask: 0
+                callbacks: LifecycleCallbacks.init()
+                is_active: false
+            }
+        }
+
+        for i in 0..4096 {
+            manager.entity_states[i] = EntityComponentState {
+                entity_id: -1
+                is_fully_created: false
+                is_drawable_bound: false
+                is_enabled: true
+                is_pending_destroy: false
+                build_progress: 1.0
+                need_build_complete: false
+            }
+        }
+
+        for i in 0..1024 {
+            manager.pending_events[i] = PendingLifecycleEvent {
+                entity_id: -1
+                component_type_id: -1
+                component_ptr: null
+                event_type: LifecycleEvent::None
+                param1: 0
+                param2: 0
+                is_pending: false
+            }
+        }
+
+        return manager
+    }
+
+    // Register a component type with lifecycle callbacks
+    fn register_component_type(
+        &self,
+        component_type_id: i32,
+        name: string,
+        category: ComponentCategory,
+        interface_mask: i32,
+        callbacks: LifecycleCallbacks
+    ): bool {
+        if self.entry_count >= 256 {
+            return false
+        }
+
+        // Check for duplicate
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id {
+                // Update existing entry
+                self.entries[i].component_name = name
+                self.entries[i].category = category
+                self.entries[i].interface_mask = interface_mask
+                self.entries[i].callbacks = callbacks
+                return true
+            }
+        }
+
+        // Add new entry
+        let index = self.entry_count
+        self.entries[index] = LifecycleEntry {
+            component_type_id: component_type_id
+            component_name: name
+            category: category
+            interface_mask: interface_mask
+            callbacks: callbacks
+            is_active: true
+        }
+        self.entry_count += 1
+
+        return true
+    }
+
+    // Unregister a component type
+    fn unregister_component_type(&self, component_type_id: i32): bool {
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id {
+                self.entries[i].is_active = false
+                return true
+            }
+        }
+        return false
+    }
+
+    // Get callbacks for a component type
+    fn get_callbacks(&self, component_type_id: i32): ?*LifecycleCallbacks {
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id and self.entries[i].is_active {
+                return &self.entries[i].callbacks
+            }
+        }
+        return null
+    }
+
+    // Get or create entity state
+    fn get_or_create_entity_state(&self, entity_id: i32): *EntityComponentState {
+        // Check if exists
+        for i in 0..self.entity_state_count {
+            if self.entity_states[i].entity_id == entity_id {
+                return &self.entity_states[i]
+            }
+        }
+
+        // Create new
+        if self.entity_state_count < 4096 {
+            let index = self.entity_state_count
+            self.entity_states[index] = EntityComponentState {
+                entity_id: entity_id
+                is_fully_created: false
+                is_drawable_bound: false
+                is_enabled: true
+                is_pending_destroy: false
+                build_progress: 1.0
+                need_build_complete: false
+            }
+            self.entity_state_count += 1
+            return &self.entity_states[index]
+        }
+
+        // Fallback to first slot (should never happen)
+        return &self.entity_states[0]
+    }
+
+    // Remove entity state
+    fn remove_entity_state(&self, entity_id: i32) {
+        for i in 0..self.entity_state_count {
+            if self.entity_states[i].entity_id == entity_id {
+                // Swap with last
+                if i < self.entity_state_count - 1 {
+                    self.entity_states[i] = self.entity_states[self.entity_state_count - 1]
+                }
+                self.entity_state_count -= 1
+                return
+            }
+        }
+    }
+
+    // Queue a lifecycle event for deferred processing
+    fn queue_event(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque,
+        event_type: LifecycleEvent,
+        param1: i32,
+        param2: i32
+    ): bool {
+        if self.pending_event_count >= 1024 {
+            return false
+        }
+
+        let index = self.pending_event_tail
+        self.pending_events[index] = PendingLifecycleEvent {
+            entity_id: entity_id
+            component_type_id: component_type_id
+            component_ptr: component_ptr
+            event_type: event_type
+            param1: param1
+            param2: param2
+            is_pending: true
+        }
+
+        self.pending_event_tail = (self.pending_event_tail + 1) % 1024
+        self.pending_event_count += 1
+
+        return true
+    }
+
+    // Process pending lifecycle events
+    fn process_pending_events(&self) {
+        if self.is_processing_events {
+            return  // Prevent re-entry
+        }
+
+        self.is_processing_events = true
+
+        while self.pending_event_count > 0 {
+            let event = &self.pending_events[self.pending_event_head]
+            if event.is_pending {
+                self.dispatch_event(event)
+                event.is_pending = false
+            }
+
+            self.pending_event_head = (self.pending_event_head + 1) % 1024
+            self.pending_event_count -= 1
+        }
+
+        self.is_processing_events = false
+    }
+
+    // Dispatch a single event
+    fn dispatch_event(&self, event: *PendingLifecycleEvent) {
+        let callbacks = self.get_callbacks(event.component_type_id)
+        if callbacks == null {
+            return
+        }
+
+        match event.event_type {
+            LifecycleEvent::Create => {
+                if callbacks.?.on_create != null {
+                    callbacks.?.on_create.?(event.entity_id, event.component_ptr)
+                }
+            }
+            LifecycleEvent::BuildComplete => {
+                if callbacks.?.on_build_complete != null {
+                    callbacks.?.on_build_complete.?(event.entity_id, event.component_ptr)
+                }
+            }
+            LifecycleEvent::ObjectCreated => {
+                if callbacks.?.on_object_created != null {
+                    callbacks.?.on_object_created.?(event.entity_id, event.component_ptr)
+                }
+            }
+            LifecycleEvent::DrawableBound => {
+                if callbacks.?.on_drawable_bound != null {
+                    callbacks.?.on_drawable_bound.?(event.entity_id, event.component_ptr)
+                }
+            }
+            LifecycleEvent::Capture => {
+                if callbacks.?.on_capture != null {
+                    callbacks.?.on_capture.?(event.entity_id, event.component_ptr, event.param1, event.param2)
+                }
+            }
+            LifecycleEvent::Enable => {
+                if callbacks.?.on_enable != null {
+                    callbacks.?.on_enable.?(event.entity_id, event.component_ptr)
+                }
+                if callbacks.?.on_disabled_edge != null {
+                    callbacks.?.on_disabled_edge.?(event.entity_id, event.component_ptr, false)
+                }
+            }
+            LifecycleEvent::Disable => {
+                if callbacks.?.on_disable != null {
+                    callbacks.?.on_disable.?(event.entity_id, event.component_ptr)
+                }
+                if callbacks.?.on_disabled_edge != null {
+                    callbacks.?.on_disabled_edge.?(event.entity_id, event.component_ptr, true)
+                }
+            }
+            LifecycleEvent::Destroy => {
+                if callbacks.?.on_destroy != null {
+                    callbacks.?.on_destroy.?(event.entity_id, event.component_ptr)
+                }
+            }
+            LifecycleEvent::Delete => {
+                if callbacks.?.on_delete != null {
+                    callbacks.?.on_delete.?(event.entity_id, event.component_ptr)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Immediate lifecycle calls (for time-critical events)
+
+    // Called when a component is added to an entity
+    fn on_component_added(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque
+    ) {
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_create != null {
+            callbacks.?.on_create.?(entity_id, component_ptr)
+        }
+    }
+
+    // Called when all components are added to an entity
+    fn on_entity_created(&self, entity_id: i32) {
+        let state = self.get_or_create_entity_state(entity_id)
+        state.is_fully_created = true
+
+        // Queue ObjectCreated events for all components
+        // (In practice, the ECS would iterate components and call this)
+    }
+
+    // Called when a drawable is bound to an object
+    fn on_drawable_bound(&self, entity_id: i32) {
+        let state = self.get_or_create_entity_state(entity_id)
+        state.is_drawable_bound = true
+    }
+
+    // Called when building construction completes
+    fn on_build_complete(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque
+    ) {
+        let state = self.get_or_create_entity_state(entity_id)
+        state.build_progress = 1.0
+        state.need_build_complete = false
+
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_build_complete != null {
+            callbacks.?.on_build_complete.?(entity_id, component_ptr)
+        }
+    }
+
+    // Called when entity ownership changes
+    fn on_capture(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque,
+        old_owner: i32,
+        new_owner: i32
+    ) {
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_capture != null {
+            callbacks.?.on_capture.?(entity_id, component_ptr, old_owner, new_owner)
+        }
+    }
+
+    // Called when entity enabled state changes
+    fn on_disabled_edge(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque,
+        now_disabled: bool
+    ) {
+        let state = self.get_or_create_entity_state(entity_id)
+        state.is_enabled = !now_disabled
+
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_disabled_edge != null {
+            callbacks.?.on_disabled_edge.?(entity_id, component_ptr, now_disabled)
+        }
+    }
+
+    // Called when component is about to be removed
+    fn on_component_removing(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque
+    ) {
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_destroy != null {
+            callbacks.?.on_destroy.?(entity_id, component_ptr)
+        }
+    }
+
+    // Called for final cleanup before memory release
+    fn on_component_deleted(
+        &self,
+        entity_id: i32,
+        component_type_id: i32,
+        component_ptr: *anyopaque
+    ) {
+        let callbacks = self.get_callbacks(component_type_id)
+        if callbacks != null and callbacks.?.on_delete != null {
+            callbacks.?.on_delete.?(entity_id, component_ptr)
+        }
+    }
+
+    // Called when entity is fully destroyed
+    fn on_entity_destroyed(&self, entity_id: i32) {
+        self.remove_entity_state(entity_id)
+    }
+
+    // Update - process pending events
+    fn update(&self) {
+        self.current_frame += 1
+        self.process_pending_events()
+    }
+
+    // Check if component type has CREATE interface
+    fn has_create_interface(&self, component_type_id: i32): bool {
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id and self.entries[i].is_active {
+                return (self.entries[i].interface_mask & INTERFACE_CREATE) != 0
+            }
+        }
+        return false
+    }
+
+    // Check if component type has DESTROY interface
+    fn has_destroy_interface(&self, component_type_id: i32): bool {
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id and self.entries[i].is_active {
+                return (self.entries[i].interface_mask & INTERFACE_DESTROY) != 0
+            }
+        }
+        return false
+    }
+
+    // Get interface mask for component type
+    fn get_interface_mask(&self, component_type_id: i32): i32 {
+        for i in 0..self.entry_count {
+            if self.entries[i].component_type_id == component_type_id and self.entries[i].is_active {
+                return self.entries[i].interface_mask
+            }
+        }
+        return 0
+    }
+
+    fn deinit(&self) {
+        // Nothing to free - all arrays are inline
+    }
+}
+
+// Create module helper - wraps common create behavior
+struct CreateModuleState {
+    entity_id: i32
+    need_to_run_on_build_complete: bool
+
+    fn init(entity_id: i32): CreateModuleState {
+        return CreateModuleState {
+            entity_id: entity_id
+            need_to_run_on_build_complete: true
+        }
+    }
+
+    fn should_do_on_build_complete(&self): bool {
+        return self.need_to_run_on_build_complete
+    }
+
+    fn mark_build_complete(&self) {
+        self.need_to_run_on_build_complete = false
+    }
+}
+
+// Destroy module helper
+struct DestroyModuleState {
+    entity_id: i32
+    is_destroyed: bool
+
+    fn init(entity_id: i32): DestroyModuleState {
+        return DestroyModuleState {
+            entity_id: entity_id
+            is_destroyed: false
+        }
+    }
+
+    fn mark_destroyed(&self) {
+        self.is_destroyed = true
+    }
+
+    fn is_already_destroyed(&self): bool {
+        return self.is_destroyed
+    }
+}
+
+// Component lifecycle trait - can be added to components
+struct ComponentLifecycle {
+    entity_id: i32
+    component_type_id: i32
+    is_created: bool
+    is_enabled: bool
+    create_state: ?CreateModuleState
+    destroy_state: ?DestroyModuleState
+
+    fn init(entity_id: i32, component_type_id: i32): ComponentLifecycle {
+        return ComponentLifecycle {
+            entity_id: entity_id
+            component_type_id: component_type_id
+            is_created: false
+            is_enabled: true
+            create_state: null
+            destroy_state: null
+        }
+    }
+
+    fn with_create(entity_id: i32, component_type_id: i32): ComponentLifecycle {
+        return ComponentLifecycle {
+            entity_id: entity_id
+            component_type_id: component_type_id
+            is_created: false
+            is_enabled: true
+            create_state: CreateModuleState.init(entity_id)
+            destroy_state: null
+        }
+    }
+
+    fn with_destroy(entity_id: i32, component_type_id: i32): ComponentLifecycle {
+        return ComponentLifecycle {
+            entity_id: entity_id
+            component_type_id: component_type_id
+            is_created: false
+            is_enabled: true
+            create_state: null
+            destroy_state: DestroyModuleState.init(entity_id)
+        }
+    }
+
+    fn with_both(entity_id: i32, component_type_id: i32): ComponentLifecycle {
+        return ComponentLifecycle {
+            entity_id: entity_id
+            component_type_id: component_type_id
+            is_created: false
+            is_enabled: true
+            create_state: CreateModuleState.init(entity_id)
+            destroy_state: DestroyModuleState.init(entity_id)
+        }
+    }
+
+    fn mark_created(&self) {
+        self.is_created = true
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.is_enabled = enabled
+    }
+}
+
+// Lifecycle batch processor for efficient bulk operations
+struct LifecycleBatch {
+    entities: [i32; 256]
+    component_types: [i32; 256]
+    component_ptrs: [*anyopaque; 256]
+    event_types: [LifecycleEvent; 256]
+    count: i32
+
+    fn init(): LifecycleBatch {
+        return LifecycleBatch {
+            entities: [0; 256]
+            component_types: [0; 256]
+            component_ptrs: [null; 256]
+            event_types: [LifecycleEvent::None; 256]
+            count: 0
+        }
+    }
+
+    fn add(&self, entity_id: i32, component_type_id: i32, component_ptr: *anyopaque, event_type: LifecycleEvent): bool {
+        if self.count >= 256 {
+            return false
+        }
+
+        self.entities[self.count] = entity_id
+        self.component_types[self.count] = component_type_id
+        self.component_ptrs[self.count] = component_ptr
+        self.event_types[self.count] = event_type
+        self.count += 1
+
+        return true
+    }
+
+    fn clear(&self) {
+        self.count = 0
+    }
+
+    fn process(&self, manager: *ComponentLifecycleManager) {
+        for i in 0..self.count {
+            let event_type = self.event_types[i]
+            match event_type {
+                LifecycleEvent::Create => {
+                    manager.on_component_added(
+                        self.entities[i],
+                        self.component_types[i],
+                        self.component_ptrs[i]
+                    )
+                }
+                LifecycleEvent::Destroy => {
+                    manager.on_component_removing(
+                        self.entities[i],
+                        self.component_types[i],
+                        self.component_ptrs[i]
+                    )
+                }
+                LifecycleEvent::Delete => {
+                    manager.on_component_deleted(
+                        self.entities[i],
+                        self.component_types[i],
+                        self.component_ptrs[i]
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// Global lifecycle manager instance
+var g_lifecycle_manager: ?ComponentLifecycleManager = null
+
+// Initialize the lifecycle system
+export fn init_component_lifecycle(allocator: Allocator) {
+    g_lifecycle_manager = ComponentLifecycleManager.init(allocator)
+}
+
+// Shutdown the lifecycle system
+export fn shutdown_component_lifecycle() {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.deinit()
+        g_lifecycle_manager = null
+    }
+}
+
+// Get the global lifecycle manager
+export fn get_lifecycle_manager(): ?*ComponentLifecycleManager {
+    if g_lifecycle_manager != null {
+        return &g_lifecycle_manager.?
+    }
+    return null
+}
+
+// Register a component type with callbacks
+export fn register_component_lifecycle(
+    component_type_id: i32,
+    name: string,
+    category: ComponentCategory,
+    interface_mask: i32,
+    callbacks: LifecycleCallbacks
+): bool {
+    if g_lifecycle_manager != null {
+        return g_lifecycle_manager.?.register_component_type(
+            component_type_id,
+            name,
+            category,
+            interface_mask,
+            callbacks
+        )
+    }
+    return false
+}
+
+// Notify component added
+export fn notify_component_added(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_component_added(entity_id, component_type_id, component_ptr)
+    }
+}
+
+// Notify entity fully created
+export fn notify_entity_created(entity_id: i32) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_entity_created(entity_id)
+    }
+}
+
+// Notify drawable bound
+export fn notify_drawable_bound(entity_id: i32) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_drawable_bound(entity_id)
+    }
+}
+
+// Notify build complete
+export fn notify_build_complete(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_build_complete(entity_id, component_type_id, component_ptr)
+    }
+}
+
+// Notify capture
+export fn notify_capture(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque, old_owner: i32, new_owner: i32) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_capture(entity_id, component_type_id, component_ptr, old_owner, new_owner)
+    }
+}
+
+// Notify disabled edge
+export fn notify_disabled_edge(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque, now_disabled: bool) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_disabled_edge(entity_id, component_type_id, component_ptr, now_disabled)
+    }
+}
+
+// Notify component removing
+export fn notify_component_removing(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_component_removing(entity_id, component_type_id, component_ptr)
+    }
+}
+
+// Notify component deleted
+export fn notify_component_deleted(entity_id: i32, component_type_id: i32, component_ptr: *anyopaque) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_component_deleted(entity_id, component_type_id, component_ptr)
+    }
+}
+
+// Notify entity destroyed
+export fn notify_entity_destroyed(entity_id: i32) {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.on_entity_destroyed(entity_id)
+    }
+}
+
+// Update lifecycle system
+export fn update_component_lifecycle() {
+    if g_lifecycle_manager != null {
+        g_lifecycle_manager.?.update()
+    }
+}
+
+// Helper to create callbacks for a simple component with just onCreate/onDestroy
+export fn make_simple_callbacks(
+    on_create: ?OnCreateFn,
+    on_destroy: ?OnDestroyFn
+): LifecycleCallbacks {
+    let mut callbacks = LifecycleCallbacks.init()
+    callbacks.on_create = on_create
+    callbacks.on_destroy = on_destroy
+    return callbacks
+}
+
+// Helper to create callbacks for a building with build complete
+export fn make_building_callbacks(
+    on_create: ?OnCreateFn,
+    on_build_complete: ?OnBuildCompleteFn,
+    on_destroy: ?OnDestroyFn
+): LifecycleCallbacks {
+    let mut callbacks = LifecycleCallbacks.init()
+    callbacks.on_create = on_create
+    callbacks.on_build_complete = on_build_complete
+    callbacks.on_destroy = on_destroy
+    return callbacks
+}
+
+// Helper to create full callbacks
+export fn make_full_callbacks(
+    on_create: ?OnCreateFn,
+    on_build_complete: ?OnBuildCompleteFn,
+    on_destroy: ?OnDestroyFn,
+    on_delete: ?OnDeleteFn,
+    on_object_created: ?OnObjectCreatedFn,
+    on_drawable_bound: ?OnDrawableBoundFn,
+    on_capture: ?OnCaptureFn,
+    on_disabled_edge: ?OnDisabledEdgeFn
+): LifecycleCallbacks {
+    return LifecycleCallbacks {
+        on_create: on_create
+        on_build_complete: on_build_complete
+        on_destroy: on_destroy
+        on_delete: on_delete
+        on_object_created: on_object_created
+        on_drawable_bound: on_drawable_bound
+        on_capture: on_capture
+        on_disabled_edge: on_disabled_edge
+        on_enable: null
+        on_disable: null
+    }
+}

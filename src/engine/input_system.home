@@ -1030,3 +1030,618 @@ fn shutdown_input_system() {
     g_edge_scroll = null
     g_cursor_manager = null
 }
+
+// ============================================================================
+// GAMEPAD/CONTROLLER INPUT SUPPORT (H0-015)
+// ============================================================================
+
+enum GamepadButton {
+    A = 0,              // Confirm / Select
+    B = 1,              // Cancel / Back
+    X = 2,              // Action 1
+    Y = 3,              // Action 2
+    LEFT_BUMPER = 4,
+    RIGHT_BUMPER = 5,
+    BACK = 6,           // View/Select
+    START = 7,          // Menu/Pause
+    LEFT_STICK = 8,     // Click
+    RIGHT_STICK = 9,    // Click
+    DPAD_UP = 10,
+    DPAD_DOWN = 11,
+    DPAD_LEFT = 12,
+    DPAD_RIGHT = 13,
+    GUIDE = 14,         // Xbox/PS button
+    COUNT = 15,
+}
+
+enum GamepadAxis {
+    LEFT_X = 0,
+    LEFT_Y = 1,
+    RIGHT_X = 2,
+    RIGHT_Y = 3,
+    LEFT_TRIGGER = 4,
+    RIGHT_TRIGGER = 5,
+    COUNT = 6,
+}
+
+struct GamepadState {
+    is_connected: bool,
+    device_id: i32,
+    name: string,
+
+    // Button states
+    buttons: [KeyState],
+
+    // Analog axis values (-1.0 to 1.0, triggers 0.0 to 1.0)
+    axes: [f32],
+
+    // Deadzones
+    stick_deadzone: f32,
+    trigger_deadzone: f32,
+
+    // Vibration state
+    left_motor: f32,
+    right_motor: f32,
+    vibration_duration: f32,
+}
+
+impl GamepadState {
+    fn init(device_id: i32): GamepadState {
+        let buttons: [KeyState] = []
+        for i in 0..15 {
+            buttons = buttons + [KeyState::init()]
+        }
+
+        let axes: [f32] = []
+        for i in 0..6 {
+            axes = axes + [0.0]
+        }
+
+        return GamepadState {
+            is_connected: false,
+            device_id: device_id,
+            name: "",
+            buttons: buttons,
+            axes: axes,
+            stick_deadzone: 0.15,
+            trigger_deadzone: 0.05,
+            left_motor: 0.0,
+            right_motor: 0.0,
+            vibration_duration: 0.0,
+        }
+    }
+
+    fn update(&self, delta_time: f64) {
+        // Update previous button states
+        for i in 0..15 {
+            self.buttons[i].was_down = self.buttons[i].is_down
+        }
+
+        // Update vibration
+        if self.vibration_duration > 0.0 {
+            self.vibration_duration = self.vibration_duration - (delta_time as f32)
+            if self.vibration_duration <= 0.0 {
+                self.left_motor = 0.0
+                self.right_motor = 0.0
+                self.vibration_duration = 0.0
+            }
+        }
+    }
+
+    fn on_button_down(&self, button: i32) {
+        if button >= 0 && button < 15 {
+            if !self.buttons[button].is_down {
+                self.buttons[button].press_time = 0.0  // Would use current_time
+            }
+            self.buttons[button].is_down = true
+        }
+    }
+
+    fn on_button_up(&self, button: i32) {
+        if button >= 0 && button < 15 {
+            self.buttons[button].is_down = false
+            self.buttons[button].release_time = 0.0  // Would use current_time
+        }
+    }
+
+    fn set_axis(&self, axis: i32, value: f32) {
+        if axis >= 0 && axis < 6 {
+            self.axes[axis] = value
+        }
+    }
+
+    fn get_axis(&self, axis: GamepadAxis): f32 {
+        let idx = gamepad_axis_to_int(axis)
+        if idx >= 0 && idx < 6 {
+            let value = self.axes[idx]
+
+            // Apply deadzone for sticks
+            if axis == GamepadAxis::LEFT_X || axis == GamepadAxis::LEFT_Y ||
+               axis == GamepadAxis::RIGHT_X || axis == GamepadAxis::RIGHT_Y {
+                if value > -self.stick_deadzone && value < self.stick_deadzone {
+                    return 0.0
+                }
+            }
+
+            // Apply deadzone for triggers
+            if axis == GamepadAxis::LEFT_TRIGGER || axis == GamepadAxis::RIGHT_TRIGGER {
+                if value < self.trigger_deadzone {
+                    return 0.0
+                }
+            }
+
+            return value
+        }
+        return 0.0
+    }
+
+    fn get_axis_raw(&self, axis: GamepadAxis): f32 {
+        let idx = gamepad_axis_to_int(axis)
+        if idx >= 0 && idx < 6 {
+            return self.axes[idx]
+        }
+        return 0.0
+    }
+
+    fn is_button_down(&self, button: GamepadButton): bool {
+        let idx = gamepad_button_to_int(button)
+        if idx >= 0 && idx < 15 {
+            return self.buttons[idx].is_down
+        }
+        return false
+    }
+
+    fn is_button_pressed(&self, button: GamepadButton): bool {
+        let idx = gamepad_button_to_int(button)
+        if idx >= 0 && idx < 15 {
+            return self.buttons[idx].is_down && !self.buttons[idx].was_down
+        }
+        return false
+    }
+
+    fn is_button_released(&self, button: GamepadButton): bool {
+        let idx = gamepad_button_to_int(button)
+        if idx >= 0 && idx < 15 {
+            return !self.buttons[idx].is_down && self.buttons[idx].was_down
+        }
+        return false
+    }
+
+    fn set_vibration(&self, left: f32, right: f32, duration: f32) {
+        self.left_motor = clamp_f32(left, 0.0, 1.0)
+        self.right_motor = clamp_f32(right, 0.0, 1.0)
+        self.vibration_duration = duration
+    }
+
+    fn stop_vibration(&self) {
+        self.left_motor = 0.0
+        self.right_motor = 0.0
+        self.vibration_duration = 0.0
+    }
+
+    // Get left stick as 2D vector
+    fn get_left_stick(&self): [f32] {
+        let result: [f32] = []
+        result = result + [self.get_axis(GamepadAxis::LEFT_X)]
+        result = result + [self.get_axis(GamepadAxis::LEFT_Y)]
+        return result
+    }
+
+    // Get right stick as 2D vector
+    fn get_right_stick(&self): [f32] {
+        let result: [f32] = []
+        result = result + [self.get_axis(GamepadAxis::RIGHT_X)]
+        result = result + [self.get_axis(GamepadAxis::RIGHT_Y)]
+        return result
+    }
+
+    // Get D-pad direction as 2D vector
+    fn get_dpad(&self): [i32] {
+        let x = 0
+        let y = 0
+
+        if self.is_button_down(GamepadButton::DPAD_LEFT) {
+            x = -1
+        } else if self.is_button_down(GamepadButton::DPAD_RIGHT) {
+            x = 1
+        }
+
+        if self.is_button_down(GamepadButton::DPAD_UP) {
+            y = -1
+        } else if self.is_button_down(GamepadButton::DPAD_DOWN) {
+            y = 1
+        }
+
+        let result: [i32] = []
+        result = result + [x]
+        result = result + [y]
+        return result
+    }
+}
+
+fn gamepad_button_to_int(button: GamepadButton): i32 {
+    if button == GamepadButton::A { return 0 }
+    if button == GamepadButton::B { return 1 }
+    if button == GamepadButton::X { return 2 }
+    if button == GamepadButton::Y { return 3 }
+    if button == GamepadButton::LEFT_BUMPER { return 4 }
+    if button == GamepadButton::RIGHT_BUMPER { return 5 }
+    if button == GamepadButton::BACK { return 6 }
+    if button == GamepadButton::START { return 7 }
+    if button == GamepadButton::LEFT_STICK { return 8 }
+    if button == GamepadButton::RIGHT_STICK { return 9 }
+    if button == GamepadButton::DPAD_UP { return 10 }
+    if button == GamepadButton::DPAD_DOWN { return 11 }
+    if button == GamepadButton::DPAD_LEFT { return 12 }
+    if button == GamepadButton::DPAD_RIGHT { return 13 }
+    if button == GamepadButton::GUIDE { return 14 }
+    return 0
+}
+
+fn gamepad_axis_to_int(axis: GamepadAxis): i32 {
+    if axis == GamepadAxis::LEFT_X { return 0 }
+    if axis == GamepadAxis::LEFT_Y { return 1 }
+    if axis == GamepadAxis::RIGHT_X { return 2 }
+    if axis == GamepadAxis::RIGHT_Y { return 3 }
+    if axis == GamepadAxis::LEFT_TRIGGER { return 4 }
+    if axis == GamepadAxis::RIGHT_TRIGGER { return 5 }
+    return 0
+}
+
+fn clamp_f32(value: f32, min_val: f32, max_val: f32): f32 {
+    if value < min_val {
+        return min_val
+    }
+    if value > max_val {
+        return max_val
+    }
+    return value
+}
+
+// ============================================================================
+// GAMEPAD MANAGER - Supports up to 4 controllers
+// ============================================================================
+
+const MAX_GAMEPADS: i32 = 4
+
+struct GamepadManager {
+    gamepads: [GamepadState],
+    active_gamepad: i32,
+}
+
+impl GamepadManager {
+    fn init(): GamepadManager {
+        let gamepads: [GamepadState] = []
+        for i in 0..4 {
+            gamepads = gamepads + [GamepadState::init(i)]
+        }
+
+        return GamepadManager {
+            gamepads: gamepads,
+            active_gamepad: 0,
+        }
+    }
+
+    fn update(&self, delta_time: f64) {
+        for i in 0..4 {
+            self.gamepads[i].update(delta_time)
+        }
+    }
+
+    fn get_gamepad(&self, index: i32): GamepadState? {
+        if index >= 0 && index < 4 {
+            return self.gamepads[index]
+        }
+        return null
+    }
+
+    fn get_active_gamepad(&self): GamepadState? {
+        return self.get_gamepad(self.active_gamepad)
+    }
+
+    fn set_active_gamepad(&self, index: i32) {
+        if index >= 0 && index < 4 {
+            self.active_gamepad = index
+        }
+    }
+
+    fn on_gamepad_connected(&self, index: i32, name: string) {
+        if index >= 0 && index < 4 {
+            self.gamepads[index].is_connected = true
+            self.gamepads[index].name = name
+
+            // If no active gamepad, make this one active
+            if !self.gamepads[self.active_gamepad].is_connected {
+                self.active_gamepad = index
+            }
+        }
+    }
+
+    fn on_gamepad_disconnected(&self, index: i32) {
+        if index >= 0 && index < 4 {
+            self.gamepads[index].is_connected = false
+            self.gamepads[index].stop_vibration()
+
+            // Find another connected gamepad
+            if self.active_gamepad == index {
+                for i in 0..4 {
+                    if self.gamepads[i].is_connected {
+                        self.active_gamepad = i
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_connected_count(&self): i32 {
+        let count = 0
+        for i in 0..4 {
+            if self.gamepads[i].is_connected {
+                count = count + 1
+            }
+        }
+        return count
+    }
+
+    fn any_connected(&self): bool {
+        return self.get_connected_count() > 0
+    }
+}
+
+// ============================================================================
+// GAMEPAD TO GAME ACTION MAPPING
+// ============================================================================
+
+struct GamepadActionMapping {
+    action: GameAction,
+    button: GamepadButton,
+    axis: GamepadAxis?,
+    axis_threshold: f32,
+    axis_positive: bool,
+}
+
+impl GamepadActionMapping {
+    fn from_button(action: GameAction, button: GamepadButton): GamepadActionMapping {
+        return GamepadActionMapping {
+            action: action,
+            button: button,
+            axis: null,
+            axis_threshold: 0.5,
+            axis_positive: true,
+        }
+    }
+
+    fn from_axis(action: GameAction, axis: GamepadAxis, threshold: f32, positive: bool): GamepadActionMapping {
+        return GamepadActionMapping {
+            action: action,
+            button: GamepadButton::A,  // Dummy
+            axis: axis,
+            axis_threshold: threshold,
+            axis_positive: positive,
+        }
+    }
+}
+
+struct GamepadActionMapper {
+    mappings: [GamepadActionMapping],
+}
+
+impl GamepadActionMapper {
+    fn init(): GamepadActionMapper {
+        let mapper = GamepadActionMapper {
+            mappings: [],
+        }
+
+        // Default RTS gamepad mappings
+        // A button = Confirm/Select
+        mapper.add_button_mapping(GameAction::MOVE, GamepadButton::A)
+
+        // B button = Cancel/Back
+        mapper.add_button_mapping(GameAction::STOP, GamepadButton::B)
+
+        // X button = Attack
+        mapper.add_button_mapping(GameAction::FORCE_ATTACK, GamepadButton::X)
+
+        // Y button = Special ability
+        mapper.add_button_mapping(GameAction::DEPLOY, GamepadButton::Y)
+
+        // Bumpers for group cycling
+        mapper.add_button_mapping(GameAction::GROUP_1, GamepadButton::LEFT_BUMPER)
+        mapper.add_button_mapping(GameAction::GROUP_2, GamepadButton::RIGHT_BUMPER)
+
+        // Start = Pause
+        mapper.add_button_mapping(GameAction::PAUSE_GAME, GamepadButton::START)
+
+        // Back = Diplomacy/Menu
+        mapper.add_button_mapping(GameAction::DIPLOMACY, GamepadButton::BACK)
+
+        // D-Pad for camera
+        mapper.add_button_mapping(GameAction::CAMERA_PAN_UP, GamepadButton::DPAD_UP)
+        mapper.add_button_mapping(GameAction::CAMERA_PAN_DOWN, GamepadButton::DPAD_DOWN)
+        mapper.add_button_mapping(GameAction::CAMERA_PAN_LEFT, GamepadButton::DPAD_LEFT)
+        mapper.add_button_mapping(GameAction::CAMERA_PAN_RIGHT, GamepadButton::DPAD_RIGHT)
+
+        // Triggers for zoom
+        mapper.add_axis_mapping(GameAction::CAMERA_ZOOM_IN, GamepadAxis::RIGHT_TRIGGER, 0.3, true)
+        mapper.add_axis_mapping(GameAction::CAMERA_ZOOM_OUT, GamepadAxis::LEFT_TRIGGER, 0.3, true)
+
+        return mapper
+    }
+
+    fn add_button_mapping(&self, action: GameAction, button: GamepadButton) {
+        self.mappings = self.mappings + [GamepadActionMapping::from_button(action, button)]
+    }
+
+    fn add_axis_mapping(&self, action: GameAction, axis: GamepadAxis, threshold: f32, positive: bool) {
+        self.mappings = self.mappings + [GamepadActionMapping::from_axis(action, axis, threshold, positive)]
+    }
+
+    fn get_triggered_actions(&self, gamepad: GamepadState): [GameAction] {
+        let actions: [GameAction] = []
+
+        for i in 0..self.mappings.length {
+            let mapping = self.mappings[i]
+
+            if mapping.axis != null {
+                // Axis-based mapping
+                let value = gamepad.get_axis(mapping.axis)
+                if mapping.axis_positive {
+                    if value >= mapping.axis_threshold {
+                        actions = actions + [mapping.action]
+                    }
+                } else {
+                    if value <= -mapping.axis_threshold {
+                        actions = actions + [mapping.action]
+                    }
+                }
+            } else {
+                // Button-based mapping
+                if gamepad.is_button_pressed(mapping.button) {
+                    actions = actions + [mapping.action]
+                }
+            }
+        }
+
+        return actions
+    }
+
+    fn rebind_button(&self, action: GameAction, new_button: GamepadButton) {
+        for i in 0..self.mappings.length {
+            if self.mappings[i].action == action && self.mappings[i].axis == null {
+                self.mappings[i].button = new_button
+                break
+            }
+        }
+    }
+}
+
+// ============================================================================
+// GAMEPAD CURSOR (for RTS cursor simulation)
+// ============================================================================
+
+struct GamepadCursor {
+    x: f32,
+    y: f32,
+    speed: f32,
+    acceleration: f32,
+    max_speed: f32,
+    current_velocity_x: f32,
+    current_velocity_y: f32,
+    screen_width: f32,
+    screen_height: f32,
+}
+
+impl GamepadCursor {
+    fn init(screen_width: f32, screen_height: f32): GamepadCursor {
+        return GamepadCursor {
+            x: screen_width / 2.0,
+            y: screen_height / 2.0,
+            speed: 500.0,
+            acceleration: 10.0,
+            max_speed: 1000.0,
+            current_velocity_x: 0.0,
+            current_velocity_y: 0.0,
+            screen_width: screen_width,
+            screen_height: screen_height,
+        }
+    }
+
+    fn update(&self, gamepad: GamepadState, delta_time: f32) {
+        // Get right stick input for cursor movement
+        let stick = gamepad.get_right_stick()
+        let input_x = stick[0]
+        let input_y = stick[1]
+
+        // Accelerate towards target velocity
+        let target_vx = input_x * self.max_speed
+        let target_vy = input_y * self.max_speed
+
+        let accel_factor = self.acceleration * delta_time
+        self.current_velocity_x = self.current_velocity_x + (target_vx - self.current_velocity_x) * accel_factor
+        self.current_velocity_y = self.current_velocity_y + (target_vy - self.current_velocity_y) * accel_factor
+
+        // Apply velocity
+        self.x = self.x + self.current_velocity_x * delta_time
+        self.y = self.y + self.current_velocity_y * delta_time
+
+        // Clamp to screen bounds
+        if self.x < 0.0 {
+            self.x = 0.0
+        }
+        if self.x > self.screen_width {
+            self.x = self.screen_width
+        }
+        if self.y < 0.0 {
+            self.y = 0.0
+        }
+        if self.y > self.screen_height {
+            self.y = self.screen_height
+        }
+    }
+
+    fn get_position(&self): [f32] {
+        let result: [f32] = []
+        result = result + [self.x]
+        result = result + [self.y]
+        return result
+    }
+
+    fn set_position(&self, x: f32, y: f32) {
+        self.x = clamp_f32(x, 0.0, self.screen_width)
+        self.y = clamp_f32(y, 0.0, self.screen_height)
+    }
+
+    fn set_screen_size(&self, width: f32, height: f32) {
+        self.screen_width = width
+        self.screen_height = height
+        // Re-clamp position
+        self.x = clamp_f32(self.x, 0.0, self.screen_width)
+        self.y = clamp_f32(self.y, 0.0, self.screen_height)
+    }
+}
+
+// ============================================================================
+// GLOBAL GAMEPAD INSTANCE
+// ============================================================================
+
+let g_gamepad_manager: GamepadManager? = null
+let g_gamepad_mapper: GamepadActionMapper? = null
+let g_gamepad_cursor: GamepadCursor? = null
+
+fn init_gamepad_system(screen_width: f32, screen_height: f32) {
+    g_gamepad_manager = GamepadManager::init()
+    g_gamepad_mapper = GamepadActionMapper::init()
+    g_gamepad_cursor = GamepadCursor::init(screen_width, screen_height)
+}
+
+fn get_gamepad_manager(): GamepadManager? {
+    return g_gamepad_manager
+}
+
+fn get_gamepad_mapper(): GamepadActionMapper? {
+    return g_gamepad_mapper
+}
+
+fn get_gamepad_cursor(): GamepadCursor? {
+    return g_gamepad_cursor
+}
+
+fn update_gamepad_system(delta_time: f64) {
+    if g_gamepad_manager != null {
+        g_gamepad_manager.update(delta_time)
+    }
+
+    if g_gamepad_cursor != null && g_gamepad_manager != null {
+        let gamepad = g_gamepad_manager.get_active_gamepad()
+        if gamepad != null && gamepad.is_connected {
+            g_gamepad_cursor.update(gamepad, delta_time as f32)
+        }
+    }
+}
+
+fn shutdown_gamepad_system() {
+    g_gamepad_manager = null
+    g_gamepad_mapper = null
+    g_gamepad_cursor = null
+}

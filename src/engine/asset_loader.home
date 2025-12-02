@@ -1,0 +1,1275 @@
+// C&C Generals Zero Hour - Home Port
+// Async Asset Loading System
+//
+// High-level asset loading with:
+// - Background streaming
+// - Priority-based loading
+// - Dependency resolution
+// - Load-on-demand support
+// - Progress callbacks
+//
+// Based on original WW3DAssetManager and TextureLoader
+
+import basics/allocator
+import platform/async_io
+import engine/virtual_filesystem
+import engine/compression
+
+// ============================================================================
+// ASSET TYPES
+// ============================================================================
+enum AssetType {
+    Unknown = 0
+    Texture = 1           // .tga, .dds
+    Model = 2             // .w3d
+    Animation = 3         // .w3d animation
+    Skeleton = 4          // HTree/skeleton
+    Audio = 5             // .wav, .mp3
+    INI = 6               // .ini configuration
+    Map = 7               // .map terrain data
+    Script = 8            // Script/behavior
+    Shader = 9            // Shader program
+    Font = 10             // Font data
+    UI = 11               // UI layout
+    Particle = 12         // Particle system def
+}
+
+// ============================================================================
+// ASSET LOAD STATUS
+// ============================================================================
+enum AssetLoadStatus {
+    NotLoaded = 0         // Asset not in memory
+    Queued = 1            // In load queue
+    Loading = 2           // Currently loading
+    Processing = 3        // Post-load processing (decompression, GPU upload)
+    Ready = 4             // Fully loaded and ready
+    Failed = 5            // Load failed
+    Unloading = 6         // Being unloaded
+}
+
+// ============================================================================
+// ASSET LOAD PRIORITY
+// ============================================================================
+enum AssetLoadPriority {
+    Background = 0        // Preloading, low priority
+    Normal = 1            // Standard loading
+    High = 2              // Needed soon
+    Immediate = 3         // Block until loaded
+}
+
+// ============================================================================
+// ASSET DEPENDENCY
+// ============================================================================
+struct AssetDependency {
+    asset_name: string
+    asset_type: AssetType
+    is_required: bool     // Fail if dependency missing?
+    is_resolved: bool     // Has dependency been loaded?
+
+    fn init(name: string, asset_type: AssetType, required: bool): AssetDependency {
+        return AssetDependency {
+            asset_name: name
+            asset_type: asset_type
+            is_required: required
+            is_resolved: false
+        }
+    }
+}
+
+// ============================================================================
+// ASSET LOAD REQUEST
+// ============================================================================
+struct AssetLoadRequest {
+    // Identity
+    request_id: i32
+    asset_name: string
+    asset_type: AssetType
+    priority: AssetLoadPriority
+    status: AssetLoadStatus
+
+    // File info
+    file_path: string
+    source_archive: string    // BIG archive if from archive
+    file_size: i64
+    is_compressed: bool
+
+    // Data
+    raw_data: *u8
+    raw_size: i64
+    processed_data: *anyopaque
+    processed_size: i64
+
+    // Dependencies
+    dependencies: [AssetDependency; 16]
+    dependency_count: i32
+    pending_dependencies: i32
+
+    // Timing
+    queue_time: f64
+    start_time: f64
+    complete_time: f64
+
+    // Callbacks
+    on_complete: ?AssetLoadCallback
+    on_progress: ?AssetProgressCallback
+    user_data: *anyopaque
+
+    // Error info
+    error_code: i32
+    error_message: string
+
+    // Internal
+    io_request_id: i32        // Async I/O request ID
+    next_in_queue: i32
+
+    fn init(): AssetLoadRequest {
+        return AssetLoadRequest {
+            request_id: -1
+            asset_name: ""
+            asset_type: AssetType::Unknown
+            priority: AssetLoadPriority::Normal
+            status: AssetLoadStatus::NotLoaded
+            file_path: ""
+            source_archive: ""
+            file_size: 0
+            is_compressed: false
+            raw_data: null
+            raw_size: 0
+            processed_data: null
+            processed_size: 0
+            dependencies: undefined
+            dependency_count: 0
+            pending_dependencies: 0
+            queue_time: 0.0
+            start_time: 0.0
+            complete_time: 0.0
+            on_complete: null
+            on_progress: null
+            user_data: null
+            error_code: 0
+            error_message: ""
+            io_request_id: -1
+            next_in_queue: -1
+        }
+    }
+
+    fn is_complete(&self): bool {
+        return self.status == AssetLoadStatus::Ready or
+               self.status == AssetLoadStatus::Failed
+    }
+
+    fn has_pending_dependencies(&self): bool {
+        return self.pending_dependencies > 0
+    }
+
+    fn get_progress(&self): f32 {
+        if self.status == AssetLoadStatus::Ready {
+            return 1.0
+        }
+        if self.status == AssetLoadStatus::Failed {
+            return 0.0
+        }
+        if self.file_size == 0 {
+            return 0.0
+        }
+        return self.raw_size as f32 / self.file_size as f32
+    }
+}
+
+// ============================================================================
+// CALLBACK TYPES
+// ============================================================================
+type AssetLoadCallback = fn(request: *AssetLoadRequest): void
+type AssetProgressCallback = fn(request: *AssetLoadRequest, progress: f32): void
+
+// ============================================================================
+// LOADED ASSET - Cached asset in memory
+// ============================================================================
+struct LoadedAsset {
+    name: string
+    name_hash: u32
+    asset_type: AssetType
+    data: *anyopaque
+    size: i64
+    ref_count: i32
+    last_access_time: f64
+    load_time: f64
+    is_persistent: bool       // Don't unload automatically
+    source_path: string
+
+    fn init(): LoadedAsset {
+        return LoadedAsset {
+            name: ""
+            name_hash: 0
+            asset_type: AssetType::Unknown
+            data: null
+            size: 0
+            ref_count: 0
+            last_access_time: 0.0
+            load_time: 0.0
+            is_persistent: false
+            source_path: ""
+        }
+    }
+
+    fn add_ref(&self) {
+        self.ref_count = self.ref_count + 1
+    }
+
+    fn release(&self) {
+        self.ref_count = self.ref_count - 1
+    }
+}
+
+// ============================================================================
+// ASSET TYPE PROCESSOR - Interface for type-specific processing
+// ============================================================================
+struct AssetProcessor {
+    asset_type: AssetType
+    process_fn: fn(raw: *u8, size: i64, output: **anyopaque): bool
+    unload_fn: fn(data: *anyopaque): void
+    get_dependencies_fn: ?fn(raw: *u8, size: i64, deps: *[AssetDependency; 16]): i32
+
+    fn init(asset_type: AssetType): AssetProcessor {
+        return AssetProcessor {
+            asset_type: asset_type
+            process_fn: default_process
+            unload_fn: default_unload
+            get_dependencies_fn: null
+        }
+    }
+}
+
+fn default_process(raw: *u8, size: i64, output: **anyopaque): bool {
+    output.* = raw as *anyopaque
+    return true
+}
+
+fn default_unload(data: *anyopaque) {
+    // Would free data
+}
+
+// ============================================================================
+// ASSET LOADER - Main async loading manager
+// ============================================================================
+struct AssetLoader {
+    // Request pool
+    requests: [AssetLoadRequest; 512]
+    next_request_id: i32
+    free_list_head: i32
+
+    // Priority queues
+    queue_heads: [i32; 4]     // One per priority
+    queue_tails: [i32; 4]
+    queue_counts: [i32; 4]
+
+    // In-flight requests
+    in_flight: [i32; 32]
+    in_flight_count: i32
+    max_concurrent: i32
+
+    // Loaded assets cache
+    assets: [LoadedAsset; 4096]
+    asset_count: i32
+
+    // Asset hash table for quick lookup
+    asset_hash: [i32; 1024]   // Hash -> asset index
+
+    // Type processors
+    processors: [AssetProcessor; 16]
+    processor_count: i32
+
+    // Load-on-demand setting
+    load_on_demand: bool
+
+    // Statistics
+    total_loads: i64
+    total_bytes_loaded: i64
+    cache_hits: i64
+    cache_misses: i64
+    load_failures: i64
+
+    // Memory management
+    memory_budget: i64        // Max memory for cached assets
+    memory_used: i64
+    auto_unload: bool         // Unload LRU assets when over budget
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): AssetLoader {
+        let mut loader = AssetLoader {
+            requests: undefined
+            next_request_id: 1
+            free_list_head: 0
+            queue_heads: [-1, -1, -1, -1]
+            queue_tails: [-1, -1, -1, -1]
+            queue_counts: [0, 0, 0, 0]
+            in_flight: [-1; 32]
+            in_flight_count: 0
+            max_concurrent: 8
+            assets: undefined
+            asset_count: 0
+            asset_hash: [-1; 1024]
+            processors: undefined
+            processor_count: 0
+            load_on_demand: true
+            total_loads: 0
+            total_bytes_loaded: 0
+            cache_hits: 0
+            cache_misses: 0
+            load_failures: 0
+            memory_budget: 512 * 1024 * 1024  // 512 MB default
+            memory_used: 0
+            auto_unload: true
+            allocator: allocator
+        }
+
+        // Initialize request pool
+        for i in 0..512 {
+            loader.requests[i] = AssetLoadRequest.init()
+            loader.requests[i].next_in_queue = i + 1
+        }
+        loader.requests[511].next_in_queue = -1
+
+        // Initialize asset cache
+        for i in 0..4096 {
+            loader.assets[i] = LoadedAsset.init()
+        }
+
+        // Register default processors
+        loader.register_default_processors()
+
+        return loader
+    }
+
+    fn register_default_processors(&self) {
+        // Texture processor
+        self.register_processor(AssetProcessor {
+            asset_type: AssetType::Texture
+            process_fn: process_texture
+            unload_fn: unload_texture
+            get_dependencies_fn: null
+        })
+
+        // Model processor
+        self.register_processor(AssetProcessor {
+            asset_type: AssetType::Model
+            process_fn: process_model
+            unload_fn: unload_model
+            get_dependencies_fn: get_model_dependencies
+        })
+
+        // Animation processor
+        self.register_processor(AssetProcessor {
+            asset_type: AssetType::Animation
+            process_fn: process_animation
+            unload_fn: unload_animation
+            get_dependencies_fn: null
+        })
+    }
+
+    fn register_processor(&self, processor: AssetProcessor) {
+        if self.processor_count < 16 {
+            self.processors[self.processor_count] = processor
+            self.processor_count = self.processor_count + 1
+        }
+    }
+
+    fn get_processor(&self, asset_type: AssetType): ?*AssetProcessor {
+        for i in 0..self.processor_count {
+            if self.processors[i].asset_type == asset_type {
+                return &self.processors[i]
+            }
+        }
+        return null
+    }
+
+    // ========================================
+    // REQUEST MANAGEMENT
+    // ========================================
+
+    fn allocate_request(&self): i32 {
+        if self.free_list_head < 0 {
+            return -1
+        }
+
+        let index = self.free_list_head
+        self.free_list_head = self.requests[index].next_in_queue
+
+        self.requests[index] = AssetLoadRequest.init()
+        self.requests[index].request_id = self.next_request_id
+        self.next_request_id = self.next_request_id + 1
+
+        return index
+    }
+
+    fn free_request(&self, index: i32) {
+        if index < 0 or index >= 512 {
+            return
+        }
+
+        // Free raw data if allocated
+        if self.requests[index].raw_data != null {
+            self.allocator.free(self.requests[index].raw_data)
+        }
+
+        self.requests[index] = AssetLoadRequest.init()
+        self.requests[index].next_in_queue = self.free_list_head
+        self.free_list_head = index
+    }
+
+    fn enqueue_request(&self, index: i32, priority: AssetLoadPriority) {
+        let p = priority as i32
+
+        self.requests[index].next_in_queue = -1
+        self.requests[index].status = AssetLoadStatus::Queued
+
+        if self.queue_tails[p] >= 0 {
+            self.requests[self.queue_tails[p]].next_in_queue = index
+        } else {
+            self.queue_heads[p] = index
+        }
+
+        self.queue_tails[p] = index
+        self.queue_counts[p] = self.queue_counts[p] + 1
+    }
+
+    fn dequeue_request(&self): i32 {
+        // Check priorities from highest to lowest
+        for p in [3, 2, 1, 0] {
+            if self.queue_counts[p] > 0 {
+                let index = self.queue_heads[p]
+                self.queue_heads[p] = self.requests[index].next_in_queue
+
+                if self.queue_heads[p] < 0 {
+                    self.queue_tails[p] = -1
+                }
+
+                self.queue_counts[p] = self.queue_counts[p] - 1
+                return index
+            }
+        }
+
+        return -1
+    }
+
+    // ========================================
+    // ASSET CACHE
+    // ========================================
+
+    fn hash_name(name: string): u32 {
+        let mut hash: u32 = 5381
+        for i in 0..name.length() {
+            let c = name.char_at(i)
+            let lower = if c >= 'A' and c <= 'Z' { c + 32 } else { c }
+            hash = ((hash << 5) + hash) + (lower as u32)
+        }
+        return hash
+    }
+
+    fn find_cached_asset(&self, name: string, asset_type: AssetType): ?*LoadedAsset {
+        let hash = self.hash_name(name)
+        let bucket = (hash % 1024) as i32
+
+        let mut index = self.asset_hash[bucket]
+        while index >= 0 and index < 4096 {
+            if self.assets[index].name_hash == hash and
+               self.assets[index].asset_type == asset_type and
+               self.assets[index].name == name {
+                return &self.assets[index]
+            }
+            index = index + 1  // Linear probe (simplified)
+            if index >= 4096 {
+                break
+            }
+        }
+
+        return null
+    }
+
+    fn cache_asset(&self, name: string, asset_type: AssetType, data: *anyopaque, size: i64): ?*LoadedAsset {
+        // Find free slot
+        let mut slot = -1
+        for i in 0..4096 {
+            if self.assets[i].data == null {
+                slot = i
+                break
+            }
+        }
+
+        if slot < 0 {
+            // Evict LRU if auto_unload enabled
+            if self.auto_unload {
+                slot = self.evict_lru_asset()
+            }
+            if slot < 0 {
+                return null
+            }
+        }
+
+        let hash = self.hash_name(name)
+        let bucket = (hash % 1024) as i32
+
+        self.assets[slot] = LoadedAsset {
+            name: name
+            name_hash: hash
+            asset_type: asset_type
+            data: data
+            size: size
+            ref_count: 1
+            last_access_time: 0.0  // Would be current time
+            load_time: 0.0
+            is_persistent: false
+            source_path: ""
+        }
+
+        self.asset_hash[bucket] = slot
+        self.asset_count = self.asset_count + 1
+        self.memory_used = self.memory_used + size
+
+        return &self.assets[slot]
+    }
+
+    fn evict_lru_asset(&self): i32 {
+        let mut oldest_time: f64 = 999999999.0
+        let mut oldest_index: i32 = -1
+
+        for i in 0..4096 {
+            if self.assets[i].data != null and
+               !self.assets[i].is_persistent and
+               self.assets[i].ref_count <= 0 {
+                if self.assets[i].last_access_time < oldest_time {
+                    oldest_time = self.assets[i].last_access_time
+                    oldest_index = i
+                }
+            }
+        }
+
+        if oldest_index >= 0 {
+            self.unload_asset_at(oldest_index)
+        }
+
+        return oldest_index
+    }
+
+    fn unload_asset_at(&self, index: i32) {
+        let asset = &self.assets[index]
+        if asset.data == null {
+            return
+        }
+
+        // Get processor to unload
+        let processor = self.get_processor(asset.asset_type)
+        if processor != null {
+            processor.?.unload_fn(asset.data)
+        }
+
+        self.memory_used = self.memory_used - asset.size
+
+        // Clear hash entry
+        let bucket = (asset.name_hash % 1024) as i32
+        if self.asset_hash[bucket] == index {
+            self.asset_hash[bucket] = -1
+        }
+
+        self.assets[index] = LoadedAsset.init()
+        self.asset_count = self.asset_count - 1
+    }
+
+    // ========================================
+    // LOAD REQUESTS
+    // ========================================
+
+    // Request to load an asset
+    fn load_asset(
+        &self,
+        name: string,
+        asset_type: AssetType,
+        priority: AssetLoadPriority,
+        callback: ?AssetLoadCallback,
+        user_data: *anyopaque
+    ): i32 {
+        // Check if already loaded
+        let cached = self.find_cached_asset(name, asset_type)
+        if cached != null {
+            cached.?.add_ref()
+            cached.?.last_access_time = 0.0  // Would be current time
+            self.cache_hits = self.cache_hits + 1
+
+            // Call callback immediately if provided
+            if callback != null {
+                let mut temp_request = AssetLoadRequest.init()
+                temp_request.asset_name = name
+                temp_request.asset_type = asset_type
+                temp_request.status = AssetLoadStatus::Ready
+                temp_request.processed_data = cached.?.data
+                callback.?(&temp_request)
+            }
+
+            return 0  // Already loaded
+        }
+
+        self.cache_misses = self.cache_misses + 1
+
+        // Check if already loading
+        for i in 0..512 {
+            if self.requests[i].asset_name == name and
+               self.requests[i].asset_type == asset_type and
+               !self.requests[i].is_complete() {
+                // Already loading - add callback? For now return existing ID
+                return self.requests[i].request_id
+            }
+        }
+
+        // Allocate new request
+        let index = self.allocate_request()
+        if index < 0 {
+            return -1
+        }
+
+        let request = &self.requests[index]
+        request.asset_name = name
+        request.asset_type = asset_type
+        request.priority = priority
+        request.on_complete = callback
+        request.user_data = user_data
+
+        // Resolve file path
+        let file_path = self.resolve_asset_path(name, asset_type)
+        if file_path == "" {
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Asset not found"
+            self.load_failures = self.load_failures + 1
+            return request.request_id
+        }
+
+        request.file_path = file_path
+
+        // Get file info
+        let info = vfs_get_file_info(file_path)
+        request.file_size = info.size
+        request.is_compressed = info.is_compressed
+        request.source_archive = info.archive_path
+
+        // Queue the request
+        self.enqueue_request(index, priority)
+        self.total_loads = self.total_loads + 1
+
+        // If immediate priority, block until loaded
+        if priority == AssetLoadPriority::Immediate {
+            self.load_immediate(index)
+        }
+
+        return request.request_id
+    }
+
+    fn resolve_asset_path(&self, name: string, asset_type: AssetType): string {
+        // Build expected path based on asset type
+        let extension = get_asset_extension(asset_type)
+        let search_paths = get_asset_search_paths(asset_type)
+
+        // Try each search path
+        for path in search_paths {
+            let full_path = path + "/" + name + extension
+            if vfs_file_exists(full_path) {
+                return full_path
+            }
+
+            // Try without extension (in case name includes it)
+            if vfs_file_exists(path + "/" + name) {
+                return path + "/" + name
+            }
+        }
+
+        // Try just the name
+        if vfs_file_exists(name) {
+            return name
+        }
+
+        return ""
+    }
+
+    fn load_immediate(&self, index: i32) {
+        let request = &self.requests[index]
+
+        // Open file and read synchronously
+        let file = vfs_open_file(request.file_path, FILE_READ)
+        if file == null {
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Failed to open file"
+            return
+        }
+
+        let file_ref = file.?
+
+        // Allocate buffer
+        request.raw_data = self.allocator.alloc(u8, request.file_size)
+        if request.raw_data == null {
+            file_ref.close()
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Out of memory"
+            return
+        }
+
+        // Read entire file
+        let bytes_read = file_ref.read(request.raw_data, request.file_size)
+        file_ref.close()
+
+        if bytes_read != request.file_size {
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Read error"
+            return
+        }
+
+        request.raw_size = bytes_read
+
+        // Decompress if needed
+        if request.is_compressed {
+            self.decompress_request(index)
+        }
+
+        // Process the asset
+        self.process_request(index)
+    }
+
+    // ========================================
+    // PROCESSING
+    // ========================================
+
+    fn update(&self) {
+        // Start new loads
+        while self.in_flight_count < self.max_concurrent {
+            let index = self.dequeue_request()
+            if index < 0 {
+                break
+            }
+
+            // Check dependencies first
+            if self.requests[index].has_pending_dependencies() {
+                self.resolve_dependencies(index)
+                if self.requests[index].has_pending_dependencies() {
+                    // Re-queue until dependencies ready
+                    self.enqueue_request(index, self.requests[index].priority)
+                    continue
+                }
+            }
+
+            self.start_load(index)
+        }
+
+        // Check in-flight for completion
+        let mut i: i32 = 0
+        while i < self.in_flight_count {
+            let index = self.in_flight[i]
+            if index >= 0 and self.check_load_complete(index) {
+                self.finish_load(index)
+
+                // Remove from in-flight
+                self.in_flight[i] = self.in_flight[self.in_flight_count - 1]
+                self.in_flight[self.in_flight_count - 1] = -1
+                self.in_flight_count = self.in_flight_count - 1
+                // Don't increment i
+            } else {
+                i = i + 1
+            }
+        }
+
+        // Check memory budget
+        if self.auto_unload and self.memory_used > self.memory_budget {
+            self.enforce_memory_budget()
+        }
+    }
+
+    fn start_load(&self, index: i32) {
+        let request = &self.requests[index]
+        request.status = AssetLoadStatus::Loading
+        // request.start_time = get_current_time()
+
+        // Allocate buffer
+        request.raw_data = self.allocator.alloc(u8, request.file_size)
+        if request.raw_data == null {
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Out of memory"
+            return
+        }
+
+        // Submit async I/O request
+        let io = get_async_io()
+        if io != null {
+            request.io_request_id = io.?.read_file_async(
+                request.file_path,
+                request.raw_data,
+                request.file_size,
+                0,
+                map_priority(request.priority),
+                on_io_complete,
+                request as *anyopaque
+            )
+        }
+
+        // Add to in-flight
+        if self.in_flight_count < 32 {
+            self.in_flight[self.in_flight_count] = index
+            self.in_flight_count = self.in_flight_count + 1
+        }
+    }
+
+    fn check_load_complete(&self, index: i32): bool {
+        let request = &self.requests[index]
+
+        if request.io_request_id < 0 {
+            return true  // No I/O request means sync load
+        }
+
+        let io = get_async_io()
+        if io != null {
+            let status = io.?.get_status(request.io_request_id)
+            if status == IOStatus::Completed {
+                let result = io.?.get_result(request.io_request_id)
+                if result != null {
+                    request.raw_size = result.?.bytes_completed
+                }
+                io.?.release(request.io_request_id)
+                return true
+            }
+            if status == IOStatus::Failed or status == IOStatus::Cancelled {
+                request.status = AssetLoadStatus::Failed
+                request.error_message = "I/O error"
+                io.?.release(request.io_request_id)
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn finish_load(&self, index: i32) {
+        let request = &self.requests[index]
+
+        if request.status == AssetLoadStatus::Failed {
+            self.complete_request(index)
+            return
+        }
+
+        // Decompress if needed
+        if request.is_compressed {
+            request.status = AssetLoadStatus::Processing
+            self.decompress_request(index)
+        }
+
+        // Process the asset
+        self.process_request(index)
+        self.complete_request(index)
+    }
+
+    fn decompress_request(&self, index: i32) {
+        let request = &self.requests[index]
+
+        // Detect compression type
+        let comp_type = detect_compression_type(request.raw_data, request.raw_size)
+        if comp_type == CompressionType::None {
+            return  // Not actually compressed
+        }
+
+        // Decompress
+        let mut decompressed: *u8 = null
+        let mut decompressed_size: i64 = 0
+
+        if decompress_data(request.raw_data, request.raw_size, &decompressed, &decompressed_size) {
+            // Replace raw data with decompressed
+            self.allocator.free(request.raw_data)
+            request.raw_data = decompressed
+            request.raw_size = decompressed_size
+        }
+    }
+
+    fn process_request(&self, index: i32) {
+        let request = &self.requests[index]
+        request.status = AssetLoadStatus::Processing
+
+        let processor = self.get_processor(request.asset_type)
+        if processor == null {
+            // No processor - just use raw data
+            request.processed_data = request.raw_data as *anyopaque
+            request.processed_size = request.raw_size
+            request.status = AssetLoadStatus::Ready
+            return
+        }
+
+        // Process the asset
+        if processor.?.process_fn(request.raw_data, request.raw_size, &request.processed_data) {
+            request.status = AssetLoadStatus::Ready
+
+            // Cache the processed asset
+            self.cache_asset(
+                request.asset_name,
+                request.asset_type,
+                request.processed_data,
+                request.raw_size
+            )
+
+            self.total_bytes_loaded = self.total_bytes_loaded + request.raw_size
+        } else {
+            request.status = AssetLoadStatus::Failed
+            request.error_message = "Processing failed"
+            self.load_failures = self.load_failures + 1
+        }
+    }
+
+    fn complete_request(&self, index: i32) {
+        let request = &self.requests[index]
+        // request.complete_time = get_current_time()
+
+        // Call completion callback
+        if request.on_complete != null {
+            request.on_complete.?(request)
+        }
+
+        // Note: Don't free request here - caller may want to access results
+    }
+
+    fn resolve_dependencies(&self, index: i32) {
+        let request = &self.requests[index]
+
+        // Get processor to find dependencies
+        let processor = self.get_processor(request.asset_type)
+        if processor != null and processor.?.get_dependencies_fn != null {
+            // Would read file header to get dependencies
+            // For now assume dependencies set during request creation
+        }
+
+        // Check each dependency
+        request.pending_dependencies = 0
+        for i in 0..request.dependency_count {
+            let dep = &request.dependencies[i]
+            if !dep.is_resolved {
+                // Check if already loaded
+                let cached = self.find_cached_asset(dep.asset_name, dep.asset_type)
+                if cached != null {
+                    dep.is_resolved = true
+                } else {
+                    // Start loading dependency
+                    let dep_id = self.load_asset(
+                        dep.asset_name,
+                        dep.asset_type,
+                        request.priority,
+                        null,
+                        null
+                    )
+
+                    if dep_id < 0 and dep.is_required {
+                        request.status = AssetLoadStatus::Failed
+                        request.error_message = "Required dependency not found: " + dep.asset_name
+                        return
+                    }
+
+                    request.pending_dependencies = request.pending_dependencies + 1
+                }
+            }
+        }
+    }
+
+    fn enforce_memory_budget(&self) {
+        while self.memory_used > self.memory_budget {
+            let evicted = self.evict_lru_asset()
+            if evicted < 0 {
+                break  // Nothing left to evict
+            }
+        }
+    }
+
+    // ========================================
+    // PUBLIC API
+    // ========================================
+
+    fn get_asset(&self, name: string, asset_type: AssetType): ?*anyopaque {
+        let cached = self.find_cached_asset(name, asset_type)
+        if cached != null {
+            cached.?.add_ref()
+            cached.?.last_access_time = 0.0  // Would be current time
+            self.cache_hits = self.cache_hits + 1
+            return cached.?.data
+        }
+
+        self.cache_misses = self.cache_misses + 1
+
+        // Load on demand if enabled
+        if self.load_on_demand {
+            self.load_asset(name, asset_type, AssetLoadPriority::Immediate, null, null)
+            let loaded = self.find_cached_asset(name, asset_type)
+            if loaded != null {
+                loaded.?.add_ref()
+                return loaded.?.data
+            }
+        }
+
+        return null
+    }
+
+    fn release_asset(&self, name: string, asset_type: AssetType) {
+        let cached = self.find_cached_asset(name, asset_type)
+        if cached != null {
+            cached.?.release()
+        }
+    }
+
+    fn asset_exists(&self, name: string, asset_type: AssetType): bool {
+        // Check cache
+        if self.find_cached_asset(name, asset_type) != null {
+            return true
+        }
+
+        // Check filesystem
+        let path = self.resolve_asset_path(name, asset_type)
+        return path != ""
+    }
+
+    fn preload_assets(&self, names: *[string; 64], count: i32, asset_type: AssetType) {
+        for i in 0..count {
+            self.load_asset(names.*[i], asset_type, AssetLoadPriority::Background, null, null)
+        }
+    }
+
+    fn free_all_assets(&self) {
+        for i in 0..4096 {
+            if self.assets[i].data != null {
+                self.unload_asset_at(i)
+            }
+        }
+    }
+
+    fn release_unused_assets(&self) {
+        for i in 0..4096 {
+            if self.assets[i].data != null and
+               self.assets[i].ref_count <= 0 and
+               !self.assets[i].is_persistent {
+                self.unload_asset_at(i)
+            }
+        }
+    }
+
+    fn set_memory_budget(&self, budget: i64) {
+        self.memory_budget = budget
+        if self.auto_unload and self.memory_used > budget {
+            self.enforce_memory_budget()
+        }
+    }
+
+    fn get_statistics(&self): AssetLoaderStats {
+        return AssetLoaderStats {
+            total_loads: self.total_loads
+            total_bytes_loaded: self.total_bytes_loaded
+            cache_hits: self.cache_hits
+            cache_misses: self.cache_misses
+            load_failures: self.load_failures
+            cached_assets: self.asset_count
+            memory_used: self.memory_used
+            memory_budget: self.memory_budget
+            pending_loads: self.queue_counts[0] + self.queue_counts[1] +
+                          self.queue_counts[2] + self.queue_counts[3]
+            in_flight: self.in_flight_count
+        }
+    }
+
+    fn deinit(&self) {
+        self.free_all_assets()
+    }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+struct AssetLoaderStats {
+    total_loads: i64
+    total_bytes_loaded: i64
+    cache_hits: i64
+    cache_misses: i64
+    load_failures: i64
+    cached_assets: i32
+    memory_used: i64
+    memory_budget: i64
+    pending_loads: i32
+    in_flight: i32
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn get_asset_extension(asset_type: AssetType): string {
+    if asset_type == AssetType::Texture {
+        return ".tga"
+    } else if asset_type == AssetType::Model {
+        return ".w3d"
+    } else if asset_type == AssetType::Animation {
+        return ".w3d"
+    } else if asset_type == AssetType::Audio {
+        return ".wav"
+    } else if asset_type == AssetType::INI {
+        return ".ini"
+    } else if asset_type == AssetType::Map {
+        return ".map"
+    } else if asset_type == AssetType::Font {
+        return ".fnt"
+    }
+    return ""
+}
+
+fn get_asset_search_paths(asset_type: AssetType): [string; 4] {
+    if asset_type == AssetType::Texture {
+        return ["Art/Textures", "Art/W3D", "Data/Art/Textures", ""]
+    } else if asset_type == AssetType::Model or asset_type == AssetType::Animation {
+        return ["Art/W3D", "Data/Art/W3D", "", ""]
+    } else if asset_type == AssetType::Audio {
+        return ["Data/Audio", "Audio", "", ""]
+    } else if asset_type == AssetType::INI {
+        return ["Data/INI", "INI", "", ""]
+    } else if asset_type == AssetType::Map {
+        return ["Maps", "Data/Maps", "", ""]
+    }
+    return ["", "", "", ""]
+}
+
+fn map_priority(priority: AssetLoadPriority): IOPriority {
+    if priority == AssetLoadPriority::Background {
+        return IOPriority::Low
+    } else if priority == AssetLoadPriority::Normal {
+        return IOPriority::Normal
+    } else if priority == AssetLoadPriority::High {
+        return IOPriority::High
+    } else {
+        return IOPriority::Immediate
+    }
+}
+
+fn on_io_complete(request: *IORequest) {
+    // Would signal the asset request is ready for processing
+}
+
+// ============================================================================
+// PROCESSOR IMPLEMENTATIONS
+// ============================================================================
+
+fn process_texture(raw: *u8, size: i64, output: **anyopaque): bool {
+    // Would parse TGA/DDS and create GPU texture
+    output.* = raw as *anyopaque
+    return true
+}
+
+fn unload_texture(data: *anyopaque) {
+    // Would release GPU texture
+}
+
+fn process_model(raw: *u8, size: i64, output: **anyopaque): bool {
+    // Would parse W3D and create renderable model
+    output.* = raw as *anyopaque
+    return true
+}
+
+fn unload_model(data: *anyopaque) {
+    // Would free model data
+}
+
+fn get_model_dependencies(raw: *u8, size: i64, deps: *[AssetDependency; 16]): i32 {
+    // Would parse W3D header to find texture dependencies
+    return 0
+}
+
+fn process_animation(raw: *u8, size: i64, output: **anyopaque): bool {
+    // Would parse W3D animation data
+    output.* = raw as *anyopaque
+    return true
+}
+
+fn unload_animation(data: *anyopaque) {
+    // Would free animation data
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_asset_loader: ?AssetLoader = null
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+export fn init_asset_loader(allocator: Allocator) {
+    g_asset_loader = AssetLoader.init(allocator)
+}
+
+export fn shutdown_asset_loader() {
+    if g_asset_loader != null {
+        g_asset_loader.?.deinit()
+        g_asset_loader = null
+    }
+}
+
+export fn update_asset_loader() {
+    if g_asset_loader != null {
+        g_asset_loader.?.update()
+    }
+}
+
+export fn load_asset_async(
+    name: string,
+    asset_type: AssetType,
+    priority: AssetLoadPriority,
+    callback: ?AssetLoadCallback
+): i32 {
+    if g_asset_loader != null {
+        return g_asset_loader.?.load_asset(name, asset_type, priority, callback, null)
+    }
+    return -1
+}
+
+export fn get_asset(name: string, asset_type: AssetType): ?*anyopaque {
+    if g_asset_loader != null {
+        return g_asset_loader.?.get_asset(name, asset_type)
+    }
+    return null
+}
+
+export fn release_asset(name: string, asset_type: AssetType) {
+    if g_asset_loader != null {
+        g_asset_loader.?.release_asset(name, asset_type)
+    }
+}
+
+export fn asset_exists(name: string, asset_type: AssetType): bool {
+    if g_asset_loader != null {
+        return g_asset_loader.?.asset_exists(name, asset_type)
+    }
+    return false
+}
+
+export fn set_asset_memory_budget(budget: i64) {
+    if g_asset_loader != null {
+        g_asset_loader.?.set_memory_budget(budget)
+    }
+}
+
+export fn get_asset_loader_stats(): ?AssetLoaderStats {
+    if g_asset_loader != null {
+        return g_asset_loader.?.get_statistics()
+    }
+    return null
+}
+
+export fn preload_assets(names: *[string; 64], count: i32, asset_type: AssetType) {
+    if g_asset_loader != null {
+        g_asset_loader.?.preload_assets(names, count, asset_type)
+    }
+}
+
+export fn free_all_assets() {
+    if g_asset_loader != null {
+        g_asset_loader.?.free_all_assets()
+    }
+}
+
+export fn release_unused_assets() {
+    if g_asset_loader != null {
+        g_asset_loader.?.release_unused_assets()
+    }
+}

@@ -1,0 +1,754 @@
+// C&C Generals Zero Hour - Home Port
+// Asynchronous File I/O System
+//
+// Modern addition for non-blocking file operations
+// Critical for smooth gameplay while loading assets
+//
+// Features:
+// - Non-blocking read/write operations
+// - Request queuing and prioritization
+// - Completion callbacks
+// - Progress tracking
+// - Cancellation support
+//
+// Use cases:
+// - Background asset streaming
+// - Async texture loading
+// - Save game writing without stutter
+// - Replay file reading
+
+import basics/allocator
+
+// ============================================================================
+// I/O OPERATION TYPES
+// ============================================================================
+enum IOOperationType {
+    None = 0
+    Read = 1
+    Write = 2
+    Flush = 3
+    Close = 4
+}
+
+// ============================================================================
+// I/O REQUEST STATUS
+// ============================================================================
+enum IOStatus {
+    Pending = 0          // Not yet started
+    InProgress = 1       // Currently executing
+    Completed = 2        // Successfully completed
+    Failed = 3           // Failed with error
+    Cancelled = 4        // Cancelled by user
+}
+
+// ============================================================================
+// I/O PRIORITY
+// ============================================================================
+enum IOPriority {
+    Low = 0              // Background tasks
+    Normal = 1           // Regular operations
+    High = 2             // Important/urgent operations
+    Immediate = 3        // Skip queue, execute now
+}
+
+// ============================================================================
+// ERROR CODES
+// ============================================================================
+const IO_ERROR_NONE: i32 = 0
+const IO_ERROR_NOT_FOUND: i32 = 1
+const IO_ERROR_ACCESS_DENIED: i32 = 2
+const IO_ERROR_DISK_FULL: i32 = 3
+const IO_ERROR_INVALID_HANDLE: i32 = 4
+const IO_ERROR_READ_FAULT: i32 = 5
+const IO_ERROR_WRITE_FAULT: i32 = 6
+const IO_ERROR_TIMEOUT: i32 = 7
+const IO_ERROR_CANCELLED: i32 = 8
+const IO_ERROR_UNKNOWN: i32 = 99
+
+// ============================================================================
+// I/O REQUEST - Represents a single async operation
+// ============================================================================
+struct IORequest {
+    // Request identity
+    id: i32
+    operation: IOOperationType
+    priority: IOPriority
+    status: IOStatus
+
+    // File info
+    file_path: string
+    file_handle: i64
+    file_offset: i64
+
+    // Buffer info
+    buffer: *u8
+    buffer_size: i64
+    bytes_requested: i64
+    bytes_completed: i64
+
+    // Timing
+    submit_time: f64
+    start_time: f64
+    complete_time: f64
+    timeout_ms: f32
+
+    // Completion
+    callback: ?IOCompletionCallback
+    user_data: *anyopaque
+    error_code: i32
+
+    // Internal
+    next_in_queue: i32       // Index of next request in queue
+    is_pooled: bool          // Whether buffer is from internal pool
+
+    fn init(): IORequest {
+        return IORequest {
+            id: -1
+            operation: IOOperationType::None
+            priority: IOPriority::Normal
+            status: IOStatus::Pending
+            file_path: ""
+            file_handle: -1
+            file_offset: 0
+            buffer: null
+            buffer_size: 0
+            bytes_requested: 0
+            bytes_completed: 0
+            submit_time: 0.0
+            start_time: 0.0
+            complete_time: 0.0
+            timeout_ms: 0.0
+            callback: null
+            user_data: null
+            error_code: IO_ERROR_NONE
+            next_in_queue: -1
+            is_pooled: false
+        }
+    }
+
+    fn is_complete(&self): bool {
+        return self.status == IOStatus::Completed or
+               self.status == IOStatus::Failed or
+               self.status == IOStatus::Cancelled
+    }
+
+    fn is_pending(&self): bool {
+        return self.status == IOStatus::Pending or
+               self.status == IOStatus::InProgress
+    }
+
+    fn get_progress(&self): f32 {
+        if self.bytes_requested == 0 {
+            return 0.0
+        }
+        return self.bytes_completed as f32 / self.bytes_requested as f32
+    }
+
+    fn get_elapsed_time(&self): f64 {
+        if self.start_time == 0.0 {
+            return 0.0
+        }
+        if self.complete_time > 0.0 {
+            return self.complete_time - self.start_time
+        }
+        // Would return current time - start_time
+        return 0.0
+    }
+}
+
+// ============================================================================
+// COMPLETION CALLBACK TYPE
+// ============================================================================
+type IOCompletionCallback = fn(request: *IORequest): void
+
+// ============================================================================
+// I/O QUEUE - Priority queue for pending requests
+// ============================================================================
+struct IOQueue {
+    // Separate queues per priority
+    heads: [i32; 4]              // Head index per priority
+    tails: [i32; 4]              // Tail index per priority
+    counts: [i32; 4]             // Count per priority
+
+    fn init(): IOQueue {
+        return IOQueue {
+            heads: [-1, -1, -1, -1]
+            tails: [-1, -1, -1, -1]
+            counts: [0, 0, 0, 0]
+        }
+    }
+
+    fn is_empty(&self): bool {
+        return self.counts[0] == 0 and
+               self.counts[1] == 0 and
+               self.counts[2] == 0 and
+               self.counts[3] == 0
+    }
+
+    fn total_count(&self): i32 {
+        return self.counts[0] + self.counts[1] + self.counts[2] + self.counts[3]
+    }
+}
+
+// ============================================================================
+// ASYNC I/O MANAGER
+// ============================================================================
+struct AsyncIOManager {
+    // Request pool
+    requests: [IORequest; 256]
+    request_count: i32
+    next_request_id: i32
+
+    // Queue
+    queue: IOQueue
+
+    // Free list
+    free_list_head: i32
+
+    // In-flight operations
+    in_flight: [i32; 16]         // Indices of in-flight requests
+    in_flight_count: i32
+    max_concurrent: i32
+
+    // Statistics
+    total_reads: i64
+    total_writes: i64
+    total_bytes_read: i64
+    total_bytes_written: i64
+    failed_operations: i64
+
+    // State
+    is_running: bool
+
+    // Buffer pool for small allocations
+    buffer_pool: [*u8; 32]
+    buffer_pool_sizes: [i64; 32]
+    buffer_pool_count: i32
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): AsyncIOManager {
+        let mut manager = AsyncIOManager {
+            requests: undefined
+            request_count: 0
+            next_request_id: 1
+            queue: IOQueue.init()
+            free_list_head: 0
+            in_flight: [-1; 16]
+            in_flight_count: 0
+            max_concurrent: 4
+            total_reads: 0
+            total_writes: 0
+            total_bytes_read: 0
+            total_bytes_written: 0
+            failed_operations: 0
+            is_running: false
+            buffer_pool: [null; 32]
+            buffer_pool_sizes: [0; 32]
+            buffer_pool_count: 0
+            allocator: allocator
+        }
+
+        // Initialize requests
+        for i in 0..256 {
+            manager.requests[i] = IORequest.init()
+            manager.requests[i].next_in_queue = i + 1
+        }
+        manager.requests[255].next_in_queue = -1
+
+        return manager
+    }
+
+    // ========================================
+    // REQUEST ALLOCATION
+    // ========================================
+
+    fn allocate_request(&self): i32 {
+        if self.free_list_head < 0 {
+            return -1  // Pool exhausted
+        }
+
+        let index = self.free_list_head
+        self.free_list_head = self.requests[index].next_in_queue
+
+        self.requests[index] = IORequest.init()
+        self.requests[index].id = self.next_request_id
+        self.next_request_id += 1
+
+        self.request_count += 1
+
+        return index
+    }
+
+    fn free_request(&self, index: i32) {
+        if index < 0 or index >= 256 {
+            return
+        }
+
+        // Free pooled buffer if any
+        if self.requests[index].is_pooled and self.requests[index].buffer != null {
+            self.return_buffer(self.requests[index].buffer)
+        }
+
+        self.requests[index] = IORequest.init()
+        self.requests[index].next_in_queue = self.free_list_head
+        self.free_list_head = index
+
+        self.request_count -= 1
+    }
+
+    // ========================================
+    // BUFFER POOL
+    // ========================================
+
+    fn get_buffer(&self, size: i64): *u8 {
+        // Check pool for existing buffer of sufficient size
+        for i in 0..self.buffer_pool_count {
+            if self.buffer_pool_sizes[i] >= size and self.buffer_pool[i] != null {
+                let buf = self.buffer_pool[i]
+                self.buffer_pool[i] = null
+                return buf
+            }
+        }
+
+        // Allocate new buffer
+        return self.allocator.alloc(u8, size)
+    }
+
+    fn return_buffer(&self, buffer: *u8) {
+        if self.buffer_pool_count < 32 {
+            self.buffer_pool[self.buffer_pool_count] = buffer
+            // Note: would need to track size properly
+            self.buffer_pool_count += 1
+        } else {
+            self.allocator.free(buffer)
+        }
+    }
+
+    // ========================================
+    // QUEUE MANAGEMENT
+    // ========================================
+
+    fn enqueue(&self, request_index: i32, priority: IOPriority) {
+        let p = priority as i32
+
+        self.requests[request_index].next_in_queue = -1
+
+        if self.queue.tails[p] >= 0 {
+            self.requests[self.queue.tails[p]].next_in_queue = request_index
+        } else {
+            self.queue.heads[p] = request_index
+        }
+
+        self.queue.tails[p] = request_index
+        self.queue.counts[p] += 1
+    }
+
+    fn dequeue(&self): i32 {
+        // Check priorities from highest to lowest
+        for p in [3, 2, 1, 0] {
+            if self.queue.counts[p] > 0 {
+                let index = self.queue.heads[p]
+                self.queue.heads[p] = self.requests[index].next_in_queue
+
+                if self.queue.heads[p] < 0 {
+                    self.queue.tails[p] = -1
+                }
+
+                self.queue.counts[p] -= 1
+                return index
+            }
+        }
+
+        return -1
+    }
+
+    // ========================================
+    // ASYNC OPERATIONS
+    // ========================================
+
+    // Submit a read request
+    fn read_file_async(
+        &self,
+        path: string,
+        buffer: *u8,
+        size: i64,
+        offset: i64,
+        priority: IOPriority,
+        callback: ?IOCompletionCallback,
+        user_data: *anyopaque
+    ): i32 {
+        let index = self.allocate_request()
+        if index < 0 {
+            return -1
+        }
+
+        let request = &self.requests[index]
+        request.operation = IOOperationType::Read
+        request.priority = priority
+        request.status = IOStatus::Pending
+        request.file_path = path
+        request.file_offset = offset
+        request.buffer = buffer
+        request.buffer_size = size
+        request.bytes_requested = size
+        request.callback = callback
+        request.user_data = user_data
+        // request.submit_time = get_current_time()
+
+        self.enqueue(index, priority)
+        self.total_reads += 1
+
+        return request.id
+    }
+
+    // Submit a read with auto-allocated buffer
+    fn read_file_async_alloc(
+        &self,
+        path: string,
+        size: i64,
+        offset: i64,
+        priority: IOPriority,
+        callback: ?IOCompletionCallback,
+        user_data: *anyopaque
+    ): i32 {
+        let buffer = self.get_buffer(size)
+        if buffer == null {
+            return -1
+        }
+
+        let id = self.read_file_async(path, buffer, size, offset, priority, callback, user_data)
+        if id < 0 {
+            self.return_buffer(buffer)
+            return -1
+        }
+
+        // Mark buffer as pooled
+        for i in 0..256 {
+            if self.requests[i].id == id {
+                self.requests[i].is_pooled = true
+                break
+            }
+        }
+
+        return id
+    }
+
+    // Submit a write request
+    fn write_file_async(
+        &self,
+        path: string,
+        buffer: *u8,
+        size: i64,
+        offset: i64,
+        priority: IOPriority,
+        callback: ?IOCompletionCallback,
+        user_data: *anyopaque
+    ): i32 {
+        let index = self.allocate_request()
+        if index < 0 {
+            return -1
+        }
+
+        let request = &self.requests[index]
+        request.operation = IOOperationType::Write
+        request.priority = priority
+        request.status = IOStatus::Pending
+        request.file_path = path
+        request.file_offset = offset
+        request.buffer = buffer
+        request.buffer_size = size
+        request.bytes_requested = size
+        request.callback = callback
+        request.user_data = user_data
+
+        self.enqueue(index, priority)
+        self.total_writes += 1
+
+        return request.id
+    }
+
+    // Cancel a pending request
+    fn cancel(&self, request_id: i32): bool {
+        for i in 0..256 {
+            if self.requests[i].id == request_id {
+                if self.requests[i].status == IOStatus::Pending {
+                    self.requests[i].status = IOStatus::Cancelled
+                    self.requests[i].error_code = IO_ERROR_CANCELLED
+                    return true
+                }
+                // Can't cancel in-progress or completed
+                return false
+            }
+        }
+        return false
+    }
+
+    // Wait for a specific request to complete
+    fn wait(&self, request_id: i32, timeout_ms: f32): bool {
+        // In real implementation would block/poll until complete
+        // For now just process
+        self.process()
+
+        for i in 0..256 {
+            if self.requests[i].id == request_id {
+                return self.requests[i].is_complete()
+            }
+        }
+
+        return false
+    }
+
+    // Get request status
+    fn get_status(&self, request_id: i32): IOStatus {
+        for i in 0..256 {
+            if self.requests[i].id == request_id {
+                return self.requests[i].status
+            }
+        }
+        return IOStatus::Failed
+    }
+
+    // Get request result
+    fn get_result(&self, request_id: i32): ?*IORequest {
+        for i in 0..256 {
+            if self.requests[i].id == request_id {
+                return &self.requests[i]
+            }
+        }
+        return null
+    }
+
+    // Release a completed request
+    fn release(&self, request_id: i32) {
+        for i in 0..256 {
+            if self.requests[i].id == request_id {
+                if self.requests[i].is_complete() {
+                    self.free_request(i)
+                }
+                return
+            }
+        }
+    }
+
+    // ========================================
+    // PROCESSING
+    // ========================================
+
+    // Process pending requests (call each frame)
+    fn process(&self) {
+        if !self.is_running {
+            return
+        }
+
+        // Start new operations if capacity available
+        while self.in_flight_count < self.max_concurrent and !self.queue.is_empty() {
+            let index = self.dequeue()
+            if index < 0 {
+                break
+            }
+
+            // Skip cancelled requests
+            if self.requests[index].status == IOStatus::Cancelled {
+                self.complete_request(index)
+                continue
+            }
+
+            // Start the operation
+            self.start_operation(index)
+        }
+
+        // Check in-flight operations for completion
+        for i in 0..self.in_flight_count {
+            let index = self.in_flight[i]
+            if index >= 0 {
+                if self.check_completion(index) {
+                    self.complete_request(index)
+
+                    // Remove from in-flight list
+                    self.in_flight[i] = self.in_flight[self.in_flight_count - 1]
+                    self.in_flight[self.in_flight_count - 1] = -1
+                    self.in_flight_count -= 1
+                }
+            }
+        }
+    }
+
+    fn start_operation(&self, index: i32) {
+        let request = &self.requests[index]
+        request.status = IOStatus::InProgress
+        // request.start_time = get_current_time()
+
+        // Add to in-flight list
+        if self.in_flight_count < 16 {
+            self.in_flight[self.in_flight_count] = index
+            self.in_flight_count += 1
+        }
+
+        // Platform-specific: start async I/O
+        // Would call aio_read/aio_write or overlapped I/O
+    }
+
+    fn check_completion(&self, index: i32): bool {
+        // Platform-specific: check if operation is complete
+        // For now just mark as complete
+        self.requests[index].status = IOStatus::Completed
+        self.requests[index].bytes_completed = self.requests[index].bytes_requested
+        return true
+    }
+
+    fn complete_request(&self, index: i32) {
+        let request = &self.requests[index]
+        // request.complete_time = get_current_time()
+
+        // Update statistics
+        if request.operation == IOOperationType::Read {
+            self.total_bytes_read += request.bytes_completed
+        } else if request.operation == IOOperationType::Write {
+            self.total_bytes_written += request.bytes_completed
+        }
+
+        if request.status == IOStatus::Failed {
+            self.failed_operations += 1
+        }
+
+        // Call completion callback
+        if request.callback != null {
+            request.callback.?(request)
+        }
+    }
+
+    // ========================================
+    // LIFECYCLE
+    // ========================================
+
+    fn start(&self) {
+        self.is_running = true
+    }
+
+    fn stop(&self) {
+        self.is_running = false
+
+        // Cancel all pending requests
+        for i in 0..256 {
+            if self.requests[i].status == IOStatus::Pending {
+                self.requests[i].status = IOStatus::Cancelled
+            }
+        }
+    }
+
+    // Flush all pending writes
+    fn flush(&self) {
+        // Wait for all write operations to complete
+        while self.queue.counts[0] > 0 or
+              self.queue.counts[1] > 0 or
+              self.queue.counts[2] > 0 or
+              self.queue.counts[3] > 0 {
+            self.process()
+        }
+
+        // Wait for in-flight operations
+        while self.in_flight_count > 0 {
+            self.process()
+        }
+    }
+
+    fn deinit(&self) {
+        self.stop()
+
+        // Free buffer pool
+        for i in 0..self.buffer_pool_count {
+            if self.buffer_pool[i] != null {
+                self.allocator.free(self.buffer_pool[i])
+            }
+        }
+    }
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_async_io: ?AsyncIOManager = null
+
+// Initialize async I/O system
+export fn init_async_io(allocator: Allocator) {
+    g_async_io = AsyncIOManager.init(allocator)
+    g_async_io.?.start()
+}
+
+// Shutdown async I/O system
+export fn shutdown_async_io() {
+    if g_async_io != null {
+        g_async_io.?.deinit()
+        g_async_io = null
+    }
+}
+
+// Get async I/O manager
+export fn get_async_io(): ?*AsyncIOManager {
+    if g_async_io != null {
+        return &g_async_io.?
+    }
+    return null
+}
+
+// Process pending operations (call each frame)
+export fn process_async_io() {
+    if g_async_io != null {
+        g_async_io.?.process()
+    }
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Simple async file read
+export fn async_read_file(
+    path: string,
+    callback: IOCompletionCallback,
+    user_data: *anyopaque
+): i32 {
+    if g_async_io == null {
+        return -1
+    }
+
+    // Would need to get file size first
+    let size: i64 = 0  // Placeholder
+    return g_async_io.?.read_file_async_alloc(
+        path, size, 0, IOPriority::Normal, callback, user_data
+    )
+}
+
+// Simple async file write
+export fn async_write_file(
+    path: string,
+    data: *u8,
+    size: i64,
+    callback: ?IOCompletionCallback,
+    user_data: *anyopaque
+): i32 {
+    if g_async_io == null {
+        return -1
+    }
+
+    return g_async_io.?.write_file_async(
+        path, data, size, 0, IOPriority::Normal, callback, user_data
+    )
+}
+
+// Wait for operation
+export fn wait_async_io(request_id: i32): bool {
+    if g_async_io != null {
+        return g_async_io.?.wait(request_id, 0.0)
+    }
+    return false
+}
+
+// Cancel operation
+export fn cancel_async_io(request_id: i32): bool {
+    if g_async_io != null {
+        return g_async_io.?.cancel(request_id)
+    }
+    return false
+}

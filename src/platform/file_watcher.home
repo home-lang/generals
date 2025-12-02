@@ -1,0 +1,723 @@
+// C&C Generals Zero Hour - Home Port
+// File Watching / Notification System
+//
+// Modern addition for development - not in original game
+// Enables hot-reloading of assets, INI files, scripts, etc.
+//
+// Platform abstractions:
+// - macOS: FSEvents API
+// - Windows: ReadDirectoryChangesW
+// - Linux: inotify
+//
+// Use cases:
+// - Hot-reload INI configuration during development
+// - Auto-refresh textures when modified
+// - Watch for map file changes
+// - Monitor mod directories
+
+import basics/allocator
+
+// ============================================================================
+// FILE EVENT TYPES
+// ============================================================================
+enum FileEventType {
+    None = 0
+    Created = 1          // File or directory was created
+    Modified = 2         // File was modified
+    Deleted = 3          // File or directory was deleted
+    Renamed = 4          // File or directory was renamed
+    MovedFrom = 5        // File was moved out of watched directory
+    MovedTo = 6          // File was moved into watched directory
+    AttributeChanged = 7 // File attributes changed
+}
+
+// ============================================================================
+// FILE EVENT FLAGS
+// ============================================================================
+const EVENT_FLAG_NONE: i32 = 0x00
+const EVENT_FLAG_IS_DIRECTORY: i32 = 0x01
+const EVENT_FLAG_IS_HIDDEN: i32 = 0x02
+const EVENT_FLAG_IS_SYMLINK: i32 = 0x04
+const EVENT_FLAG_RECURSIVE: i32 = 0x08
+
+// ============================================================================
+// WATCH FLAGS - What to watch for
+// ============================================================================
+const WATCH_CREATE: i32 = 0x01
+const WATCH_MODIFY: i32 = 0x02
+const WATCH_DELETE: i32 = 0x04
+const WATCH_RENAME: i32 = 0x08
+const WATCH_MOVE: i32 = 0x10
+const WATCH_ATTRIB: i32 = 0x20
+const WATCH_ALL: i32 = 0x3F
+
+// ============================================================================
+// FILE EVENT - Describes a file system change
+// ============================================================================
+struct FileEvent {
+    event_type: FileEventType
+    path: string                   // Full path to the file
+    old_path: string               // For renames, the previous path
+    flags: i32                     // EVENT_FLAG_*
+    timestamp: f64                 // When the event occurred
+    watch_id: i32                  // Which watch generated this event
+
+    fn init(): FileEvent {
+        return FileEvent {
+            event_type: FileEventType::None
+            path: ""
+            old_path: ""
+            flags: EVENT_FLAG_NONE
+            timestamp: 0.0
+            watch_id: -1
+        }
+    }
+
+    fn is_directory(&self): bool {
+        return (self.flags & EVENT_FLAG_IS_DIRECTORY) != 0
+    }
+
+    fn is_file(&self): bool {
+        return !self.is_directory()
+    }
+
+    fn is_hidden(&self): bool {
+        return (self.flags & EVENT_FLAG_IS_HIDDEN) != 0
+    }
+
+    fn is_symlink(&self): bool {
+        return (self.flags & EVENT_FLAG_IS_SYMLINK) != 0
+    }
+
+    fn get_filename(&self): string {
+        // Extract filename from path
+        let path_len = self.path.len()
+        let mut last_sep = -1
+
+        for i in 0..path_len {
+            let c = self.path.char_at(i)
+            if c == '/' or c == '\\' {
+                last_sep = i as i32
+            }
+        }
+
+        if last_sep >= 0 {
+            return self.path.substring(last_sep as i32 + 1, path_len as i32)
+        }
+
+        return self.path
+    }
+
+    fn get_extension(&self): string {
+        let filename = self.get_filename()
+        let len = filename.len()
+        let mut last_dot = -1
+
+        for i in 0..len {
+            if filename.char_at(i) == '.' {
+                last_dot = i as i32
+            }
+        }
+
+        if last_dot >= 0 and last_dot < (len - 1) as i32 {
+            return filename.substring(last_dot + 1, len as i32)
+        }
+
+        return ""
+    }
+}
+
+// ============================================================================
+// FILE WATCH - Represents a directory being watched
+// ============================================================================
+struct FileWatch {
+    id: i32                        // Unique watch ID
+    path: string                   // Directory being watched
+    watch_flags: i32               // WATCH_* flags
+    recursive: bool                // Watch subdirectories too
+    is_active: bool                // Whether watch is active
+
+    // Filter settings
+    include_extensions: [string; 16]   // Only watch these extensions (empty = all)
+    include_count: i32
+    exclude_patterns: [string; 16]     // Ignore files matching these patterns
+    exclude_count: i32
+
+    // Platform handle (would be platform-specific in real implementation)
+    platform_handle: i64
+
+    fn init(id: i32, path: string, flags: i32, recursive: bool): FileWatch {
+        return FileWatch {
+            id: id
+            path: path
+            watch_flags: flags
+            recursive: recursive
+            is_active: false
+            include_extensions: [""; 16]
+            include_count: 0
+            exclude_patterns: [""; 16]
+            exclude_count: 0
+            platform_handle: 0
+        }
+    }
+
+    fn add_include_extension(&self, ext: string): bool {
+        if self.include_count >= 16 {
+            return false
+        }
+        self.include_extensions[self.include_count] = ext
+        self.include_count += 1
+        return true
+    }
+
+    fn add_exclude_pattern(&self, pattern: string): bool {
+        if self.exclude_count >= 16 {
+            return false
+        }
+        self.exclude_patterns[self.exclude_count] = pattern
+        self.exclude_count += 1
+        return true
+    }
+
+    fn should_process_event(&self, event: *FileEvent): bool {
+        // Check if event type is being watched
+        match event.event_type {
+            FileEventType::Created => {
+                if (self.watch_flags & WATCH_CREATE) == 0 {
+                    return false
+                }
+            }
+            FileEventType::Modified => {
+                if (self.watch_flags & WATCH_MODIFY) == 0 {
+                    return false
+                }
+            }
+            FileEventType::Deleted => {
+                if (self.watch_flags & WATCH_DELETE) == 0 {
+                    return false
+                }
+            }
+            FileEventType::Renamed => {
+                if (self.watch_flags & WATCH_RENAME) == 0 {
+                    return false
+                }
+            }
+            FileEventType::MovedFrom, FileEventType::MovedTo => {
+                if (self.watch_flags & WATCH_MOVE) == 0 {
+                    return false
+                }
+            }
+            FileEventType::AttributeChanged => {
+                if (self.watch_flags & WATCH_ATTRIB) == 0 {
+                    return false
+                }
+            }
+            _ => return false
+        }
+
+        // Check extension filter
+        if self.include_count > 0 and event.is_file() {
+            let ext = event.get_extension()
+            let mut found = false
+
+            for i in 0..self.include_count {
+                if self.include_extensions[i] == ext {
+                    found = true
+                    break
+                }
+            }
+
+            if !found {
+                return false
+            }
+        }
+
+        // Check exclude patterns
+        let filename = event.get_filename()
+        for i in 0..self.exclude_count {
+            if filename.contains(self.exclude_patterns[i]) {
+                return false
+            }
+        }
+
+        return true
+    }
+}
+
+// ============================================================================
+// FILE EVENT CALLBACK TYPE
+// ============================================================================
+type FileEventCallback = fn(event: *FileEvent, user_data: *anyopaque): void
+
+// ============================================================================
+// CALLBACK ENTRY
+// ============================================================================
+struct CallbackEntry {
+    callback: ?FileEventCallback
+    user_data: *anyopaque
+    watch_id: i32                  // -1 for all watches
+    is_active: bool
+}
+
+// ============================================================================
+// FILE WATCHER - Main watcher system
+// ============================================================================
+struct FileWatcher {
+    // Active watches
+    watches: [FileWatch; 64]
+    watch_count: i32
+    next_watch_id: i32
+
+    // Event queue
+    events: [FileEvent; 256]
+    event_count: i32
+    event_head: i32
+    event_tail: i32
+
+    // Callbacks
+    callbacks: [CallbackEntry; 32]
+    callback_count: i32
+
+    // State
+    is_running: bool
+    debounce_time_ms: f32          // Ignore rapid duplicate events
+    last_event_times: [f64; 256]   // For debouncing
+
+    // Platform state
+    platform_initialized: bool
+
+    allocator: Allocator
+
+    fn init(allocator: Allocator): FileWatcher {
+        let mut watcher = FileWatcher {
+            watches: undefined
+            watch_count: 0
+            next_watch_id: 1
+            events: undefined
+            event_count: 0
+            event_head: 0
+            event_tail: 0
+            callbacks: undefined
+            callback_count: 0
+            is_running: false
+            debounce_time_ms: 50.0
+            last_event_times: [0.0; 256]
+            platform_initialized: false
+            allocator: allocator
+        }
+
+        // Initialize arrays
+        for i in 0..64 {
+            watcher.watches[i] = FileWatch.init(-1, "", 0, false)
+        }
+
+        for i in 0..256 {
+            watcher.events[i] = FileEvent.init()
+        }
+
+        for i in 0..32 {
+            watcher.callbacks[i] = CallbackEntry {
+                callback: null
+                user_data: null
+                watch_id: -1
+                is_active: false
+            }
+        }
+
+        return watcher
+    }
+
+    // ========================================
+    // WATCH MANAGEMENT
+    // ========================================
+
+    // Add a new watch
+    fn add_watch(&self, path: string, flags: i32, recursive: bool): i32 {
+        if self.watch_count >= 64 {
+            return -1
+        }
+
+        let id = self.next_watch_id
+        self.next_watch_id += 1
+
+        let index = self.watch_count
+        self.watches[index] = FileWatch.init(id, path, flags, recursive)
+        self.watch_count += 1
+
+        // Platform-specific: start watching
+        if self.is_running {
+            self.start_platform_watch(index)
+        }
+
+        return id
+    }
+
+    // Add watch with extension filter
+    fn add_watch_filtered(&self, path: string, extensions: [string], ext_count: i32): i32 {
+        let id = self.add_watch(path, WATCH_ALL, true)
+        if id < 0 {
+            return id
+        }
+
+        // Add extension filters
+        let watch = self.get_watch_by_id(id)
+        if watch != null {
+            for i in 0..ext_count {
+                watch.?.add_include_extension(extensions[i])
+            }
+        }
+
+        return id
+    }
+
+    // Remove a watch
+    fn remove_watch(&self, watch_id: i32): bool {
+        for i in 0..self.watch_count {
+            if self.watches[i].id == watch_id {
+                // Platform-specific: stop watching
+                if self.watches[i].is_active {
+                    self.stop_platform_watch(i)
+                }
+
+                // Swap with last
+                if i < self.watch_count - 1 {
+                    self.watches[i] = self.watches[self.watch_count - 1]
+                }
+
+                self.watch_count -= 1
+                return true
+            }
+        }
+
+        return false
+    }
+
+    // Get watch by ID
+    fn get_watch_by_id(&self, watch_id: i32): ?*FileWatch {
+        for i in 0..self.watch_count {
+            if self.watches[i].id == watch_id {
+                return &self.watches[i]
+            }
+        }
+        return null
+    }
+
+    // ========================================
+    // CALLBACK MANAGEMENT
+    // ========================================
+
+    // Register a callback for file events
+    fn register_callback(&self, callback: FileEventCallback, user_data: *anyopaque, watch_id: i32): bool {
+        if self.callback_count >= 32 {
+            return false
+        }
+
+        self.callbacks[self.callback_count] = CallbackEntry {
+            callback: callback
+            user_data: user_data
+            watch_id: watch_id
+            is_active: true
+        }
+        self.callback_count += 1
+
+        return true
+    }
+
+    // Unregister a callback
+    fn unregister_callback(&self, callback: FileEventCallback): bool {
+        for i in 0..self.callback_count {
+            if self.callbacks[i].callback == callback {
+                self.callbacks[i].is_active = false
+                return true
+            }
+        }
+        return false
+    }
+
+    // ========================================
+    // EVENT PROCESSING
+    // ========================================
+
+    // Queue an event (called by platform layer)
+    fn queue_event(&self, event: FileEvent): bool {
+        if self.event_count >= 256 {
+            // Queue full - drop oldest event
+            self.event_head = (self.event_head + 1) % 256
+            self.event_count -= 1
+        }
+
+        // Debounce check
+        let hash = self.hash_event(&event)
+        let now = event.timestamp
+
+        if now - self.last_event_times[hash] < (self.debounce_time_ms / 1000.0) as f64 {
+            // Duplicate event within debounce window
+            return false
+        }
+
+        self.last_event_times[hash] = now
+
+        // Add to queue
+        self.events[self.event_tail] = event
+        self.event_tail = (self.event_tail + 1) % 256
+        self.event_count += 1
+
+        return true
+    }
+
+    // Hash an event for debouncing
+    fn hash_event(&self, event: *FileEvent): i32 {
+        // Simple hash of path and event type
+        let mut hash: u32 = event.event_type as u32
+        let len = event.path.len()
+
+        for i in 0..len {
+            hash = hash * 31 + event.path.char_at(i) as u32
+        }
+
+        return (hash % 256) as i32
+    }
+
+    // Process pending events (call each frame)
+    fn process_events(&self) {
+        while self.event_count > 0 {
+            let event = &self.events[self.event_head]
+
+            // Find the watch and check if event should be processed
+            let watch = self.get_watch_by_id(event.watch_id)
+            let should_dispatch = watch == null or watch.?.should_process_event(event)
+
+            if should_dispatch {
+                // Dispatch to callbacks
+                for i in 0..self.callback_count {
+                    let cb = &self.callbacks[i]
+                    if cb.is_active and cb.callback != null {
+                        // Check watch filter
+                        if cb.watch_id < 0 or cb.watch_id == event.watch_id {
+                            cb.callback.?(event, cb.user_data)
+                        }
+                    }
+                }
+            }
+
+            self.event_head = (self.event_head + 1) % 256
+            self.event_count -= 1
+        }
+    }
+
+    // Check for events without blocking (poll)
+    fn poll(&self, timeout_ms: f32) {
+        // Platform-specific polling would go here
+        // This is where FSEvents/inotify/etc. would be checked
+        self.poll_platform(timeout_ms)
+        self.process_events()
+    }
+
+    // ========================================
+    // LIFECYCLE
+    // ========================================
+
+    fn start(&self) {
+        if self.is_running {
+            return
+        }
+
+        self.is_running = true
+
+        // Initialize platform layer
+        self.init_platform()
+
+        // Start all watches
+        for i in 0..self.watch_count {
+            self.start_platform_watch(i)
+        }
+    }
+
+    fn stop(&self) {
+        if !self.is_running {
+            return
+        }
+
+        // Stop all watches
+        for i in 0..self.watch_count {
+            if self.watches[i].is_active {
+                self.stop_platform_watch(i)
+            }
+        }
+
+        // Shutdown platform layer
+        self.shutdown_platform()
+
+        self.is_running = false
+    }
+
+    // ========================================
+    // PLATFORM STUBS (would be implemented per-platform)
+    // ========================================
+
+    fn init_platform(&self) {
+        // Would initialize FSEvents (macOS), inotify (Linux), etc.
+        self.platform_initialized = true
+    }
+
+    fn shutdown_platform(&self) {
+        self.platform_initialized = false
+    }
+
+    fn start_platform_watch(&self, index: i32) {
+        if index < 0 or index >= self.watch_count {
+            return
+        }
+
+        // Would create platform-specific watch
+        self.watches[index].is_active = true
+    }
+
+    fn stop_platform_watch(&self, index: i32) {
+        if index < 0 or index >= self.watch_count {
+            return
+        }
+
+        // Would destroy platform-specific watch
+        self.watches[index].is_active = false
+    }
+
+    fn poll_platform(&self, timeout_ms: f32) {
+        // Would poll for platform events
+        // This is where we'd read from FSEvents/inotify/etc.
+    }
+
+    fn deinit(&self) {
+        self.stop()
+    }
+}
+
+// ============================================================================
+// PRESET WATCHERS - Common configurations
+// ============================================================================
+
+// Watch for INI file changes
+fn create_ini_watcher(watcher: *FileWatcher, path: string): i32 {
+    let id = watcher.add_watch(path, WATCH_MODIFY | WATCH_CREATE, true)
+    if id >= 0 {
+        let watch = watcher.get_watch_by_id(id)
+        if watch != null {
+            watch.?.add_include_extension("ini")
+            watch.?.add_include_extension("INI")
+        }
+    }
+    return id
+}
+
+// Watch for texture changes
+fn create_texture_watcher(watcher: *FileWatcher, path: string): i32 {
+    let id = watcher.add_watch(path, WATCH_MODIFY | WATCH_CREATE, true)
+    if id >= 0 {
+        let watch = watcher.get_watch_by_id(id)
+        if watch != null {
+            watch.?.add_include_extension("tga")
+            watch.?.add_include_extension("dds")
+            watch.?.add_include_extension("png")
+            watch.?.add_include_extension("jpg")
+        }
+    }
+    return id
+}
+
+// Watch for map changes
+fn create_map_watcher(watcher: *FileWatcher, path: string): i32 {
+    let id = watcher.add_watch(path, WATCH_MODIFY | WATCH_CREATE | WATCH_DELETE, true)
+    if id >= 0 {
+        let watch = watcher.get_watch_by_id(id)
+        if watch != null {
+            watch.?.add_include_extension("map")
+            watch.?.add_include_extension("str")
+            watch.?.add_include_extension("scb")
+        }
+    }
+    return id
+}
+
+// Watch for script changes
+fn create_script_watcher(watcher: *FileWatcher, path: string): i32 {
+    let id = watcher.add_watch(path, WATCH_MODIFY | WATCH_CREATE, true)
+    if id >= 0 {
+        let watch = watcher.get_watch_by_id(id)
+        if watch != null {
+            watch.?.add_include_extension("scb")
+            watch.?.add_include_extension("inc")
+        }
+    }
+    return id
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_file_watcher: ?FileWatcher = null
+
+// Initialize the file watcher system
+export fn init_file_watcher(allocator: Allocator) {
+    g_file_watcher = FileWatcher.init(allocator)
+}
+
+// Shutdown the file watcher system
+export fn shutdown_file_watcher() {
+    if g_file_watcher != null {
+        g_file_watcher.?.deinit()
+        g_file_watcher = null
+    }
+}
+
+// Get the global file watcher
+export fn get_file_watcher(): ?*FileWatcher {
+    if g_file_watcher != null {
+        return &g_file_watcher.?
+    }
+    return null
+}
+
+// Start watching
+export fn start_file_watching() {
+    if g_file_watcher != null {
+        g_file_watcher.?.start()
+    }
+}
+
+// Stop watching
+export fn stop_file_watching() {
+    if g_file_watcher != null {
+        g_file_watcher.?.stop()
+    }
+}
+
+// Update file watching (call each frame)
+export fn update_file_watching() {
+    if g_file_watcher != null and g_file_watcher.?.is_running {
+        g_file_watcher.?.poll(0.0)  // Non-blocking poll
+    }
+}
+
+// Add a watch
+export fn watch_directory(path: string, recursive: bool): i32 {
+    if g_file_watcher != null {
+        return g_file_watcher.?.add_watch(path, WATCH_ALL, recursive)
+    }
+    return -1
+}
+
+// Remove a watch
+export fn unwatch_directory(watch_id: i32): bool {
+    if g_file_watcher != null {
+        return g_file_watcher.?.remove_watch(watch_id)
+    }
+    return false
+}
+
+// Register a callback
+export fn register_file_callback(callback: FileEventCallback, user_data: *anyopaque): bool {
+    if g_file_watcher != null {
+        return g_file_watcher.?.register_callback(callback, user_data, -1)
+    }
+    return false
+}

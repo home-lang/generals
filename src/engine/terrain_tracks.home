@@ -1,0 +1,645 @@
+// Terrain Tracks - Unit Footprint and Tread Mark System
+// Based on original W3DTerrainTracks.cpp
+// Draws track marks on terrain when vehicles/tanks move
+
+// ============================================================================
+// Track Configuration
+// ============================================================================
+
+const MAX_TRACK_EDGE_COUNT: i32 = 64     // Max edges per track
+const MAX_TRACKS_PER_SCENE: i32 = 256    // Max active track objects
+const TRACK_HEIGHT_OFFSET: f64 = 0.2     // Height above terrain
+const BRIDGE_OFFSET_FACTOR: f64 = 0.25   // Additional height on bridges
+const MAP_XY_FACTOR: f64 = 10.0          // World units per cell
+
+enum TrackType {
+    TankTreads,             // Wide tank tracks
+    WheelTracks,            // Wheel tracks (thin)
+    FootprintLight,         // Light infantry
+    FootprintHeavy,         // Heavy infantry/mechs
+    SkidMarks,              // Braking skids
+    DragMarks,              // Dragged objects
+}
+
+// ============================================================================
+// Track Edge - Single segment of a track
+// ============================================================================
+
+struct TrackEdge {
+    // Two endpoints for the edge (left and right)
+    pos_left_x: f64,
+    pos_left_y: f64,
+    pos_left_z: f64,
+    pos_right_x: f64,
+    pos_right_y: f64,
+    pos_right_z: f64,
+
+    // UV coordinates at each endpoint
+    uv_left_u: f64,
+    uv_left_v: f64,
+    uv_right_u: f64,
+    uv_right_v: f64,
+
+    // Timing and visibility
+    time_added: i32,            // Frame when edge was created
+    alpha: f64,                 // Current alpha for fading (0.0 - 1.0)
+}
+
+fn create_track_edge(): TrackEdge {
+    return TrackEdge {
+        pos_left_x: 0.0,
+        pos_left_y: 0.0,
+        pos_left_z: 0.0,
+        pos_right_x: 0.0,
+        pos_right_y: 0.0,
+        pos_right_z: 0.0,
+        uv_left_u: 0.0,
+        uv_left_v: 0.0,
+        uv_right_u: 1.0,
+        uv_right_v: 0.0,
+        time_added: 0,
+        alpha: 1.0,
+    }
+}
+
+// ============================================================================
+// Track Object - A complete track trail for one vehicle
+// ============================================================================
+
+struct TerrainTrack {
+    track_id: i32,
+    track_type: TrackType,
+
+    // Edge ring buffer
+    edges: Vec<TrackEdge>,
+    bottom_index: i32,          // Oldest edge
+    top_index: i32,             // Newest edge
+    active_edge_count: i32,
+    total_edges_added: i32,
+
+    // Track properties
+    width: f64,                 // Track width in world units
+    length: f64,                // Length per segment
+    fade_time: i32,             // Frames until fully faded
+
+    // Anchor point (last position)
+    anchor_x: f64,
+    anchor_y: f64,
+    anchor_z: f64,
+    have_anchor: bool,
+    have_cap: bool,             // Track end is capped
+
+    // Owner info
+    owner_id: i32,              // Object ID that owns this track
+    is_bound: bool,             // Track is active
+    is_airborne: bool,          // Owner is in the air
+
+    // Texture
+    texture_id: i32,
+
+    // Bounding
+    bound_center_x: f64,
+    bound_center_y: f64,
+    bound_center_z: f64,
+    bound_radius: f64,
+}
+
+fn create_terrain_track(id: i32): TerrainTrack {
+    let edges = Vec<TrackEdge>{}
+    for i in 0..MAX_TRACK_EDGE_COUNT {
+        edges.add(create_track_edge())
+    }
+
+    return TerrainTrack {
+        track_id: id,
+        track_type: TrackType.TankTreads,
+        edges: edges,
+        bottom_index: 0,
+        top_index: 0,
+        active_edge_count: 0,
+        total_edges_added: 0,
+        width: 5.0,
+        length: 2.0,
+        fade_time: 300,     // ~5 seconds at 60fps
+        anchor_x: 0.0,
+        anchor_y: 0.0,
+        anchor_z: 0.0,
+        have_anchor: false,
+        have_cap: true,
+        owner_id: -1,
+        is_bound: false,
+        is_airborne: false,
+        texture_id: 0,
+        bound_center_x: 0.0,
+        bound_center_y: 0.0,
+        bound_center_z: 0.0,
+        bound_radius: 400.0 * MAP_XY_FACTOR,
+    }
+}
+
+// Initialize track for a specific vehicle
+fn track_init(track: TerrainTrack, width: f64, length: f64, texture_id: i32) {
+    track.width = width
+    track.length = length
+    track.texture_id = texture_id
+    track.bottom_index = 0
+    track.top_index = 0
+    track.active_edge_count = 0
+    track.total_edges_added = 0
+    track.have_anchor = false
+    track.have_cap = true
+    track.is_bound = true
+}
+
+// Add an edge to the track
+fn track_add_edge(track: TerrainTrack, x: f64, y: f64, z: f64,
+                  dir_x: f64, dir_y: f64, normal_x: f64, normal_y: f64, normal_z: f64,
+                  current_frame: i32, get_height: fn(f64, f64): f64): bool {
+
+    if track.is_airborne {
+        return false  // Don't add tracks while airborne
+    }
+
+    // Check distance from anchor
+    if track.have_anchor {
+        let dx = x - track.anchor_x
+        let dy = y - track.anchor_y
+        let dist_sq = dx * dx + dy * dy
+        let min_dist_sq = track.length * track.length
+
+        if dist_sq < min_dist_sq {
+            return false  // Not far enough from last edge
+        }
+    }
+
+    // Make room if buffer is full
+    if track.active_edge_count >= MAX_TRACK_EDGE_COUNT {
+        track.bottom_index = track.bottom_index + 1
+        track.active_edge_count = track.active_edge_count - 1
+        if track.bottom_index >= MAX_TRACK_EDGE_COUNT {
+            track.bottom_index = 0
+        }
+    }
+
+    if track.top_index >= MAX_TRACK_EDGE_COUNT {
+        track.top_index = 0
+    }
+
+    // Calculate perpendicular direction for track width
+    // Cross product of direction with up vector
+    let perp_x = dir_y * normal_z - 0.0 * normal_y
+    let perp_y = 0.0 * normal_x - dir_x * normal_z
+    let perp_z = dir_x * normal_y - dir_y * normal_x
+
+    // Normalize
+    let len = sqrt(perp_x * perp_x + perp_y * perp_y + perp_z * perp_z)
+    if len > 0.001 {
+        perp_x = perp_x / len
+        perp_y = perp_y / len
+        perp_z = perp_z / len
+    } else {
+        perp_x = 1.0
+        perp_y = 0.0
+        perp_z = 0.0
+    }
+
+    let half_width = track.width / 2.0
+    let edge = track.edges.get(track.top_index)
+
+    // Left endpoint
+    edge.pos_left_x = x - perp_x * half_width
+    edge.pos_left_y = y - perp_y * half_width
+    edge.pos_left_z = get_height(edge.pos_left_x, edge.pos_left_y) + TRACK_HEIGHT_OFFSET * MAP_XY_FACTOR
+
+    // Right endpoint
+    edge.pos_right_x = x + perp_x * half_width
+    edge.pos_right_y = y + perp_y * half_width
+    edge.pos_right_z = get_height(edge.pos_right_x, edge.pos_right_y) + TRACK_HEIGHT_OFFSET * MAP_XY_FACTOR
+
+    // UV coordinates - alternate based on edge count for seamless tiling
+    if (track.total_edges_added & 1) == 0 {
+        edge.uv_left_u = 0.0
+        edge.uv_left_v = 0.0
+        edge.uv_right_u = 1.0
+        edge.uv_right_v = 0.0
+    } else {
+        edge.uv_left_u = 0.0
+        edge.uv_left_v = 1.0
+        edge.uv_right_u = 1.0
+        edge.uv_right_v = 1.0
+    }
+
+    // Timing
+    edge.time_added = current_frame
+    edge.alpha = 1.0
+
+    // Update indices
+    track.top_index = track.top_index + 1
+    track.active_edge_count = track.active_edge_count + 1
+    track.total_edges_added = track.total_edges_added + 1
+
+    // Update anchor
+    track.anchor_x = x
+    track.anchor_y = y
+    track.anchor_z = z
+    track.have_anchor = true
+    track.have_cap = false
+
+    return true
+}
+
+// Add a cap edge (for when vehicle enters fog of war, etc.)
+fn track_add_cap(track: TerrainTrack, x: f64, y: f64) {
+    if track.have_cap {
+        return
+    }
+
+    if track.active_edge_count == 1 {
+        // Only have anchor edge, which is already a cap
+        track.have_cap = true
+        track.have_anchor = false
+        return
+    }
+
+    // Force last edge to transparent
+    let last_edge_idx = track.top_index - 1
+    if last_edge_idx < 0 {
+        last_edge_idx = MAX_TRACK_EDGE_COUNT - 1
+    }
+
+    track.edges.get(last_edge_idx).alpha = 0.0
+    track.have_cap = true
+    track.have_anchor = false
+}
+
+// Update track alpha values for fading
+fn track_update(track: TerrainTrack, current_frame: i32) {
+    if track.active_edge_count == 0 {
+        return
+    }
+
+    let idx = track.bottom_index
+    let count = 0
+
+    while count < track.active_edge_count {
+        let edge = track.edges.get(idx)
+        let age = current_frame - edge.time_added
+
+        // Fade based on age
+        if age > track.fade_time {
+            edge.alpha = 0.0
+
+            // Remove fully faded edges from bottom
+            if idx == track.bottom_index {
+                track.bottom_index = track.bottom_index + 1
+                if track.bottom_index >= MAX_TRACK_EDGE_COUNT {
+                    track.bottom_index = 0
+                }
+                track.active_edge_count = track.active_edge_count - 1
+            }
+        } else {
+            // Linear fade
+            edge.alpha = 1.0 - ((age as f64) / (track.fade_time as f64))
+        }
+
+        idx = idx + 1
+        if idx >= MAX_TRACK_EDGE_COUNT {
+            idx = 0
+        }
+        count = count + 1
+    }
+}
+
+// Set airborne state
+fn track_set_airborne(track: TerrainTrack, airborne: bool) {
+    if airborne && !track.is_airborne {
+        // Just became airborne, cap the track
+        track_add_cap(track, track.anchor_x, track.anchor_y)
+    }
+    track.is_airborne = airborne
+}
+
+// Unbind track from owner
+fn track_unbind(track: TerrainTrack) {
+    track.is_bound = false
+    track.owner_id = -1
+    track_add_cap(track, track.anchor_x, track.anchor_y)
+}
+
+// Check if track has any visible edges
+fn track_is_visible(track: TerrainTrack): bool {
+    return track.active_edge_count > 0
+}
+
+// ============================================================================
+// Track Rendering Data Generation
+// ============================================================================
+
+struct TrackVertex {
+    x: f64,
+    y: f64,
+    z: f64,
+    diffuse: i32,
+    u: f64,
+    v: f64,
+}
+
+// Generate vertices for rendering a track
+fn track_generate_vertices(track: TerrainTrack): Vec<TrackVertex> {
+    let vertices = Vec<TrackVertex>{}
+
+    if track.active_edge_count < 2 {
+        return vertices
+    }
+
+    let idx = track.bottom_index
+    let count = 0
+
+    while count < track.active_edge_count {
+        let edge = track.edges.get(idx)
+
+        // Alpha to diffuse color
+        let alpha_byte = (edge.alpha * 255.0) as i32
+        let diffuse = (alpha_byte << 24) | 0x00FFFFFF
+
+        // Left vertex
+        let v_left = TrackVertex {
+            x: edge.pos_left_x,
+            y: edge.pos_left_y,
+            z: edge.pos_left_z,
+            diffuse: diffuse,
+            u: edge.uv_left_u,
+            v: edge.uv_left_v,
+        }
+        vertices.add(v_left)
+
+        // Right vertex
+        let v_right = TrackVertex {
+            x: edge.pos_right_x,
+            y: edge.pos_right_y,
+            z: edge.pos_right_z,
+            diffuse: diffuse,
+            u: edge.uv_right_u,
+            v: edge.uv_right_v,
+        }
+        vertices.add(v_right)
+
+        idx = idx + 1
+        if idx >= MAX_TRACK_EDGE_COUNT {
+            idx = 0
+        }
+        count = count + 1
+    }
+
+    return vertices
+}
+
+// Generate indices for track (triangle strip)
+fn track_generate_indices(track: TerrainTrack): Vec<i32> {
+    let indices = Vec<i32>{}
+
+    if track.active_edge_count < 2 {
+        return indices
+    }
+
+    // Generate triangle strip indices
+    let num_quads = track.active_edge_count - 1
+    for i in 0..num_quads {
+        let base = i * 2
+
+        // First triangle of quad
+        indices.add(base)
+        indices.add(base + 1)
+        indices.add(base + 2)
+
+        // Second triangle of quad
+        indices.add(base + 1)
+        indices.add(base + 3)
+        indices.add(base + 2)
+    }
+
+    return indices
+}
+
+// ============================================================================
+// Track Manager System
+// ============================================================================
+
+struct TrackManager {
+    tracks: Vec<TerrainTrack>,
+    next_track_id: i32,
+    max_tank_track_edges: i32,
+
+    // Global settings
+    tracks_enabled: bool,
+    fade_time: i32,
+
+    // Statistics
+    total_active_tracks: i32,
+    total_visible_edges: i32,
+}
+
+fn create_track_manager(): TrackManager {
+    return TrackManager {
+        tracks: Vec<TerrainTrack>{},
+        next_track_id: 1,
+        max_tank_track_edges: MAX_TRACK_EDGE_COUNT,
+        tracks_enabled: true,
+        fade_time: 300,
+        total_active_tracks: 0,
+        total_visible_edges: 0,
+    }
+}
+
+// Create a new track for a vehicle
+fn manager_create_track(mgr: TrackManager, owner_id: i32, track_type: TrackType,
+                        width: f64, length: f64, texture_id: i32): i32 {
+    if mgr.tracks.len() >= MAX_TRACKS_PER_SCENE {
+        // Reuse oldest unbound track
+        for i in 0..mgr.tracks.len() {
+            let track = mgr.tracks.get(i)
+            if !track.is_bound && track.active_edge_count == 0 {
+                track.track_id = mgr.next_track_id
+                mgr.next_track_id = mgr.next_track_id + 1
+                track.track_type = track_type
+                track.owner_id = owner_id
+                track.fade_time = mgr.fade_time
+                track_init(track, width, length, texture_id)
+                return track.track_id
+            }
+        }
+        return -1  // No available slots
+    }
+
+    let track = create_terrain_track(mgr.next_track_id)
+    mgr.next_track_id = mgr.next_track_id + 1
+    track.track_type = track_type
+    track.owner_id = owner_id
+    track.fade_time = mgr.fade_time
+    track_init(track, width, length, texture_id)
+
+    mgr.tracks.add(track)
+    return track.track_id
+}
+
+// Get track by ID
+fn manager_get_track(mgr: TrackManager, track_id: i32): TerrainTrack {
+    for i in 0..mgr.tracks.len() {
+        if mgr.tracks.get(i).track_id == track_id {
+            return mgr.tracks.get(i)
+        }
+    }
+    return create_terrain_track(-1)  // Return dummy track
+}
+
+// Update all tracks
+fn manager_update(mgr: TrackManager, current_frame: i32) {
+    mgr.total_active_tracks = 0
+    mgr.total_visible_edges = 0
+
+    for i in 0..mgr.tracks.len() {
+        let track = mgr.tracks.get(i)
+        track_update(track, current_frame)
+
+        if track.active_edge_count > 0 {
+            mgr.total_active_tracks = mgr.total_active_tracks + 1
+            mgr.total_visible_edges = mgr.total_visible_edges + track.active_edge_count
+        }
+    }
+}
+
+// Enable/disable tracks globally
+fn manager_set_enabled(mgr: TrackManager, enabled: bool) {
+    mgr.tracks_enabled = enabled
+}
+
+// Set global fade time
+fn manager_set_fade_time(mgr: TrackManager, fade_frames: i32) {
+    mgr.fade_time = fade_frames
+}
+
+// Clear all tracks
+fn manager_clear_all(mgr: TrackManager) {
+    mgr.tracks = Vec<TerrainTrack>{}
+}
+
+fn sqrt(x: f64): f64 {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_track_edge_creation(): bool {
+    let edge = create_track_edge()
+    assert(edge.alpha == 1.0, "Edge should start fully visible")
+    assert(edge.uv_left_u == 0.0, "Left UV should be 0")
+    return true
+}
+
+fn test_track_creation(): bool {
+    let track = create_terrain_track(1)
+    assert(track.track_id == 1, "Track ID should be 1")
+    assert(track.active_edge_count == 0, "Should start with no edges")
+    assert(track.edges.len() == MAX_TRACK_EDGE_COUNT, "Should have edge buffer")
+    return true
+}
+
+fn test_track_add_edge(): bool {
+    let track = create_terrain_track(1)
+    track_init(track, 5.0, 2.0, 1)
+
+    fn get_height(x: f64, y: f64): f64 {
+        return 0.0
+    }
+
+    // First edge (anchor)
+    let result = track_add_edge(track, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0, get_height)
+    assert(result == true, "Should add first edge")
+    assert(track.active_edge_count == 1, "Should have 1 edge")
+    assert(track.have_anchor == true, "Should have anchor")
+
+    // Second edge (too close)
+    result = track_add_edge(track, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1, get_height)
+    assert(result == false, "Should not add edge too close")
+
+    // Third edge (far enough)
+    result = track_add_edge(track, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2, get_height)
+    assert(result == true, "Should add edge at distance")
+    assert(track.active_edge_count == 2, "Should have 2 edges")
+
+    return true
+}
+
+fn test_track_fade(): bool {
+    let track = create_terrain_track(1)
+    track.fade_time = 10
+    track_init(track, 5.0, 2.0, 1)
+
+    fn get_height(x: f64, y: f64): f64 {
+        return 0.0
+    }
+
+    track_add_edge(track, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0, get_height)
+    track_add_edge(track, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1, get_height)
+
+    // Update at frame 5 (half faded)
+    track_update(track, 5)
+    let edge = track.edges.get(0)
+    assert(edge.alpha < 1.0 && edge.alpha > 0.0, "Edge should be partially faded")
+
+    // Update at frame 15 (fully faded)
+    track_update(track, 15)
+    assert(track.active_edge_count < 2, "Old edges should be removed")
+
+    return true
+}
+
+fn test_track_manager(): bool {
+    let mgr = create_track_manager()
+
+    let id = manager_create_track(mgr, 100, TrackType.TankTreads, 5.0, 2.0, 1)
+    assert(id > 0, "Should create track")
+    assert(mgr.tracks.len() == 1, "Should have 1 track")
+
+    let track = manager_get_track(mgr, id)
+    assert(track.owner_id == 100, "Owner should match")
+
+    return true
+}
+
+fn test_track_vertices(): bool {
+    let track = create_terrain_track(1)
+    track_init(track, 5.0, 2.0, 1)
+
+    fn get_height(x: f64, y: f64): f64 {
+        return 0.0
+    }
+
+    track_add_edge(track, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0, get_height)
+    track_add_edge(track, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1, get_height)
+
+    let verts = track_generate_vertices(track)
+    assert(verts.len() == 4, "Should have 4 vertices (2 edges x 2 points)")
+
+    let indices = track_generate_indices(track)
+    assert(indices.len() == 6, "Should have 6 indices (1 quad = 2 triangles)")
+
+    return true
+}
+
+fn run_all_tests(): bool {
+    assert(test_track_edge_creation(), "Track edge creation test failed")
+    assert(test_track_creation(), "Track creation test failed")
+    assert(test_track_add_edge(), "Track add edge test failed")
+    assert(test_track_fade(), "Track fade test failed")
+    assert(test_track_manager(), "Track manager test failed")
+    assert(test_track_vertices(), "Track vertices test failed")
+    return true
+}

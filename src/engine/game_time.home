@@ -1,0 +1,780 @@
+// C&C Generals Zero Hour - Home Port
+// Game Time and Pause System
+//
+// Original: GameLogic.cpp, FramePacer.h (Westwood Studios/EA)
+// Comprehensive time control matching original functionality
+//
+// Features:
+// - Pause/resume with granular control (logic, sound, music, input)
+// - Time scaling for slow-motion and fast-forward
+// - Fixed timestep game loop (30 Hz like original)
+// - Frame pacing and FPS limiting
+// - Time frozen state for scripted camera movement
+// - Game halted state that blocks all time progression
+
+import basics/allocator
+
+// ============================================================================
+// TIME CONSTANTS
+// ============================================================================
+const GAME_LOGIC_FPS: i32 = 30                    // Original game runs at 30 logic FPS
+const FRAME_TIME_MS: f32 = 1000.0 / 30.0          // ~33.33 ms per frame
+const FRAME_TIME_SEC: f32 = 1.0 / 30.0            // ~0.0333 seconds per frame
+const MAX_ACCUMULATED_FRAMES: i32 = 10            // Prevent spiral of death
+const DEFAULT_FPS_LIMIT: i32 = 60                 // Default render FPS limit
+
+// ============================================================================
+// AUDIO AFFECT FLAGS - What audio to pause/resume
+// ============================================================================
+const AUDIO_AFFECT_NONE: i32 = 0x00
+const AUDIO_AFFECT_SOUND: i32 = 0x01
+const AUDIO_AFFECT_3D_SOUND: i32 = 0x02
+const AUDIO_AFFECT_SPEECH: i32 = 0x04
+const AUDIO_AFFECT_MUSIC: i32 = 0x08
+const AUDIO_AFFECT_AMBIENT: i32 = 0x10
+const AUDIO_AFFECT_ALL: i32 = 0x1F
+const AUDIO_AFFECT_ALL_EXCEPT_MUSIC: i32 = 0x17   // All & ~Music
+
+// ============================================================================
+// LOGIC TIME QUERY FLAGS
+// ============================================================================
+const IGNORE_FROZEN_TIME: i32 = 0x01
+const IGNORE_HALTED_GAME: i32 = 0x02
+
+// ============================================================================
+// PAUSE STATE - Tracks what's paused
+// ============================================================================
+struct PauseState {
+    // Individual pause flags
+    logic_paused: bool
+    sound_paused: bool
+    music_paused: bool
+    input_paused: bool
+
+    // Memory for restoring state on unpause
+    input_enabled_memory: bool
+    mouse_visible_memory: bool
+    logic_time_scale_enabled_memory: bool
+
+    // Scheduled pause frame
+    pause_frame: u32
+    has_scheduled_pause: bool
+
+    fn init(): PauseState {
+        return PauseState {
+            logic_paused: false
+            sound_paused: false
+            music_paused: false
+            input_paused: false
+            input_enabled_memory: true
+            mouse_visible_memory: true
+            logic_time_scale_enabled_memory: false
+            pause_frame: 0
+            has_scheduled_pause: false
+        }
+    }
+
+    fn is_any_paused(&self): bool {
+        return self.logic_paused or self.sound_paused or self.music_paused or self.input_paused
+    }
+
+    fn is_fully_paused(&self): bool {
+        return self.logic_paused and self.sound_paused and self.music_paused and self.input_paused
+    }
+}
+
+// ============================================================================
+// FRAME PACER - Controls update timing and FPS limiting
+// ============================================================================
+struct FramePacer {
+    // FPS limiting
+    max_fps: i32
+    enable_fps_limit: bool
+
+    // Logic time scaling
+    logic_time_scale_fps: i32
+    enable_logic_time_scale: bool
+
+    // Time states
+    is_time_frozen: bool         // Allows scripted camera movement
+    is_game_halted: bool         // Blocks all time progression
+
+    // Timing measurements
+    update_time: f32             // Last update delta time in seconds
+    last_update_timestamp: f64   // Timestamp of last update
+    accumulated_time: f64        // Accumulated time for fixed timestep
+
+    // Statistics
+    frames_this_second: i32
+    current_fps: f32
+    fps_timer: f32
+
+    fn init(): FramePacer {
+        return FramePacer {
+            max_fps: DEFAULT_FPS_LIMIT
+            enable_fps_limit: true
+            logic_time_scale_fps: GAME_LOGIC_FPS
+            enable_logic_time_scale: false
+            is_time_frozen: false
+            is_game_halted: false
+            update_time: 0.0
+            last_update_timestamp: 0.0
+            accumulated_time: 0.0
+            frames_this_second: 0
+            current_fps: 0.0
+            fps_timer: 0.0
+        }
+    }
+
+    // Set the render FPS limit
+    fn set_fps_limit(&self, fps: i32) {
+        if fps < 1 {
+            self.max_fps = 1
+        } else if fps > 1000 {
+            self.max_fps = 1000
+        } else {
+            self.max_fps = fps
+        }
+    }
+
+    fn get_fps_limit(&self): i32 {
+        return self.max_fps
+    }
+
+    fn set_fps_limit_enabled(&self, enabled: bool) {
+        self.enable_fps_limit = enabled
+    }
+
+    fn is_fps_limit_enabled(&self): bool {
+        return self.enable_fps_limit
+    }
+
+    // Logic time scale control
+    fn set_logic_time_scale_fps(&self, fps: i32) {
+        if fps < 1 {
+            self.logic_time_scale_fps = 1
+        } else if fps > 120 {
+            self.logic_time_scale_fps = 120
+        } else {
+            self.logic_time_scale_fps = fps
+        }
+    }
+
+    fn get_logic_time_scale_fps(&self): i32 {
+        return self.logic_time_scale_fps
+    }
+
+    fn set_logic_time_scale_enabled(&self, enabled: bool) {
+        self.enable_logic_time_scale = enabled
+    }
+
+    fn is_logic_time_scale_enabled(&self): bool {
+        return self.enable_logic_time_scale
+    }
+
+    // Get actual logic time scale fps considering all factors
+    fn get_actual_logic_time_scale_fps(&self, flags: i32): i32 {
+        // Check if halted
+        if self.is_game_halted and (flags & IGNORE_HALTED_GAME) == 0 {
+            return 0
+        }
+
+        // Check if frozen
+        if self.is_time_frozen and (flags & IGNORE_FROZEN_TIME) == 0 {
+            return 0
+        }
+
+        // Check if time scale is enabled
+        if !self.enable_logic_time_scale {
+            return GAME_LOGIC_FPS
+        }
+
+        // Cap by render FPS
+        if self.logic_time_scale_fps > self.max_fps {
+            return self.max_fps
+        }
+
+        return self.logic_time_scale_fps
+    }
+
+    // Get logic time scale ratio (1.0 = normal, 0.5 = half speed, 2.0 = double speed)
+    fn get_actual_logic_time_scale_ratio(&self, flags: i32): f32 {
+        let actual_fps = self.get_actual_logic_time_scale_fps(flags)
+        if actual_fps == 0 {
+            return 0.0
+        }
+        return actual_fps as f32 / GAME_LOGIC_FPS as f32
+    }
+
+    // Get logic time step in seconds
+    fn get_logic_time_step_seconds(&self, flags: i32): f32 {
+        let actual_fps = self.get_actual_logic_time_scale_fps(flags)
+        if actual_fps == 0 {
+            return 0.0
+        }
+        return 1.0 / actual_fps as f32
+    }
+
+    // Get logic time step in milliseconds
+    fn get_logic_time_step_ms(&self, flags: i32): f32 {
+        return self.get_logic_time_step_seconds(flags) * 1000.0
+    }
+
+    // Time frozen state (allows scripted camera)
+    fn set_time_frozen(&self, frozen: bool) {
+        self.is_time_frozen = frozen
+    }
+
+    fn get_time_frozen(&self): bool {
+        return self.is_time_frozen
+    }
+
+    // Game halted state (blocks everything)
+    fn set_game_halted(&self, halted: bool) {
+        self.is_game_halted = halted
+    }
+
+    fn get_game_halted(&self): bool {
+        return self.is_game_halted
+    }
+
+    // Update timing
+    fn get_update_time(&self): f32 {
+        return self.update_time
+    }
+
+    fn get_update_fps(&self): f32 {
+        return self.current_fps
+    }
+
+    // Get ratio for frame-rate independent scaling
+    fn get_base_over_update_fps_ratio(&self, min_update_fps: f32): f32 {
+        let fps = self.current_fps
+        if fps < min_update_fps {
+            return GAME_LOGIC_FPS as f32 / min_update_fps
+        }
+        return GAME_LOGIC_FPS as f32 / fps
+    }
+
+    // Begin frame - call at start of render frame
+    fn begin_frame(&self, current_time: f64) {
+        if self.last_update_timestamp > 0.0 {
+            self.update_time = (current_time - self.last_update_timestamp) as f32
+        }
+        self.last_update_timestamp = current_time
+
+        // Update FPS counter
+        self.frames_this_second += 1
+        self.fps_timer += self.update_time
+
+        if self.fps_timer >= 1.0 {
+            self.current_fps = self.frames_this_second as f32 / self.fps_timer
+            self.frames_this_second = 0
+            self.fps_timer = 0.0
+        }
+    }
+
+    // Wait for frame - call at end of render frame to limit FPS
+    fn end_frame(&self, current_time: f64): f64 {
+        if !self.enable_fps_limit or self.max_fps <= 0 {
+            return 0.0
+        }
+
+        let target_frame_time = 1.0 / self.max_fps as f64
+        let elapsed = current_time - self.last_update_timestamp
+
+        if elapsed < target_frame_time {
+            return target_frame_time - elapsed
+        }
+
+        return 0.0
+    }
+
+    // Accumulate time for fixed timestep
+    fn accumulate_time(&self, delta_time: f64) {
+        self.accumulated_time += delta_time
+    }
+
+    // Consume accumulated time for one logic frame
+    fn consume_frame(&self): bool {
+        let frame_time = self.get_logic_time_step_seconds(0) as f64
+
+        if frame_time <= 0.0 {
+            return false
+        }
+
+        if self.accumulated_time >= frame_time {
+            self.accumulated_time -= frame_time
+            return true
+        }
+
+        return false
+    }
+
+    // Get number of logic frames to run
+    fn get_frames_to_run(&self): i32 {
+        let frame_time = self.get_logic_time_step_seconds(0) as f64
+
+        if frame_time <= 0.0 {
+            return 0
+        }
+
+        let frames = (self.accumulated_time / frame_time) as i32
+
+        // Cap to prevent spiral of death
+        if frames > MAX_ACCUMULATED_FRAMES {
+            return MAX_ACCUMULATED_FRAMES
+        }
+
+        return frames
+    }
+
+    // Reset accumulated time (for after loading, etc.)
+    fn reset_accumulator(&self) {
+        self.accumulated_time = 0.0
+    }
+}
+
+// ============================================================================
+// GAME TIME MANAGER - Central time control system
+// ============================================================================
+struct GameTimeManager {
+    // Current game frame
+    current_frame: u32
+
+    // Pause state
+    pause_state: PauseState
+
+    // Frame pacer
+    frame_pacer: FramePacer
+
+    // Time multiplier for slow-motion/fast-forward (separate from time scale)
+    time_multiplier: f32
+    target_time_multiplier: f32
+    multiplier_lerp_speed: f32
+
+    // Statistics
+    total_game_time: f64          // Total time in seconds
+    session_start_time: f64       // When this session started
+
+    // Callbacks (would be function pointers in full implementation)
+    // on_pause: ?fn(bool): void
+    // on_time_scale_changed: ?fn(f32): void
+
+    fn init(): GameTimeManager {
+        return GameTimeManager {
+            current_frame: 0
+            pause_state: PauseState.init()
+            frame_pacer: FramePacer.init()
+            time_multiplier: 1.0
+            target_time_multiplier: 1.0
+            multiplier_lerp_speed: 5.0
+            total_game_time: 0.0
+            session_start_time: 0.0
+        }
+    }
+
+    // ========================================
+    // PAUSE CONTROL
+    // ========================================
+
+    // Set game paused with all options
+    fn set_game_paused(&self, paused: bool, pause_music: bool, pause_input: bool) {
+        self.pause_game_logic(paused)
+        self.pause_game_sound(paused)
+        self.pause_game_music(paused and pause_music)
+        self.pause_game_input(paused and pause_input)
+    }
+
+    // Schedule pause at specific frame
+    fn set_game_paused_in_frame(&self, frame: u32, disable_logic_time_scale: bool) {
+        if frame >= self.current_frame {
+            self.pause_state.pause_frame = frame
+            self.pause_state.has_scheduled_pause = true
+
+            if disable_logic_time_scale {
+                self.pause_state.logic_time_scale_enabled_memory = self.frame_pacer.is_logic_time_scale_enabled()
+                self.frame_pacer.set_logic_time_scale_enabled(false)
+            }
+        }
+    }
+
+    // Check and execute scheduled pause
+    fn check_scheduled_pause(&self) {
+        if self.pause_state.has_scheduled_pause and self.current_frame >= self.pause_state.pause_frame {
+            self.set_game_paused(true, true, true)
+            self.pause_state.has_scheduled_pause = false
+        }
+    }
+
+    fn is_game_paused(&self): bool {
+        return self.pause_state.logic_paused
+    }
+
+    fn get_pause_frame(&self): u32 {
+        return self.pause_state.pause_frame
+    }
+
+    fn get_input_enabled_memory(&self): bool {
+        return self.pause_state.input_enabled_memory
+    }
+
+    // Individual pause controls
+    fn pause_game_logic(&self, paused: bool) {
+        self.pause_state.logic_paused = paused
+
+        // Restore time scale if unpausing
+        if !paused and self.pause_state.logic_time_scale_enabled_memory {
+            self.pause_state.logic_time_scale_enabled_memory = false
+            self.frame_pacer.set_logic_time_scale_enabled(true)
+        }
+    }
+
+    fn pause_game_sound(&self, paused: bool) {
+        if self.pause_state.sound_paused == paused {
+            return
+        }
+
+        self.pause_state.sound_paused = paused
+
+        // Would call audio system here:
+        // if paused:
+        //     TheAudio.pause_audio(AUDIO_AFFECT_ALL_EXCEPT_MUSIC)
+        // else:
+        //     TheAudio.resume_audio(AUDIO_AFFECT_ALL_EXCEPT_MUSIC)
+    }
+
+    fn pause_game_music(&self, paused: bool) {
+        if self.pause_state.music_paused == paused {
+            return
+        }
+
+        self.pause_state.music_paused = paused
+
+        // Would call audio system here:
+        // if paused:
+        //     TheAudio.pause_audio(AUDIO_AFFECT_MUSIC)
+        // else:
+        //     TheAudio.resume_audio(AUDIO_AFFECT_MUSIC)
+    }
+
+    fn pause_game_input(&self, paused: bool) {
+        if self.pause_state.input_paused == paused {
+            return
+        }
+
+        self.pause_state.input_paused = paused
+
+        // Would call input/mouse system here:
+        // TheMouse.on_game_paused(paused)
+
+        if paused {
+            // Remember current state for restore
+            // self.pause_state.input_enabled_memory = TheInGameUI.get_input_enabled()
+            // self.pause_state.mouse_visible_memory = TheMouse.get_visibility()
+
+            // Show mouse and set arrow cursor
+            // TheMouse.set_visibility(true)
+            // TheMouse.set_cursor(ARROW)
+
+            // Disable input if it was enabled
+            // if self.pause_state.input_enabled_memory:
+            //     TheInGameUI.set_input_enabled(false)
+        } else {
+            // Restore previous state
+            // TheMouse.set_visibility(self.pause_state.mouse_visible_memory)
+            // if self.pause_state.input_enabled_memory:
+            //     TheInGameUI.set_input_enabled(true)
+        }
+    }
+
+    // ========================================
+    // TIME SCALING / SLOW-MOTION
+    // ========================================
+
+    // Set time multiplier immediately
+    fn set_time_multiplier(&self, multiplier: f32) {
+        let clamped = multiplier
+        if clamped < 0.1 {
+            clamped = 0.1
+        } else if clamped > 4.0 {
+            clamped = 4.0
+        }
+
+        self.time_multiplier = clamped
+        self.target_time_multiplier = clamped
+    }
+
+    // Set time multiplier with smooth transition
+    fn set_time_multiplier_smooth(&self, multiplier: f32, lerp_speed: f32) {
+        let clamped = multiplier
+        if clamped < 0.1 {
+            clamped = 0.1
+        } else if clamped > 4.0 {
+            clamped = 4.0
+        }
+
+        self.target_time_multiplier = clamped
+        self.multiplier_lerp_speed = lerp_speed
+    }
+
+    fn get_time_multiplier(&self): f32 {
+        return self.time_multiplier
+    }
+
+    // Update time multiplier lerp
+    fn update_time_multiplier(&self, delta_time: f32) {
+        if self.time_multiplier != self.target_time_multiplier {
+            let diff = self.target_time_multiplier - self.time_multiplier
+            let change = self.multiplier_lerp_speed * delta_time
+
+            if diff > 0.0 {
+                self.time_multiplier += change
+                if self.time_multiplier > self.target_time_multiplier {
+                    self.time_multiplier = self.target_time_multiplier
+                }
+            } else {
+                self.time_multiplier -= change
+                if self.time_multiplier < self.target_time_multiplier {
+                    self.time_multiplier = self.target_time_multiplier
+                }
+            }
+        }
+    }
+
+    // Slow-motion preset
+    fn enter_slow_motion(&self) {
+        self.set_time_multiplier_smooth(0.25, 3.0)
+    }
+
+    // Exit slow-motion
+    fn exit_slow_motion(&self) {
+        self.set_time_multiplier_smooth(1.0, 5.0)
+    }
+
+    // Fast forward preset
+    fn enter_fast_forward(&self) {
+        self.set_time_multiplier_smooth(2.0, 5.0)
+    }
+
+    // ========================================
+    // FRAME ADVANCEMENT
+    // ========================================
+
+    fn get_current_frame(&self): u32 {
+        return self.current_frame
+    }
+
+    fn advance_frame(&self) {
+        self.current_frame += 1
+        self.total_game_time += FRAME_TIME_SEC as f64
+    }
+
+    fn get_total_game_time(&self): f64 {
+        return self.total_game_time
+    }
+
+    fn get_total_game_time_seconds(&self): f32 {
+        return self.total_game_time as f32
+    }
+
+    fn get_total_game_time_minutes(&self): f32 {
+        return self.total_game_time as f32 / 60.0
+    }
+
+    // ========================================
+    // UPDATE
+    // ========================================
+
+    // Main update - call each render frame
+    fn update(&self, delta_time: f64, current_time: f64) {
+        // Check for scheduled pause
+        self.check_scheduled_pause()
+
+        // Update frame pacer
+        self.frame_pacer.begin_frame(current_time)
+
+        // Update time multiplier lerp
+        self.update_time_multiplier(delta_time as f32)
+
+        // Accumulate time if not paused
+        if !self.pause_state.logic_paused {
+            let scaled_delta = delta_time * self.time_multiplier as f64
+            self.frame_pacer.accumulate_time(scaled_delta)
+        }
+    }
+
+    // Check if should run a logic frame
+    fn should_run_logic_frame(&self): bool {
+        if self.pause_state.logic_paused {
+            return false
+        }
+        return self.frame_pacer.consume_frame()
+    }
+
+    // Get number of logic frames to catch up
+    fn get_pending_logic_frames(&self): i32 {
+        if self.pause_state.logic_paused {
+            return 0
+        }
+        return self.frame_pacer.get_frames_to_run()
+    }
+
+    // Called after each logic frame
+    fn on_logic_frame_complete(&self) {
+        self.advance_frame()
+    }
+
+    // ========================================
+    // RESET
+    // ========================================
+
+    fn reset(&self) {
+        self.current_frame = 0
+        self.pause_state = PauseState.init()
+        self.time_multiplier = 1.0
+        self.target_time_multiplier = 1.0
+        self.total_game_time = 0.0
+        self.frame_pacer.reset_accumulator()
+    }
+
+    fn set_session_start_time(&self, time: f64) {
+        self.session_start_time = time
+    }
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_game_time_manager: ?GameTimeManager = null
+
+// Initialize the game time system
+export fn init_game_time() {
+    g_game_time_manager = GameTimeManager.init()
+}
+
+// Shutdown the game time system
+export fn shutdown_game_time() {
+    g_game_time_manager = null
+}
+
+// Get the global time manager
+export fn get_game_time_manager(): ?*GameTimeManager {
+    if g_game_time_manager != null {
+        return &g_game_time_manager.?
+    }
+    return null
+}
+
+// Get the frame pacer
+export fn get_frame_pacer(): ?*FramePacer {
+    if g_game_time_manager != null {
+        return &g_game_time_manager.?.frame_pacer
+    }
+    return null
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Pause/resume
+export fn pause_game(pause_music: bool, pause_input: bool) {
+    if g_game_time_manager != null {
+        g_game_time_manager.?.set_game_paused(true, pause_music, pause_input)
+    }
+}
+
+export fn resume_game() {
+    if g_game_time_manager != null {
+        g_game_time_manager.?.set_game_paused(false, true, true)
+    }
+}
+
+export fn toggle_pause() {
+    if g_game_time_manager != null {
+        let is_paused = g_game_time_manager.?.is_game_paused()
+        if is_paused {
+            resume_game()
+        } else {
+            pause_game(true, true)
+        }
+    }
+}
+
+export fn is_game_paused(): bool {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.is_game_paused()
+    }
+    return false
+}
+
+// Time control
+export fn set_slow_motion(enabled: bool) {
+    if g_game_time_manager != null {
+        if enabled {
+            g_game_time_manager.?.enter_slow_motion()
+        } else {
+            g_game_time_manager.?.exit_slow_motion()
+        }
+    }
+}
+
+export fn set_fast_forward(enabled: bool) {
+    if g_game_time_manager != null {
+        if enabled {
+            g_game_time_manager.?.enter_fast_forward()
+        } else {
+            g_game_time_manager.?.set_time_multiplier_smooth(1.0, 5.0)
+        }
+    }
+}
+
+export fn set_time_scale(scale: f32) {
+    if g_game_time_manager != null {
+        g_game_time_manager.?.set_time_multiplier(scale)
+    }
+}
+
+export fn get_time_scale(): f32 {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.get_time_multiplier()
+    }
+    return 1.0
+}
+
+// Frame info
+export fn get_current_frame(): u32 {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.get_current_frame()
+    }
+    return 0
+}
+
+export fn get_game_time_seconds(): f32 {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.get_total_game_time_seconds()
+    }
+    return 0.0
+}
+
+// FPS control
+export fn set_fps_limit(fps: i32) {
+    if g_game_time_manager != null {
+        g_game_time_manager.?.frame_pacer.set_fps_limit(fps)
+    }
+}
+
+export fn get_fps_limit(): i32 {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.frame_pacer.get_fps_limit()
+    }
+    return DEFAULT_FPS_LIMIT
+}
+
+export fn get_current_fps(): f32 {
+    if g_game_time_manager != null {
+        return g_game_time_manager.?.frame_pacer.get_update_fps()
+    }
+    return 0.0
+}

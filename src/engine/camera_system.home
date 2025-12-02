@@ -885,6 +885,459 @@ fn mat4_mul_vec4(m: Mat4, v: Vec4): Vec4 {
 }
 
 // ============================================================================
+// WAYPOINT PATH CAMERA
+// Camera movement along a defined path of waypoints
+// Used for cinematics, intros, and guided camera movement
+// ============================================================================
+
+enum WaypointInterpolation {
+    Linear,             // Straight line between points
+    CatmullRom,         // Smooth spline through all points
+    Bezier,             // Bezier curve using control points
+    Hermite,            // Hermite spline with tangents
+}
+
+struct CameraWaypoint {
+    // Position and orientation
+    position: Vec3,
+    target: Vec3,
+    up: Vec3,
+    fov: f32,
+
+    // Timing
+    arrive_time: f32,       // When to arrive at this waypoint
+    pause_duration: f32,    // How long to pause at this waypoint
+
+    // Interpolation hints
+    tension: f32,           // For Catmull-Rom (0 = smooth, 1 = sharp)
+    continuity: f32,        // For Hermite tangents
+    bias: f32,              // Forward/backward bias
+
+    // Optional control points (for Bezier)
+    control_in_x: f32,
+    control_in_y: f32,
+    control_in_z: f32,
+    control_out_x: f32,
+    control_out_y: f32,
+    control_out_z: f32,
+    has_control_points: bool,
+}
+
+fn create_camera_waypoint(pos: Vec3, target: Vec3, time: f32): CameraWaypoint {
+    return CameraWaypoint {
+        position: pos,
+        target: target,
+        up: Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+        fov: 45.0,
+        arrive_time: time,
+        pause_duration: 0.0,
+        tension: 0.5,
+        continuity: 0.0,
+        bias: 0.0,
+        control_in_x: 0.0,
+        control_in_y: 0.0,
+        control_in_z: 0.0,
+        control_out_x: 0.0,
+        control_out_y: 0.0,
+        control_out_z: 0.0,
+        has_control_points: false,
+    }
+}
+
+struct WaypointPath {
+    waypoints: [CameraWaypoint],
+    waypoint_count: i32,
+    max_waypoints: i32,
+
+    // Playback state
+    current_time: f32,
+    total_duration: f32,
+    is_playing: bool,
+    is_paused: bool,
+    is_looping: bool,
+    is_reversed: bool,
+    playback_speed: f32,
+
+    // Current interpolation mode
+    interpolation: WaypointInterpolation,
+
+    // Events
+    on_waypoint_reached: i32,   // Callback ID (0 = none)
+    on_path_complete: i32,
+    last_waypoint_index: i32,
+
+    // Smoothing
+    smooth_factor: f32,
+    current_position: Vec3,
+    current_target: Vec3,
+    current_fov: f32,
+}
+
+fn create_waypoint_path(): WaypointPath {
+    let wps: [CameraWaypoint] = []
+    for i in 0..64 {
+        wps = wps + [create_camera_waypoint(
+            Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            0.0
+        )]
+    }
+    return WaypointPath {
+        waypoints: wps,
+        waypoint_count: 0,
+        max_waypoints: 64,
+        current_time: 0.0,
+        total_duration: 0.0,
+        is_playing: false,
+        is_paused: false,
+        is_looping: false,
+        is_reversed: false,
+        playback_speed: 1.0,
+        interpolation: WaypointInterpolation.CatmullRom,
+        on_waypoint_reached: 0,
+        on_path_complete: 0,
+        last_waypoint_index: -1,
+        smooth_factor: 0.1,
+        current_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        current_target: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        current_fov: 45.0,
+    }
+}
+
+// Add a waypoint to the path
+fn path_add_waypoint(path: WaypointPath, wp: CameraWaypoint): bool {
+    if path.waypoint_count >= path.max_waypoints {
+        return false
+    }
+
+    path.waypoints[path.waypoint_count] = wp
+    path.waypoint_count = path.waypoint_count + 1
+
+    // Update total duration
+    if wp.arrive_time + wp.pause_duration > path.total_duration {
+        path.total_duration = wp.arrive_time + wp.pause_duration
+    }
+
+    return true
+}
+
+// Clear all waypoints
+fn path_clear(path: WaypointPath) {
+    path.waypoint_count = 0
+    path.total_duration = 0.0
+    path.current_time = 0.0
+    path.is_playing = false
+    path.last_waypoint_index = -1
+}
+
+// Start playing the path
+fn path_play(path: WaypointPath) {
+    if path.waypoint_count < 2 {
+        return  // Need at least 2 waypoints
+    }
+    path.is_playing = true
+    path.is_paused = false
+    path.current_time = 0.0
+    path.last_waypoint_index = -1
+
+    // Initialize current values to first waypoint
+    path.current_position = path.waypoints[0].position
+    path.current_target = path.waypoints[0].target
+    path.current_fov = path.waypoints[0].fov
+}
+
+// Pause playback
+fn path_pause(path: WaypointPath) {
+    path.is_paused = true
+}
+
+// Resume playback
+fn path_resume(path: WaypointPath) {
+    path.is_paused = false
+}
+
+// Stop playback
+fn path_stop(path: WaypointPath) {
+    path.is_playing = false
+    path.is_paused = false
+}
+
+// Set playback speed
+fn path_set_speed(path: WaypointPath, speed: f32) {
+    path.playback_speed = speed
+}
+
+// Jump to specific time
+fn path_seek(path: WaypointPath, time: f32) {
+    path.current_time = time
+    if path.current_time < 0.0 {
+        path.current_time = 0.0
+    }
+    if path.current_time > path.total_duration {
+        path.current_time = path.total_duration
+    }
+}
+
+// Catmull-Rom spline interpolation
+fn catmull_rom_interp(p0: f32, p1: f32, p2: f32, p3: f32, t: f32, tension: f32): f32 {
+    let t2: f32 = t * t
+    let t3: f32 = t2 * t
+    let s: f32 = (1.0 - tension) / 2.0
+
+    let a0: f32 = -s * p0 + (2.0 - s) * p1 + (s - 2.0) * p2 + s * p3
+    let a1: f32 = 2.0 * s * p0 + (s - 3.0) * p1 + (3.0 - 2.0 * s) * p2 - s * p3
+    let a2: f32 = -s * p0 + s * p2
+    let a3: f32 = p1
+
+    return a0 * t3 + a1 * t2 + a2 * t + a3
+}
+
+// Interpolate Vec3 using Catmull-Rom
+fn catmull_rom_vec3(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32, tension: f32): Vec3 {
+    return Vec3 {
+        x: catmull_rom_interp(p0.x, p1.x, p2.x, p3.x, t, tension),
+        y: catmull_rom_interp(p0.y, p1.y, p2.y, p3.y, t, tension),
+        z: catmull_rom_interp(p0.z, p1.z, p2.z, p3.z, t, tension),
+    }
+}
+
+// Linear interpolation
+fn lerp_f32(a: f32, b: f32, t: f32): f32 {
+    return a + (b - a) * t
+}
+
+fn lerp_vec3(a: Vec3, b: Vec3, t: f32): Vec3 {
+    return Vec3 {
+        x: lerp_f32(a.x, b.x, t),
+        y: lerp_f32(a.y, b.y, t),
+        z: lerp_f32(a.z, b.z, t),
+    }
+}
+
+// Find current waypoint segment
+fn path_find_segment(path: WaypointPath): (i32, i32, f32) {
+    // Returns: (start_index, end_index, segment_t)
+    if path.waypoint_count < 2 {
+        return (0, 0, 0.0)
+    }
+
+    let time: f32 = path.current_time
+    if path.is_reversed {
+        time = path.total_duration - time
+    }
+
+    // Find the segment we're in
+    for i in 0..(path.waypoint_count - 1) {
+        let wp1: CameraWaypoint = path.waypoints[i]
+        let wp2: CameraWaypoint = path.waypoints[i + 1]
+
+        let t1: f32 = wp1.arrive_time + wp1.pause_duration
+        let t2: f32 = wp2.arrive_time
+
+        if time >= wp1.arrive_time && time < t1 {
+            // In pause at waypoint i
+            return (i, i, 0.0)
+        }
+
+        if time >= t1 && time <= t2 {
+            // Moving between waypoint i and i+1
+            let segment_duration: f32 = t2 - t1
+            let segment_t: f32 = 0.0
+            if segment_duration > 0.001 {
+                segment_t = (time - t1) / segment_duration
+            }
+            return (i, i + 1, segment_t)
+        }
+    }
+
+    // Past the last waypoint
+    return (path.waypoint_count - 1, path.waypoint_count - 1, 1.0)
+}
+
+// Update path playback
+fn path_update(path: WaypointPath, delta_time: f32) {
+    if !path.is_playing || path.is_paused {
+        return
+    }
+
+    if path.waypoint_count < 2 {
+        return
+    }
+
+    // Advance time
+    let dt: f32 = delta_time * path.playback_speed
+    if path.is_reversed {
+        path.current_time = path.current_time - dt
+    } else {
+        path.current_time = path.current_time + dt
+    }
+
+    // Check bounds
+    if path.current_time >= path.total_duration {
+        if path.is_looping {
+            path.current_time = 0.0
+            path.last_waypoint_index = -1
+        } else {
+            path.current_time = path.total_duration
+            path.is_playing = false
+            // Trigger completion callback here if needed
+        }
+    }
+    if path.current_time < 0.0 {
+        if path.is_looping {
+            path.current_time = path.total_duration
+            path.last_waypoint_index = -1
+        } else {
+            path.current_time = 0.0
+            path.is_playing = false
+        }
+    }
+
+    // Find current segment
+    let segment: (i32, i32, f32) = path_find_segment(path)
+    let i0: i32 = segment.0
+    let i1: i32 = segment.1
+    let t: f32 = segment.2
+
+    // Check for waypoint reached event
+    if i1 != path.last_waypoint_index && i0 == i1 {
+        path.last_waypoint_index = i1
+        // Trigger waypoint callback here if needed
+    }
+
+    // Interpolate camera values
+    if i0 == i1 {
+        // At a waypoint (possibly paused)
+        path.current_position = path.waypoints[i0].position
+        path.current_target = path.waypoints[i0].target
+        path.current_fov = path.waypoints[i0].fov
+    } else {
+        // Between waypoints
+        let wp1: CameraWaypoint = path.waypoints[i0]
+        let wp2: CameraWaypoint = path.waypoints[i1]
+
+        if path.interpolation == WaypointInterpolation.Linear {
+            path.current_position = lerp_vec3(wp1.position, wp2.position, t)
+            path.current_target = lerp_vec3(wp1.target, wp2.target, t)
+            path.current_fov = lerp_f32(wp1.fov, wp2.fov, t)
+        } else if path.interpolation == WaypointInterpolation.CatmullRom {
+            // Get 4 control points for spline
+            let i_prev: i32 = i0 - 1
+            let i_next: i32 = i1 + 1
+            if i_prev < 0 { i_prev = 0 }
+            if i_next >= path.waypoint_count { i_next = path.waypoint_count - 1 }
+
+            let p0: Vec3 = path.waypoints[i_prev].position
+            let p1: Vec3 = wp1.position
+            let p2: Vec3 = wp2.position
+            let p3: Vec3 = path.waypoints[i_next].position
+
+            let tension: f32 = (wp1.tension + wp2.tension) / 2.0
+            path.current_position = catmull_rom_vec3(p0, p1, p2, p3, t, tension)
+
+            // Also interpolate target with spline
+            let t0: Vec3 = path.waypoints[i_prev].target
+            let t1: Vec3 = wp1.target
+            let t2: Vec3 = wp2.target
+            let t3: Vec3 = path.waypoints[i_next].target
+            path.current_target = catmull_rom_vec3(t0, t1, t2, t3, t, tension)
+
+            path.current_fov = lerp_f32(wp1.fov, wp2.fov, t)
+        } else {
+            // Default to linear
+            path.current_position = lerp_vec3(wp1.position, wp2.position, t)
+            path.current_target = lerp_vec3(wp1.target, wp2.target, t)
+            path.current_fov = lerp_f32(wp1.fov, wp2.fov, t)
+        }
+    }
+}
+
+// Apply path to camera
+fn path_apply_to_camera(path: WaypointPath, camera: Camera) {
+    camera.position = path.current_position
+    camera.target = path.current_target
+    camera.fov = path.current_fov
+
+    // Update derived camera values
+    camera.smooth_position = camera.position
+    camera.smooth_target = camera.target
+}
+
+// Get current progress (0.0 - 1.0)
+fn path_get_progress(path: WaypointPath): f32 {
+    if path.total_duration <= 0.0 {
+        return 0.0
+    }
+    return path.current_time / path.total_duration
+}
+
+// Check if path is complete
+fn path_is_complete(path: WaypointPath): bool {
+    return !path.is_playing && path.current_time >= path.total_duration
+}
+
+// Create a circular path around a center point
+fn path_create_orbit(path: WaypointPath, center: Vec3, radius: f32, height: f32,
+                     num_points: i32, duration: f32) {
+    path_clear(path)
+
+    let angle_step: f32 = 6.28318 / (num_points as f32)  // 2*PI
+    let time_step: f32 = duration / (num_points as f32)
+
+    for i in 0..num_points {
+        let angle: f32 = (i as f32) * angle_step
+        let pos: Vec3 = Vec3 {
+            x: center.x + cos(angle) * radius,
+            y: center.y + height,
+            z: center.z + sin(angle) * radius,
+        }
+        let wp: CameraWaypoint = create_camera_waypoint(pos, center, (i as f32) * time_step)
+        path_add_waypoint(path, wp)
+    }
+
+    // Add final point to close the loop
+    let final_wp: CameraWaypoint = create_camera_waypoint(
+        path.waypoints[0].position,
+        center,
+        duration
+    )
+    path_add_waypoint(path, final_wp)
+
+    path.is_looping = true
+}
+
+// Create a fly-by path between two points
+fn path_create_flyby(path: WaypointPath, start: Vec3, end: Vec3, target: Vec3,
+                     height_curve: f32, duration: f32) {
+    path_clear(path)
+
+    // Start waypoint
+    let wp1: CameraWaypoint = create_camera_waypoint(
+        Vec3 { x: start.x, y: start.y + height_curve * 0.5, z: start.z },
+        target,
+        0.0
+    )
+    path_add_waypoint(path, wp1)
+
+    // Midpoint (higher)
+    let mid: Vec3 = Vec3 {
+        x: (start.x + end.x) / 2.0,
+        y: (start.y + end.y) / 2.0 + height_curve,
+        z: (start.z + end.z) / 2.0,
+    }
+    let wp2: CameraWaypoint = create_camera_waypoint(mid, target, duration / 2.0)
+    path_add_waypoint(path, wp2)
+
+    // End waypoint
+    let wp3: CameraWaypoint = create_camera_waypoint(
+        Vec3 { x: end.x, y: end.y + height_curve * 0.5, z: end.z },
+        target,
+        duration
+    )
+    path_add_waypoint(path, wp3)
+}
+
+// ============================================================================
 // TEST FUNCTIONS
 // ============================================================================
 

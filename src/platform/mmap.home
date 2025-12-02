@@ -1,0 +1,575 @@
+// C&C Generals Zero Hour - Home Port
+// Memory-Mapped File Support
+//
+// Provides platform-abstracted memory-mapped file access
+// Critical for efficient loading of:
+// - BIG archives (can be several GB)
+// - W3D model files
+// - Large texture files
+// - Map data
+//
+// Benefits:
+// - Zero-copy file access
+// - Lazy loading (pages loaded on demand)
+// - Efficient random access
+// - Reduced memory pressure (OS manages pages)
+//
+// Platform implementations:
+// - POSIX: mmap/munmap
+// - Windows: CreateFileMapping/MapViewOfFile
+
+import basics/allocator
+
+// ============================================================================
+// ACCESS FLAGS
+// ============================================================================
+const MMAP_READ: i32 = 0x01          // Read access
+const MMAP_WRITE: i32 = 0x02         // Write access
+const MMAP_EXEC: i32 = 0x04          // Execute access (rarely needed)
+const MMAP_PRIVATE: i32 = 0x08       // Private mapping (copy-on-write)
+const MMAP_SHARED: i32 = 0x10        // Shared mapping (changes visible to others)
+
+// Default is read-only private
+const MMAP_DEFAULT: i32 = MMAP_READ | MMAP_PRIVATE
+
+// ============================================================================
+// MAPPING HINTS
+// ============================================================================
+const MMAP_HINT_SEQUENTIAL: i32 = 0x01    // Will be accessed sequentially
+const MMAP_HINT_RANDOM: i32 = 0x02        // Will be accessed randomly
+const MMAP_HINT_WILLNEED: i32 = 0x04      // Will need this data soon
+const MMAP_HINT_DONTNEED: i32 = 0x08      // Won't need this data soon
+
+// ============================================================================
+// MAPPED REGION - A single mapped memory region
+// ============================================================================
+struct MappedRegion {
+    // Mapping info
+    file_path: string
+    file_offset: i64             // Offset into file
+    length: i64                  // Length of mapping
+    flags: i32                   // Access flags
+
+    // Memory pointers
+    base_address: *u8            // Pointer to mapped memory
+    aligned_address: *u8         // Page-aligned address (actual mmap address)
+    alignment_offset: i64        // Offset from aligned to base
+
+    // Platform handles
+    file_handle: i64             // Platform file handle
+    mapping_handle: i64          // Platform mapping handle (Windows only)
+
+    // State
+    is_valid: bool
+    is_locked: bool              // Memory is locked in RAM
+    ref_count: i32               // Reference count
+
+    fn init(): MappedRegion {
+        return MappedRegion {
+            file_path: ""
+            file_offset: 0
+            length: 0
+            flags: 0
+            base_address: null
+            aligned_address: null
+            alignment_offset: 0
+            file_handle: -1
+            mapping_handle: -1
+            is_valid: false
+            is_locked: false
+            ref_count: 0
+        }
+    }
+
+    // Get pointer to mapped data
+    fn data(&self): ?*u8 {
+        if !self.is_valid {
+            return null
+        }
+        return self.base_address
+    }
+
+    // Get data at offset
+    fn get_ptr(&self, offset: i64): ?*u8 {
+        if !self.is_valid or offset < 0 or offset >= self.length {
+            return null
+        }
+        return self.base_address + offset
+    }
+
+    // Read bytes
+    fn read_bytes(&self, offset: i64, buffer: *u8, count: i64): i64 {
+        if !self.is_valid {
+            return 0
+        }
+
+        let available = self.length - offset
+        let to_read = if count < available { count } else { available }
+
+        if to_read <= 0 {
+            return 0
+        }
+
+        // Copy data
+        let src = self.base_address + offset
+        for i in 0..to_read {
+            buffer[i] = src[i]
+        }
+
+        return to_read
+    }
+
+    // Read a value at offset
+    fn read_u8(&self, offset: i64): u8 {
+        let ptr = self.get_ptr(offset)
+        if ptr != null {
+            return ptr.?[0]
+        }
+        return 0
+    }
+
+    fn read_u16(&self, offset: i64): u16 {
+        if !self.is_valid or offset + 2 > self.length {
+            return 0
+        }
+        let ptr = self.base_address + offset
+        return ptr[0] as u16 | ((ptr[1] as u16) << 8)
+    }
+
+    fn read_u32(&self, offset: i64): u32 {
+        if !self.is_valid or offset + 4 > self.length {
+            return 0
+        }
+        let ptr = self.base_address + offset
+        return ptr[0] as u32 |
+               ((ptr[1] as u32) << 8) |
+               ((ptr[2] as u32) << 16) |
+               ((ptr[3] as u32) << 24)
+    }
+
+    fn read_i32(&self, offset: i64): i32 {
+        return self.read_u32(offset) as i32
+    }
+
+    fn read_f32(&self, offset: i64): f32 {
+        let bits = self.read_u32(offset)
+        // Reinterpret as float (platform-specific in real impl)
+        return bits as f32 / 4294967296.0 * 2.0 - 1.0  // Placeholder
+    }
+
+    // Size info
+    fn size(&self): i64 {
+        return self.length
+    }
+
+    fn is_empty(&self): bool {
+        return self.length == 0 or !self.is_valid
+    }
+}
+
+// ============================================================================
+// MEMORY MAPPED FILE - High-level interface for a mapped file
+// ============================================================================
+struct MemoryMappedFile {
+    // File info
+    path: string
+    file_size: i64
+    is_open: bool
+
+    // Current mapping
+    region: MappedRegion
+
+    // Platform handles
+    file_handle: i64
+
+    // Options
+    default_flags: i32
+
+    fn init(): MemoryMappedFile {
+        return MemoryMappedFile {
+            path: ""
+            file_size: 0
+            is_open: false
+            region: MappedRegion.init()
+            file_handle: -1
+            default_flags: MMAP_DEFAULT
+        }
+    }
+
+    // Open a file for memory mapping
+    fn open(&self, path: string, flags: i32): bool {
+        if self.is_open {
+            self.close()
+        }
+
+        self.path = path
+        self.default_flags = flags
+
+        // Platform-specific: open file
+        self.file_handle = open_file_platform(path, flags)
+        if self.file_handle < 0 {
+            return false
+        }
+
+        // Get file size
+        self.file_size = get_file_size_platform(self.file_handle)
+        if self.file_size < 0 {
+            close_file_platform(self.file_handle)
+            self.file_handle = -1
+            return false
+        }
+
+        self.is_open = true
+        return true
+    }
+
+    // Map entire file
+    fn map_all(&self): bool {
+        return self.map(0, self.file_size)
+    }
+
+    // Map a region of the file
+    fn map(&self, offset: i64, length: i64): bool {
+        if !self.is_open {
+            return false
+        }
+
+        // Unmap previous region
+        if self.region.is_valid {
+            self.unmap()
+        }
+
+        // Clamp to file size
+        let actual_length = length
+        if offset + length > self.file_size {
+            actual_length = self.file_size - offset
+        }
+
+        if actual_length <= 0 {
+            return false
+        }
+
+        // Platform-specific: create mapping
+        let result = create_mapping_platform(
+            self.file_handle,
+            offset,
+            actual_length,
+            self.default_flags
+        )
+
+        if result.is_valid {
+            self.region = result
+            self.region.file_path = self.path
+            self.region.ref_count = 1
+            return true
+        }
+
+        return false
+    }
+
+    // Unmap current region
+    fn unmap(&self) {
+        if !self.region.is_valid {
+            return
+        }
+
+        // Platform-specific: destroy mapping
+        destroy_mapping_platform(&self.region)
+
+        self.region = MappedRegion.init()
+    }
+
+    // Close file
+    fn close(&self) {
+        self.unmap()
+
+        if self.file_handle >= 0 {
+            close_file_platform(self.file_handle)
+            self.file_handle = -1
+        }
+
+        self.is_open = false
+        self.file_size = 0
+        self.path = ""
+    }
+
+    // Get mapped data
+    fn data(&self): ?*u8 {
+        return self.region.data()
+    }
+
+    // Get mapped size
+    fn size(&self): i64 {
+        return self.region.length
+    }
+
+    // Advise OS about access pattern
+    fn advise(&self, hint: i32) {
+        if !self.region.is_valid {
+            return
+        }
+
+        // Platform-specific: madvise/VirtualAlloc hints
+        advise_platform(&self.region, hint)
+    }
+
+    // Lock region in memory (prevent paging)
+    fn lock(&self): bool {
+        if !self.region.is_valid or self.region.is_locked {
+            return false
+        }
+
+        if lock_region_platform(&self.region) {
+            self.region.is_locked = true
+            return true
+        }
+
+        return false
+    }
+
+    // Unlock region (allow paging)
+    fn unlock(&self) {
+        if !self.region.is_valid or !self.region.is_locked {
+            return
+        }
+
+        unlock_region_platform(&self.region)
+        self.region.is_locked = false
+    }
+
+    // Sync changes to disk (for writable mappings)
+    fn sync(&self, async_sync: bool): bool {
+        if !self.region.is_valid {
+            return false
+        }
+
+        return sync_region_platform(&self.region, async_sync)
+    }
+
+    fn deinit(&self) {
+        self.close()
+    }
+}
+
+// ============================================================================
+// PLATFORM STUBS (would be implemented per-platform)
+// ============================================================================
+
+fn get_page_size(): i64 {
+    // Would call sysconf(_SC_PAGESIZE) or GetSystemInfo
+    return 4096
+}
+
+fn open_file_platform(path: string, flags: i32): i64 {
+    // Would call open() or CreateFile
+    return -1  // Stub
+}
+
+fn close_file_platform(handle: i64) {
+    // Would call close() or CloseHandle
+}
+
+fn get_file_size_platform(handle: i64): i64 {
+    // Would call fstat() or GetFileSizeEx
+    return -1  // Stub
+}
+
+fn create_mapping_platform(file_handle: i64, offset: i64, length: i64, flags: i32): MappedRegion {
+    let mut region = MappedRegion.init()
+
+    // Get page size for alignment
+    let page_size = get_page_size()
+
+    // Align offset to page boundary
+    let aligned_offset = (offset / page_size) * page_size
+    let alignment_offset = offset - aligned_offset
+    let aligned_length = length + alignment_offset
+
+    // Would call mmap() or CreateFileMapping/MapViewOfFile
+    // region.aligned_address = mmap(...)
+    // region.base_address = region.aligned_address + alignment_offset
+
+    region.file_offset = offset
+    region.length = length
+    region.flags = flags
+    region.alignment_offset = alignment_offset
+    region.file_handle = file_handle
+    // region.is_valid = true  // Set when platform call succeeds
+
+    return region
+}
+
+fn destroy_mapping_platform(region: *MappedRegion) {
+    if !region.is_valid {
+        return
+    }
+
+    // Would call munmap() or UnmapViewOfFile/CloseHandle
+    region.is_valid = false
+    region.base_address = null
+    region.aligned_address = null
+}
+
+fn advise_platform(region: *MappedRegion, hint: i32) {
+    // Would call madvise() or VirtualAlloc with hints
+}
+
+fn lock_region_platform(region: *MappedRegion): bool {
+    // Would call mlock() or VirtualLock
+    return false  // Stub
+}
+
+fn unlock_region_platform(region: *MappedRegion) {
+    // Would call munlock() or VirtualUnlock
+}
+
+fn sync_region_platform(region: *MappedRegion, async_sync: bool): bool {
+    // Would call msync() or FlushViewOfFile
+    return false  // Stub
+}
+
+// ============================================================================
+// MAPPED FILE VIEW - Sliding window over a large mapped file
+// ============================================================================
+// Useful for very large files where mapping everything isn't practical
+struct MappedFileView {
+    file: MemoryMappedFile
+    window_size: i64             // Size of each window
+    current_offset: i64          // Current window offset
+    total_size: i64              // Total file size
+
+    fn init(path: string, window_size: i64): MappedFileView {
+        let mut view = MappedFileView {
+            file: MemoryMappedFile.init()
+            window_size: window_size
+            current_offset: 0
+            total_size: 0
+        }
+
+        if view.file.open(path, MMAP_READ | MMAP_PRIVATE) {
+            view.total_size = view.file.file_size
+            view.file.map(0, window_size)
+        }
+
+        return view
+    }
+
+    // Seek to offset (remaps if necessary)
+    fn seek(&self, offset: i64): bool {
+        if offset < 0 or offset >= self.total_size {
+            return false
+        }
+
+        // Check if offset is within current window
+        if offset >= self.current_offset and
+           offset < self.current_offset + self.file.size() {
+            return true
+        }
+
+        // Remap to new window
+        self.current_offset = (offset / self.window_size) * self.window_size
+        return self.file.map(self.current_offset, self.window_size)
+    }
+
+    // Get pointer to data at offset
+    fn get_ptr(&self, offset: i64): ?*u8 {
+        if !self.seek(offset) {
+            return null
+        }
+
+        let local_offset = offset - self.current_offset
+        return self.file.region.get_ptr(local_offset)
+    }
+
+    // Read bytes at offset
+    fn read_bytes(&self, offset: i64, buffer: *u8, count: i64): i64 {
+        if !self.seek(offset) {
+            return 0
+        }
+
+        let local_offset = offset - self.current_offset
+        return self.file.region.read_bytes(local_offset, buffer, count)
+    }
+
+    fn close(&self) {
+        self.file.close()
+    }
+
+    fn deinit(&self) {
+        self.close()
+    }
+}
+
+// ============================================================================
+// BIG ARCHIVE MMAP HELPER
+// ============================================================================
+// Specialized helper for BIG archive access
+struct BigArchiveMmap {
+    file: MemoryMappedFile
+    header_offset: i64
+    data_offset: i64
+    entry_count: i32
+
+    fn init(): BigArchiveMmap {
+        return BigArchiveMmap {
+            file: MemoryMappedFile.init()
+            header_offset: 0
+            data_offset: 0
+            entry_count: 0
+        }
+    }
+
+    fn open(&self, path: string): bool {
+        if !self.file.open(path, MMAP_READ | MMAP_PRIVATE) {
+            return false
+        }
+
+        // Map just the header initially
+        if !self.file.map(0, 8192) {
+            self.file.close()
+            return false
+        }
+
+        // Read BIG header
+        // Would parse header here...
+
+        return true
+    }
+
+    // Map a specific entry from the archive
+    fn map_entry(&self, entry_offset: i64, entry_size: i64): ?*u8 {
+        if !self.file.map(entry_offset, entry_size) {
+            return null
+        }
+        return self.file.data()
+    }
+
+    fn close(&self) {
+        self.file.close()
+    }
+}
+
+// ============================================================================
+// GLOBAL CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Quick map file read-only
+export fn mmap_file(path: string): MemoryMappedFile {
+    let mut file = MemoryMappedFile.init()
+    file.open(path, MMAP_READ | MMAP_PRIVATE)
+    file.map_all()
+    return file
+}
+
+// Quick map file with specific size
+export fn mmap_file_region(path: string, offset: i64, length: i64): MemoryMappedFile {
+    let mut file = MemoryMappedFile.init()
+    file.open(path, MMAP_READ | MMAP_PRIVATE)
+    file.map(offset, length)
+    return file
+}
+
+// Get the system page size
+export fn get_system_page_size(): i64 {
+    return get_page_size()
+}

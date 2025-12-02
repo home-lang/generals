@@ -1,0 +1,490 @@
+// C&C Generals Zero Hour - Home Port
+// File Permissions and Attributes API
+//
+// Cross-platform file metadata access
+// Useful for:
+// - Checking if files are writable before save
+// - Filtering hidden/system files
+// - Getting file sizes efficiently
+// - Checking modification times for caching
+// - Managing read-only game data files
+
+import basics/allocator
+
+// ============================================================================
+// FILE TYPE
+// ============================================================================
+enum FileType {
+    Unknown = 0
+    Regular = 1          // Normal file
+    Directory = 2        // Directory
+    SymbolicLink = 3     // Symbolic link
+    BlockDevice = 4      // Block device
+    CharDevice = 5       // Character device
+    Pipe = 6             // Named pipe (FIFO)
+    Socket = 7           // Socket
+}
+
+// ============================================================================
+// PERMISSION FLAGS (POSIX-style)
+// ============================================================================
+const PERM_OWNER_READ: i32 = 0o400
+const PERM_OWNER_WRITE: i32 = 0o200
+const PERM_OWNER_EXEC: i32 = 0o100
+const PERM_GROUP_READ: i32 = 0o040
+const PERM_GROUP_WRITE: i32 = 0o020
+const PERM_GROUP_EXEC: i32 = 0o010
+const PERM_OTHER_READ: i32 = 0o004
+const PERM_OTHER_WRITE: i32 = 0o002
+const PERM_OTHER_EXEC: i32 = 0o001
+
+// Common permission masks
+const PERM_RWXU: i32 = 0o700        // Owner read/write/execute
+const PERM_RWXG: i32 = 0o070        // Group read/write/execute
+const PERM_RWXO: i32 = 0o007        // Other read/write/execute
+const PERM_ALL_READ: i32 = 0o444    // Everyone can read
+const PERM_ALL_WRITE: i32 = 0o222   // Everyone can write
+const PERM_ALL_EXEC: i32 = 0o111    // Everyone can execute
+
+// Default permissions for new files/directories
+const PERM_DEFAULT_FILE: i32 = 0o644       // rw-r--r--
+const PERM_DEFAULT_DIR: i32 = 0o755        // rwxr-xr-x
+
+// ============================================================================
+// FILE ATTRIBUTE FLAGS
+// ============================================================================
+const ATTR_NONE: i32 = 0x00
+const ATTR_READONLY: i32 = 0x01      // Read-only (Windows) / no write permission
+const ATTR_HIDDEN: i32 = 0x02        // Hidden file
+const ATTR_SYSTEM: i32 = 0x04        // System file (Windows)
+const ATTR_ARCHIVE: i32 = 0x08       // Archive flag (Windows)
+const ATTR_TEMPORARY: i32 = 0x10     // Temporary file
+const ATTR_COMPRESSED: i32 = 0x20    // Compressed file
+const ATTR_ENCRYPTED: i32 = 0x40     // Encrypted file
+const ATTR_SPARSE: i32 = 0x80        // Sparse file
+const ATTR_REPARSE: i32 = 0x100      // Reparse point (Windows)
+
+// ============================================================================
+// TIME REPRESENTATION
+// ============================================================================
+struct FileTime {
+    // Unix timestamp (seconds since epoch)
+    seconds: i64
+    // Nanoseconds for high-precision timestamps
+    nanoseconds: i32
+
+    fn init(): FileTime {
+        return FileTime {
+            seconds: 0
+            nanoseconds: 0
+        }
+    }
+
+    fn from_seconds(secs: i64): FileTime {
+        return FileTime {
+            seconds: secs
+            nanoseconds: 0
+        }
+    }
+
+    fn to_seconds(&self): f64 {
+        return self.seconds as f64 + (self.nanoseconds as f64 / 1000000000.0)
+    }
+
+    fn equals(&self, other: FileTime): bool {
+        return self.seconds == other.seconds and self.nanoseconds == other.nanoseconds
+    }
+
+    fn is_newer_than(&self, other: FileTime): bool {
+        if self.seconds > other.seconds {
+            return true
+        }
+        if self.seconds == other.seconds {
+            return self.nanoseconds > other.nanoseconds
+        }
+        return false
+    }
+
+    fn is_older_than(&self, other: FileTime): bool {
+        if self.seconds < other.seconds {
+            return true
+        }
+        if self.seconds == other.seconds {
+            return self.nanoseconds < other.nanoseconds
+        }
+        return false
+    }
+
+    fn diff_seconds(&self, other: FileTime): f64 {
+        return self.to_seconds() - other.to_seconds()
+    }
+}
+
+// ============================================================================
+// FILE ATTRIBUTES - Complete file metadata
+// ============================================================================
+struct FileAttributes {
+    // Basic info
+    file_type: FileType
+    size: i64                    // File size in bytes
+
+    // Permissions
+    permissions: i32             // POSIX permission bits
+    attributes: i32              // Platform-specific attributes
+
+    // Ownership (POSIX)
+    owner_id: i32
+    group_id: i32
+
+    // Timestamps
+    created_time: FileTime       // Creation time (not always available)
+    modified_time: FileTime      // Last modification time
+    accessed_time: FileTime      // Last access time
+    changed_time: FileTime       // Last status change time (POSIX)
+
+    // Link info
+    link_count: i32              // Number of hard links
+    is_symlink: bool             // Is this a symbolic link?
+    link_target: string          // Target path if symlink
+
+    // Device info
+    device_id: i64               // Device ID containing file
+    inode: i64                   // Inode number (POSIX)
+
+    // Validity
+    is_valid: bool               // Whether attributes were successfully retrieved
+
+    fn init(): FileAttributes {
+        return FileAttributes {
+            file_type: FileType::Unknown
+            size: 0
+            permissions: 0
+            attributes: ATTR_NONE
+            owner_id: 0
+            group_id: 0
+            created_time: FileTime.init()
+            modified_time: FileTime.init()
+            accessed_time: FileTime.init()
+            changed_time: FileTime.init()
+            link_count: 0
+            is_symlink: false
+            link_target: ""
+            device_id: 0
+            inode: 0
+            is_valid: false
+        }
+    }
+
+    // ========================================
+    // CONVENIENCE METHODS
+    // ========================================
+
+    fn is_file(&self): bool {
+        return self.file_type == FileType::Regular
+    }
+
+    fn is_directory(&self): bool {
+        return self.file_type == FileType::Directory
+    }
+
+    fn is_readable(&self): bool {
+        return (self.permissions & PERM_OWNER_READ) != 0
+    }
+
+    fn is_writable(&self): bool {
+        return (self.permissions & PERM_OWNER_WRITE) != 0 and
+               (self.attributes & ATTR_READONLY) == 0
+    }
+
+    fn is_executable(&self): bool {
+        return (self.permissions & PERM_OWNER_EXEC) != 0
+    }
+
+    fn is_hidden(&self): bool {
+        return (self.attributes & ATTR_HIDDEN) != 0
+    }
+
+    fn is_readonly(&self): bool {
+        return (self.attributes & ATTR_READONLY) != 0
+    }
+
+    fn is_system(&self): bool {
+        return (self.attributes & ATTR_SYSTEM) != 0
+    }
+
+    fn is_empty(&self): bool {
+        return self.size == 0
+    }
+
+    // Get size in human-readable format
+    fn get_size_kb(&self): f64 {
+        return self.size as f64 / 1024.0
+    }
+
+    fn get_size_mb(&self): f64 {
+        return self.size as f64 / (1024.0 * 1024.0)
+    }
+
+    fn get_size_gb(&self): f64 {
+        return self.size as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    // Get permission string (e.g., "rwxr-xr-x")
+    fn get_permission_string(&self): string {
+        let mut result = ""
+
+        // Owner
+        if (self.permissions & PERM_OWNER_READ) != 0 { result = result + "r" } else { result = result + "-" }
+        if (self.permissions & PERM_OWNER_WRITE) != 0 { result = result + "w" } else { result = result + "-" }
+        if (self.permissions & PERM_OWNER_EXEC) != 0 { result = result + "x" } else { result = result + "-" }
+
+        // Group
+        if (self.permissions & PERM_GROUP_READ) != 0 { result = result + "r" } else { result = result + "-" }
+        if (self.permissions & PERM_GROUP_WRITE) != 0 { result = result + "w" } else { result = result + "-" }
+        if (self.permissions & PERM_GROUP_EXEC) != 0 { result = result + "x" } else { result = result + "-" }
+
+        // Other
+        if (self.permissions & PERM_OTHER_READ) != 0 { result = result + "r" } else { result = result + "-" }
+        if (self.permissions & PERM_OTHER_WRITE) != 0 { result = result + "w" } else { result = result + "-" }
+        if (self.permissions & PERM_OTHER_EXEC) != 0 { result = result + "x" } else { result = result + "-" }
+
+        return result
+    }
+}
+
+// ============================================================================
+// PLATFORM STUBS (would be implemented per-platform)
+// ============================================================================
+
+fn stat_file_platform(path: string): FileAttributes {
+    let mut attr = FileAttributes.init()
+    // Would call stat()/lstat() on POSIX or GetFileAttributesEx on Windows
+    return attr
+}
+
+fn set_permissions_platform(path: string, permissions: i32): bool {
+    // Would call chmod() on POSIX or SetFileAttributes on Windows
+    return false
+}
+
+fn set_attributes_platform(path: string, attributes: i32): bool {
+    // Would call SetFileAttributes on Windows
+    // On POSIX, some attributes map to extended attributes
+    return false
+}
+
+fn set_times_platform(path: string, accessed: FileTime, modified: FileTime): bool {
+    // Would call utimes()/utimensat() on POSIX or SetFileTime on Windows
+    return false
+}
+
+fn get_symlink_target_platform(path: string): string {
+    // Would call readlink() on POSIX
+    return ""
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+// Get file attributes
+export fn get_file_attributes(path: string): FileAttributes {
+    return stat_file_platform(path)
+}
+
+// Check if file exists
+export fn file_exists(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid
+}
+
+// Check if path is a directory
+export fn is_directory(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_directory()
+}
+
+// Check if path is a regular file
+export fn is_file(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_file()
+}
+
+// Check if path is a symbolic link
+export fn is_symlink(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_symlink
+}
+
+// Get file size
+export fn get_file_size(path: string): i64 {
+    let attr = stat_file_platform(path)
+    if attr.is_valid {
+        return attr.size
+    }
+    return -1
+}
+
+// Get modification time
+export fn get_modification_time(path: string): FileTime {
+    let attr = stat_file_platform(path)
+    return attr.modified_time
+}
+
+// Check if file is readable
+export fn can_read(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_readable()
+}
+
+// Check if file is writable
+export fn can_write(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_writable()
+}
+
+// Check if file is executable
+export fn can_execute(path: string): bool {
+    let attr = stat_file_platform(path)
+    return attr.is_valid and attr.is_executable()
+}
+
+// Set file permissions
+export fn set_permissions(path: string, permissions: i32): bool {
+    return set_permissions_platform(path, permissions)
+}
+
+// Set file as read-only
+export fn set_readonly(path: string, readonly: bool): bool {
+    let attr = stat_file_platform(path)
+    if !attr.is_valid {
+        return false
+    }
+
+    let new_attr = if readonly {
+        attr.attributes | ATTR_READONLY
+    } else {
+        attr.attributes & ~ATTR_READONLY
+    }
+
+    return set_attributes_platform(path, new_attr)
+}
+
+// Set file as hidden
+export fn set_hidden(path: string, hidden: bool): bool {
+    let attr = stat_file_platform(path)
+    if !attr.is_valid {
+        return false
+    }
+
+    let new_attr = if hidden {
+        attr.attributes | ATTR_HIDDEN
+    } else {
+        attr.attributes & ~ATTR_HIDDEN
+    }
+
+    return set_attributes_platform(path, new_attr)
+}
+
+// Update modification time to now
+export fn touch(path: string): bool {
+    // Would get current time and call set_times_platform
+    let now = FileTime.init()  // Would be current time
+    return set_times_platform(path, now, now)
+}
+
+// Set specific modification time
+export fn set_modification_time(path: string, time: FileTime): bool {
+    let attr = stat_file_platform(path)
+    if !attr.is_valid {
+        return false
+    }
+    return set_times_platform(path, attr.accessed_time, time)
+}
+
+// Check if file A is newer than file B
+export fn is_newer_than(path_a: string, path_b: string): bool {
+    let attr_a = stat_file_platform(path_a)
+    let attr_b = stat_file_platform(path_b)
+
+    if !attr_a.is_valid or !attr_b.is_valid {
+        return false
+    }
+
+    return attr_a.modified_time.is_newer_than(attr_b.modified_time)
+}
+
+// Get symbolic link target
+export fn get_link_target(path: string): string {
+    return get_symlink_target_platform(path)
+}
+
+// ============================================================================
+// FILTER HELPERS - For directory listing
+// ============================================================================
+
+// File filter function type
+type FileFilter = fn(attr: *FileAttributes, name: string): bool
+
+// Built-in filters
+fn filter_files_only(attr: *FileAttributes, name: string): bool {
+    return attr.is_file()
+}
+
+fn filter_directories_only(attr: *FileAttributes, name: string): bool {
+    return attr.is_directory()
+}
+
+fn filter_no_hidden(attr: *FileAttributes, name: string): bool {
+    return !attr.is_hidden() and !name.starts_with(".")
+}
+
+fn filter_writable_only(attr: *FileAttributes, name: string): bool {
+    return attr.is_writable()
+}
+
+fn filter_by_extension(attr: *FileAttributes, name: string): bool {
+    // Would need extension parameter - this is a placeholder
+    return true
+}
+
+// ============================================================================
+// GAME-SPECIFIC HELPERS
+// ============================================================================
+
+// Check if file needs recompilation (source newer than target)
+export fn needs_rebuild(source_path: string, target_path: string): bool {
+    let source_attr = stat_file_platform(source_path)
+    let target_attr = stat_file_platform(target_path)
+
+    // If source doesn't exist, can't build
+    if !source_attr.is_valid {
+        return false
+    }
+
+    // If target doesn't exist, need to build
+    if !target_attr.is_valid {
+        return true
+    }
+
+    // Build if source is newer
+    return source_attr.modified_time.is_newer_than(target_attr.modified_time)
+}
+
+// Check if save directory is writable
+export fn can_save_to_directory(dir_path: string): bool {
+    let attr = stat_file_platform(dir_path)
+    return attr.is_valid and attr.is_directory() and attr.is_writable()
+}
+
+// Get total size of directory (non-recursive)
+export fn get_directory_size(dir_path: string): i64 {
+    // Would iterate directory and sum file sizes
+    return 0  // Placeholder
+}
+
+// Check if path is within another directory
+export fn is_path_under(path: string, parent: string): bool {
+    // Normalize paths and check if path starts with parent
+    return path.starts_with(parent)
+}

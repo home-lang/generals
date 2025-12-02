@@ -1,5 +1,13 @@
-// State Machine System - Generic State Machine Implementation
-// Based on Thyme engine state machine architecture
+// C&C Generals Zero Hour - Home Port
+// Finite State Machine System
+//
+// Generic state machine implementation for:
+// - AI behavior control
+// - Unit states (idle, move, attack, etc.)
+// - Animation state transitions
+// - Game flow states
+//
+// Based on original StateMachine.h by Michael S. Booth
 // Used for AI behavior, game states, animations, and more
 
 
@@ -762,5 +770,697 @@ fn run_all_tests(): bool {
     assert(test_timer_transition(), "Timer transition test failed")
     assert(test_context(), "Context test failed")
     assert(test_builder(), "Builder test failed")
+    return true
+}
+
+// ============================================================================
+// ORIGINAL STATE MACHINE COMPATIBLE TYPES
+// ============================================================================
+// These types match the original C++ StateMachine.h for compatibility
+
+// State ID type (matches original)
+type StateID = u32
+
+// Special state IDs (matches original)
+const INVALID_STATE_ID: StateID = 999999
+const MACHINE_DONE_STATE_ID: StateID = 999998
+const EXIT_MACHINE_WITH_SUCCESS: StateID = 9998
+const EXIT_MACHINE_WITH_FAILURE: StateID = 9999
+
+// State return codes (matches original)
+// Positive values = sleep for N frames
+// Zero = continue
+// Negative = success/failure
+const STATE_CONTINUE: i32 = 0
+const STATE_SUCCESS: i32 = -1
+const STATE_FAILURE: i32 = -2
+const STATE_SLEEP_FOREVER: i32 = 0x3FFFFFFF
+
+fn state_sleep(num_frames: i32): i32 {
+    return num_frames
+}
+
+fn is_state_sleep(ret: i32): bool {
+    return ret > 0
+}
+
+fn get_state_sleep_frames(ret: i32): i32 {
+    return ret
+}
+
+fn convert_sleep_to_continue(s: i32): i32 {
+    if is_state_sleep(s) { return STATE_CONTINUE }
+    return s
+}
+
+fn min_sleep(encloser_sleep: i32, enclosee_result: i32): i32 {
+    if is_state_sleep(enclosee_result) {
+        let enclosee_sleep = get_state_sleep_frames(enclosee_result)
+        if encloser_sleep < enclosee_sleep {
+            return state_sleep(encloser_sleep)
+        }
+        return state_sleep(enclosee_sleep)
+    }
+    return enclosee_result
+}
+
+// State exit type
+enum StateExitType {
+    ExitNormal,    // State exited due to normal state transitioning
+    ExitReset,     // State exited due to state machine reset
+}
+
+// Object-based state machine for AI (matches original pattern)
+struct ObjectStateMachine {
+    definition: StateMachineDefinition,
+    current_state_id: StateID,
+    sleep_till: i32,
+    owner_id: i32,
+    goal_object_id: i32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_z: f64,
+    is_locked: bool,
+    locked_by: string,
+    default_state_inited: bool,
+    current_frame: i32,
+    name: string,
+    ref_count: i32,
+}
+
+fn create_object_state_machine(name: string, owner_id: i32): ObjectStateMachine {
+    return ObjectStateMachine {
+        definition: create_definition(name),
+        current_state_id: INVALID_STATE_ID,
+        sleep_till: 0,
+        owner_id: owner_id,
+        goal_object_id: 0,
+        goal_x: 0.0,
+        goal_y: 0.0,
+        goal_z: 0.0,
+        is_locked: false,
+        locked_by: "",
+        default_state_inited: false,
+        current_frame: 0,
+        name: name,
+        ref_count: 1,
+    }
+}
+
+fn osm_set_goal_object(osm: ObjectStateMachine, object_id: i32) {
+    osm.goal_object_id = object_id
+}
+
+fn osm_set_goal_position(osm: ObjectStateMachine, x: f64, y: f64, z: f64) {
+    osm.goal_x = x
+    osm.goal_y = y
+    osm.goal_z = z
+}
+
+fn osm_lock(osm: ObjectStateMachine, msg: string) {
+    osm.is_locked = true
+    osm.locked_by = msg
+}
+
+fn osm_unlock(osm: ObjectStateMachine) {
+    osm.is_locked = false
+    osm.locked_by = ""
+}
+
+fn osm_is_locked(osm: ObjectStateMachine): bool {
+    return osm.is_locked
+}
+
+fn osm_halt(osm: ObjectStateMachine) {
+    osm.current_state_id = INVALID_STATE_ID
+    osm.is_locked = true
+}
+
+fn osm_add_ref(osm: ObjectStateMachine) {
+    osm.ref_count = osm.ref_count + 1
+}
+
+fn osm_release_ref(osm: ObjectStateMachine) {
+    osm.ref_count = osm.ref_count - 1
+}
+
+fn osm_num_refs(osm: ObjectStateMachine): i32 {
+    return osm.ref_count
+}
+
+// ============================================================================
+// HIERARCHICAL STATE MACHINE
+// ============================================================================
+// Hierarchical State Machines (HSM) allow states to contain sub-state machines.
+// This enables:
+// - Grouping related states together
+// - Shared transitions for all states in a group
+// - History states (remember which sub-state was active)
+// - Default sub-states
+//
+// Structure:
+// - Parent state contains a nested state machine
+// - When parent is entered, nested machine starts at its initial state
+// - Parent transitions take priority over child transitions
+// - exit() cascades from child to parent
+
+// HSM State - Can optionally contain a nested state machine
+struct HierarchicalState {
+    name: string,
+    enter_actions: Vec<StateAction>,
+    update_actions: Vec<StateAction>,
+    exit_actions: Vec<StateAction>,
+    transitions: Vec<StateTransition>,
+    is_initial: bool,
+    is_final: bool,
+
+    // Hierarchical extensions
+    parent_state: string,       // Name of parent state, "" if root
+    nested_machine: ?StateMachineDefinition,  // Nested state machine if this is a composite state
+    use_history: bool,          // If true, remember last active child state
+    history_state: string,      // Last active child state (for history)
+    default_child: string,      // Default child state to enter
+}
+
+fn create_hierarchical_state(name: string): HierarchicalState {
+    return HierarchicalState {
+        name: name,
+        enter_actions: Vec<StateAction>{},
+        update_actions: Vec<StateAction>{},
+        exit_actions: Vec<StateAction>{},
+        transitions: Vec<StateTransition>{},
+        is_initial: false,
+        is_final: false,
+        parent_state: "",
+        nested_machine: null,
+        use_history: false,
+        history_state: "",
+        default_child: "",
+    }
+}
+
+// Hierarchical State Machine Instance
+struct HierarchicalStateMachine {
+    definition: StateMachineDefinition,
+    states: HashMap<String, HierarchicalState>,  // All states (hierarchical)
+    current_state: string,
+    state_stack: Vec<string>,    // Stack of active states (parent -> child)
+    context: StateMachineContext,
+    is_running: bool,
+    state_time: f64,
+    total_time: f64,
+}
+
+fn create_hsm(name: string): HierarchicalStateMachine {
+    return HierarchicalStateMachine {
+        definition: create_definition(name),
+        states: HashMap<String, HierarchicalState>{},
+        current_state: "",
+        state_stack: Vec<string>{},
+        context: create_context(),
+        is_running: false,
+        state_time: 0.0,
+        total_time: 0.0,
+    }
+}
+
+// Add hierarchical state
+fn hsm_add_state(hsm: HierarchicalStateMachine, state: HierarchicalState) {
+    hsm.states.set(state.name, state)
+    if state.is_initial and state.parent_state == "" {
+        hsm.current_state = state.name
+    }
+}
+
+// Set parent-child relationship
+fn hsm_set_parent(hsm: HierarchicalStateMachine, child_name: string, parent_name: string) {
+    if hsm.states.has(child_name) {
+        let child = hsm.states.get(child_name)
+        child.parent_state = parent_name
+        hsm.states.set(child_name, child)
+    }
+}
+
+// Set nested state machine for composite state
+fn hsm_set_nested_machine(hsm: HierarchicalStateMachine, state_name: string, nested: StateMachineDefinition) {
+    if hsm.states.has(state_name) {
+        let state = hsm.states.get(state_name)
+        state.nested_machine = nested
+        hsm.states.set(state_name, state)
+    }
+}
+
+// Get all ancestors of a state (bottom-up)
+fn hsm_get_ancestors(hsm: HierarchicalStateMachine, state_name: string): Vec<string> {
+    let result = Vec<string>{}
+    let current = state_name
+
+    while current != "" {
+        if hsm.states.has(current) {
+            let state = hsm.states.get(current)
+            if state.parent_state != "" {
+                result.add(state.parent_state)
+            }
+            current = state.parent_state
+        } else {
+            break
+        }
+    }
+
+    return result
+}
+
+// Get path from root to state (top-down)
+fn hsm_get_path_to_state(hsm: HierarchicalStateMachine, state_name: string): Vec<string> {
+    let ancestors = hsm_get_ancestors(hsm, state_name)
+    let result = Vec<string>{}
+
+    // Reverse order (ancestors is bottom-up, we need top-down)
+    for i in 0..ancestors.len() {
+        let idx = ancestors.len() - 1 - i
+        result.add(ancestors.get(idx))
+    }
+    result.add(state_name)
+
+    return result
+}
+
+// Find Lowest Common Ancestor of two states
+fn hsm_find_lca(hsm: HierarchicalStateMachine, state_a: string, state_b: string): string {
+    let ancestors_a = hsm_get_ancestors(hsm, state_a)
+    ancestors_a.add(state_a)
+
+    let ancestors_b = hsm_get_ancestors(hsm, state_b)
+    ancestors_b.add(state_b)
+
+    // Find common ancestor (start from roots)
+    let lca = ""
+    let min_len = ancestors_a.len()
+    if ancestors_b.len() < min_len {
+        min_len = ancestors_b.len()
+    }
+
+    for i in 0..min_len {
+        let idx_a = ancestors_a.len() - 1 - i
+        let idx_b = ancestors_b.len() - 1 - i
+        if ancestors_a.get(idx_a) == ancestors_b.get(idx_b) {
+            lca = ancestors_a.get(idx_a)
+        } else {
+            break
+        }
+    }
+
+    return lca
+}
+
+// Start HSM
+fn hsm_start(hsm: HierarchicalStateMachine) {
+    hsm.is_running = true
+    hsm.state_time = 0.0
+    hsm.total_time = 0.0
+    hsm.state_stack.clear()
+
+    // Enter initial state and all its default children
+    hsm_enter_state_path(hsm, hsm.current_state)
+}
+
+// Enter a state and optionally its default children
+fn hsm_enter_state_path(hsm: HierarchicalStateMachine, target_state: string) {
+    if !hsm.states.has(target_state) {
+        return
+    }
+
+    let state = hsm.states.get(target_state)
+
+    // Execute enter actions
+    execute_actions(state.enter_actions, hsm.context)
+
+    // Add to stack
+    hsm.state_stack.add(target_state)
+    hsm.current_state = target_state
+
+    // If composite state with nested machine, enter default child
+    if state.nested_machine != null {
+        let nested = state.nested_machine
+        let child_state = ""
+
+        // Use history if enabled and available
+        if state.use_history and state.history_state != "" {
+            child_state = state.history_state
+        } else if state.default_child != "" {
+            child_state = state.default_child
+        } else if nested.initial_state != "" {
+            child_state = nested.initial_state
+        }
+
+        if child_state != "" {
+            hsm_enter_state_path(hsm, child_state)
+        }
+    }
+}
+
+// Exit current state (and children)
+fn hsm_exit_current_state(hsm: HierarchicalStateMachine) {
+    // Exit in reverse order (children first)
+    while hsm.state_stack.len() > 0 {
+        let state_name = hsm.state_stack.get(hsm.state_stack.len() - 1)
+        hsm.state_stack.remove(hsm.state_stack.len() - 1)
+
+        if hsm.states.has(state_name) {
+            let state = hsm.states.get(state_name)
+
+            // Save history
+            if state.use_history and hsm.state_stack.len() > 0 {
+                // Parent is now at top of stack
+                let parent_name = state.parent_state
+                if hsm.states.has(parent_name) {
+                    let parent = hsm.states.get(parent_name)
+                    parent.history_state = state_name
+                    hsm.states.set(parent_name, parent)
+                }
+            }
+
+            // Execute exit actions
+            execute_actions(state.exit_actions, hsm.context)
+        }
+    }
+}
+
+// Exit states up to (but not including) a target ancestor
+fn hsm_exit_to_ancestor(hsm: HierarchicalStateMachine, ancestor: string) {
+    while hsm.state_stack.len() > 0 {
+        let state_name = hsm.state_stack.get(hsm.state_stack.len() - 1)
+
+        if state_name == ancestor {
+            break
+        }
+
+        hsm.state_stack.remove(hsm.state_stack.len() - 1)
+
+        if hsm.states.has(state_name) {
+            let state = hsm.states.get(state_name)
+            execute_actions(state.exit_actions, hsm.context)
+        }
+    }
+}
+
+// Transition to a new state
+fn hsm_transition(hsm: HierarchicalStateMachine, target_state: string) {
+    if !hsm.states.has(target_state) {
+        return
+    }
+
+    // Find lowest common ancestor
+    let current = hsm.current_state
+    let lca = hsm_find_lca(hsm, current, target_state)
+
+    // Exit up to LCA
+    hsm_exit_to_ancestor(hsm, lca)
+
+    // Get path from LCA to target (excluding LCA itself)
+    let path_to_target = hsm_get_path_to_state(hsm, target_state)
+
+    // Find index of LCA in path
+    let start_idx = 0
+    for i in 0..path_to_target.len() {
+        if path_to_target.get(i) == lca {
+            start_idx = i + 1
+            break
+        }
+    }
+
+    // Enter states from LCA to target
+    for i in start_idx..path_to_target.len() {
+        let state_name = path_to_target.get(i)
+        if hsm.states.has(state_name) {
+            let state = hsm.states.get(state_name)
+            execute_actions(state.enter_actions, hsm.context)
+            hsm.state_stack.add(state_name)
+        }
+    }
+
+    hsm.current_state = target_state
+    hsm.state_time = 0.0
+}
+
+// Update HSM
+fn hsm_update(hsm: HierarchicalStateMachine, delta_time: f64): StateResult {
+    if !hsm.is_running {
+        return StateResult::Continue
+    }
+
+    hsm.state_time = hsm.state_time + delta_time
+    hsm.total_time = hsm.total_time + delta_time
+    update_timer(hsm.context, "state_time", delta_time)
+
+    // Process states from root to current (outer transitions have priority)
+    for i in 0..hsm.state_stack.len() {
+        let state_name = hsm.state_stack.get(i)
+        if !hsm.states.has(state_name) {
+            continue
+        }
+
+        let state = hsm.states.get(state_name)
+
+        // Check transitions
+        for trans in state.transitions {
+            if evaluate_transition(trans, hsm.context) {
+                hsm_transition(hsm, trans.target_state)
+                return StateResult::Transition
+            }
+        }
+
+        // Execute update actions
+        execute_actions(state.update_actions, hsm.context)
+    }
+
+    // Check if in final state
+    if hsm.states.has(hsm.current_state) {
+        let current = hsm.states.get(hsm.current_state)
+        if current.is_final {
+            return StateResult::Success
+        }
+    }
+
+    return StateResult::Continue
+}
+
+// Stop HSM
+fn hsm_stop(hsm: HierarchicalStateMachine) {
+    hsm_exit_current_state(hsm)
+    hsm.is_running = false
+}
+
+// Reset HSM
+fn hsm_reset(hsm: HierarchicalStateMachine) {
+    hsm_exit_current_state(hsm)
+    hsm.state_stack.clear()
+    hsm.context = create_context()
+    hsm.is_running = false
+    hsm.state_time = 0.0
+    hsm.total_time = 0.0
+
+    // Clear history
+    for state_name in hsm.states.keys() {
+        let state = hsm.states.get(state_name)
+        state.history_state = ""
+        hsm.states.set(state_name, state)
+    }
+}
+
+// Get deepest active state
+fn hsm_get_current_state(hsm: HierarchicalStateMachine): string {
+    return hsm.current_state
+}
+
+// Get full state path
+fn hsm_get_state_path(hsm: HierarchicalStateMachine): Vec<string> {
+    let result = Vec<string>{}
+    for i in 0..hsm.state_stack.len() {
+        result.add(hsm.state_stack.get(i))
+    }
+    return result
+}
+
+// Check if a state is currently active (including ancestors)
+fn hsm_is_in_state(hsm: HierarchicalStateMachine, state_name: string): bool {
+    for i in 0..hsm.state_stack.len() {
+        if hsm.state_stack.get(i) == state_name {
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================================
+// HSM BUILDER
+// ============================================================================
+
+struct HSMBuilder {
+    hsm: HierarchicalStateMachine,
+    current_state: HierarchicalState,
+    state_stack: Vec<string>,  // For nested building
+}
+
+fn hsm_builder(name: string): HSMBuilder {
+    return HSMBuilder {
+        hsm: create_hsm(name),
+        current_state: create_hierarchical_state(""),
+        state_stack: Vec<string>{},
+    }
+}
+
+fn hsm_build_state(b: HSMBuilder, name: string, is_initial: bool, is_final: bool): HSMBuilder {
+    // Save previous state
+    if b.current_state.name != "" {
+        hsm_add_state(b.hsm, b.current_state)
+    }
+
+    b.current_state = create_hierarchical_state(name)
+    b.current_state.is_initial = is_initial
+    b.current_state.is_final = is_final
+
+    // Set parent if building nested
+    if b.state_stack.len() > 0 {
+        b.current_state.parent_state = b.state_stack.get(b.state_stack.len() - 1)
+    }
+
+    return b
+}
+
+fn hsm_build_enter_nested(b: HSMBuilder): HSMBuilder {
+    // Push current state onto stack for nesting
+    if b.current_state.name != "" {
+        b.state_stack.add(b.current_state.name)
+    }
+    return b
+}
+
+fn hsm_build_exit_nested(b: HSMBuilder): HSMBuilder {
+    // Pop from nesting stack
+    if b.state_stack.len() > 0 {
+        b.state_stack.remove(b.state_stack.len() - 1)
+    }
+    return b
+}
+
+fn hsm_build_on_enter(b: HSMBuilder, action_type: string): HSMBuilder {
+    let action = create_action(action_type)
+    b.current_state.enter_actions.add(action)
+    return b
+}
+
+fn hsm_build_on_exit(b: HSMBuilder, action_type: string): HSMBuilder {
+    let action = create_action(action_type)
+    b.current_state.exit_actions.add(action)
+    return b
+}
+
+fn hsm_build_on_update(b: HSMBuilder, action_type: string): HSMBuilder {
+    let action = create_action(action_type)
+    b.current_state.update_actions.add(action)
+    return b
+}
+
+fn hsm_build_transition(b: HSMBuilder, target: string, condition: ConditionType): HSMBuilder {
+    let trans = create_transition(target)
+    let cond = create_condition(condition)
+    trans.conditions.add(cond)
+    b.current_state.transitions.add(trans)
+    return b
+}
+
+fn hsm_build_history(b: HSMBuilder): HSMBuilder {
+    b.current_state.use_history = true
+    return b
+}
+
+fn hsm_build_default_child(b: HSMBuilder, child_name: string): HSMBuilder {
+    b.current_state.default_child = child_name
+    return b
+}
+
+fn hsm_build_finish(b: HSMBuilder): HierarchicalStateMachine {
+    // Save final state
+    if b.current_state.name != "" {
+        hsm_add_state(b.hsm, b.current_state)
+    }
+    return b.hsm
+}
+
+// ============================================================================
+// HSM TESTS
+// ============================================================================
+
+fn test_hsm_basic(): bool {
+    let hsm = create_hsm("test_hsm")
+
+    // Root states
+    let s1 = create_hierarchical_state("root1")
+    s1.is_initial = true
+    let t1 = create_transition("root2")
+    let c1 = create_condition(ConditionType::Flag)
+    c1.flag_name = "go_to_root2"
+    t1.conditions.add(c1)
+    s1.transitions.add(t1)
+    hsm_add_state(hsm, s1)
+
+    let s2 = create_hierarchical_state("root2")
+    s2.is_final = true
+    hsm_add_state(hsm, s2)
+
+    hsm_start(hsm)
+    assert(hsm_get_current_state(hsm) == "root1", "Should start in root1")
+
+    set_flag(hsm.context, "go_to_root2", true)
+    hsm_update(hsm, 0.1)
+    assert(hsm_get_current_state(hsm) == "root2", "Should transition to root2")
+
+    return true
+}
+
+fn test_hsm_nested(): bool {
+    let hsm = create_hsm("nested_test")
+
+    // Parent composite state
+    let parent = create_hierarchical_state("parent")
+    parent.is_initial = true
+    parent.default_child = "child1"
+    hsm_add_state(hsm, parent)
+
+    // Child states
+    let child1 = create_hierarchical_state("child1")
+    child1.parent_state = "parent"
+    child1.is_initial = true
+    let t_c1 = create_transition("child2")
+    let c_c1 = create_condition(ConditionType::Flag)
+    c_c1.flag_name = "next_child"
+    t_c1.conditions.add(c_c1)
+    child1.transitions.add(t_c1)
+    hsm_add_state(hsm, child1)
+
+    let child2 = create_hierarchical_state("child2")
+    child2.parent_state = "parent"
+    hsm_add_state(hsm, child2)
+
+    hsm_start(hsm)
+
+    // Should be in child1 (default child of parent)
+    assert(hsm_is_in_state(hsm, "parent"), "Should be in parent")
+    assert(hsm_is_in_state(hsm, "child1"), "Should be in child1")
+
+    // Trigger child transition
+    set_flag(hsm.context, "next_child", true)
+    hsm_update(hsm, 0.1)
+
+    assert(hsm_is_in_state(hsm, "parent"), "Should still be in parent")
+    assert(hsm_is_in_state(hsm, "child2"), "Should now be in child2")
+
+    return true
+}
+
+fn run_hsm_tests(): bool {
+    assert(test_hsm_basic(), "Basic HSM test failed")
+    assert(test_hsm_nested(), "Nested HSM test failed")
     return true
 }

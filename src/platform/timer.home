@@ -1,0 +1,953 @@
+// C&C Generals Zero Hour - Home Port
+// High-Resolution Timer System
+//
+// Provides platform-abstracted high-precision timing for:
+// - Frame timing and delta time calculation
+// - Performance profiling
+// - Animation timing
+// - Game logic fixed timesteps
+// - Network synchronization
+//
+// Platform implementations:
+// - Windows: QueryPerformanceCounter or RDTSC
+// - macOS: mach_absolute_time
+// - Linux: clock_gettime(CLOCK_MONOTONIC)
+//
+// Based on original PerfTimer.h
+
+// ============================================================================
+// TIME CONSTANTS
+// ============================================================================
+const NANOSECONDS_PER_SECOND: i64 = 1000000000
+const MICROSECONDS_PER_SECOND: i64 = 1000000
+const MILLISECONDS_PER_SECOND: i64 = 1000
+
+// Game logic runs at 30 FPS
+const LOGIC_FRAMES_PER_SECOND: i32 = 30
+const LOGIC_FRAME_TIME_MS: f64 = 1000.0 / 30.0
+const LOGIC_FRAME_TIME_SEC: f64 = 1.0 / 30.0
+
+// ============================================================================
+// TIMESTAMP - Raw timer value
+// ============================================================================
+struct Timestamp {
+    ticks: i64
+
+    fn init(): Timestamp {
+        return Timestamp { ticks: 0 }
+    }
+
+    fn now(): Timestamp {
+        return Timestamp { ticks: get_timer_ticks() }
+    }
+
+    fn is_zero(&self): bool {
+        return self.ticks == 0
+    }
+
+    fn diff(&self, other: Timestamp): i64 {
+        return self.ticks - other.ticks
+    }
+
+    fn add_ticks(&self, ticks: i64): Timestamp {
+        return Timestamp { ticks: self.ticks + ticks }
+    }
+
+    fn is_after(&self, other: Timestamp): bool {
+        return self.ticks > other.ticks
+    }
+
+    fn is_before(&self, other: Timestamp): bool {
+        return self.ticks < other.ticks
+    }
+}
+
+// ============================================================================
+// DURATION - Time span between two timestamps
+// ============================================================================
+struct Duration {
+    ticks: i64
+
+    fn init(): Duration {
+        return Duration { ticks: 0 }
+    }
+
+    fn from_ticks(ticks: i64): Duration {
+        return Duration { ticks: ticks }
+    }
+
+    fn from_seconds(seconds: f64): Duration {
+        let ticks_per_sec = get_timer_frequency()
+        return Duration { ticks: (seconds * ticks_per_sec as f64) as i64 }
+    }
+
+    fn from_milliseconds(ms: f64): Duration {
+        return Duration.from_seconds(ms / 1000.0)
+    }
+
+    fn from_microseconds(us: f64): Duration {
+        return Duration.from_seconds(us / 1000000.0)
+    }
+
+    fn to_seconds(&self): f64 {
+        let ticks_per_sec = get_timer_frequency()
+        return self.ticks as f64 / ticks_per_sec as f64
+    }
+
+    fn to_milliseconds(&self): f64 {
+        return self.to_seconds() * 1000.0
+    }
+
+    fn to_microseconds(&self): f64 {
+        return self.to_seconds() * 1000000.0
+    }
+
+    fn to_nanoseconds(&self): i64 {
+        let ticks_per_sec = get_timer_frequency()
+        return (self.ticks * NANOSECONDS_PER_SECOND) / ticks_per_sec
+    }
+
+    fn add(&self, other: Duration): Duration {
+        return Duration { ticks: self.ticks + other.ticks }
+    }
+
+    fn sub(&self, other: Duration): Duration {
+        return Duration { ticks: self.ticks - other.ticks }
+    }
+
+    fn scale(&self, factor: f64): Duration {
+        return Duration { ticks: (self.ticks as f64 * factor) as i64 }
+    }
+
+    fn is_zero(&self): bool {
+        return self.ticks == 0
+    }
+}
+
+// ============================================================================
+// STOPWATCH - Measure elapsed time
+// ============================================================================
+struct Stopwatch {
+    start_time: Timestamp
+    accumulated: Duration
+    is_running: bool
+
+    fn init(): Stopwatch {
+        return Stopwatch {
+            start_time: Timestamp.init()
+            accumulated: Duration.init()
+            is_running: false
+        }
+    }
+
+    fn start(&self) {
+        if !self.is_running {
+            self.start_time = Timestamp.now()
+            self.is_running = true
+        }
+    }
+
+    fn stop(&self) {
+        if self.is_running {
+            let now = Timestamp.now()
+            let elapsed = now.diff(self.start_time)
+            self.accumulated = self.accumulated.add(Duration.from_ticks(elapsed))
+            self.is_running = false
+        }
+    }
+
+    fn reset(&self) {
+        self.start_time = Timestamp.init()
+        self.accumulated = Duration.init()
+        self.is_running = false
+    }
+
+    fn restart(&self) {
+        self.reset()
+        self.start()
+    }
+
+    fn elapsed(&self): Duration {
+        if self.is_running {
+            let now = Timestamp.now()
+            let current = Duration.from_ticks(now.diff(self.start_time))
+            return self.accumulated.add(current)
+        }
+        return self.accumulated
+    }
+
+    fn elapsed_seconds(&self): f64 {
+        return self.elapsed().to_seconds()
+    }
+
+    fn elapsed_milliseconds(&self): f64 {
+        return self.elapsed().to_milliseconds()
+    }
+}
+
+// ============================================================================
+// FRAME TIMER - Track frame timing and FPS
+// ============================================================================
+struct FrameTimer {
+    // Timing
+    last_frame_time: Timestamp
+    current_frame_time: Timestamp
+    delta_time: Duration
+    total_time: Duration
+
+    // FPS tracking
+    frame_count: i64
+    fps_frame_count: i32
+    fps_accumulator: Duration
+    current_fps: f32
+    min_fps: f32
+    max_fps: f32
+
+    // Frame time history for averaging
+    frame_times: [f64; 60]
+    frame_time_index: i32
+    frame_time_count: i32
+    average_frame_time: f64
+
+    // Fixed timestep accumulator
+    fixed_accumulator: Duration
+    fixed_timestep: Duration
+
+    // Time scaling
+    time_scale: f64
+
+    // Caps
+    max_delta_time: Duration
+    min_frame_time: Duration
+
+    fn init(): FrameTimer {
+        let now = Timestamp.now()
+        return FrameTimer {
+            last_frame_time: now
+            current_frame_time: now
+            delta_time: Duration.init()
+            total_time: Duration.init()
+            frame_count: 0
+            fps_frame_count: 0
+            fps_accumulator: Duration.init()
+            current_fps: 0.0
+            min_fps: 9999.0
+            max_fps: 0.0
+            frame_times: [0.0; 60]
+            frame_time_index: 0
+            frame_time_count: 0
+            average_frame_time: 0.0
+            fixed_accumulator: Duration.init()
+            fixed_timestep: Duration.from_seconds(LOGIC_FRAME_TIME_SEC)
+            time_scale: 1.0
+            max_delta_time: Duration.from_seconds(0.25)  // 250ms max delta
+            min_frame_time: Duration.from_seconds(0.0)   // No cap by default
+        }
+    }
+
+    // Call once per frame at start of frame
+    fn update(&self) {
+        self.last_frame_time = self.current_frame_time
+        self.current_frame_time = Timestamp.now()
+
+        // Calculate raw delta
+        let raw_delta = Duration.from_ticks(
+            self.current_frame_time.diff(self.last_frame_time)
+        )
+
+        // Clamp to max
+        if raw_delta.ticks > self.max_delta_time.ticks {
+            self.delta_time = self.max_delta_time
+        } else {
+            self.delta_time = raw_delta
+        }
+
+        // Apply time scale
+        if self.time_scale != 1.0 {
+            self.delta_time = self.delta_time.scale(self.time_scale)
+        }
+
+        // Update totals
+        self.total_time = self.total_time.add(self.delta_time)
+        self.frame_count = self.frame_count + 1
+
+        // Update frame time history
+        let dt_ms = raw_delta.to_milliseconds()
+        self.frame_times[self.frame_time_index] = dt_ms
+        self.frame_time_index = (self.frame_time_index + 1) % 60
+        if self.frame_time_count < 60 {
+            self.frame_time_count = self.frame_time_count + 1
+        }
+
+        // Calculate average frame time
+        let mut total: f64 = 0.0
+        for i in 0..self.frame_time_count {
+            total = total + self.frame_times[i]
+        }
+        self.average_frame_time = total / self.frame_time_count as f64
+
+        // Update FPS counter
+        self.fps_accumulator = self.fps_accumulator.add(raw_delta)
+        self.fps_frame_count = self.fps_frame_count + 1
+
+        if self.fps_accumulator.to_seconds() >= 1.0 {
+            self.current_fps = self.fps_frame_count as f32 / self.fps_accumulator.to_seconds() as f32
+
+            if self.current_fps < self.min_fps {
+                self.min_fps = self.current_fps
+            }
+            if self.current_fps > self.max_fps {
+                self.max_fps = self.current_fps
+            }
+
+            self.fps_frame_count = 0
+            self.fps_accumulator = Duration.init()
+        }
+
+        // Update fixed timestep accumulator
+        self.fixed_accumulator = self.fixed_accumulator.add(self.delta_time)
+    }
+
+    // Check if a fixed timestep tick should run
+    fn should_run_fixed_update(&self): bool {
+        return self.fixed_accumulator.ticks >= self.fixed_timestep.ticks
+    }
+
+    // Consume one fixed timestep tick
+    fn consume_fixed_update(&self) {
+        self.fixed_accumulator = self.fixed_accumulator.sub(self.fixed_timestep)
+    }
+
+    // Get interpolation factor for rendering between fixed updates
+    fn get_interpolation(&self): f64 {
+        return self.fixed_accumulator.to_seconds() / self.fixed_timestep.to_seconds()
+    }
+
+    fn get_delta_time(&self): f64 {
+        return self.delta_time.to_seconds()
+    }
+
+    fn get_delta_time_ms(&self): f64 {
+        return self.delta_time.to_milliseconds()
+    }
+
+    fn get_total_time(&self): f64 {
+        return self.total_time.to_seconds()
+    }
+
+    fn get_fps(&self): f32 {
+        return self.current_fps
+    }
+
+    fn get_average_frame_time(&self): f64 {
+        return self.average_frame_time
+    }
+
+    fn set_time_scale(&self, scale: f64) {
+        self.time_scale = scale
+    }
+
+    fn set_fixed_timestep(&self, seconds: f64) {
+        self.fixed_timestep = Duration.from_seconds(seconds)
+    }
+
+    fn set_max_delta_time(&self, seconds: f64) {
+        self.max_delta_time = Duration.from_seconds(seconds)
+    }
+
+    fn set_min_frame_time(&self, seconds: f64) {
+        self.min_frame_time = Duration.from_seconds(seconds)
+    }
+
+    fn reset_stats(&self) {
+        self.min_fps = 9999.0
+        self.max_fps = 0.0
+        self.frame_time_count = 0
+    }
+}
+
+// ============================================================================
+// PERFORMANCE TIMER - For profiling code sections
+// ============================================================================
+struct PerfTimer {
+    identifier: string
+    start_time: Timestamp
+    running_time: Duration
+    call_count: i32
+    is_active: bool
+    start_frame: i32
+    end_frame: i32
+
+    fn init(identifier: string): PerfTimer {
+        return PerfTimer {
+            identifier: identifier
+            start_time: Timestamp.init()
+            running_time: Duration.init()
+            call_count: 0
+            is_active: false
+            start_frame: 0
+            end_frame: -1
+        }
+    }
+
+    fn start(&self) {
+        self.start_time = Timestamp.now()
+        self.is_active = true
+    }
+
+    fn stop(&self) {
+        if self.is_active {
+            let now = Timestamp.now()
+            let elapsed = Duration.from_ticks(now.diff(self.start_time))
+            self.running_time = self.running_time.add(elapsed)
+            self.call_count = self.call_count + 1
+            self.is_active = false
+        }
+    }
+
+    fn reset(&self) {
+        self.running_time = Duration.init()
+        self.call_count = 0
+    }
+
+    fn get_average_time(&self): f64 {
+        if self.call_count == 0 {
+            return 0.0
+        }
+        return self.running_time.to_milliseconds() / self.call_count as f64
+    }
+
+    fn get_total_time(&self): f64 {
+        return self.running_time.to_milliseconds()
+    }
+}
+
+// ============================================================================
+// SCOPED TIMER - RAII-style timer for profiling
+// ============================================================================
+struct ScopedTimer {
+    timer: *PerfTimer
+
+    fn init(timer: *PerfTimer): ScopedTimer {
+        timer.start()
+        return ScopedTimer { timer: timer }
+    }
+
+    fn deinit(&self) {
+        self.timer.stop()
+    }
+}
+
+// ============================================================================
+// TIMER WHEEL - For scheduling delayed callbacks
+// ============================================================================
+struct TimerWheelEntry {
+    callback: ?fn(user_data: *anyopaque): void
+    user_data: *anyopaque
+    deadline: Timestamp
+    interval: Duration      // 0 for one-shot, >0 for repeating
+    is_active: bool
+    id: i32
+
+    fn init(): TimerWheelEntry {
+        return TimerWheelEntry {
+            callback: null
+            user_data: null
+            deadline: Timestamp.init()
+            interval: Duration.init()
+            is_active: false
+            id: 0
+        }
+    }
+}
+
+struct TimerWheel {
+    entries: [TimerWheelEntry; 256]
+    next_id: i32
+    active_count: i32
+
+    fn init(): TimerWheel {
+        let mut wheel = TimerWheel {
+            entries: undefined
+            next_id: 1
+            active_count: 0
+        }
+        for i in 0..256 {
+            wheel.entries[i] = TimerWheelEntry.init()
+        }
+        return wheel
+    }
+
+    fn schedule(
+        &self,
+        delay: Duration,
+        callback: fn(user_data: *anyopaque): void,
+        user_data: *anyopaque
+    ): i32 {
+        return self.schedule_internal(delay, Duration.init(), callback, user_data)
+    }
+
+    fn schedule_repeating(
+        &self,
+        interval: Duration,
+        callback: fn(user_data: *anyopaque): void,
+        user_data: *anyopaque
+    ): i32 {
+        return self.schedule_internal(interval, interval, callback, user_data)
+    }
+
+    fn schedule_internal(
+        &self,
+        delay: Duration,
+        interval: Duration,
+        callback: fn(user_data: *anyopaque): void,
+        user_data: *anyopaque
+    ): i32 {
+        // Find free slot
+        for i in 0..256 {
+            if !self.entries[i].is_active {
+                let now = Timestamp.now()
+                self.entries[i] = TimerWheelEntry {
+                    callback: callback
+                    user_data: user_data
+                    deadline: now.add_ticks(delay.ticks)
+                    interval: interval
+                    is_active: true
+                    id: self.next_id
+                }
+                self.next_id = self.next_id + 1
+                self.active_count = self.active_count + 1
+                return self.entries[i].id
+            }
+        }
+        return -1  // No slots available
+    }
+
+    fn cancel(&self, timer_id: i32) {
+        for i in 0..256 {
+            if self.entries[i].is_active and self.entries[i].id == timer_id {
+                self.entries[i].is_active = false
+                self.active_count = self.active_count - 1
+                return
+            }
+        }
+    }
+
+    fn process(&self) {
+        let now = Timestamp.now()
+
+        for i in 0..256 {
+            if self.entries[i].is_active {
+                if now.is_after(self.entries[i].deadline) or now.ticks == self.entries[i].deadline.ticks {
+                    // Execute callback
+                    if self.entries[i].callback != null {
+                        self.entries[i].callback.?(self.entries[i].user_data)
+                    }
+
+                    // Handle repeating timers
+                    if self.entries[i].interval.ticks > 0 {
+                        self.entries[i].deadline = self.entries[i].deadline.add_ticks(
+                            self.entries[i].interval.ticks
+                        )
+                    } else {
+                        self.entries[i].is_active = false
+                        self.active_count = self.active_count - 1
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear(&self) {
+        for i in 0..256 {
+            self.entries[i].is_active = false
+        }
+        self.active_count = 0
+    }
+}
+
+// ============================================================================
+// PLATFORM STUBS - Platform-specific implementations
+// ============================================================================
+
+// Timer frequency (ticks per second)
+var g_timer_frequency: i64 = 0
+var g_timer_initialized: bool = false
+
+fn init_timer_platform() {
+    if g_timer_initialized {
+        return
+    }
+
+    // Platform-specific initialization
+    // macOS: mach_timebase_info
+    // Windows: QueryPerformanceFrequency
+    // Linux: CLOCK_MONOTONIC always has 1ns resolution
+
+    // Default to nanoseconds (1 billion ticks per second)
+    g_timer_frequency = NANOSECONDS_PER_SECOND
+
+    g_timer_initialized = true
+}
+
+fn get_timer_frequency(): i64 {
+    if !g_timer_initialized {
+        init_timer_platform()
+    }
+    return g_timer_frequency
+}
+
+fn get_timer_ticks(): i64 {
+    if !g_timer_initialized {
+        init_timer_platform()
+    }
+
+    // Platform-specific:
+    // macOS: mach_absolute_time()
+    // Windows: QueryPerformanceCounter()
+    // Linux: clock_gettime(CLOCK_MONOTONIC)
+
+    return 0  // Placeholder
+}
+
+// ============================================================================
+// FRAME LIMITER - Limit FPS to target rate
+// ============================================================================
+enum FrameLimiterMode {
+    Off = 0             // No limiting
+    Spin = 1            // Busy wait (most accurate but uses CPU)
+    Sleep = 2           // Sleep (power efficient but less accurate)
+    Hybrid = 3          // Sleep then spin (balance of both)
+    VSync = 4           // VSync-based (GPU-synchronized)
+}
+
+struct FrameLimiter {
+    mode: FrameLimiterMode,
+    target_fps: f64,
+    target_frame_time: Duration,
+    last_frame_end: Timestamp,
+    enabled: bool,
+
+    // Adaptive settings for hybrid mode
+    sleep_threshold_ms: f64,  // Sleep if remaining time > this
+    spin_threshold_ms: f64,   // Start spinning when remaining < this
+
+    // Stats
+    wait_time_ms: f64,
+    oversleep_compensation: f64,  // Accumulated oversleep to compensate
+
+    fn init(): FrameLimiter {
+        return FrameLimiter {
+            mode: FrameLimiterMode::Hybrid,
+            target_fps: 60.0,
+            target_frame_time: Duration.from_seconds(1.0 / 60.0),
+            last_frame_end: Timestamp.now(),
+            enabled: true,
+            sleep_threshold_ms: 5.0,
+            spin_threshold_ms: 1.5,
+            wait_time_ms: 0.0,
+            oversleep_compensation: 0.0,
+        }
+    }
+
+    fn set_target_fps(&self, fps: f64) {
+        if fps > 0.0 {
+            self.target_fps = fps
+            self.target_frame_time = Duration.from_seconds(1.0 / fps)
+        }
+    }
+
+    fn set_mode(&self, mode: FrameLimiterMode) {
+        self.mode = mode
+    }
+
+    fn enable(&self) {
+        self.enabled = true
+    }
+
+    fn disable(&self) {
+        self.enabled = false
+    }
+
+    // Call at start of frame
+    fn begin_frame(&self) {
+        // Nothing needed at start
+    }
+
+    // Call at end of frame - will wait if needed
+    fn end_frame(&self) {
+        if !self.enabled or self.mode == FrameLimiterMode::Off {
+            self.last_frame_end = Timestamp.now()
+            self.wait_time_ms = 0.0
+            return
+        }
+
+        let now = Timestamp.now()
+        let elapsed = Duration.from_ticks(now.diff(self.last_frame_end))
+        let target_with_compensation = self.target_frame_time.to_milliseconds() - self.oversleep_compensation
+
+        let remaining_ms = target_with_compensation - elapsed.to_milliseconds()
+
+        if remaining_ms > 0.0 {
+            self.wait_time_ms = remaining_ms
+
+            match self.mode {
+                FrameLimiterMode::Spin => {
+                    self.spin_wait(remaining_ms)
+                }
+                FrameLimiterMode::Sleep => {
+                    self.sleep_wait(remaining_ms)
+                }
+                FrameLimiterMode::Hybrid => {
+                    self.hybrid_wait(remaining_ms)
+                }
+                FrameLimiterMode::VSync => {
+                    // VSync handled by GPU/display, just track time
+                }
+                _ => {}
+            }
+        } else {
+            self.wait_time_ms = 0.0
+        }
+
+        // Track actual frame end for next iteration
+        let actual_end = Timestamp.now()
+        let actual_elapsed = Duration.from_ticks(actual_end.diff(self.last_frame_end))
+
+        // Calculate oversleep/undershoot for next frame compensation
+        let target_ms = self.target_frame_time.to_milliseconds()
+        let actual_ms = actual_elapsed.to_milliseconds()
+        self.oversleep_compensation = actual_ms - target_ms
+
+        // Clamp compensation to reasonable range
+        if self.oversleep_compensation > 5.0 {
+            self.oversleep_compensation = 5.0
+        }
+        if self.oversleep_compensation < -5.0 {
+            self.oversleep_compensation = -5.0
+        }
+
+        self.last_frame_end = actual_end
+    }
+
+    fn spin_wait(&self, ms: f64) {
+        let target = Timestamp.now().add_ticks(Duration.from_milliseconds(ms).ticks)
+        while Timestamp.now().is_before(target) {
+            // Busy wait
+        }
+    }
+
+    fn sleep_wait(&self, ms: f64) {
+        if ms > 0.0 {
+            // Platform sleep - actual implementation would call OS sleep
+            // For now just simulate with spin (real impl would use nanosleep/Sleep)
+            sleep_ms(ms)
+        }
+    }
+
+    fn hybrid_wait(&self, ms: f64) {
+        if ms > self.sleep_threshold_ms {
+            // Sleep for most of the time, leaving some for spin
+            let sleep_time = ms - self.spin_threshold_ms
+            if sleep_time > 0.0 {
+                sleep_ms(sleep_time)
+            }
+        }
+
+        // Spin wait for remaining time (more accurate)
+        let now = Timestamp.now()
+        let target = self.last_frame_end.add_ticks(self.target_frame_time.ticks)
+        while now.is_before(target) {
+            // Busy wait for accuracy
+        }
+    }
+
+    fn get_wait_time_ms(&self): f64 {
+        return self.wait_time_ms
+    }
+
+    fn get_target_fps(&self): f64 {
+        return self.target_fps
+    }
+
+    fn get_target_frame_time_ms(&self): f64 {
+        return self.target_frame_time.to_milliseconds()
+    }
+}
+
+// Platform sleep stub (would use nanosleep/Sleep)
+fn sleep_ms(ms: f64) {
+    // Placeholder - real implementation would call:
+    // macOS/Linux: nanosleep()
+    // Windows: Sleep()
+    let target = Timestamp.now().add_ticks(Duration.from_milliseconds(ms).ticks)
+    while Timestamp.now().is_before(target) {
+        // Simulate sleep with spin for now
+    }
+}
+
+// ============================================================================
+// GLOBAL TIMER INSTANCE
+// ============================================================================
+var g_frame_timer = FrameTimer.init()
+var g_frame_limiter = FrameLimiter.init()
+
+export fn init_timer() {
+    init_timer_platform()
+    g_frame_timer = FrameTimer.init()
+    g_frame_limiter = FrameLimiter.init()
+}
+
+export fn update_timer() {
+    g_frame_timer.update()
+}
+
+export fn get_delta_time(): f64 {
+    return g_frame_timer.get_delta_time()
+}
+
+export fn get_delta_time_ms(): f64 {
+    return g_frame_timer.get_delta_time_ms()
+}
+
+export fn get_total_time(): f64 {
+    return g_frame_timer.get_total_time()
+}
+
+export fn get_fps(): f32 {
+    return g_frame_timer.get_fps()
+}
+
+export fn set_time_scale(scale: f64) {
+    g_frame_timer.set_time_scale(scale)
+}
+
+export fn should_run_fixed_update(): bool {
+    return g_frame_timer.should_run_fixed_update()
+}
+
+export fn consume_fixed_update() {
+    g_frame_timer.consume_fixed_update()
+}
+
+export fn get_frame_timer(): *FrameTimer {
+    return &g_frame_timer
+}
+
+// ============================================================================
+// FRAME LIMITER EXPORTS
+// ============================================================================
+export fn set_target_fps(fps: f64) {
+    g_frame_limiter.set_target_fps(fps)
+}
+
+export fn set_frame_limiter_mode(mode: FrameLimiterMode) {
+    g_frame_limiter.set_mode(mode)
+}
+
+export fn enable_frame_limiter() {
+    g_frame_limiter.enable()
+}
+
+export fn disable_frame_limiter() {
+    g_frame_limiter.disable()
+}
+
+export fn begin_frame() {
+    g_frame_limiter.begin_frame()
+}
+
+export fn end_frame() {
+    g_frame_limiter.end_frame()
+}
+
+export fn get_frame_limiter(): *FrameLimiter {
+    return &g_frame_limiter
+}
+
+export fn get_target_fps(): f64 {
+    return g_frame_limiter.get_target_fps()
+}
+
+export fn get_frame_wait_time_ms(): f64 {
+    return g_frame_limiter.get_wait_time_ms()
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+export fn get_time_now(): f64 {
+    let ticks = get_timer_ticks()
+    let freq = get_timer_frequency()
+    return ticks as f64 / freq as f64
+}
+
+export fn sleep_ms(milliseconds: i32) {
+    // Platform-specific sleep
+    // Would call usleep/Sleep/nanosleep
+}
+
+export fn sleep_until(target: Timestamp) {
+    let now = Timestamp.now()
+    if now.is_before(target) {
+        let wait = Duration.from_ticks(target.diff(now))
+        let ms = wait.to_milliseconds() as i32
+        if ms > 0 {
+            sleep_ms(ms)
+        }
+    }
+}
+
+// ============================================================================
+// PERF GATHERING (for profiling)
+// ============================================================================
+struct PerfGather {
+    identifier: string
+    start_time: Timestamp
+    running_time_gross: Duration
+    running_time_net: Duration
+    call_count: i32
+    next: ?*PerfGather
+    prev: ?*PerfGather
+
+    fn init(identifier: string): PerfGather {
+        return PerfGather {
+            identifier: identifier
+            start_time: Timestamp.init()
+            running_time_gross: Duration.init()
+            running_time_net: Duration.init()
+            call_count: 0
+            next: null
+            prev: null
+        }
+    }
+
+    fn start(&self) {
+        self.start_time = Timestamp.now()
+    }
+
+    fn stop(&self) {
+        let now = Timestamp.now()
+        let elapsed = Duration.from_ticks(now.diff(self.start_time))
+        self.running_time_gross = self.running_time_gross.add(elapsed)
+        self.running_time_net = self.running_time_net.add(elapsed)
+        self.call_count = self.call_count + 1
+    }
+
+    fn reset(&self) {
+        self.running_time_gross = Duration.init()
+        self.running_time_net = Duration.init()
+        self.call_count = 0
+    }
+
+    fn get_average_gross(&self): f64 {
+        if self.call_count == 0 { return 0.0 }
+        return self.running_time_gross.to_milliseconds() / self.call_count as f64
+    }
+
+    fn get_average_net(&self): f64 {
+        if self.call_count == 0 { return 0.0 }
+        return self.running_time_net.to_milliseconds() / self.call_count as f64
+    }
+}

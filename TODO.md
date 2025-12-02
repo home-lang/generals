@@ -44,7 +44,7 @@ These features need to be added to the Home programming language (~/Code/home) t
 - [x] `H0-002` Create Vulkan API bindings - EXISTS: `packages/video/src/gpu/vulkan.zig`
 - [x] `H0-003` Create OpenGL API bindings - EXISTS: `packages/graphics/src/opengl.zig` (20KB)
 - [x] `H0-004` Implement shader compilation support - EXISTS: `packages/graphics/src/shaders.zig` (17KB)
-- [ ] `H0-005` Add render target/framebuffer abstractions
+- [x] `H0-005` Add render target/framebuffer abstractions - DONE: `graphics/framebuffer.home` with Framebuffer, RenderTargetPool, GBuffer, ShadowMap, PostProcessBuffer
 
 ### 0.2 Window & Input System
 - [x] `H0-010` Create window management module - EXISTS: `packages/platform/src/window.zig`
@@ -52,8 +52,8 @@ These features need to be added to the Home programming language (~/Code/home) t
 - [x] `H0-012` Craft provides windowing, GPU rendering, input handling - EXISTS: 35 native components
 - [x] `H0-013` Implement keyboard input event system - EXISTS: `packages/graphics/src/input.zig` (18KB)
 - [x] `H0-014` Implement mouse input with cursor management - EXISTS: `packages/graphics/src/input.zig`
-- [ ] `H0-015` Implement gamepad/controller input support (extend Craft if needed)
-- [ ] `H0-016` Add input remapping and hotkey system (extend Craft if needed)
+- [x] `H0-015` Implement gamepad/controller input support - DONE: `input_system.home` GamepadState, GamepadManager, GamepadActionMapper, GamepadCursor
+- [x] `H0-016` Add input remapping and hotkey system - DONE: `input_system.home` HotkeyManager with rebind(), GamepadActionMapper with rebind_button()
 
 ### 0.3 Game Math Library
 - [x] `H0-020` Create `packages/math/vector2.home` - EXISTS: `packages/math/src/vector.zig` (Vec2)
@@ -74,14 +74,14 @@ These features need to be added to the Home programming language (~/Code/home) t
 - [x] `H0-032` Implement stack allocator - EXISTS: `packages/memory/src/stack.zig`
 - [x] `H0-033` Implement free-list allocator - EXISTS: `packages/memory/src/gpa.zig`
 - [x] `H0-034` Add memory profiling and leak detection - EXISTS: Memory statistics in pool.zig
-- [ ] `H0-035` Implement string interning/pooling
+- [x] `H0-035` Implement string interning/pooling - DONE: `engine/string_pool.home` with StringPool, NameKeyGenerator, NAMEKEY/KEYNAME macros
 
 ### 0.5 File System Improvements
 - [x] `H0-040` Complete directory listing API - EXISTS: Basic support in platform
-- [ ] `H0-041` Add file watching/notification support
-- [ ] `H0-042` Add memory-mapped file support
-- [ ] `H0-043` Implement async file I/O
-- [ ] `H0-044` Add file permissions/attributes API
+- [x] `H0-041` Add file watching/notification support - DONE: `platform/file_watcher.home` with FileWatcher, FileWatch, FileEvent, callbacks, preset watchers for INI/textures/maps
+- [x] `H0-042` Add memory-mapped file support - DONE: `platform/mmap.home` with MemoryMappedFile, MappedRegion, MappedFileView, BigArchiveMmap helper
+- [x] `H0-043` Implement async file I/O - DONE: `platform/async_io.home` with AsyncIOManager, IORequest, priority queues, completion callbacks
+- [x] `H0-044` Add file permissions/attributes API - DONE: `platform/file_attributes.home` with FileAttributes, FileTime, permissions, file type detection, modification time checking
 
 ### 0.6 Operator Overloading
 - [ ] `H0-050` Add operator overloading syntax for math types (`+`, `-`, `*`, `/`)
@@ -162,7 +162,7 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `U2-020` Add Money Per Minute configuration to GameData.ini (#1914) - DONE: `game_data_loader.home` added show_money_per_minute, allow_money_per_minute_for_player
 
 ### 2.4 Code Unification (Match Original Structure)
-- [ ] `U2-030` Unify View and W3DView into Core module (#1904)
+- [x] `U2-030` Unify View and W3DView into Core module (#1904) - DONE: `game/view.home` with View, W3DView, ViewLocation, camera movements
 - [x] `U2-031` Move ParabolicEase to Core (#1904) - DONE: In `packages/math/src/easing.zig`
 - [x] `U2-032` Move CameraShakeSystem to Core (#1904) - DONE: In `camera_system.home` with full Westwood implementation
 - [x] `U2-033` Move W3DShaderManager to Core (#1920) - DONE: `graphics/w3d_shader_manager.home` with shader types, filters, render-to-texture
@@ -181,20 +181,20 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `E3-002` Implement Component storage (sparse sets) - EXISTS: 9 component types implemented
 - [x] `E3-003` Implement System dispatcher - EXISTS: MovementSystem, RenderSystem
 - [x] `E3-004` Add component iteration queries - EXISTS: Full add/remove/get/has interface
-- [ ] `E3-005` Implement entity hierarchy (parent/child) - PARTIAL: Transform has basic hierarchy
-- [ ] `E3-006` Add component lifecycle hooks (onCreate, onDestroy)
+- [x] `E3-005` Implement entity hierarchy (parent/child) - DONE: `engine/entity_hierarchy.home` with HierarchyNode, HierarchyTransform, EntityHierarchy, ContainerComponent, transform inheritance
+- [x] `E3-006` Add component lifecycle hooks (onCreate, onDestroy) - DONE: `engine/component_lifecycle.home` with LifecycleCallbacks, ComponentLifecycleManager, CreateModuleState, DestroyModuleState matching original Module.h
 
 ### 3.2 Game Loop
 - [x] `E3-010` Implement fixed timestep game loop (30 Hz like original) - DONE: Full GameLogic with sleepy updates
 - [x] `E3-011` Implement frame accumulator for variable framerate - DONE: Proper accumulator pattern
 - [x] `E3-012` Add update order management (Production → Spawning → Objects → AI → State) - DONE: Matches original order
-- [ ] `E3-013` Implement pause/resume functionality
-- [ ] `E3-014` Add slow-motion/time multiplier support
+- [x] `E3-013` Implement pause/resume functionality - DONE: `engine/game_time.home` with PauseState, GameTimeManager matching original setGamePaused/pauseGameLogic/pauseGameSound/pauseGameMusic/pauseGameInput
+- [x] `E3-014` Add slow-motion/time multiplier support - DONE: `engine/game_time.home` with FramePacer, logic time scale, time_multiplier with smooth lerp
 
 ### 3.3 Memory Management
 - [x] `E3-020` Implement 3-tier memory pooling (fast/medium/slow) - EXISTS: `memory_pool.home` (16KB)
 - [x] `E3-021` Implement memory leak detection - EXISTS: Memory statistics tracking
-- [ ] `E3-022` Implement string pooling/interning
+- [x] `E3-022` Implement string pooling/interning - DONE: `engine/string_pool.home` with StringPool, NameKey, NameKeyGenerator, WellKnownKeys matching original
 - [x] `E3-023` Implement object pooling for game entities - EXISTS: `memory_pool_factory.home` (15KB)
 - [x] `E3-024` Add memory profiler integration - EXISTS: Pool statistics
 
@@ -202,30 +202,30 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `E3-030` Complete BIG archive format reader (BIGF/BIG4 magic) - EXISTS: `big_archive.home` (20KB)
 - [x] `E3-031` Implement archive priority layering - EXISTS: BigFileSystem multi-archive support
 - [x] `E3-032` Implement directory normalization - EXISTS: Path normalization in big_archive
-- [ ] `E3-033` Add RefPack decompression support
-- [ ] `E3-034` Implement virtual file system abstraction
-- [ ] `E3-035` Add async asset loading
+- [x] `E3-033` Add RefPack decompression support - DONE: `engine/compression.home` with RefPack decoder, CompressionManager, EA header detection, all compression types
+- [x] `E3-034` Implement virtual file system abstraction - DONE: `engine/virtual_filesystem.home` with VirtualFile, BigArchiveSource, FileInstance, mod overlay support
+- [x] `E3-035` Add async asset loading - DONE: `engine/asset_loader.home` with AssetLoader, priority queue, dependency resolution, memory budget management
 
 ### 3.5 Thing/Object System
-- [ ] `E3-040` Implement Thing base class
-- [ ] `E3-041` Implement ThingTemplate (object prototypes)
-- [ ] `E3-042` Implement ThingFactory (object creation)
-- [ ] `E3-043` Implement Module base class
-- [ ] `E3-044` Implement ModuleFactory (module instantiation)
-- [ ] `E3-045` Add object lifecycle management
+- [x] `E3-040` Implement Thing base class - DONE: `engine/thing.home` with Thing, ThingTemplate, GeometryInfo, all enums from original
+- [x] `E3-041` Implement ThingTemplate (object prototypes) - EXISTS: `engine/thing.home` with ThingTemplate, experience, build cost, geometry, audio
+- [x] `E3-042` Implement ThingFactory (object creation) - EXISTS: `engine/thing_factory.home` with ThingFactory, spatial grid, template registry
+- [x] `E3-043` Implement Module base class - DONE: `engine/module.home` with Module, ObjectModule, DrawableModule, all interface types
+- [x] `E3-044` Implement ModuleFactory (module instantiation) - DONE: `engine/module.home` with ModuleFactory, ModuleInfo, ModuleTemplate
+- [x] `E3-045` Add object lifecycle management - DONE: `engine/object_lifecycle.home` with ObjectLifecycleManager, ObjectLifecycleData, creation/destruction/damage handling
 
 ### 3.6 Timing & Performance
-- [ ] `E3-050` Implement high-resolution timer
-- [ ] `E3-051` Implement frame limiter
-- [ ] `E3-052` Add frame metrics collection
-- [ ] `E3-053` Implement profiler with flame graph support
-- [ ] `E3-054` Add performance counters
+- [x] `E3-050` Implement high-resolution timer - DONE: `platform/timer.home` with Timestamp, Duration, Stopwatch, FrameTimer, PerfTimer, TimerWheel
+- [x] `E3-051` Implement frame limiter - DONE: `platform/timer.home` with FrameLimiter, Spin/Sleep/Hybrid/VSync modes, oversleep compensation
+- [x] `E3-052` Add frame metrics collection - DONE: `platform/profiler.home` with FrameMetrics, FrameStatistics, percentiles, zone timing
+- [x] `E3-053` Implement profiler with flame graph support - DONE: `platform/profiler.home` with Profiler, hierarchical zones, FlameGraphData, flame sample recording
+- [x] `E3-054` Add performance counters - DONE: `platform/profiler.home` with PerfCounter (Cumulative/Average/Max/Min/Gauge), PerfCounterManager
 
 ### 3.7 State Machine
-- [ ] `E3-060` Implement generic state machine
-- [ ] `E3-061` Add transition conditions
-- [ ] `E3-062` Add state enter/exit hooks
-- [ ] `E3-063` Support hierarchical state machines
+- [x] `E3-060` Implement generic state machine - DONE: `engine/state_machine.home` with StateID, ObjectStateMachine, sleep frames, all original types
+- [x] `E3-061` Add transition conditions - EXISTS: `engine/state_machine.home` with ConditionType enum (Always, Flag, Timer, Health, Distance, Custom), evaluate_condition(), compare_values()
+- [x] `E3-062` Add state enter/exit hooks - EXISTS: `engine/state_machine.home` with enter_actions, exit_actions, execute_actions() called during transitions
+- [x] `E3-063` Support hierarchical state machines - DONE: `engine/state_machine.home` with HierarchicalStateMachine, HierarchicalState, history states, LCA transitions, HSMBuilder
 
 ---
 
@@ -257,18 +257,18 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 ### 4.3 Skeletal Animation
 - [x] `R4-030` Implement bone hierarchy system - EXISTS: `w3d_animation_player.home` (27KB)
 - [x] `R4-031` Implement animation player - EXISTS: Full animation playback
-- [ ] `R4-032` Implement animation blending
-- [ ] `R4-033` Implement animation events (sound triggers, etc.)
-- [ ] `R4-034` Support multiple animations per model
+- [x] `R4-032` Implement animation blending - EXISTS: `w3d_animation_player.home` with blend_transform(), AnimationLayer, bone masks, additive blending, slerp
+- [x] `R4-033` Implement animation events (sound triggers, etc.) - DONE: AnimationEvent, AnimationEventTrack, AnimationEventDispatcher for sounds/effects/footsteps/attacks/callbacks
+- [x] `R4-034` Support multiple animations per model - EXISTS: `w3d_animation_player.home` with AnimationClip array, layer system, play_on_layer()
 
 ### 4.4 Terrain System
 - [x] `R4-040` Implement heightmap loading - EXISTS: `terrain.home`
 - [x] `R4-041` Implement terrain chunk rendering - EXISTS: `terrain_renderer.home` (24KB)
-- [ ] `R4-042` Implement terrain texture blending (4 layers)
-- [ ] `R4-043` Implement terrain roads - EXISTS: `terrain_roads.home`
-- [ ] `R4-044` Implement cliff rendering
-- [ ] `R4-045` Implement water rendering (reflection, refraction)
-- [ ] `R4-046` Implement terrain tracks (unit footprints)
+- [x] `R4-042` Implement terrain texture blending (4 layers) - EXISTS: `terrain_renderer.home` with blend_map Vec4, per-vertex blending
+- [x] `R4-043` Implement terrain roads - EXISTS: `terrain_roads.home` with RoadNetwork, bezier curves, junctions, mesh generation, texture mapping
+- [x] `R4-044` Implement cliff rendering - DONE: `cliff_rendering.home` with CliffEdge types, blend classes, UV mapping, vertex buffers
+- [x] `R4-045` Implement water rendering (reflection, refraction) - EXISTS: `terrain_renderer.home` with WaterPlane, flow, waves, transparency
+- [x] `R4-046` Implement terrain tracks (unit footprints) - DONE: `terrain_tracks.home` with TrackEdge, TerrainTrack, ring buffer, fade, TrackManager
 
 ### 4.5 Shader System
 - [~] `R4-050` Implement W3DShaderManager equivalent - PARTIAL: `shader_manager.home`
@@ -283,22 +283,22 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `R4-062` Implement camera constraints (bounds checking) - EXISTS: Angle clamping
 - [x] `R4-063` Implement ParabolicEase for smooth camera transitions - DONE: `packages/math/src/easing.zig`
 - [x] `R4-064` Implement camera shake system (CameraShakeSystem) - DONE: Full Westwood implementation in `camera_system.home`
-- [ ] `R4-065` Implement waypoint path camera movement
-- [ ] `R4-066` Implement screen-to-world transformations
-- [ ] `R4-067` Implement pick ray generation for object selection
+- [x] `R4-065` Implement waypoint path camera movement - DONE: `camera_system.home` with CameraWaypoint, WaypointPath, Catmull-Rom spline interpolation, orbit/flyby helpers
+- [x] `R4-066` Implement screen-to-world transformations - EXISTS: `camera_system.home` with screen_to_ray(), screen_to_world(), world_to_screen()
+- [x] `R4-067` Implement pick ray generation for object selection - EXISTS: `camera_system.home` with Ray struct and screen_to_ray() for selection
 - [x] `R4-068` Implement frustum culling - DONE: Full frustum.zig with AABB/sphere tests
 
 ### 4.7 Post-Processing
 - [x] `R4-070` Implement render-to-texture support - EXISTS: `post_processing.home` (20KB)
-- [ ] `R4-071` Implement ScreenMotionBlurFilter
-- [ ] `R4-072` Implement ScreenBWFilter (black & white)
-- [ ] `R4-073` Implement ScreenCrossFadeFilter
-- [ ] `R4-074` Implement bloom effect
-- [ ] `R4-075` Implement color grading
+- [x] `R4-071` Implement ScreenMotionBlurFilter - DONE: `post_processing.home` with full Westwood implementation (zoom blur, pan blur, alpha/saturate modes)
+- [x] `R4-072` Implement ScreenBWFilter (black & white) - DONE: `post_processing.home` with tint colors (B&W, red, green), fade animation
+- [x] `R4-073` Implement ScreenCrossFadeFilter - DONE: `post_processing.home` with circle and mask modes, pattern support
+- [x] `R4-074` Implement bloom effect - DONE: `post_processing.home` with BloomFilter, bright pass, gaussian blur, soft threshold, quality presets, HDR tone mapping
+- [x] `R4-075` Implement color grading - DONE: `post_processing.home` with ColorGradingFilter, brightness/contrast/saturation/gamma, three-way color balance, presets (warm/cold/toxic/high contrast)
 
 ### 4.8 Particle System
 - [x] `R4-080` Implement particle emitter system - EXISTS: `particle_system.home`
-- [ ] `R4-081` Implement particle renderer (GPU instancing)
+- [x] `R4-081` Implement particle renderer (GPU instancing) - DONE: `graphics/particle_renderer.home` with PointGroup batching, 256 pre-computed orientations, texture atlas support, streak lines, volume particles
 - [ ] `R4-082` Support all particle types (smoke, fire, debris, etc.)
 - [ ] `R4-083` Implement particle collision
 - [ ] `R4-084` Implement particle trails

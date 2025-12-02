@@ -1,0 +1,823 @@
+// C&C Generals Zero Hour - Home Port
+// Object Lifecycle Management
+//
+// This module handles the complete lifecycle of game objects:
+// - Creation: Allocating, initializing, attaching modules
+// - Updating: Per-frame logic updates
+// - Destruction: Death handling, cleanup, recycling
+//
+// Objects go through these lifecycle states:
+// 1. Creating -> Object allocated but not fully initialized
+// 2. Alive -> Normal gameplay state
+// 3. Dying -> Death animation/effects playing
+// 4. Dead -> Ready for cleanup
+//
+// Based on original Object.h, GameLogic.h
+
+import engine/thing
+import engine/module
+
+// ============================================================================
+// OBJECT LIFECYCLE STATE
+// ============================================================================
+enum ObjectLifecycleState {
+    Creating = 0       // Being constructed/initialized
+    Alive = 1          // Normal gameplay
+    UnderConstruction = 2  // Building under construction
+    Dying = 3          // Death in progress
+    Dead = 4           // Ready for cleanup
+    Sold = 5           // Being sold (buildings)
+}
+
+// ============================================================================
+// OBJECT STATUS FLAGS
+// ============================================================================
+// These are persistent status flags that affect object behavior
+const OBJECT_STATUS_NONE: i64 = 0x0000000000000000
+const OBJECT_STATUS_DESTROYED: i64 = 0x0000000000000001
+const OBJECT_STATUS_SOLD: i64 = 0x0000000000000002
+const OBJECT_STATUS_UNDER_CONSTRUCTION: i64 = 0x0000000000000004
+const OBJECT_STATUS_NO_COLLISIONS: i64 = 0x0000000000000008
+const OBJECT_STATUS_NO_ATTACK: i64 = 0x0000000000000010
+const OBJECT_STATUS_STEALTHED: i64 = 0x0000000000000020
+const OBJECT_STATUS_DETECTED: i64 = 0x0000000000000040
+const OBJECT_STATUS_CAN_ATTACK: i64 = 0x0000000000000080
+const OBJECT_STATUS_PARACHUTING: i64 = 0x0000000000000100
+const OBJECT_STATUS_TOPPLED: i64 = 0x0000000000000200
+const OBJECT_STATUS_AIRBORNE_TARGET: i64 = 0x0000000000000400
+const OBJECT_STATUS_IMMOBILE: i64 = 0x0000000000000800
+const OBJECT_STATUS_IS_FIRING_WEAPON: i64 = 0x0000000000001000
+const OBJECT_STATUS_IS_BRAKING: i64 = 0x0000000000002000
+const OBJECT_STATUS_POWERED: i64 = 0x0000000000004000
+const OBJECT_STATUS_INSIDE_GARRISON: i64 = 0x0000000000008000
+const OBJECT_STATUS_UNSELECTABLE: i64 = 0x0000000000010000
+const OBJECT_STATUS_MASKED: i64 = 0x0000000000020000
+const OBJECT_STATUS_IGNORING_STEALTH: i64 = 0x0000000000040000
+const OBJECT_STATUS_IS_ATTACKING: i64 = 0x0000000000080000
+const OBJECT_STATUS_NO_ATTACK_FROM_AI: i64 = 0x0000000000100000
+const OBJECT_STATUS_IS_AIMING_WEAPON: i64 = 0x0000000000200000
+const OBJECT_STATUS_AFLAME: i64 = 0x0000000000400000
+const OBJECT_STATUS_BURNED: i64 = 0x0000000000800000
+const OBJECT_STATUS_WETTED: i64 = 0x0000000001000000
+const OBJECT_STATUS_USING_ABILITY: i64 = 0x0000000002000000
+
+// ============================================================================
+// DISABLED TYPES - Reasons an object can be disabled
+// ============================================================================
+const DISABLED_TYPE_NONE: i32 = 0
+const DISABLED_TYPE_HACKED: i32 = 0x00000001
+const DISABLED_TYPE_EMP: i32 = 0x00000002
+const DISABLED_TYPE_HELD: i32 = 0x00000004
+const DISABLED_TYPE_PARALYZED: i32 = 0x00000008
+const DISABLED_TYPE_UNMANNED: i32 = 0x00000010
+const DISABLED_TYPE_UNDERPOWERED: i32 = 0x00000020
+const DISABLED_TYPE_FREEFALL: i32 = 0x00000040
+const DISABLED_TYPE_SCRIPT_DISABLED: i32 = 0x00000080
+const DISABLED_TYPE_SCRIPT_UNDERPOWERED: i32 = 0x00000100
+
+// ============================================================================
+// OBJECT CREATION INFO
+// ============================================================================
+struct ObjectCreationInfo {
+    template_name: string,
+    position_x: f64,
+    position_y: f64,
+    position_z: f64,
+    facing: f64,
+    team_id: i32,
+    player_id: i32,
+    producer_id: i32,
+    builder_id: i32,
+    status_mask: i64,
+    starting_health_percent: f64,
+    experience_level: i32,
+    is_prebuild: bool,
+
+    fn init(): ObjectCreationInfo {
+        return ObjectCreationInfo {
+            template_name: "",
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+            facing: 0.0,
+            team_id: 0,
+            player_id: 0,
+            producer_id: 0,
+            builder_id: 0,
+            status_mask: OBJECT_STATUS_NONE,
+            starting_health_percent: 1.0,
+            experience_level: 0,
+            is_prebuild: false,
+        }
+    }
+}
+
+// ============================================================================
+// OBJECT DESTRUCTION INFO
+// ============================================================================
+enum DeathReason {
+    Unknown = 0
+    Killed = 1
+    Crushed = 2
+    Exploded = 3
+    Burned = 4
+    Poisoned = 5
+    Drowned = 6
+    Sold = 7
+    Captured = 8
+    Detonated = 9
+    Lasered = 10
+    Suicided = 11
+    Toppled = 12
+}
+
+struct ObjectDestructionInfo {
+    object_id: i32,
+    death_reason: DeathReason,
+    killer_id: i32,
+    damage_type: i32,
+    damage_amount: f64,
+    death_position_x: f64,
+    death_position_y: f64,
+    death_position_z: f64,
+    experience_value: i32,
+
+    fn init(): ObjectDestructionInfo {
+        return ObjectDestructionInfo {
+            object_id: 0,
+            death_reason: DeathReason::Unknown,
+            killer_id: 0,
+            damage_type: 0,
+            damage_amount: 0.0,
+            death_position_x: 0.0,
+            death_position_y: 0.0,
+            death_position_z: 0.0,
+            experience_value: 0,
+        }
+    }
+}
+
+// ============================================================================
+// OBJECT LIFECYCLE DATA - Runtime state for each object
+// ============================================================================
+struct ObjectLifecycleData {
+    object_id: i32,
+    lifecycle_state: ObjectLifecycleState,
+    status_mask: i64,
+    disabled_mask: i32,
+    creation_frame: i32,
+    death_frame: i32,
+    cleanup_delay_frames: i32,
+
+    // Producer/Builder tracking
+    producer_id: i32,
+    builder_id: i32,
+
+    // Death info
+    death_reason: DeathReason,
+    killer_id: i32,
+
+    // Health tracking
+    current_health: f64,
+    max_health: f64,
+    previous_health: f64,
+
+    // Experience
+    experience_points: i32,
+    veterancy_level: i32,
+
+    fn init(object_id: i32): ObjectLifecycleData {
+        return ObjectLifecycleData {
+            object_id: object_id,
+            lifecycle_state: ObjectLifecycleState::Creating,
+            status_mask: OBJECT_STATUS_NONE,
+            disabled_mask: DISABLED_TYPE_NONE,
+            creation_frame: 0,
+            death_frame: 0,
+            cleanup_delay_frames: 30,  // 1 second at 30 FPS
+            producer_id: 0,
+            builder_id: 0,
+            death_reason: DeathReason::Unknown,
+            killer_id: 0,
+            current_health: 100.0,
+            max_health: 100.0,
+            previous_health: 100.0,
+            experience_points: 0,
+            veterancy_level: 0,
+        }
+    }
+
+    fn is_alive(&self): bool {
+        return self.lifecycle_state == ObjectLifecycleState::Alive or
+               self.lifecycle_state == ObjectLifecycleState::UnderConstruction
+    }
+
+    fn is_dying(&self): bool {
+        return self.lifecycle_state == ObjectLifecycleState::Dying
+    }
+
+    fn is_dead(&self): bool {
+        return self.lifecycle_state == ObjectLifecycleState::Dead
+    }
+
+    fn is_destroyed(&self): bool {
+        return (self.status_mask & OBJECT_STATUS_DESTROYED) != 0
+    }
+
+    fn is_disabled(&self): bool {
+        return self.disabled_mask != DISABLED_TYPE_NONE
+    }
+
+    fn set_status(&self, status: i64) {
+        self.status_mask = self.status_mask | status
+    }
+
+    fn clear_status(&self, status: i64) {
+        self.status_mask = self.status_mask & (~status)
+    }
+
+    fn has_status(&self, status: i64): bool {
+        return (self.status_mask & status) != 0
+    }
+
+    fn add_disabled_type(&self, disabled_type: i32) {
+        self.disabled_mask = self.disabled_mask | disabled_type
+    }
+
+    fn remove_disabled_type(&self, disabled_type: i32) {
+        self.disabled_mask = self.disabled_mask & (~disabled_type)
+    }
+
+    fn has_disabled_type(&self, disabled_type: i32): bool {
+        return (self.disabled_mask & disabled_type) != 0
+    }
+
+    fn get_health_percent(&self): f64 {
+        if self.max_health > 0.0 {
+            return self.current_health / self.max_health
+        }
+        return 0.0
+    }
+
+    fn set_health(&self, health: f64) {
+        self.previous_health = self.current_health
+        self.current_health = health
+        if self.current_health > self.max_health {
+            self.current_health = self.max_health
+        }
+        if self.current_health < 0.0 {
+            self.current_health = 0.0
+        }
+    }
+}
+
+// ============================================================================
+// LIFECYCLE CALLBACK INTERFACE
+// ============================================================================
+type OnObjectCreatedCallback = fn(object_id: i32)
+type OnObjectDestroyedCallback = fn(info: ObjectDestructionInfo)
+type OnObjectDamagedCallback = fn(object_id: i32, damage: f64, source_id: i32)
+type OnObjectHealedCallback = fn(object_id: i32, amount: f64, healer_id: i32)
+
+struct LifecycleCallbacks {
+    on_created: ?OnObjectCreatedCallback,
+    on_destroyed: ?OnObjectDestroyedCallback,
+    on_damaged: ?OnObjectDamagedCallback,
+    on_healed: ?OnObjectHealedCallback,
+
+    fn init(): LifecycleCallbacks {
+        return LifecycleCallbacks {
+            on_created: null,
+            on_destroyed: null,
+            on_damaged: null,
+            on_healed: null,
+        }
+    }
+}
+
+// ============================================================================
+// OBJECT LIFECYCLE MANAGER
+// ============================================================================
+const MAX_LIFECYCLE_OBJECTS: i32 = 8192
+
+struct ObjectLifecycleManager {
+    data: [ObjectLifecycleData; 8192],
+    active_count: i32,
+    current_frame: i32,
+
+    // Pending destruction queue
+    pending_destruction: [i32; 256],
+    pending_destruction_count: i32,
+
+    // Callbacks
+    callbacks: LifecycleCallbacks,
+
+    fn init(): ObjectLifecycleManager {
+        let manager = ObjectLifecycleManager {
+            data: [ObjectLifecycleData::init(0); 8192],
+            active_count: 0,
+            current_frame: 0,
+            pending_destruction: [0; 256],
+            pending_destruction_count: 0,
+            callbacks: LifecycleCallbacks::init(),
+        }
+        return manager
+    }
+
+    fn reset(&self) {
+        self.active_count = 0
+        self.current_frame = 0
+        self.pending_destruction_count = 0
+    }
+
+    // Get or create lifecycle data for an object
+    fn get_data(&self, object_id: i32): ?ObjectLifecycleData {
+        for i in 0..self.active_count {
+            if self.data[i].object_id == object_id {
+                return self.data[i]
+            }
+        }
+        return null
+    }
+
+    fn find_slot(&self, object_id: i32): i32 {
+        for i in 0..self.active_count {
+            if self.data[i].object_id == object_id {
+                return i
+            }
+        }
+        return -1
+    }
+
+    // ========================================================================
+    // OBJECT CREATION
+    // ========================================================================
+
+    fn create_object(&self, info: ObjectCreationInfo): i32 {
+        if self.active_count >= MAX_LIFECYCLE_OBJECTS {
+            return -1
+        }
+
+        let slot = self.active_count
+        self.active_count = self.active_count + 1
+
+        // Generate object ID
+        let object_id = self.generate_object_id()
+
+        // Initialize lifecycle data
+        self.data[slot] = ObjectLifecycleData::init(object_id)
+        self.data[slot].creation_frame = self.current_frame
+        self.data[slot].producer_id = info.producer_id
+        self.data[slot].builder_id = info.builder_id
+        self.data[slot].status_mask = info.status_mask
+        self.data[slot].lifecycle_state = ObjectLifecycleState::Creating
+
+        // Set initial health
+        let max_health = 100.0  // Would come from template
+        self.data[slot].max_health = max_health
+        self.data[slot].current_health = max_health * info.starting_health_percent
+
+        // Set experience
+        self.data[slot].veterancy_level = info.experience_level
+
+        return object_id
+    }
+
+    fn complete_object_creation(&self, object_id: i32) {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return
+        }
+
+        // Transition to Alive state
+        if self.data[slot].has_status(OBJECT_STATUS_UNDER_CONSTRUCTION) {
+            self.data[slot].lifecycle_state = ObjectLifecycleState::UnderConstruction
+        } else {
+            self.data[slot].lifecycle_state = ObjectLifecycleState::Alive
+        }
+
+        // Fire callback
+        if self.callbacks.on_created {
+            self.callbacks.on_created(object_id)
+        }
+    }
+
+    fn generate_object_id(&self): i32 {
+        // Simple incrementing ID - in production would need generation tracking
+        return self.active_count + 1
+    }
+
+    // ========================================================================
+    // OBJECT DESTRUCTION
+    // ========================================================================
+
+    fn kill_object(&self, object_id: i32, reason: DeathReason, killer_id: i32) {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return
+        }
+
+        // Already dying or dead?
+        if self.data[slot].lifecycle_state == ObjectLifecycleState::Dying or
+           self.data[slot].lifecycle_state == ObjectLifecycleState::Dead {
+            return
+        }
+
+        // Store death info
+        self.data[slot].death_reason = reason
+        self.data[slot].killer_id = killer_id
+        self.data[slot].death_frame = self.current_frame
+        self.data[slot].lifecycle_state = ObjectLifecycleState::Dying
+
+        // Mark as destroyed
+        self.data[slot].set_status(OBJECT_STATUS_DESTROYED)
+    }
+
+    fn sell_object(&self, object_id: i32) {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return
+        }
+
+        self.data[slot].lifecycle_state = ObjectLifecycleState::Sold
+        self.data[slot].set_status(OBJECT_STATUS_SOLD)
+        self.data[slot].death_reason = DeathReason::Sold
+        self.data[slot].death_frame = self.current_frame
+    }
+
+    fn queue_destruction(&self, object_id: i32) {
+        if self.pending_destruction_count < 256 {
+            self.pending_destruction[self.pending_destruction_count] = object_id
+            self.pending_destruction_count = self.pending_destruction_count + 1
+        }
+    }
+
+    fn process_pending_destructions(&self) {
+        for i in 0..self.pending_destruction_count {
+            let object_id = self.pending_destruction[i]
+            self.destroy_object(object_id)
+        }
+        self.pending_destruction_count = 0
+    }
+
+    fn destroy_object(&self, object_id: i32) {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return
+        }
+
+        // Create destruction info for callback
+        let info = ObjectDestructionInfo::init()
+        info.object_id = object_id
+        info.death_reason = self.data[slot].death_reason
+        info.killer_id = self.data[slot].killer_id
+        info.experience_value = self.data[slot].experience_points
+
+        // Mark as dead
+        self.data[slot].lifecycle_state = ObjectLifecycleState::Dead
+
+        // Fire callback
+        if self.callbacks.on_destroyed {
+            self.callbacks.on_destroyed(info)
+        }
+
+        // Remove from active list by swapping with last element
+        if slot < self.active_count - 1 {
+            self.data[slot] = self.data[self.active_count - 1]
+        }
+        self.active_count = self.active_count - 1
+    }
+
+    // ========================================================================
+    // DAMAGE AND HEALING
+    // ========================================================================
+
+    fn apply_damage(&self, object_id: i32, damage: f64, source_id: i32, damage_type: i32): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return false
+        }
+
+        let data = self.data[slot]
+
+        // Can't damage dead/dying objects
+        if !data.is_alive() {
+            return false
+        }
+
+        // Apply damage
+        let old_health = data.current_health
+        data.set_health(data.current_health - damage)
+
+        // Fire callback
+        if self.callbacks.on_damaged {
+            self.callbacks.on_damaged(object_id, damage, source_id)
+        }
+
+        // Check for death
+        if data.current_health <= 0.0 {
+            self.kill_object(object_id, DeathReason::Killed, source_id)
+            return true
+        }
+
+        return true
+    }
+
+    fn apply_healing(&self, object_id: i32, amount: f64, healer_id: i32): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return false
+        }
+
+        let data = self.data[slot]
+
+        // Can't heal dead objects
+        if !data.is_alive() {
+            return false
+        }
+
+        // Apply healing
+        data.set_health(data.current_health + amount)
+
+        // Fire callback
+        if self.callbacks.on_healed {
+            self.callbacks.on_healed(object_id, amount, healer_id)
+        }
+
+        return true
+    }
+
+    // ========================================================================
+    // UPDATE
+    // ========================================================================
+
+    fn update(&self, frame: i32) {
+        self.current_frame = frame
+
+        // Process dying objects - check if they should become dead
+        for i in 0..self.active_count {
+            if self.data[i].lifecycle_state == ObjectLifecycleState::Dying {
+                let frames_since_death = frame - self.data[i].death_frame
+                if frames_since_death >= self.data[i].cleanup_delay_frames {
+                    self.queue_destruction(self.data[i].object_id)
+                }
+            }
+        }
+
+        // Clean up dead objects
+        self.process_pending_destructions()
+    }
+
+    // ========================================================================
+    // EXPERIENCE AND VETERANCY
+    // ========================================================================
+
+    fn add_experience(&self, object_id: i32, points: i32, experience_required: [i32; 4]): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return false
+        }
+
+        let data = self.data[slot]
+        data.experience_points = data.experience_points + points
+
+        // Check for level up
+        while data.veterancy_level < 3 {
+            let required = experience_required[data.veterancy_level + 1]
+            if data.experience_points >= required {
+                data.veterancy_level = data.veterancy_level + 1
+                // Could fire level up event here
+            } else {
+                break
+            }
+        }
+
+        return true
+    }
+
+    fn get_veterancy_level(&self, object_id: i32): i32 {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return 0
+        }
+        return self.data[slot].veterancy_level
+    }
+
+    // ========================================================================
+    // STATUS QUERIES
+    // ========================================================================
+
+    fn is_alive(&self, object_id: i32): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return false
+        }
+        return self.data[slot].is_alive()
+    }
+
+    fn is_dying(&self, object_id: i32): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return false
+        }
+        return self.data[slot].is_dying()
+    }
+
+    fn is_dead(&self, object_id: i32): bool {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return true  // Unknown object is "dead"
+        }
+        return self.data[slot].is_dead()
+    }
+
+    fn get_health(&self, object_id: i32): f64 {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return 0.0
+        }
+        return self.data[slot].current_health
+    }
+
+    fn get_health_percent(&self, object_id: i32): f64 {
+        let slot = self.find_slot(object_id)
+        if slot < 0 {
+            return 0.0
+        }
+        return self.data[slot].get_health_percent()
+    }
+
+    // ========================================================================
+    // STATISTICS
+    // ========================================================================
+
+    fn get_active_count(&self): i32 {
+        return self.active_count
+    }
+
+    fn get_alive_count(&self): i32 {
+        let count: i32 = 0
+        for i in 0..self.active_count {
+            if self.data[i].is_alive() {
+                count = count + 1
+            }
+        }
+        return count
+    }
+
+    fn get_dying_count(&self): i32 {
+        let count: i32 = 0
+        for i in 0..self.active_count {
+            if self.data[i].is_dying() {
+                count = count + 1
+            }
+        }
+        return count
+    }
+}
+
+// Global lifecycle manager
+let TheLifecycleManager = ObjectLifecycleManager::init()
+
+// ============================================================================
+// TESTS
+// ============================================================================
+test "ObjectLifecycleData: initialization" {
+    let data = ObjectLifecycleData::init(42)
+
+    assert data.object_id == 42
+    assert data.lifecycle_state == ObjectLifecycleState::Creating
+    assert data.status_mask == OBJECT_STATUS_NONE
+    assert data.disabled_mask == DISABLED_TYPE_NONE
+}
+
+test "ObjectLifecycleData: status flags" {
+    let data = ObjectLifecycleData::init(1)
+
+    assert !data.has_status(OBJECT_STATUS_STEALTHED)
+
+    data.set_status(OBJECT_STATUS_STEALTHED)
+    assert data.has_status(OBJECT_STATUS_STEALTHED)
+
+    data.clear_status(OBJECT_STATUS_STEALTHED)
+    assert !data.has_status(OBJECT_STATUS_STEALTHED)
+}
+
+test "ObjectLifecycleData: disabled types" {
+    let data = ObjectLifecycleData::init(1)
+
+    assert !data.is_disabled()
+
+    data.add_disabled_type(DISABLED_TYPE_EMP)
+    assert data.is_disabled()
+    assert data.has_disabled_type(DISABLED_TYPE_EMP)
+
+    data.remove_disabled_type(DISABLED_TYPE_EMP)
+    assert !data.is_disabled()
+}
+
+test "ObjectLifecycleData: health" {
+    let data = ObjectLifecycleData::init(1)
+    data.max_health = 100.0
+    data.current_health = 100.0
+
+    assert data.get_health_percent() == 1.0
+
+    data.set_health(50.0)
+    assert data.get_health_percent() == 0.5
+
+    // Can't exceed max
+    data.set_health(150.0)
+    assert data.current_health == 100.0
+
+    // Can't go below 0
+    data.set_health(-10.0)
+    assert data.current_health == 0.0
+}
+
+test "ObjectLifecycleManager: create object" {
+    let manager = ObjectLifecycleManager::init()
+
+    let info = ObjectCreationInfo::init()
+    info.template_name = "Ranger"
+    info.starting_health_percent = 1.0
+
+    let object_id = manager.create_object(info)
+    assert object_id > 0
+
+    let data = manager.get_data(object_id)
+    assert data != null
+    assert data.lifecycle_state == ObjectLifecycleState::Creating
+}
+
+test "ObjectLifecycleManager: complete creation" {
+    let manager = ObjectLifecycleManager::init()
+
+    let info = ObjectCreationInfo::init()
+    let object_id = manager.create_object(info)
+
+    manager.complete_object_creation(object_id)
+
+    let data = manager.get_data(object_id)
+    assert data != null
+    assert data.lifecycle_state == ObjectLifecycleState::Alive
+    assert manager.is_alive(object_id)
+}
+
+test "ObjectLifecycleManager: damage and kill" {
+    let manager = ObjectLifecycleManager::init()
+
+    let info = ObjectCreationInfo::init()
+    let object_id = manager.create_object(info)
+    manager.complete_object_creation(object_id)
+
+    // Get the slot and set health properly
+    let data = manager.get_data(object_id)
+    data.max_health = 100.0
+    data.current_health = 100.0
+
+    // Apply damage
+    manager.apply_damage(object_id, 50.0, 0, 0)
+    assert manager.get_health(object_id) == 50.0
+
+    // Kill with lethal damage
+    manager.apply_damage(object_id, 100.0, 999, 0)
+    assert manager.is_dying(object_id)
+
+    let dying_data = manager.get_data(object_id)
+    assert dying_data.killer_id == 999
+}
+
+test "ObjectLifecycleManager: healing" {
+    let manager = ObjectLifecycleManager::init()
+
+    let info = ObjectCreationInfo::init()
+    let object_id = manager.create_object(info)
+    manager.complete_object_creation(object_id)
+
+    let data = manager.get_data(object_id)
+    data.max_health = 100.0
+    data.current_health = 50.0
+
+    manager.apply_healing(object_id, 30.0, 0)
+    assert manager.get_health(object_id) == 80.0
+
+    // Can't heal above max
+    manager.apply_healing(object_id, 50.0, 0)
+    assert manager.get_health(object_id) == 100.0
+}
+
+test "ObjectLifecycleManager: sell object" {
+    let manager = ObjectLifecycleManager::init()
+
+    let info = ObjectCreationInfo::init()
+    let object_id = manager.create_object(info)
+    manager.complete_object_creation(object_id)
+
+    manager.sell_object(object_id)
+
+    let data = manager.get_data(object_id)
+    assert data.lifecycle_state == ObjectLifecycleState::Sold
+    assert data.has_status(OBJECT_STATUS_SOLD)
+    assert data.death_reason == DeathReason::Sold
+}

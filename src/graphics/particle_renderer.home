@@ -1,0 +1,1275 @@
+// Particle Renderer - GPU Instancing for C&C Generals
+// Based on W3D PointGroupClass from original Westwood code
+// Implements efficient batched rendering of particles using GPU instancing
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+let MAX_POINTS_PER_GROUP: i32 = 512
+let MAX_VB_SIZE: i32 = 2048
+let MAX_TRI_POINTS: i32 = MAX_VB_SIZE / 3
+let MAX_QUAD_POINTS: i32 = MAX_VB_SIZE / 4
+let MAX_VOLUME_PARTICLE_DEPTH: i32 = 16
+
+let PI: f32 = 3.14159265358979
+let TWO_PI: f32 = 6.28318530717959
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+/// Point rendering mode - triangles or quads
+enum PointMode {
+    TRIS,          // Each point is a triangle (3 vertices)
+    QUADS,         // Each point is a quad (4 vertices, 2 triangles)
+    SCREENSPACE,   // Screen-aligned triangles for post-process effects
+}
+
+/// Particle shader type matching original W3D
+enum ParticleShaderType {
+    ADDITIVE,      // Add blending (fire, glow, lasers)
+    ALPHA,         // Alpha blending (smoke, dust)
+    ALPHA_TEST,    // Alpha testing (debris, sparks)
+    MULTIPLY,      // Multiply blending (shadows, scorch)
+}
+
+/// Render flags
+enum PointGroupFlag {
+    TRANSFORM,     // Transform points with modelview matrix (worldspace points)
+}
+
+// ============================================================================
+// VECTOR TYPES (local for GPU buffers)
+// ============================================================================
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn new(x: f32, y: f32): Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    fn zero(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+
+    fn scale(&self, s: f32): Vec2 {
+        return Vec2 { x: self.x * s, y: self.y * s }
+    }
+
+    fn add(&self, other: Vec2): Vec2 {
+        return Vec2 { x: self.x + other.x, y: self.y + other.y }
+    }
+}
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3 {
+    fn new(x: f32, y: f32, z: f32): Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    fn zero(): Vec3 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn add(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }
+    }
+
+    fn sub(&self, other: Vec3): Vec3 {
+        return Vec3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }
+    }
+
+    fn scale(&self, s: f32): Vec3 {
+        return Vec3 { x: self.x * s, y: self.y * s, z: self.z * s }
+    }
+
+    fn length(&self): f32 {
+        return sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+    }
+
+    fn normalize(&self): Vec3 {
+        let len = self.length()
+        if len > 0.0001 {
+            return Vec3 { x: self.x / len, y: self.y / len, z: self.z / len }
+        }
+        return Vec3::zero()
+    }
+}
+
+struct Vec4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+
+impl Vec4 {
+    fn new(x: f32, y: f32, z: f32, w: f32): Vec4 {
+        return Vec4 { x: x, y: y, z: z, w: w }
+    }
+
+    fn white(): Vec4 {
+        return Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 }
+    }
+}
+
+// ============================================================================
+// SHARED BUFFER - GPU-friendly data arrays
+// ============================================================================
+
+/// Position buffer for particle centers
+struct PositionBuffer {
+    data: [Vec3],
+    count: i32,
+    capacity: i32,
+}
+
+impl PositionBuffer {
+    fn init(capacity: i32): PositionBuffer {
+        let data: [Vec3] = []
+        for i in 0..capacity {
+            data = data + [Vec3::zero()]
+        }
+        return PositionBuffer {
+            data: data,
+            count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn get(&self, index: i32): Vec3 {
+        if index >= 0 && index < self.count {
+            return self.data[index]
+        }
+        return Vec3::zero()
+    }
+
+    fn set(&self, index: i32, value: Vec3) {
+        if index >= 0 && index < self.capacity {
+            self.data[index] = value
+            if index >= self.count {
+                self.count = index + 1
+            }
+        }
+    }
+}
+
+/// RGBA color buffer
+struct ColorBuffer {
+    data: [Vec4],
+    count: i32,
+    capacity: i32,
+}
+
+impl ColorBuffer {
+    fn init(capacity: i32): ColorBuffer {
+        let data: [Vec4] = []
+        for i in 0..capacity {
+            data = data + [Vec4::white()]
+        }
+        return ColorBuffer {
+            data: data,
+            count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn get(&self, index: i32): Vec4 {
+        if index >= 0 && index < self.count {
+            return self.data[index]
+        }
+        return Vec4::white()
+    }
+
+    fn set(&self, index: i32, value: Vec4) {
+        if index >= 0 && index < self.capacity {
+            self.data[index] = value
+            if index >= self.count {
+                self.count = index + 1
+            }
+        }
+    }
+}
+
+/// Size buffer for particle scales
+struct SizeBuffer {
+    data: [f32],
+    count: i32,
+    capacity: i32,
+}
+
+impl SizeBuffer {
+    fn init(capacity: i32): SizeBuffer {
+        let data: [f32] = []
+        for i in 0..capacity {
+            data = data + [1.0]
+        }
+        return SizeBuffer {
+            data: data,
+            count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn get(&self, index: i32): f32 {
+        if index >= 0 && index < self.count {
+            return self.data[index]
+        }
+        return 1.0
+    }
+
+    fn set(&self, index: i32, value: f32) {
+        if index >= 0 && index < self.capacity {
+            self.data[index] = value
+            if index >= self.count {
+                self.count = index + 1
+            }
+        }
+    }
+}
+
+/// Orientation buffer (0-255 for 256 discrete rotations)
+struct OrientationBuffer {
+    data: [i32],  // u8 equivalent
+    count: i32,
+    capacity: i32,
+}
+
+impl OrientationBuffer {
+    fn init(capacity: i32): OrientationBuffer {
+        let data: [i32] = []
+        for i in 0..capacity {
+            data = data + [0]
+        }
+        return OrientationBuffer {
+            data: data,
+            count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn get(&self, index: i32): i32 {
+        if index >= 0 && index < self.count {
+            return self.data[index]
+        }
+        return 0
+    }
+
+    fn set(&self, index: i32, value: i32) {
+        if index >= 0 && index < self.capacity {
+            self.data[index] = value & 255  // Clamp to 0-255
+            if index >= self.count {
+                self.count = index + 1
+            }
+        }
+    }
+}
+
+// ============================================================================
+// VERTEX DATA - Generated for GPU submission
+// ============================================================================
+
+struct ParticleVertex {
+    position: Vec3,
+    color: Vec4,
+    uv: Vec2,
+}
+
+impl ParticleVertex {
+    fn init(): ParticleVertex {
+        return ParticleVertex {
+            position: Vec3::zero(),
+            color: Vec4::white(),
+            uv: Vec2::zero(),
+        }
+    }
+}
+
+struct VertexBuffer {
+    vertices: [ParticleVertex],
+    count: i32,
+    capacity: i32,
+}
+
+impl VertexBuffer {
+    fn init(capacity: i32): VertexBuffer {
+        let vertices: [ParticleVertex] = []
+        for i in 0..capacity {
+            vertices = vertices + [ParticleVertex::init()]
+        }
+        return VertexBuffer {
+            vertices: vertices,
+            count: 0,
+            capacity: capacity,
+        }
+    }
+
+    fn reset(&self) {
+        self.count = 0
+    }
+
+    fn add(&self, vertex: ParticleVertex) {
+        if self.count < self.capacity {
+            self.vertices[self.count] = vertex
+            self.count = self.count + 1
+        }
+    }
+}
+
+// ============================================================================
+// ORIENTATION LOOKUP TABLES
+// Pre-computed vertex offsets for 256 discrete orientations
+// ============================================================================
+
+struct OrientationTable {
+    // Triangle mode: 3 vertices per orientation
+    tri_offsets: [[Vec3]],   // [256][3]
+    // Quad mode: 4 vertices per orientation
+    quad_offsets: [[Vec3]],  // [256][4]
+    initialized: bool,
+}
+
+impl OrientationTable {
+    fn init(): OrientationTable {
+        let tri_offsets: [[Vec3]] = []
+        let quad_offsets: [[Vec3]] = []
+
+        // Pre-compute for all 256 orientations
+        for i in 0..256 {
+            let angle = cast(f32, i) * TWO_PI / 256.0
+            let c = cos(angle)
+            let s = sin(angle)
+
+            // Triangle vertices (equilateral, centered)
+            let tri: [Vec3] = [
+                rotate_vertex(Vec3::new(0.0, -2.0, 0.0), c, s),
+                rotate_vertex(Vec3::new(-1.732, 1.0, 0.0), c, s),
+                rotate_vertex(Vec3::new(1.732, 1.0, 0.0), c, s),
+            ]
+            tri_offsets = tri_offsets + [tri]
+
+            // Quad vertices (unit square, centered)
+            let quad: [Vec3] = [
+                rotate_vertex(Vec3::new(-0.5, 0.5, 0.0), c, s),
+                rotate_vertex(Vec3::new(-0.5, -0.5, 0.0), c, s),
+                rotate_vertex(Vec3::new(0.5, -0.5, 0.0), c, s),
+                rotate_vertex(Vec3::new(0.5, 0.5, 0.0), c, s),
+            ]
+            quad_offsets = quad_offsets + [quad]
+        }
+
+        return OrientationTable {
+            tri_offsets: tri_offsets,
+            quad_offsets: quad_offsets,
+            initialized: true,
+        }
+    }
+
+    fn get_tri_offset(&self, orientation: i32, vertex: i32): Vec3 {
+        let ori = orientation & 255
+        if vertex >= 0 && vertex < 3 {
+            return self.tri_offsets[ori][vertex]
+        }
+        return Vec3::zero()
+    }
+
+    fn get_quad_offset(&self, orientation: i32, vertex: i32): Vec3 {
+        let ori = orientation & 255
+        if vertex >= 0 && vertex < 4 {
+            return self.quad_offsets[ori][vertex]
+        }
+        return Vec3::zero()
+    }
+}
+
+fn rotate_vertex(v: Vec3, cos_a: f32, sin_a: f32): Vec3 {
+    return Vec3::new(
+        v.x * cos_a - v.y * sin_a,
+        v.x * sin_a + v.y * cos_a,
+        v.z
+    )
+}
+
+// ============================================================================
+// UV FRAME TABLES
+// Pre-computed UV coordinates for texture atlas frames
+// ============================================================================
+
+struct UVFrameTable {
+    // Tables for different grid sizes: 1x1, 2x2, 4x4, 8x8, 16x16
+    tri_uvs: [[[Vec2]]],   // [5][frames][3]
+    quad_uvs: [[[Vec2]]],  // [5][frames][4]
+    initialized: bool,
+}
+
+impl UVFrameTable {
+    fn init(): UVFrameTable {
+        let tri_uvs: [[[Vec2]]] = []
+        let quad_uvs: [[[Vec2]]] = []
+
+        // Base UVs (unscaled, untranslated)
+        let tri_base: [Vec2] = [
+            Vec2::new(0.5, 0.0),
+            Vec2::new(0.0, 0.866),
+            Vec2::new(1.0, 0.866),
+        ]
+        let quad_base: [Vec2] = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+        ]
+
+        // Generate for each grid size (1x1, 2x2, 4x4, 8x8, 16x16)
+        for table_idx in 0..5 {
+            let rows = 1 << table_idx  // 1, 2, 4, 8, 16
+            let frame_count = rows * rows
+            let scale = 1.0 / cast(f32, rows)
+
+            let tri_frames: [[Vec2]] = []
+            let quad_frames: [[Vec2]] = []
+
+            for v in 0..rows {
+                for u in 0..rows {
+                    let corner = Vec2::new(cast(f32, u) * scale, cast(f32, v) * scale)
+
+                    // Triangle UVs for this frame
+                    let tri_frame: [Vec2] = [
+                        corner.add(tri_base[0].scale(scale)),
+                        corner.add(tri_base[1].scale(scale)),
+                        corner.add(tri_base[2].scale(scale)),
+                    ]
+                    tri_frames = tri_frames + [tri_frame]
+
+                    // Quad UVs for this frame
+                    let quad_frame: [Vec2] = [
+                        corner.add(quad_base[0].scale(scale)),
+                        corner.add(quad_base[1].scale(scale)),
+                        corner.add(quad_base[2].scale(scale)),
+                        corner.add(quad_base[3].scale(scale)),
+                    ]
+                    quad_frames = quad_frames + [quad_frame]
+                }
+            }
+
+            tri_uvs = tri_uvs + [tri_frames]
+            quad_uvs = quad_uvs + [quad_frames]
+        }
+
+        return UVFrameTable {
+            tri_uvs: tri_uvs,
+            quad_uvs: quad_uvs,
+            initialized: true,
+        }
+    }
+
+    fn get_tri_uvs(&self, grid_log2: i32, frame: i32): [Vec2] {
+        let grid = clamp_i32(grid_log2, 0, 4)
+        let frame_count = (1 << grid) * (1 << grid)
+        let f = frame % frame_count
+        if f < 0 {
+            return [Vec2::zero(), Vec2::zero(), Vec2::zero()]
+        }
+        return self.tri_uvs[grid][f]
+    }
+
+    fn get_quad_uvs(&self, grid_log2: i32, frame: i32): [Vec2] {
+        let grid = clamp_i32(grid_log2, 0, 4)
+        let frame_count = (1 << grid) * (1 << grid)
+        let f = frame % frame_count
+        if f < 0 {
+            return [Vec2::zero(), Vec2::zero(), Vec2::zero(), Vec2::zero()]
+        }
+        return self.quad_uvs[grid][f]
+    }
+}
+
+// ============================================================================
+// INDEX BUFFER - Pre-generated indices for triangle/quad rendering
+// ============================================================================
+
+struct IndexBuffer {
+    tri_indices: [i32],   // Sequential indices for triangles
+    quad_indices: [i32],  // 6 indices per quad (2 triangles)
+    initialized: bool,
+}
+
+impl IndexBuffer {
+    fn init(): IndexBuffer {
+        // Triangle indices: sequential
+        let tri_indices: [i32] = []
+        for i in 0..(MAX_TRI_POINTS * 3) {
+            tri_indices = tri_indices + [i]
+        }
+
+        // Quad indices: 6 per quad (0,1,2, 2,3,0 pattern)
+        let quad_indices: [i32] = []
+        let vert = 0
+        for i in 0..MAX_QUAD_POINTS {
+            // First triangle: 0, 1, 2
+            quad_indices = quad_indices + [vert]
+            quad_indices = quad_indices + [vert + 1]
+            quad_indices = quad_indices + [vert + 2]
+            // Second triangle: 2, 3, 0
+            quad_indices = quad_indices + [vert + 2]
+            quad_indices = quad_indices + [vert + 3]
+            quad_indices = quad_indices + [vert]
+            vert = vert + 4
+        }
+
+        return IndexBuffer {
+            tri_indices: tri_indices,
+            quad_indices: quad_indices,
+            initialized: true,
+        }
+    }
+}
+
+// ============================================================================
+// POINT GROUP CLASS - Main batched particle renderer
+// ============================================================================
+
+struct PointGroup {
+    // Input buffers (set by particle system)
+    position_buffer: PositionBuffer?,
+    color_buffer: ColorBuffer?,
+    size_buffer: SizeBuffer?,
+    orientation_buffer: OrientationBuffer?,
+
+    point_count: i32,
+
+    // Default values (used if buffers not provided)
+    default_size: f32,
+    default_color: Vec4,
+    default_orientation: i32,
+    default_frame: i32,
+
+    // Rendering state
+    point_mode: PointMode,
+    shader_type: ParticleShaderType,
+    texture_id: i32,
+    billboard: bool,
+    flags: i32,
+
+    // Texture atlas settings
+    frame_row_column_log2: i32,  // 0=1x1, 1=2x2, 2=4x4, 3=8x8, 4=16x16
+
+    // Generated vertex data
+    vertex_buffer: VertexBuffer,
+
+    // Statistics
+    polygon_count: i32,
+}
+
+impl PointGroup {
+    fn init(): PointGroup {
+        return PointGroup {
+            position_buffer: null,
+            color_buffer: null,
+            size_buffer: null,
+            orientation_buffer: null,
+            point_count: 0,
+            default_size: 1.0,
+            default_color: Vec4::white(),
+            default_orientation: 0,
+            default_frame: 0,
+            point_mode: PointMode::QUADS,
+            shader_type: ParticleShaderType::ADDITIVE,
+            texture_id: -1,
+            billboard: true,
+            flags: 0,
+            frame_row_column_log2: 0,
+            vertex_buffer: VertexBuffer::init(MAX_VB_SIZE),
+            polygon_count: 0,
+        }
+    }
+
+    /// Set input arrays from particle system
+    fn set_arrays(&self,
+        positions: PositionBuffer,
+        colors: ColorBuffer?,
+        sizes: SizeBuffer?,
+        orientations: OrientationBuffer?,
+        active_count: i32
+    ) {
+        self.position_buffer = positions
+        self.color_buffer = colors
+        self.size_buffer = sizes
+        self.orientation_buffer = orientations
+        self.point_count = active_count
+    }
+
+    fn set_point_size(&self, size: f32) {
+        self.default_size = size
+    }
+
+    fn set_point_color(&self, color: Vec4) {
+        self.default_color = color
+    }
+
+    fn set_point_orientation(&self, orientation: i32) {
+        self.default_orientation = orientation & 255
+    }
+
+    fn set_point_frame(&self, frame: i32) {
+        self.default_frame = frame
+    }
+
+    fn set_point_mode(&self, mode: PointMode) {
+        self.point_mode = mode
+    }
+
+    fn set_shader(&self, shader: ParticleShaderType) {
+        self.shader_type = shader
+    }
+
+    fn set_texture(&self, texture_id: i32) {
+        self.texture_id = texture_id
+    }
+
+    fn set_billboard(&self, should_billboard: bool) {
+        self.billboard = should_billboard
+    }
+
+    fn set_flag(&self, flag: PointGroupFlag, on: bool) {
+        let bit = 1 << cast(i32, flag)
+        if on {
+            self.flags = self.flags | bit
+        } else {
+            self.flags = self.flags & ~bit
+        }
+    }
+
+    fn get_flag(&self, flag: PointGroupFlag): bool {
+        let bit = 1 << cast(i32, flag)
+        return (self.flags & bit) != 0
+    }
+
+    fn set_frame_grid(&self, log2: i32) {
+        self.frame_row_column_log2 = clamp_i32(log2, 0, 4)
+    }
+
+    fn get_polygon_count(&self): i32 {
+        return self.polygon_count
+    }
+
+    /// Generate vertex data from input arrays
+    fn update_vertices(&self, orientation_table: OrientationTable, uv_table: UVFrameTable) {
+        self.vertex_buffer.reset()
+
+        if self.point_count == 0 || self.position_buffer == null {
+            self.polygon_count = 0
+            return
+        }
+
+        let positions = self.position_buffer
+        let verts_per_point = if self.point_mode == PointMode::QUADS { 4 } else { 3 }
+        self.polygon_count = if self.point_mode == PointMode::QUADS {
+            self.point_count * 2
+        } else {
+            self.point_count
+        }
+
+        for i in 0..self.point_count {
+            let pos = positions.get(i)
+
+            // Get per-particle values or use defaults
+            let size = if self.size_buffer != null {
+                self.size_buffer.get(i)
+            } else {
+                self.default_size
+            }
+
+            let color = if self.color_buffer != null {
+                self.color_buffer.get(i)
+            } else {
+                self.default_color
+            }
+
+            let orientation = if self.orientation_buffer != null {
+                self.orientation_buffer.get(i)
+            } else {
+                self.default_orientation
+            }
+
+            // Get UV coordinates for this particle's frame
+            let uvs = if self.point_mode == PointMode::QUADS {
+                uv_table.get_quad_uvs(self.frame_row_column_log2, self.default_frame)
+            } else {
+                uv_table.get_tri_uvs(self.frame_row_column_log2, self.default_frame)
+            }
+
+            // Generate vertices for this particle
+            for v in 0..verts_per_point {
+                let offset = if self.point_mode == PointMode::QUADS {
+                    orientation_table.get_quad_offset(orientation, v).scale(size)
+                } else {
+                    orientation_table.get_tri_offset(orientation, v).scale(size)
+                }
+
+                let vertex = ParticleVertex {
+                    position: pos.add(offset),
+                    color: color,
+                    uv: uvs[v],
+                }
+                self.vertex_buffer.add(vertex)
+            }
+        }
+    }
+
+    /// Render the point group
+    /// Returns render data for GPU submission
+    fn render(&self, orientation_table: OrientationTable, uv_table: UVFrameTable): RenderBatch {
+        self.update_vertices(orientation_table, uv_table)
+
+        return RenderBatch {
+            vertices: self.vertex_buffer.vertices,
+            vertex_count: self.vertex_buffer.count,
+            point_mode: self.point_mode,
+            shader_type: self.shader_type,
+            texture_id: self.texture_id,
+            polygon_count: self.polygon_count,
+        }
+    }
+}
+
+/// Render batch data ready for GPU submission
+struct RenderBatch {
+    vertices: [ParticleVertex],
+    vertex_count: i32,
+    point_mode: PointMode,
+    shader_type: ParticleShaderType,
+    texture_id: i32,
+    polygon_count: i32,
+}
+
+// ============================================================================
+// PARTICLE BATCH RENDERER - High-level manager matching W3DParticleSystemManager
+// ============================================================================
+
+struct ParticleBatchRenderer {
+    // Shared buffers for all particle systems
+    position_buffer: PositionBuffer,
+    color_buffer: ColorBuffer,
+    size_buffer: SizeBuffer,
+    orientation_buffer: OrientationBuffer,
+
+    // Rendering components
+    point_group: PointGroup,
+
+    // Pre-computed lookup tables
+    orientation_table: OrientationTable,
+    uv_table: UVFrameTable,
+    index_buffer: IndexBuffer,
+
+    // State
+    ready_to_render: bool,
+    on_screen_particle_count: i32,
+    field_particle_count: i32,
+
+    // Frustum culling bounds
+    cull_box_center: Vec3,
+    cull_box_extent: Vec3,
+}
+
+impl ParticleBatchRenderer {
+    fn init(): ParticleBatchRenderer {
+        return ParticleBatchRenderer {
+            position_buffer: PositionBuffer::init(MAX_POINTS_PER_GROUP),
+            color_buffer: ColorBuffer::init(MAX_POINTS_PER_GROUP),
+            size_buffer: SizeBuffer::init(MAX_POINTS_PER_GROUP),
+            orientation_buffer: OrientationBuffer::init(MAX_POINTS_PER_GROUP),
+            point_group: PointGroup::init(),
+            orientation_table: OrientationTable::init(),
+            uv_table: UVFrameTable::init(),
+            index_buffer: IndexBuffer::init(),
+            ready_to_render: false,
+            on_screen_particle_count: 0,
+            field_particle_count: 0,
+            cull_box_center: Vec3::zero(),
+            cull_box_extent: Vec3::new(1000.0, 1000.0, 500.0),
+        }
+    }
+
+    /// Queue particles for rendering (called before flush)
+    fn queue_particle_render(&self) {
+        self.ready_to_render = true
+    }
+
+    /// Set frustum culling bounds
+    fn set_cull_box(&self, center: Vec3, extent: Vec3) {
+        self.cull_box_center = center
+        self.cull_box_extent = extent
+    }
+
+    /// Prepare a batch of particles for rendering
+    /// Returns the number of particles that passed culling
+    fn prepare_batch(&self,
+        particles: [ParticleData],
+        shader_type: ParticleShaderType,
+        texture_id: i32,
+        billboard: bool
+    ): i32 {
+        let count = 0
+
+        // Reset buffers
+        self.position_buffer.count = 0
+        self.color_buffer.count = 0
+        self.size_buffer.count = 0
+        self.orientation_buffer.count = 0
+
+        // Fill buffers with culled particles
+        for i in 0..len(particles) {
+            if count >= MAX_POINTS_PER_GROUP {
+                break
+            }
+
+            let p = particles[i]
+
+            // Frustum cull particle
+            if !self.is_visible(p.position, p.size) {
+                continue
+            }
+
+            self.position_buffer.set(count, p.position)
+            self.color_buffer.set(count, p.color)
+            self.size_buffer.set(count, p.size)
+            self.orientation_buffer.set(count, p.orientation)
+
+            count = count + 1
+        }
+
+        // Configure point group
+        self.point_group.set_arrays(
+            self.position_buffer,
+            self.color_buffer,
+            self.size_buffer,
+            self.orientation_buffer,
+            count
+        )
+        self.point_group.set_shader(shader_type)
+        self.point_group.set_texture(texture_id)
+        self.point_group.set_billboard(billboard)
+        self.point_group.set_point_mode(PointMode::QUADS)
+
+        return count
+    }
+
+    /// Check if a particle is visible within the cull box
+    fn is_visible(&self, position: Vec3, size: f32): bool {
+        // AABB test against cull box
+        if abs(position.x - self.cull_box_center.x) > (self.cull_box_extent.x + size) {
+            return false
+        }
+        if abs(position.y - self.cull_box_center.y) > (self.cull_box_extent.y + size) {
+            return false
+        }
+        if abs(position.z - self.cull_box_center.z) > (self.cull_box_extent.z + size) {
+            return false
+        }
+        return true
+    }
+
+    /// Render all queued particles
+    fn do_particles(&self): [RenderBatch] {
+        if !self.ready_to_render {
+            return []
+        }
+
+        self.ready_to_render = false
+        self.on_screen_particle_count = 0
+
+        let batch = self.point_group.render(self.orientation_table, self.uv_table)
+        self.on_screen_particle_count = batch.vertex_count / 4  // Assuming quads
+
+        return [batch]
+    }
+
+    fn get_on_screen_particle_count(&self): i32 {
+        return self.on_screen_particle_count
+    }
+}
+
+/// Particle data for batch submission
+struct ParticleData {
+    position: Vec3,
+    color: Vec4,
+    size: f32,
+    orientation: i32,  // 0-255
+}
+
+impl ParticleData {
+    fn new(pos: Vec3, color: Vec4, size: f32, orientation: i32): ParticleData {
+        return ParticleData {
+            position: pos,
+            color: color,
+            size: size,
+            orientation: orientation,
+        }
+    }
+}
+
+// ============================================================================
+// STREAK LINE RENDERER - For particle trails (missiles, tracers)
+// ============================================================================
+
+struct StreakVertex {
+    position: Vec3,
+    width: f32,
+    color: Vec4,
+    uv: Vec2,
+}
+
+struct StreakLine {
+    vertices: [StreakVertex],
+    vertex_count: i32,
+    capacity: i32,
+    texture_id: i32,
+    shader_type: ParticleShaderType,
+}
+
+impl StreakLine {
+    fn init(capacity: i32): StreakLine {
+        let vertices: [StreakVertex] = []
+        for i in 0..capacity {
+            vertices = vertices + [StreakVertex {
+                position: Vec3::zero(),
+                width: 1.0,
+                color: Vec4::white(),
+                uv: Vec2::zero(),
+            }]
+        }
+        return StreakLine {
+            vertices: vertices,
+            vertex_count: 0,
+            capacity: capacity,
+            texture_id: -1,
+            shader_type: ParticleShaderType::ADDITIVE,
+        }
+    }
+
+    fn reset(&self) {
+        self.vertex_count = 0
+    }
+
+    fn set_texture(&self, texture_id: i32) {
+        self.texture_id = texture_id
+    }
+
+    fn set_shader(&self, shader: ParticleShaderType) {
+        self.shader_type = shader
+    }
+
+    /// Set streak data from position/width/color arrays
+    fn set_locs_widths_colors(&self,
+        positions: [Vec3],
+        widths: [f32],
+        colors: [Vec4],
+        count: i32
+    ) {
+        self.reset()
+
+        let num = if count < self.capacity { count } else { self.capacity }
+
+        for i in 0..num {
+            self.vertices[i].position = positions[i]
+            self.vertices[i].width = widths[i]
+            self.vertices[i].color = colors[i]
+            self.vertices[i].uv = Vec2::new(0.0, cast(f32, i) / cast(f32, num - 1))
+        }
+
+        self.vertex_count = num
+
+        // Fade out the trailing edge (per original code)
+        if self.vertex_count > 0 {
+            self.vertices[0].color = Vec4::new(0.0, 0.0, 0.0, 0.0)
+        }
+    }
+
+    /// Generate render-ready vertices for the streak
+    fn generate_vertices(&self, camera_pos: Vec3): [ParticleVertex] {
+        let result: [ParticleVertex] = []
+
+        if self.vertex_count < 2 {
+            return result
+        }
+
+        // Generate quad strip from line points
+        for i in 0..(self.vertex_count - 1) {
+            let p0 = self.vertices[i]
+            let p1 = self.vertices[i + 1]
+
+            // Calculate tangent and perpendicular
+            let tangent = p1.position.sub(p0.position).normalize()
+            let to_camera = camera_pos.sub(p0.position).normalize()
+            let perp = cross(tangent, to_camera).normalize()
+
+            // Create quad vertices
+            let half_width_0 = p0.width * 0.5
+            let half_width_1 = p1.width * 0.5
+
+            result = result + [ParticleVertex {
+                position: p0.position.add(perp.scale(half_width_0)),
+                color: p0.color,
+                uv: Vec2::new(0.0, p0.uv.y),
+            }]
+            result = result + [ParticleVertex {
+                position: p0.position.sub(perp.scale(half_width_0)),
+                color: p0.color,
+                uv: Vec2::new(1.0, p0.uv.y),
+            }]
+            result = result + [ParticleVertex {
+                position: p1.position.sub(perp.scale(half_width_1)),
+                color: p1.color,
+                uv: Vec2::new(1.0, p1.uv.y),
+            }]
+            result = result + [ParticleVertex {
+                position: p1.position.add(perp.scale(half_width_1)),
+                color: p1.color,
+                uv: Vec2::new(0.0, p1.uv.y),
+            }]
+        }
+
+        return result
+    }
+}
+
+fn cross(a: Vec3, b: Vec3): Vec3 {
+    return Vec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    )
+}
+
+// ============================================================================
+// VOLUME PARTICLE RENDERER - For depth/fog effects
+// ============================================================================
+
+struct VolumeParticleRenderer {
+    base_renderer: ParticleBatchRenderer,
+    depth: i32,
+}
+
+impl VolumeParticleRenderer {
+    fn init(): VolumeParticleRenderer {
+        return VolumeParticleRenderer {
+            base_renderer: ParticleBatchRenderer::init(),
+            depth: 4,
+        }
+    }
+
+    fn set_depth(&self, depth: i32) {
+        self.depth = clamp_i32(depth, 1, MAX_VOLUME_PARTICLE_DEPTH)
+    }
+
+    /// Render particles with volume effect (multiple layers)
+    fn render_volume(&self, particles: [ParticleData], camera_pos: Vec3): [RenderBatch] {
+        let batches: [RenderBatch] = []
+
+        for layer in 0..self.depth {
+            // Shift particles toward camera for each layer
+            let shift_factor = 0.1 / cast(f32, self.depth) * cast(f32, layer)
+
+            let shifted_particles: [ParticleData] = []
+            for i in 0..len(particles) {
+                let p = particles[i]
+                let to_camera = camera_pos.sub(p.position).normalize()
+                let shift = to_camera.scale(p.size * shift_factor)
+
+                shifted_particles = shifted_particles + [ParticleData {
+                    position: p.position.add(shift),
+                    color: p.color,
+                    size: p.size,
+                    orientation: p.orientation,
+                }]
+            }
+
+            // Prepare and render this layer
+            self.base_renderer.prepare_batch(
+                shifted_particles,
+                ParticleShaderType::ADDITIVE,
+                -1,
+                true
+            )
+            self.base_renderer.queue_particle_render()
+
+            let layer_batches = self.base_renderer.do_particles()
+            for b in layer_batches {
+                batches = batches + [b]
+            }
+        }
+
+        return batches
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn sqrt(x: f32): f32 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn sin(x: f32): f32 {
+    let x_norm = x
+    while x_norm > PI {
+        x_norm = x_norm - TWO_PI
+    }
+    while x_norm < -PI {
+        x_norm = x_norm + TWO_PI
+    }
+    let x2 = x_norm * x_norm
+    let x3 = x2 * x_norm
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    return x_norm - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0
+}
+
+fn cos(x: f32): f32 {
+    return sin(x + PI / 2.0)
+}
+
+fn abs(x: f32): f32 {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+fn clamp_i32(x: i32, min: i32, max: i32): i32 {
+    if x < min {
+        return min
+    }
+    if x > max {
+        return max
+    }
+    return x
+}
+
+fn len<T>(arr: [T]): i32 {
+    // Placeholder for array length
+    return 0
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+
+let g_particle_renderer: ParticleBatchRenderer? = null
+
+fn init_particle_renderer(): ParticleBatchRenderer {
+    let renderer = ParticleBatchRenderer::init()
+    g_particle_renderer = renderer
+    return renderer
+}
+
+fn get_particle_renderer(): ParticleBatchRenderer? {
+    return g_particle_renderer
+}
+
+fn shutdown_particle_renderer() {
+    g_particle_renderer = null
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+fn test_particle_renderer() {
+    print("Testing GPU Particle Renderer...")
+
+    // Initialize renderer
+    let renderer = init_particle_renderer()
+    print("Particle batch renderer initialized")
+
+    // Test orientation table
+    let ori_table = OrientationTable::init()
+    print("Orientation table generated (256 rotations)")
+
+    let offset_0 = ori_table.get_quad_offset(0, 0)
+    let offset_64 = ori_table.get_quad_offset(64, 0)
+    let offset_128 = ori_table.get_quad_offset(128, 0)
+    print("Orientation 0 offset: " + str(offset_0.x) + ", " + str(offset_0.y))
+    print("Orientation 64 offset: " + str(offset_64.x) + ", " + str(offset_64.y))
+    print("Orientation 128 offset: " + str(offset_128.x) + ", " + str(offset_128.y))
+
+    // Test UV table
+    let uv_table = UVFrameTable::init()
+    print("UV frame table generated (1x1 to 16x16 grids)")
+
+    let uvs_1x1 = uv_table.get_quad_uvs(0, 0)
+    let uvs_4x4 = uv_table.get_quad_uvs(2, 5)
+    print("1x1 UV[0]: " + str(uvs_1x1[0].x) + ", " + str(uvs_1x1[0].y))
+    print("4x4 frame 5 UV[0]: " + str(uvs_4x4[0].x) + ", " + str(uvs_4x4[0].y))
+
+    // Test particle batching
+    let particles: [ParticleData] = [
+        ParticleData::new(Vec3::new(0.0, 0.0, 0.0), Vec4::new(1.0, 0.5, 0.0, 1.0), 2.0, 0),
+        ParticleData::new(Vec3::new(5.0, 0.0, 0.0), Vec4::new(0.0, 1.0, 0.0, 1.0), 1.5, 64),
+        ParticleData::new(Vec3::new(10.0, 5.0, 0.0), Vec4::new(0.0, 0.5, 1.0, 1.0), 3.0, 128),
+    ]
+
+    renderer.set_cull_box(Vec3::new(5.0, 2.5, 0.0), Vec3::new(20.0, 20.0, 10.0))
+    let visible = renderer.prepare_batch(particles, ParticleShaderType::ADDITIVE, 0, true)
+    print("Particles passed culling: " + str(visible) + " / 3")
+
+    renderer.queue_particle_render()
+    let batches = renderer.do_particles()
+    print("Render batches generated: " + str(len(batches)))
+
+    if len(batches) > 0 {
+        let batch = batches[0]
+        print("Batch vertex count: " + str(batch.vertex_count))
+        print("Batch polygon count: " + str(batch.polygon_count))
+    }
+
+    // Test streak line
+    let streak = StreakLine::init(32)
+    let positions: [Vec3] = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(5.0, 1.0, 0.0),
+        Vec3::new(10.0, 0.0, 0.0),
+        Vec3::new(15.0, -1.0, 0.0),
+    ]
+    let widths: [f32] = [0.5, 0.4, 0.3, 0.2]
+    let colors: [Vec4] = [
+        Vec4::new(1.0, 1.0, 0.0, 1.0),
+        Vec4::new(1.0, 0.8, 0.0, 0.8),
+        Vec4::new(1.0, 0.5, 0.0, 0.5),
+        Vec4::new(1.0, 0.2, 0.0, 0.2),
+    ]
+
+    streak.set_locs_widths_colors(positions, widths, colors, 4)
+    print("Streak line vertices: " + str(streak.vertex_count))
+
+    let streak_verts = streak.generate_vertices(Vec3::new(5.0, 10.0, 5.0))
+    print("Streak quad vertices: " + str(len(streak_verts)))
+
+    // Test volume particles
+    let vol_renderer = VolumeParticleRenderer::init()
+    vol_renderer.set_depth(4)
+    let vol_batches = vol_renderer.render_volume(particles, Vec3::new(0.0, 0.0, 10.0))
+    print("Volume particle layers: " + str(len(vol_batches)))
+
+    shutdown_particle_renderer()
+    print("GPU Particle Renderer tests complete!")
+}

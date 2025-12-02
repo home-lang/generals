@@ -1,0 +1,604 @@
+// C&C Generals Zero Hour - Home Port
+// Compression / Decompression System
+//
+// Original: Compression.h/cpp, refcodex.h, refdecode.cpp (EA Canada/Westwood)
+// Implements RefPack and other compression formats used in BIG archives
+//
+// RefPack (Reference Pack) is EA's proprietary LZ77-based compression
+// used extensively in C&C games for:
+// - BIG archive entries
+// - W3D model data
+// - Map files
+// - INI files when bundled
+//
+// Header format:
+// - Magic bytes: 0x10fb (3-byte size) or 0x90fb (4-byte size)
+// - With uncompressed size: 0x11fb or 0x91fb
+// - Compressed size header + uncompressed size (3 or 4 bytes each)
+
+import basics/allocator
+
+// ============================================================================
+// COMPRESSION TYPES
+// ============================================================================
+enum CompressionType {
+    None = 0
+    RefPack = 1          // EA's RefPack compression (most common)
+    NoxLZH = 2           // Nox-era LZH compression
+    ZLib1 = 3            // ZLib level 1 (fastest)
+    ZLib2 = 4
+    ZLib3 = 5
+    ZLib4 = 6
+    ZLib5 = 7            // ZLib level 5 (default)
+    ZLib6 = 8
+    ZLib7 = 9
+    ZLib8 = 10
+    ZLib9 = 11           // ZLib level 9 (slowest, best)
+    BTree = 12           // EA BTree compression
+    Huff = 13            // EA Huffman compression
+}
+
+// ============================================================================
+// COMPRESSION SIGNATURES (Big-endian magic bytes)
+// ============================================================================
+// RefPack signatures
+const REFPACK_MAGIC_3BYTE: i32 = 0x10fb      // 3-byte size field
+const REFPACK_MAGIC_3BYTE_ULEN: i32 = 0x11fb // 3-byte with uncompressed len
+const REFPACK_MAGIC_4BYTE: i32 = 0x90fb      // 4-byte size field
+const REFPACK_MAGIC_4BYTE_ULEN: i32 = 0x91fb // 4-byte with uncompressed len
+
+// EA header signatures (with 8-byte wrapper)
+const EA_REFPACK_SIG: [u8; 4] = ['E', 'A', 'R', 0]
+const EA_BTREE_SIG: [u8; 4] = ['E', 'A', 'B', 0]
+const EA_HUFF_SIG: [u8; 4] = ['E', 'A', 'H', 0]
+const NOX_SIG: [u8; 4] = ['N', 'O', 'X', 0]
+const ZLIB_SIG_BASE: [u8; 2] = ['Z', 'L']
+
+// ============================================================================
+// HELPER FUNCTIONS - Big-endian reads
+// ============================================================================
+
+// Read big-endian value (Motorola byte order)
+fn get_big_endian(src: *u8, bytes: i32): u32 {
+    if bytes == 1 {
+        return src[0] as u32
+    } else if bytes == 2 {
+        return ((src[0] as u32) << 8) | (src[1] as u32)
+    } else if bytes == 3 {
+        return ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | (src[2] as u32)
+    } else if bytes == 4 {
+        return ((src[0] as u32) << 24) | ((src[1] as u32) << 16) |
+               ((src[2] as u32) << 8) | (src[3] as u32)
+    }
+    return 0
+}
+
+// Write big-endian value
+fn put_big_endian(dest: *u8, value: u32, bytes: i32) {
+    if bytes >= 1 {
+        if bytes == 1 {
+            dest[0] = value as u8
+        } else if bytes == 2 {
+            dest[0] = (value >> 8) as u8
+            dest[1] = value as u8
+        } else if bytes == 3 {
+            dest[0] = (value >> 16) as u8
+            dest[1] = (value >> 8) as u8
+            dest[2] = value as u8
+        } else if bytes == 4 {
+            dest[0] = (value >> 24) as u8
+            dest[1] = (value >> 16) as u8
+            dest[2] = (value >> 8) as u8
+            dest[3] = value as u8
+        }
+    }
+}
+
+// ============================================================================
+// COMPRESSION DETECTION
+// ============================================================================
+
+// Check if data has EA wrapper header
+fn has_ea_header(data: *u8, len: i32): bool {
+    if len < 8 {
+        return false
+    }
+
+    // Check for EA signatures
+    if data[0] == 'E' and data[1] == 'A' {
+        if data[2] == 'R' or data[2] == 'B' or data[2] == 'H' {
+            return data[3] == 0
+        }
+    }
+
+    // Check for NOX signature
+    if data[0] == 'N' and data[1] == 'O' and data[2] == 'X' and data[3] == 0 {
+        return true
+    }
+
+    // Check for ZLib signature
+    if data[0] == 'Z' and data[1] == 'L' and data[3] == 0 {
+        let level = data[2]
+        if level >= '1' and level <= '9' {
+            return true
+        }
+    }
+
+    return false
+}
+
+// Detect compression type from data
+export fn detect_compression_type(data: *u8, len: i32): CompressionType {
+    if len < 4 {
+        return CompressionType::None
+    }
+
+    // Check for EA wrapper headers first
+    if has_ea_header(data, len) {
+        if data[0] == 'N' and data[1] == 'O' and data[2] == 'X' {
+            return CompressionType::NoxLZH
+        }
+        if data[0] == 'Z' and data[1] == 'L' {
+            let level = (data[2] - '0') as i32
+            if level >= 1 and level <= 9 {
+                return match level {
+                    1 => CompressionType::ZLib1
+                    2 => CompressionType::ZLib2
+                    3 => CompressionType::ZLib3
+                    4 => CompressionType::ZLib4
+                    5 => CompressionType::ZLib5
+                    6 => CompressionType::ZLib6
+                    7 => CompressionType::ZLib7
+                    8 => CompressionType::ZLib8
+                    9 => CompressionType::ZLib9
+                    _ => CompressionType::None
+                }
+            }
+        }
+        if data[0] == 'E' and data[1] == 'A' {
+            if data[2] == 'B' {
+                return CompressionType::BTree
+            }
+            if data[2] == 'H' {
+                return CompressionType::Huff
+            }
+            if data[2] == 'R' {
+                return CompressionType::RefPack
+            }
+        }
+    }
+
+    return CompressionType::None
+}
+
+// Check if data is compressed
+export fn is_data_compressed(data: *u8, len: i32): bool {
+    return detect_compression_type(data, len) != CompressionType::None
+}
+
+// ============================================================================
+// REFPACK DECOMPRESSION
+// ============================================================================
+
+// Check if data is RefPack compressed (raw, without EA header)
+fn is_refpack(data: *u8, len: i32): bool {
+    if len < 2 {
+        return false
+    }
+
+    let packtype = get_big_endian(data, 2) as i32
+    return packtype == REFPACK_MAGIC_3BYTE or
+           packtype == REFPACK_MAGIC_3BYTE_ULEN or
+           packtype == REFPACK_MAGIC_4BYTE or
+           packtype == REFPACK_MAGIC_4BYTE_ULEN
+}
+
+// Get uncompressed size from RefPack header
+fn refpack_get_size(data: *u8): i32 {
+    let packtype = get_big_endian(data, 2) as i32
+    let size_bytes = if (packtype & 0x8000) != 0 { 4 } else { 3 }
+
+    if (packtype & 0x100) != 0 {
+        // Has uncompressed size field after compressed size
+        return get_big_endian(data + 2 + size_bytes, size_bytes) as i32
+    } else {
+        return get_big_endian(data + 2, size_bytes) as i32
+    }
+}
+
+// Decompress RefPack data
+// Returns: uncompressed size, or 0 on error
+fn refpack_decode(dest: *u8, src: *u8, compressed_size: *i32): i32 {
+    if src == null {
+        return 0
+    }
+
+    let mut s = src
+    let mut d = dest
+    let mut ulen: i32 = 0
+
+    // Read header
+    let type_byte1 = s[0] as u32
+    s = s + 1
+    let type_byte2 = s[0] as u32
+    s = s + 1
+    let packtype = (type_byte1 << 8) | type_byte2
+
+    // Handle size field
+    if (packtype & 0x8000) != 0 {
+        // 4-byte size field
+        if (packtype & 0x100) != 0 {
+            // Skip uncompressed size field
+            s = s + 4
+        }
+
+        ulen = (s[0] as i32) << 24
+        ulen = ulen | ((s[1] as i32) << 16)
+        ulen = ulen | ((s[2] as i32) << 8)
+        ulen = ulen | (s[3] as i32)
+        s = s + 4
+    } else {
+        // 3-byte size field
+        if (packtype & 0x100) != 0 {
+            // Skip uncompressed size field
+            s = s + 3
+        }
+
+        ulen = (s[0] as i32) << 16
+        ulen = ulen | ((s[1] as i32) << 8)
+        ulen = ulen | (s[2] as i32)
+        s = s + 3
+    }
+
+    // Main decompression loop
+    loop {
+        let first = s[0]
+        s = s + 1
+
+        if (first & 0x80) == 0 {
+            // Short form: 2-byte command
+            let second = s[0]
+            s = s + 1
+
+            // Copy literal bytes
+            let mut run = (first & 3) as i32
+            while run > 0 {
+                d[0] = s[0]
+                d = d + 1
+                s = s + 1
+                run = run - 1
+            }
+
+            // Copy from back reference
+            let offset = ((((first & 0x60) as i32) << 3) + (second as i32)) as i32
+            let mut ref_ptr = d - 1 - offset
+            run = (((first & 0x1c) >> 2) + 3 - 1) as i32
+
+            loop {
+                d[0] = ref_ptr[0]
+                d = d + 1
+                ref_ptr = ref_ptr + 1
+                if run == 0 {
+                    break
+                }
+                run = run - 1
+            }
+
+            continue
+        }
+
+        if (first & 0x40) == 0 {
+            // Int form: 3-byte command
+            let second = s[0]
+            s = s + 1
+            let third = s[0]
+            s = s + 1
+
+            // Copy literal bytes
+            let mut run = (second >> 6) as i32
+            while run > 0 {
+                d[0] = s[0]
+                d = d + 1
+                s = s + 1
+                run = run - 1
+            }
+
+            // Copy from back reference
+            let offset = ((((second & 0x3f) as i32) << 8) + (third as i32)) as i32
+            let mut ref_ptr = d - 1 - offset
+            run = ((first & 0x3f) + 4 - 1) as i32
+
+            loop {
+                d[0] = ref_ptr[0]
+                d = d + 1
+                ref_ptr = ref_ptr + 1
+                if run == 0 {
+                    break
+                }
+                run = run - 1
+            }
+
+            continue
+        }
+
+        if (first & 0x20) == 0 {
+            // Very int form: 4-byte command
+            let second = s[0]
+            s = s + 1
+            let third = s[0]
+            s = s + 1
+            let forth = s[0]
+            s = s + 1
+
+            // Copy literal bytes
+            let mut run = (first & 3) as i32
+            while run > 0 {
+                d[0] = s[0]
+                d = d + 1
+                s = s + 1
+                run = run - 1
+            }
+
+            // Copy from back reference
+            let offset = ((((first & 0x10) >> 4) as i32) << 16) +
+                        (((second as i32) << 8) + (third as i32))
+            let mut ref_ptr = d - 1 - offset
+            run = (((((first & 0x0c) >> 2) as i32) << 8) + (forth as i32) + 5 - 1) as i32
+
+            loop {
+                d[0] = ref_ptr[0]
+                d = d + 1
+                ref_ptr = ref_ptr + 1
+                if run == 0 {
+                    break
+                }
+                run = run - 1
+            }
+
+            continue
+        }
+
+        // Literal or EOF
+        let mut run = (((first & 0x1f) << 2) + 4) as i32
+
+        if run <= 112 {
+            // Literal block
+            while run > 0 {
+                d[0] = s[0]
+                d = d + 1
+                s = s + 1
+                run = run - 1
+            }
+            continue
+        }
+
+        // EOF with 0-3 literal bytes
+        run = (first & 3) as i32
+        while run > 0 {
+            d[0] = s[0]
+            d = d + 1
+            s = s + 1
+            run = run - 1
+        }
+
+        break
+    }
+
+    // Return compressed size if requested
+    if compressed_size != null {
+        compressed_size[0] = (s - src) as i32
+    }
+
+    return ulen
+}
+
+// ============================================================================
+// PUBLIC DECOMPRESSION API
+// ============================================================================
+
+// Get uncompressed size from compressed data
+export fn get_uncompressed_size(data: *u8, len: i32): i32 {
+    if len < 8 {
+        return len
+    }
+
+    let comp_type = detect_compression_type(data, len)
+
+    match comp_type {
+        CompressionType::RefPack,
+        CompressionType::NoxLZH,
+        CompressionType::ZLib1,
+        CompressionType::ZLib2,
+        CompressionType::ZLib3,
+        CompressionType::ZLib4,
+        CompressionType::ZLib5,
+        CompressionType::ZLib6,
+        CompressionType::ZLib7,
+        CompressionType::ZLib8,
+        CompressionType::ZLib9,
+        CompressionType::BTree,
+        CompressionType::Huff => {
+            // Uncompressed size is at offset 4 (after 4-byte signature)
+            return (data[4] as i32) |
+                   ((data[5] as i32) << 8) |
+                   ((data[6] as i32) << 16) |
+                   ((data[7] as i32) << 24)
+        }
+        _ => return len
+    }
+}
+
+// Get maximum compressed size for a given uncompressed size
+export fn get_max_compressed_size(uncompressed_len: i32, comp_type: CompressionType): i32 {
+    match comp_type {
+        CompressionType::RefPack,
+        CompressionType::BTree,
+        CompressionType::Huff => {
+            return uncompressed_len + 8
+        }
+        CompressionType::ZLib1,
+        CompressionType::ZLib2,
+        CompressionType::ZLib3,
+        CompressionType::ZLib4,
+        CompressionType::ZLib5,
+        CompressionType::ZLib6,
+        CompressionType::ZLib7,
+        CompressionType::ZLib8,
+        CompressionType::ZLib9 => {
+            // ZLib can expand data slightly
+            return ((uncompressed_len as f32 * 1.1) as i32) + 12 + 8
+        }
+        CompressionType::NoxLZH => {
+            return uncompressed_len * 2 + 8  // Conservative estimate
+        }
+        _ => return 0
+    }
+}
+
+// Decompress data
+// Returns: uncompressed size, or 0 on error
+export fn decompress_data(src: *u8, src_len: i32, dest: *u8, dest_len: i32): i32 {
+    if src_len < 8 {
+        return 0
+    }
+
+    let comp_type = detect_compression_type(src, src_len)
+
+    match comp_type {
+        CompressionType::RefPack => {
+            // Skip 8-byte EA header
+            let compressed_data = src + 8
+            let compressed_len = src_len - 8
+            let mut consumed: i32 = 0
+            return refpack_decode(dest, compressed_data, &consumed)
+        }
+        CompressionType::NoxLZH => {
+            // Would call NoxLZH decompressor
+            return 0  // Not implemented
+        }
+        CompressionType::ZLib1,
+        CompressionType::ZLib2,
+        CompressionType::ZLib3,
+        CompressionType::ZLib4,
+        CompressionType::ZLib5,
+        CompressionType::ZLib6,
+        CompressionType::ZLib7,
+        CompressionType::ZLib8,
+        CompressionType::ZLib9 => {
+            // Would call zlib uncompress
+            return 0  // Not implemented - would use zlib
+        }
+        CompressionType::BTree => {
+            // Would call BTree decoder
+            return 0  // Not implemented
+        }
+        CompressionType::Huff => {
+            // Would call Huffman decoder
+            return 0  // Not implemented
+        }
+        _ => return 0
+    }
+}
+
+// Decompress raw RefPack data (without EA header)
+export fn decompress_refpack(src: *u8, src_len: i32, dest: *u8, dest_len: i32): i32 {
+    if !is_refpack(src, src_len) {
+        return 0
+    }
+
+    let mut consumed: i32 = 0
+    return refpack_decode(dest, src, &consumed)
+}
+
+// ============================================================================
+// COMPRESSION MANAGER - Main interface
+// ============================================================================
+struct CompressionManager {
+    // Statistics
+    total_decompressed_bytes: i64
+    total_compressed_bytes: i64
+    decompressions: i64
+    failures: i64
+
+    fn init(): CompressionManager {
+        return CompressionManager {
+            total_decompressed_bytes: 0
+            total_compressed_bytes: 0
+            decompressions: 0
+            failures: 0
+        }
+    }
+
+    fn decompress(&self, src: *u8, src_len: i32, dest: *u8, dest_len: i32): i32 {
+        let result = decompress_data(src, src_len, dest, dest_len)
+
+        if result > 0 {
+            self.total_compressed_bytes += src_len as i64
+            self.total_decompressed_bytes += result as i64
+            self.decompressions += 1
+        } else {
+            self.failures += 1
+        }
+
+        return result
+    }
+
+    fn get_compression_ratio(&self): f32 {
+        if self.total_compressed_bytes == 0 {
+            return 1.0
+        }
+        return self.total_decompressed_bytes as f32 / self.total_compressed_bytes as f32
+    }
+
+    fn reset_stats(&self) {
+        self.total_decompressed_bytes = 0
+        self.total_compressed_bytes = 0
+        self.decompressions = 0
+        self.failures = 0
+    }
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+var g_compression_manager: ?CompressionManager = null
+
+export fn init_compression() {
+    g_compression_manager = CompressionManager.init()
+}
+
+export fn shutdown_compression() {
+    g_compression_manager = null
+}
+
+export fn get_compression_manager(): ?*CompressionManager {
+    if g_compression_manager != null {
+        return &g_compression_manager.?
+    }
+    return null
+}
+
+// Get preferred compression type
+export fn get_preferred_compression(): CompressionType {
+    return CompressionType::RefPack
+}
+
+// Get compression type name
+export fn get_compression_name(comp_type: CompressionType): string {
+    match comp_type {
+        CompressionType::None => return "No compression"
+        CompressionType::RefPack => return "RefPack"
+        CompressionType::NoxLZH => return "LZHL"
+        CompressionType::ZLib1 => return "ZLib 1 (fast)"
+        CompressionType::ZLib2 => return "ZLib 2"
+        CompressionType::ZLib3 => return "ZLib 3"
+        CompressionType::ZLib4 => return "ZLib 4"
+        CompressionType::ZLib5 => return "ZLib 5 (default)"
+        CompressionType::ZLib6 => return "ZLib 6"
+        CompressionType::ZLib7 => return "ZLib 7"
+        CompressionType::ZLib8 => return "ZLib 8"
+        CompressionType::ZLib9 => return "ZLib 9 (slow)"
+        CompressionType::BTree => return "BTree"
+        CompressionType::Huff => return "Huff"
+    }
+}

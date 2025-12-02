@@ -1,0 +1,1274 @@
+// View - Game view/camera system for C&C Generals Zero Hour
+// Based on Thyme: View.cpp, W3DView.cpp
+// @unify xezon 23/11/2025 (#1904) - Merge View and W3DView code into Core
+//
+// A "view" is a window into the game world with camera controls
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const DEFAULT_VIEW_WIDTH: i32 = 640
+const DEFAULT_VIEW_HEIGHT: i32 = 480
+const DEFAULT_VIEW_ORIGIN_X: i32 = 0
+const DEFAULT_VIEW_ORIGIN_Y: i32 = 0
+const MAX_WAYPOINTS: i32 = 25
+const ZOOM_HEIGHT_PER_SECOND: i32 = 10
+const MIN_CAPPED_ZOOM: f32 = 0.5
+const TERRAIN_SAMPLE_SIZE: f32 = 40.0
+const DRAWABLE_OVERSCAN: f32 = 75.0
+const MAX_REQUEST_CACHE_SIZE: i32 = 40
+
+// ============================================================================
+// PICK TYPES
+// ============================================================================
+
+enum PickType {
+    Terrain = 0,
+    Selectable = 1,
+    Shrubbery = 2,
+    Mines = 3,          // Mines aren't normally selectable, but workers/dozers need to
+    ForceAttackable = 4,
+    AllDrawables = 15,  // Selectable | Shrubbery | Mines | ForceAttackable
+}
+
+// ============================================================================
+// CAMERA SHAKE TYPES
+// ============================================================================
+
+enum CameraShakeType {
+    Subtle = 0,
+    Normal,
+    Strong,
+    Severe,
+    CineExtreme,    // Added for cinematics ONLY
+    CineInsane,     // Added for cinematics ONLY
+    Count,
+}
+
+// ============================================================================
+// WORLD TO SCREEN RETURN
+// ============================================================================
+
+enum WorldToScreenReturn {
+    InsideFrustum = 0,  // On the screen (inside frustum of camera)
+    OutsideFrustum,     // Return is valid but off the screen (outside frustum of camera)
+    Invalid,            // No transform possible
+}
+
+// ============================================================================
+// CAMERA LOCK TYPES
+// ============================================================================
+
+enum CameraLockType {
+    Follow,
+    Tether,
+}
+
+// ============================================================================
+// FILTER TYPES
+// ============================================================================
+
+enum FilterType {
+    Default = 0,
+    BlackAndWhite,
+    MotionBlur,
+    CrossFade,
+    Count,
+}
+
+enum FilterMode {
+    Default = 0,
+    AlphaBlend,
+    Additive,
+    Count,
+}
+
+// ============================================================================
+// VIEW LOCATION - Save/restore view position
+// ============================================================================
+
+struct ViewLocation {
+    valid: bool,
+    pos: Vec3,
+    angle: f32,
+    pitch: f32,
+    zoom: f32,
+}
+
+impl ViewLocation {
+    fn init(): ViewLocation {
+        return ViewLocation {
+            valid: false,
+            pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            angle: 0.0,
+            pitch: 0.0,
+            zoom: 0.0,
+        }
+    }
+
+    fn set(&self, x: f32, y: f32, z: f32, angle: f32, pitch: f32, zoom: f32) {
+        self.pos.x = x
+        self.pos.y = y
+        self.pos.z = z
+        self.angle = angle
+        self.pitch = pitch
+        self.zoom = zoom
+        self.valid = true
+    }
+
+    fn get_position(&self): Vec3 { return self.pos }
+    fn is_valid(&self): bool { return self.valid }
+    fn get_angle(&self): f32 { return self.angle }
+    fn get_pitch(&self): f32 { return self.pitch }
+    fn get_zoom(&self): f32 { return self.zoom }
+}
+
+// ============================================================================
+// PARABOLIC EASE - Easing function for camera movements
+// ============================================================================
+
+struct ParabolicEase {
+    ease_in: f32,
+    ease_out: f32,
+}
+
+impl ParabolicEase {
+    fn init(): ParabolicEase {
+        return ParabolicEase {
+            ease_in: 0.0,
+            ease_out: 0.0,
+        }
+    }
+
+    fn set(&self, ease_in: f32, ease_out: f32) {
+        self.ease_in = ease_in
+        self.ease_out = ease_out
+    }
+
+    fn evaluate(&self, t: f32): f32 {
+        // Parabolic easing: smooth acceleration and deceleration
+        if t < self.ease_in {
+            // Ease in (accelerate)
+            let scale = t / self.ease_in
+            return self.ease_in * scale * scale / 2.0
+        } else if t > (1.0 - self.ease_out) {
+            // Ease out (decelerate)
+            let remaining = 1.0 - t
+            let scale = remaining / self.ease_out
+            return 1.0 - (self.ease_out * scale * scale / 2.0)
+        } else {
+            // Linear middle section
+            return t
+        }
+    }
+}
+
+// ============================================================================
+// WAYPOINT PATH INFO - For camera movement along paths
+// ============================================================================
+
+struct MoveAlongWaypointPathInfo {
+    num_waypoints: i32,
+    waypoints: [Vec3],      // We pad first & last for interpolation
+    way_seg_length: [f32],  // Length of each segment
+    camera_angle: [f32],    // Camera angle at each waypoint
+    time_multiplier: [i32], // Time speedup factor
+    ground_height: [f32],   // Ground height at each waypoint
+    total_time_ms: f32,     // Num of ms to do this movement
+    elapsed_time_ms: f32,   // Time since start
+    total_distance: f32,    // Total length of paths
+    cur_seg_distance: f32,  // How far we are along the current seg
+    shutter: i32,
+    cur_segment: i32,       // The current segment
+    cur_shutter: i32,       // The current shutter
+    rolling_average_frames: i32, // Number of frames to roll
+    ease: ParabolicEase,
+}
+
+impl MoveAlongWaypointPathInfo {
+    fn init(): MoveAlongWaypointPathInfo {
+        return MoveAlongWaypointPathInfo {
+            num_waypoints: 0,
+            waypoints: [],
+            way_seg_length: [],
+            camera_angle: [],
+            time_multiplier: [],
+            ground_height: [],
+            total_time_ms: 0.0,
+            elapsed_time_ms: 0.0,
+            total_distance: 0.0,
+            cur_seg_distance: 0.0,
+            shutter: 0,
+            cur_segment: 0,
+            cur_shutter: 0,
+            rolling_average_frames: 0,
+            ease: ParabolicEase::init(),
+        }
+    }
+}
+
+// ============================================================================
+// ROTATE CAMERA INFO
+// ============================================================================
+
+struct RotateCameraInfo {
+    num_frames: i32,
+    cur_frame: i32,
+    start_time_multiplier: i32,
+    end_time_multiplier: i32,
+    num_hold_frames: i32,
+    ease: ParabolicEase,
+    track_object: bool,
+    target_object_id: i32,
+    target_object_pos: Vec3,
+    start_angle: f32,
+    end_angle: f32,
+}
+
+impl RotateCameraInfo {
+    fn init(): RotateCameraInfo {
+        return RotateCameraInfo {
+            num_frames: 0,
+            cur_frame: 0,
+            start_time_multiplier: 1,
+            end_time_multiplier: 1,
+            num_hold_frames: 0,
+            ease: ParabolicEase::init(),
+            track_object: false,
+            target_object_id: 0,
+            target_object_pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            start_angle: 0.0,
+            end_angle: 0.0,
+        }
+    }
+}
+
+// ============================================================================
+// PITCH CAMERA INFO
+// ============================================================================
+
+struct PitchCameraInfo {
+    num_frames: i32,
+    cur_frame: i32,
+    angle: f32,
+    start_pitch: f32,
+    end_pitch: f32,
+    start_time_multiplier: i32,
+    end_time_multiplier: i32,
+    ease: ParabolicEase,
+}
+
+impl PitchCameraInfo {
+    fn init(): PitchCameraInfo {
+        return PitchCameraInfo {
+            num_frames: 0,
+            cur_frame: 0,
+            angle: 0.0,
+            start_pitch: 0.0,
+            end_pitch: 0.0,
+            start_time_multiplier: 1,
+            end_time_multiplier: 1,
+            ease: ParabolicEase::init(),
+        }
+    }
+}
+
+// ============================================================================
+// ZOOM CAMERA INFO
+// ============================================================================
+
+struct ZoomCameraInfo {
+    num_frames: i32,
+    cur_frame: i32,
+    start_zoom: f32,
+    end_zoom: f32,
+    start_time_multiplier: i32,
+    end_time_multiplier: i32,
+    ease: ParabolicEase,
+}
+
+impl ZoomCameraInfo {
+    fn init(): ZoomCameraInfo {
+        return ZoomCameraInfo {
+            num_frames: 0,
+            cur_frame: 0,
+            start_zoom: 1.0,
+            end_zoom: 1.0,
+            start_time_multiplier: 1,
+            end_time_multiplier: 1,
+            ease: ParabolicEase::init(),
+        }
+    }
+}
+
+// ============================================================================
+// CAMERA CONSTRAINT REGION
+// ============================================================================
+
+struct CameraConstraint {
+    lo: Vec2,
+    hi: Vec2,
+}
+
+impl CameraConstraint {
+    fn init(): CameraConstraint {
+        return CameraConstraint {
+            lo: Vec2 { x: 0.0, y: 0.0 },
+            hi: Vec2 { x: 0.0, y: 0.0 },
+        }
+    }
+}
+
+// ============================================================================
+// VIEW - Base view class with camera controls
+// ============================================================================
+
+struct View {
+    // View ID and linking
+    id: i32,
+    next: View?,
+
+    // View locked until frame
+    view_locked_until_frame: i32,
+
+    // Position and dimensions
+    pos: Vec3,
+    width: i32,
+    height: i32,
+    origin_x: i32,
+    origin_y: i32,
+
+    // Rotation angles
+    angle: f32,             // Z-axis rotation
+    pitch_angle: f32,       // X-axis rotation (horizontal axis)
+
+    // Zoom and height
+    max_height_above_ground: f32,
+    min_height_above_ground: f32,
+    zoom: f32,
+    height_above_ground: f32,
+    zoom_limited: bool,
+    default_angle: f32,
+    default_pitch_angle: f32,
+    current_height_above_ground: f32,
+    terrain_height_under_camera: f32,
+
+    // Camera lock
+    camera_lock: i32,           // Object ID to follow
+    camera_lock_drawable: i32,  // Drawable to follow
+    lock_type: CameraLockType,
+    lock_dist: f32,
+
+    // Field of view
+    fov: f32,
+    mouse_locked: bool,
+
+    // Adjustment flags
+    ok_to_adjust_height: bool,
+    snap_immediate: bool,
+
+    // Guard band for large objects
+    guard_band_bias: Vec2,
+}
+
+impl View {
+    fn init(): View {
+        return View {
+            id: 0,
+            next: null,
+            view_locked_until_frame: 0,
+            pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            width: DEFAULT_VIEW_WIDTH,
+            height: DEFAULT_VIEW_HEIGHT,
+            origin_x: DEFAULT_VIEW_ORIGIN_X,
+            origin_y: DEFAULT_VIEW_ORIGIN_Y,
+            angle: 0.0,
+            pitch_angle: 0.0,
+            max_height_above_ground: 0.0,
+            min_height_above_ground: 0.0,
+            zoom: 1.0,
+            height_above_ground: 0.0,
+            zoom_limited: true,
+            default_angle: 0.0,
+            default_pitch_angle: 0.0,
+            current_height_above_ground: 0.0,
+            terrain_height_under_camera: 0.0,
+            camera_lock: -1,  // INVALID_ID
+            camera_lock_drawable: 0,
+            lock_type: CameraLockType::Follow,
+            lock_dist: 0.0,
+            fov: 50.0 * 3.14159265 / 180.0,  // 50 degrees in radians
+            mouse_locked: false,
+            ok_to_adjust_height: false,
+            snap_immediate: false,
+            guard_band_bias: Vec2 { x: 0.0, y: 0.0 },
+        }
+    }
+
+    fn reset(&self) {
+        self.zoom_limited = true
+        self.view_locked_until_frame = 0
+    }
+
+    fn get_id(&self): i32 { return self.id }
+    fn set_id(&self, id: i32) { self.id = id }
+
+    fn set_zoom_limited(&self, limit: bool) { self.zoom_limited = limit }
+    fn is_zoom_limited(&self): bool { return self.zoom_limited }
+
+    fn set_width(&self, width: i32) { self.width = width }
+    fn get_width(&self): i32 { return self.width }
+    fn set_height(&self, height: i32) { self.height = height }
+    fn get_height(&self): i32 { return self.height }
+    fn set_origin(&self, x: i32, y: i32) { self.origin_x = x; self.origin_y = y }
+    fn get_origin(&self): Vec2 {
+        return Vec2 { x: self.origin_x as f32, y: self.origin_y as f32 }
+    }
+
+    fn lock_view_until_frame(&self, frame: i32) {
+        self.view_locked_until_frame = frame
+    }
+
+    fn look_at(&self, o: Vec3) {
+        self.pos.x = o.x - (self.width as f32) * 0.5
+        self.pos.y = o.y - (self.height as f32) * 0.5
+    }
+
+    fn scroll_by(&self, delta: Vec2) {
+        self.pos.x = self.pos.x + delta.x
+        self.pos.y = self.pos.y + delta.y
+    }
+
+    fn set_angle(&self, angle: f32) { self.angle = angle }
+    fn get_angle(&self): f32 { return self.angle }
+
+    fn set_pitch(&self, angle: f32) {
+        let limit = 3.14159265 / 5.0  // PI/5
+        if angle < -limit {
+            self.pitch_angle = -limit
+        } else if angle > limit {
+            self.pitch_angle = limit
+        } else {
+            self.pitch_angle = angle
+        }
+    }
+    fn get_pitch(&self): f32 { return self.pitch_angle }
+
+    fn set_angle_and_pitch_to_default(&self) {
+        self.angle = self.default_angle
+        self.pitch_angle = self.default_pitch_angle
+    }
+
+    fn get_position(&self): Vec3 { return self.pos }
+    fn set_position(&self, pos: Vec3) { self.pos = pos }
+
+    fn get_zoom(&self): f32 { return self.zoom }
+    fn set_zoom(&self, z: f32) { self.zoom = z }
+    fn get_height_above_ground(&self): f32 { return self.height_above_ground }
+    fn set_height_above_ground(&self, z: f32) {
+        if self.zoom_limited {
+            if z < self.min_height_above_ground {
+                self.height_above_ground = self.min_height_above_ground
+            } else if z > self.max_height_above_ground {
+                self.height_above_ground = self.max_height_above_ground
+            } else {
+                self.height_above_ground = z
+            }
+        } else {
+            self.height_above_ground = z
+        }
+    }
+
+    fn zoom_by(&self, height: f32) {
+        self.set_height_above_ground(self.get_height_above_ground() + height)
+    }
+    fn set_zoom_to_default(&self) { self.zoom = 1.0 }
+    fn set_ok_to_adjust_height(&self, val: bool) { self.ok_to_adjust_height = val }
+
+    fn get_terrain_height_under_camera(&self): f32 { return self.terrain_height_under_camera }
+    fn set_terrain_height_under_camera(&self, z: f32) { self.terrain_height_under_camera = z }
+    fn get_current_height_above_ground(&self): f32 { return self.current_height_above_ground }
+    fn set_current_height_above_ground(&self, z: f32) { self.current_height_above_ground = z }
+
+    fn set_field_of_view(&self, angle: f32) { self.fov = angle }
+    fn get_field_of_view(&self): f32 { return self.fov }
+
+    fn get_location(&self, location: ViewLocation) {
+        location.set(
+            self.pos.x, self.pos.y, self.pos.z,
+            self.angle, self.pitch_angle, self.zoom
+        )
+    }
+
+    fn set_location(&self, location: ViewLocation) {
+        if location.valid {
+            self.pos = location.pos
+            self.angle = location.angle
+            self.pitch_angle = location.pitch
+            self.zoom = location.zoom
+        }
+    }
+
+    fn get_camera_lock(&self): i32 { return self.camera_lock }
+    fn set_camera_lock(&self, id: i32) {
+        self.camera_lock = id
+        self.lock_dist = 0.0
+        self.lock_type = CameraLockType::Follow
+    }
+    fn snap_to_camera_lock(&self) { self.snap_immediate = true }
+    fn set_snap_mode(&self, lock_type: CameraLockType, lock_dist: f32) {
+        self.lock_type = lock_type
+        self.lock_dist = lock_dist
+    }
+
+    fn set_mouse_lock(&self, mouse_locked: bool) { self.mouse_locked = mouse_locked }
+    fn is_mouse_locked(&self): bool { return self.mouse_locked }
+
+    fn get_fx_pitch(&self): f32 { return 1.0 }
+    fn set_guard_band_bias(&self, gb: Vec2) { self.guard_band_bias = gb }
+
+    fn get_next(&self): View? { return self.next }
+    fn prepend_to_list(&self, list: View?): View {
+        self.next = list
+        return self
+    }
+}
+
+// ============================================================================
+// W3D VIEW - W3D-specific view implementation
+// ============================================================================
+
+struct W3DView {
+    base: View,
+
+    // Camera data
+    ground_level: f32,
+    camera_offset: Vec3,
+
+    // Filter modes
+    view_filter_mode: FilterMode,
+    view_filter: FilterType,
+    is_wire_frame_enabled: bool,
+    next_wire_frame_enabled: bool,
+
+    // Camera shake
+    shake_offset: Vec2,
+    shake_angle_cos: f32,
+    shake_angle_sin: f32,
+    shake_intensity: f32,
+    shaker_angles: Vec3,
+
+    // Rotation movement
+    rc_info: RotateCameraInfo,
+    doing_rotate_camera: bool,
+
+    // Pitch movement
+    pc_info: PitchCameraInfo,
+    doing_pitch_camera: bool,
+
+    // Zoom movement
+    zc_info: ZoomCameraInfo,
+    doing_zoom_camera: bool,
+
+    // Scripted lock
+    doing_scripted_camera_lock: bool,
+
+    // FX pitch
+    fx_pitch: f32,
+
+    // Waypoint path movement
+    mcwp_info: MoveAlongWaypointPathInfo,
+    doing_move_camera_on_waypoint_path: bool,
+    camera_arrived_at_waypoint_on_path_flag: bool,
+
+    // Time settings
+    freeze_time_for_camera_movement: bool,
+    time_multiplier: i32,
+
+    // Position tracking
+    camera_has_moved_since_request: bool,
+    previous_look_at_position: Vec3,
+    scroll_amount: Vec2,
+    scroll_amount_cutoff: f32,
+
+    // Camera constraints
+    camera_constraint: CameraConstraint,
+    camera_constraint_valid: bool,
+
+    // Camera slave mode (animation controlled camera)
+    is_camera_slaved: bool,
+    use_real_zoom_cam: bool,
+    camera_slave_object_name: string,
+    camera_slave_object_bone_name: string,
+}
+
+impl W3DView {
+    fn init(): W3DView {
+        let view = W3DView {
+            base: View::init(),
+            ground_level: 10.0,
+            camera_offset: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            view_filter_mode: FilterMode::Default,
+            view_filter: FilterType::Default,
+            is_wire_frame_enabled: false,
+            next_wire_frame_enabled: false,
+            shake_offset: Vec2 { x: 0.0, y: 0.0 },
+            shake_angle_cos: 0.0,
+            shake_angle_sin: 0.0,
+            shake_intensity: 0.0,
+            shaker_angles: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            rc_info: RotateCameraInfo::init(),
+            doing_rotate_camera: false,
+            pc_info: PitchCameraInfo::init(),
+            doing_pitch_camera: false,
+            zc_info: ZoomCameraInfo::init(),
+            doing_zoom_camera: false,
+            doing_scripted_camera_lock: false,
+            fx_pitch: 1.0,
+            mcwp_info: MoveAlongWaypointPathInfo::init(),
+            doing_move_camera_on_waypoint_path: false,
+            camera_arrived_at_waypoint_on_path_flag: false,
+            freeze_time_for_camera_movement: false,
+            time_multiplier: 1,
+            camera_has_moved_since_request: true,
+            previous_look_at_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            scroll_amount: Vec2 { x: 0.0, y: 0.0 },
+            scroll_amount_cutoff: 0.0,
+            camera_constraint: CameraConstraint::init(),
+            camera_constraint_valid: false,
+            is_camera_slaved: false,
+            use_real_zoom_cam: false,
+            camera_slave_object_name: "",
+            camera_slave_object_bone_name: "",
+        }
+
+        // Initialize camera offset based on global settings
+        // In real implementation, this comes from TheGlobalData
+        view.camera_offset.z = 200.0  // m_cameraHeight
+        let camera_pitch = 37.5       // m_cameraPitch in degrees
+        let camera_yaw = 0.0          // m_cameraYaw in degrees
+        let pi = 3.14159265
+        view.camera_offset.y = -(view.camera_offset.z / tan_f32(camera_pitch * pi / 180.0))
+        view.camera_offset.x = -(view.camera_offset.y * tan_f32(camera_yaw * pi / 180.0))
+
+        return view
+    }
+
+    fn reset(&self) {
+        self.base.reset()
+        self.time_multiplier = 1
+        self.set_view_filter(FilterType::Default)
+        self.base.guard_band_bias = Vec2 { x: 0.0, y: 0.0 }
+    }
+
+    fn set_height(&self, height: i32) {
+        self.base.set_height(height)
+        // Update 3D camera viewport
+    }
+
+    fn set_width(&self, width: i32) {
+        self.base.set_width(width)
+        // Update 3D camera viewport and FOV
+    }
+
+    fn set_origin(&self, x: i32, y: i32) {
+        self.base.set_origin(x, y)
+        // Update 3D camera viewport
+    }
+
+    fn scroll_by(&self, delta: Vec2) {
+        self.base.scroll_by(delta)
+    }
+
+    fn set_angle(&self, angle: f32) {
+        self.base.set_angle(angle)
+    }
+
+    fn set_pitch(&self, angle: f32) {
+        self.base.set_pitch(angle)
+    }
+
+    fn set_angle_and_pitch_to_default(&self) {
+        self.base.set_angle_and_pitch_to_default()
+    }
+
+    fn look_at(&self, o: Vec3) {
+        self.base.look_at(o)
+    }
+
+    fn init_height_for_map(&self) {
+        // Initialize camera height based on current map position
+    }
+
+    fn move_camera_to(&self, o: Vec3, milliseconds: i32, shutter: i32, orient: bool, ease_in: f32, ease_out: f32) {
+        // Set up waypoint path with single destination
+        self.mcwp_info = MoveAlongWaypointPathInfo::init()
+        self.mcwp_info.num_waypoints = 1
+        self.mcwp_info.waypoints = [o]
+        self.mcwp_info.total_time_ms = milliseconds as f32
+        self.mcwp_info.ease.set(ease_in, ease_out)
+        self.mcwp_info.shutter = shutter
+        self.doing_move_camera_on_waypoint_path = true
+    }
+
+    fn is_camera_movement_finished(&self): bool {
+        return !self.doing_move_camera_on_waypoint_path && !self.doing_rotate_camera
+    }
+
+    fn is_camera_movement_at_waypoint_along_path(&self): bool {
+        return self.camera_arrived_at_waypoint_on_path_flag
+    }
+
+    fn reset_camera(&self, location: Vec3, frames: i32, ease_in: f32, ease_out: f32) {
+        // Move camera to location, and reset to default angle & zoom
+        self.base.look_at(location)
+        self.base.set_angle_and_pitch_to_default()
+        self.base.set_zoom_to_default()
+    }
+
+    fn rotate_camera(&self, rotations: f32, frames: i32, ease_in: f32, ease_out: f32) {
+        self.rc_info = RotateCameraInfo::init()
+        self.rc_info.num_frames = frames
+        self.rc_info.start_angle = self.base.get_angle()
+        self.rc_info.end_angle = self.base.get_angle() + rotations * 2.0 * 3.14159265
+        self.rc_info.ease.set(ease_in, ease_out)
+        self.rc_info.track_object = false
+        self.doing_rotate_camera = true
+    }
+
+    fn rotate_camera_toward_object(&self, id: i32, milliseconds: i32, hold_milliseconds: i32, ease_in: f32, ease_out: f32) {
+        self.rc_info = RotateCameraInfo::init()
+        self.rc_info.num_frames = milliseconds / 33  // Convert ms to frames
+        self.rc_info.num_hold_frames = hold_milliseconds / 33
+        self.rc_info.ease.set(ease_in, ease_out)
+        self.rc_info.track_object = true
+        self.rc_info.target_object_id = id
+        self.doing_rotate_camera = true
+    }
+
+    fn rotate_camera_toward_position(&self, loc: Vec3, milliseconds: i32, ease_in: f32, ease_out: f32, reverse_rotation: bool) {
+        self.rc_info = RotateCameraInfo::init()
+        self.rc_info.num_frames = milliseconds / 33
+        self.rc_info.ease.set(ease_in, ease_out)
+        self.rc_info.track_object = false
+        self.rc_info.target_object_pos = loc
+        // Calculate end angle to face the position
+        let dx = loc.x - self.base.pos.x
+        let dy = loc.y - self.base.pos.y
+        self.rc_info.end_angle = atan2_f32(dy, dx)
+        if reverse_rotation {
+            self.rc_info.end_angle = self.rc_info.end_angle + 3.14159265
+        }
+        self.doing_rotate_camera = true
+    }
+
+    fn camera_mod_freeze_time(&self) {
+        self.freeze_time_for_camera_movement = true
+    }
+
+    fn camera_mod_freeze_angle(&self) {
+        // Freeze current angle during camera movement
+    }
+
+    fn is_time_frozen(&self): bool {
+        return self.freeze_time_for_camera_movement
+    }
+
+    fn camera_mod_final_zoom(&self, final_zoom: f32, ease_in: f32, ease_out: f32) {
+        self.zc_info.end_zoom = final_zoom
+        self.zc_info.ease.set(ease_in, ease_out)
+    }
+
+    fn camera_mod_rolling_average(&self, frames_to_average: i32) {
+        self.mcwp_info.rolling_average_frames = frames_to_average
+    }
+
+    fn camera_mod_final_time_multiplier(&self, final_multiplier: i32) {
+        // Set final time multiplier for camera movement
+    }
+
+    fn camera_mod_final_pitch(&self, final_pitch: f32, ease_in: f32, ease_out: f32) {
+        self.pc_info.end_pitch = final_pitch
+        self.pc_info.ease.set(ease_in, ease_out)
+    }
+
+    fn camera_mod_look_toward(&self, loc: Vec3) {
+        // Set look at point during camera movement
+    }
+
+    fn camera_mod_final_look_toward(&self, loc: Vec3) {
+        // Set final look at point for camera movement
+    }
+
+    fn camera_mod_final_move_to(&self, loc: Vec3) {
+        // Set final move to position
+    }
+
+    fn camera_enable_slave_mode(&self, thing_template_name: string, bone_name: string) {
+        self.is_camera_slaved = true
+        self.camera_slave_object_name = thing_template_name
+        self.camera_slave_object_bone_name = bone_name
+    }
+
+    fn camera_disable_slave_mode(&self) {
+        self.is_camera_slaved = false
+    }
+
+    fn camera_enable_real_zoom_mode(&self) {
+        self.use_real_zoom_cam = true
+    }
+
+    fn camera_disable_real_zoom_mode(&self) {
+        self.use_real_zoom_cam = false
+    }
+
+    fn add_camera_shake(&self, position: Vec3, radius: f32, duration: f32, power: f32) {
+        // Add camera shake source
+        // In real implementation, this would add to CameraShakerSystem
+    }
+
+    fn get_time_multiplier(&self): i32 {
+        return self.time_multiplier
+    }
+
+    fn set_time_multiplier(&self, multiple: i32) {
+        self.time_multiplier = multiple
+    }
+
+    fn set_default_view(&self, pitch: f32, angle: f32, max_height: f32) {
+        self.base.default_pitch_angle = pitch
+        self.base.default_angle = angle
+        self.base.max_height_above_ground = max_height
+    }
+
+    fn zoom_camera(&self, final_zoom: f32, milliseconds: i32, ease_in: f32, ease_out: f32) {
+        self.zc_info = ZoomCameraInfo::init()
+        self.zc_info.num_frames = milliseconds / 33
+        self.zc_info.start_zoom = self.base.get_zoom()
+        self.zc_info.end_zoom = final_zoom
+        self.zc_info.ease.set(ease_in, ease_out)
+        self.doing_zoom_camera = true
+    }
+
+    fn pitch_camera(&self, final_pitch: f32, milliseconds: i32, ease_in: f32, ease_out: f32) {
+        self.pc_info = PitchCameraInfo::init()
+        self.pc_info.num_frames = milliseconds / 33
+        self.pc_info.start_pitch = self.base.get_pitch()
+        self.pc_info.end_pitch = final_pitch
+        self.pc_info.ease.set(ease_in, ease_out)
+        self.doing_pitch_camera = true
+    }
+
+    fn set_height_above_ground(&self, z: f32) {
+        self.base.set_height_above_ground(z)
+    }
+
+    fn set_zoom(&self, z: f32) {
+        self.base.set_zoom(z)
+    }
+
+    fn set_zoom_to_default(&self) {
+        self.base.set_zoom_to_default()
+    }
+
+    fn set_field_of_view(&self, angle: f32) {
+        self.base.set_field_of_view(angle)
+    }
+
+    fn get_fx_pitch(&self): f32 {
+        return self.fx_pitch
+    }
+
+    fn set_view_filter_mode(&self, filter_mode: FilterMode): bool {
+        self.view_filter_mode = filter_mode
+        return true
+    }
+
+    fn set_view_filter(&self, filter: FilterType): bool {
+        self.view_filter = filter
+        return true
+    }
+
+    fn set_view_filter_pos(&self, pos: Vec3) {
+        // Pass position to special effect filter
+    }
+
+    fn get_view_filter_mode(&self): FilterMode {
+        return self.view_filter_mode
+    }
+
+    fn get_view_filter_type(&self): FilterType {
+        return self.view_filter
+    }
+
+    fn set_fade_parameters(&self, fade_frames: i32, direction: i32) {
+        // Set fade in/out parameters
+    }
+
+    fn set_3d_wire_frame_mode(&self, enable: bool) {
+        self.next_wire_frame_enabled = enable
+    }
+
+    fn set_guard_band_bias(&self, gb: Vec2) {
+        self.base.guard_band_bias = gb
+    }
+
+    fn force_camera_constraint_recalc(&self) {
+        self.camera_constraint_valid = false
+    }
+
+    fn shake(&self, epicenter: Vec3, shake_type: CameraShakeType) {
+        // Calculate shake intensity based on distance from epicenter
+        let dx = self.base.pos.x - epicenter.x
+        let dy = self.base.pos.y - epicenter.y
+        let dist = sqrt_f32(dx * dx + dy * dy)
+
+        // Determine intensity based on shake type
+        let base_intensity = match shake_type {
+            CameraShakeType::Subtle => 2.0,
+            CameraShakeType::Normal => 5.0,
+            CameraShakeType::Strong => 10.0,
+            CameraShakeType::Severe => 20.0,
+            CameraShakeType::CineExtreme => 40.0,
+            CameraShakeType::CineInsane => 80.0,
+            _ => 5.0,
+        }
+
+        // Apply distance falloff
+        let falloff_dist = 500.0
+        let intensity = base_intensity * max_f32(0.0, 1.0 - dist / falloff_dist)
+
+        if intensity > self.shake_intensity {
+            self.shake_intensity = intensity
+            // Random angle for shake direction
+            self.shake_angle_cos = cos_f32(dx)
+            self.shake_angle_sin = sin_f32(dy)
+        }
+    }
+
+    // Update methods
+    fn update_camera_movements(&self): bool {
+        let did_update = false
+
+        if self.doing_zoom_camera {
+            self.zoom_camera_one_frame()
+            did_update = true
+        }
+        if self.doing_pitch_camera {
+            self.pitch_camera_one_frame()
+            did_update = true
+        }
+        if self.doing_rotate_camera {
+            self.previous_look_at_position = self.base.get_position()
+            self.rotate_camera_one_frame()
+            did_update = true
+        } else if self.doing_move_camera_on_waypoint_path {
+            self.previous_look_at_position = self.base.get_position()
+            // TheSuperHackers @tweak The scripted camera movement is now decoupled from the render update.
+            self.move_along_waypoint_path(33.0)  // Assume 33ms per frame
+            did_update = true
+        }
+        if self.doing_scripted_camera_lock {
+            did_update = true
+        }
+        return did_update
+    }
+
+    fn update_view(&self) {
+        self.update()
+    }
+
+    // TheSuperHackers @tweak xezon 12/08/2025 The camera shaker is no longer tied to the render
+    // update. The shake does sharp shakes on every fixed time step.
+    fn step_view(&self) {
+        // Process camera shake
+        if self.shake_intensity > 0.01 {
+            self.shake_offset.x = self.shake_intensity * self.shake_angle_cos
+            self.shake_offset.y = self.shake_intensity * self.shake_angle_sin
+
+            // Fake a stiff spring/damper
+            let damping_coeff = 0.75
+            self.shake_intensity = self.shake_intensity * damping_coeff
+
+            // Spring is so "stiff", it pulls 180 degrees opposite each frame
+            self.shake_angle_cos = -self.shake_angle_cos
+            self.shake_angle_sin = -self.shake_angle_sin
+        } else {
+            self.shake_intensity = 0.0
+            self.shake_offset.x = 0.0
+            self.shake_offset.y = 0.0
+        }
+    }
+
+    fn update(&self) {
+        let recalc_camera = false
+        let did_scripted_movement = false
+
+        // Update camera movements
+        if self.update_camera_movements() {
+            recalc_camera = true
+            did_scripted_movement = true
+        }
+
+        // Handle camera lock
+        let camera_lock = self.base.get_camera_lock()
+        if camera_lock != -1 {
+            self.doing_move_camera_on_waypoint_path = false
+            self.camera_arrived_at_waypoint_on_path_flag = false
+            // In real implementation, follow the locked object
+        }
+
+        self.camera_has_moved_since_request = true
+    }
+
+    fn draw_view(&self) {
+        self.draw()
+    }
+
+    fn draw(&self) {
+        // Render the 3D scene
+        // In real implementation, this iterates drawables and renders them
+    }
+
+    fn force_redraw(&self) {
+        // Force a redraw of the view
+    }
+
+    // Internal helper methods
+    fn rotate_camera_one_frame(&self) {
+        if !self.doing_rotate_camera {
+            return
+        }
+
+        self.rc_info.cur_frame = self.rc_info.cur_frame + 1
+
+        if self.rc_info.cur_frame >= self.rc_info.num_frames {
+            self.doing_rotate_camera = false
+            self.base.set_angle(self.rc_info.end_angle)
+            return
+        }
+
+        let t = (self.rc_info.cur_frame as f32) / (self.rc_info.num_frames as f32)
+        let eased_t = self.rc_info.ease.evaluate(t)
+        let angle = self.rc_info.start_angle + (self.rc_info.end_angle - self.rc_info.start_angle) * eased_t
+        self.base.set_angle(angle)
+    }
+
+    fn zoom_camera_one_frame(&self) {
+        if !self.doing_zoom_camera {
+            return
+        }
+
+        self.zc_info.cur_frame = self.zc_info.cur_frame + 1
+
+        if self.zc_info.cur_frame >= self.zc_info.num_frames {
+            self.doing_zoom_camera = false
+            self.base.set_zoom(self.zc_info.end_zoom)
+            return
+        }
+
+        let t = (self.zc_info.cur_frame as f32) / (self.zc_info.num_frames as f32)
+        let eased_t = self.zc_info.ease.evaluate(t)
+        let zoom = self.zc_info.start_zoom + (self.zc_info.end_zoom - self.zc_info.start_zoom) * eased_t
+        self.base.set_zoom(zoom)
+    }
+
+    fn pitch_camera_one_frame(&self) {
+        if !self.doing_pitch_camera {
+            return
+        }
+
+        self.pc_info.cur_frame = self.pc_info.cur_frame + 1
+
+        if self.pc_info.cur_frame >= self.pc_info.num_frames {
+            self.doing_pitch_camera = false
+            self.base.set_pitch(self.pc_info.end_pitch)
+            return
+        }
+
+        let t = (self.pc_info.cur_frame as f32) / (self.pc_info.num_frames as f32)
+        let eased_t = self.pc_info.ease.evaluate(t)
+        let pitch = self.pc_info.start_pitch + (self.pc_info.end_pitch - self.pc_info.start_pitch) * eased_t
+        self.base.set_pitch(pitch)
+    }
+
+    fn move_along_waypoint_path(&self, elapsed_ms: f32) {
+        if !self.doing_move_camera_on_waypoint_path {
+            return
+        }
+
+        self.mcwp_info.elapsed_time_ms = self.mcwp_info.elapsed_time_ms + elapsed_ms
+
+        if self.mcwp_info.elapsed_time_ms >= self.mcwp_info.total_time_ms {
+            self.doing_move_camera_on_waypoint_path = false
+            self.camera_arrived_at_waypoint_on_path_flag = true
+            if self.mcwp_info.num_waypoints > 0 {
+                self.base.look_at(self.mcwp_info.waypoints[self.mcwp_info.num_waypoints - 1])
+            }
+            return
+        }
+
+        // Calculate position along path
+        let t = self.mcwp_info.elapsed_time_ms / self.mcwp_info.total_time_ms
+        let eased_t = self.mcwp_info.ease.evaluate(t)
+
+        // Simple linear interpolation for single waypoint
+        if self.mcwp_info.num_waypoints == 1 {
+            let start = self.base.get_position()
+            let end = self.mcwp_info.waypoints[0]
+            let pos = Vec3 {
+                x: start.x + (end.x - start.x) * eased_t,
+                y: start.y + (end.y - start.y) * eased_t,
+                z: start.z + (end.z - start.z) * eased_t,
+            }
+            self.base.look_at(pos)
+        }
+    }
+
+    fn calc_camera_constraints(&self) {
+        // Calculate camera movement constraints based on map boundaries
+        // In real implementation, this queries terrain logic for map extents
+        self.camera_constraint_valid = true
+    }
+
+    fn build_camera_transform(&self) {
+        // Build the camera transform matrix
+        // In real implementation, this creates the 3D camera transformation
+    }
+
+    fn set_camera_transform(&self) {
+        // Apply the camera transform to the 3D camera
+        if self.base.view_locked_until_frame > 0 {
+            // Check against current frame
+            return
+        }
+
+        self.camera_has_moved_since_request = true
+
+        if !self.camera_constraint_valid {
+            self.build_camera_transform()
+            self.calc_camera_constraints()
+        }
+
+        // Apply constraints to position
+        let mut pos = self.base.get_position()
+        if self.camera_constraint_valid {
+            if pos.x < self.camera_constraint.lo.x {
+                pos.x = self.camera_constraint.lo.x
+            }
+            if pos.x > self.camera_constraint.hi.x {
+                pos.x = self.camera_constraint.hi.x
+            }
+            if pos.y < self.camera_constraint.lo.y {
+                pos.y = self.camera_constraint.lo.y
+            }
+            if pos.y > self.camera_constraint.hi.y {
+                pos.y = self.camera_constraint.hi.y
+            }
+            self.base.set_position(pos)
+        }
+
+        self.build_camera_transform()
+    }
+}
+
+// ============================================================================
+// GLOBAL VIEW INSTANCE
+// ============================================================================
+
+let g_tactical_view: W3DView? = null
+
+fn init_tactical_view(): W3DView {
+    let view = W3DView::init()
+    g_tactical_view = view
+    return view
+}
+
+fn get_tactical_view(): W3DView? {
+    return g_tactical_view
+}
+
+fn shutdown_tactical_view() {
+    g_tactical_view = null
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn tan_f32(x: f32): f32 {
+    return sin_f32(x) / cos_f32(x)
+}
+
+fn sin_f32(x: f32): f32 {
+    // Simple Taylor series approximation
+    let x2 = x * x
+    return x - (x * x2 / 6.0) + (x * x2 * x2 / 120.0)
+}
+
+fn cos_f32(x: f32): f32 {
+    // Simple Taylor series approximation
+    let x2 = x * x
+    return 1.0 - (x2 / 2.0) + (x2 * x2 / 24.0)
+}
+
+fn sqrt_f32(x: f32): f32 {
+    // Newton's method approximation
+    if x <= 0.0 {
+        return 0.0
+    }
+    let mut guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+fn atan2_f32(y: f32, x: f32): f32 {
+    // Approximation of atan2
+    let pi = 3.14159265
+    if x == 0.0 {
+        if y > 0.0 {
+            return pi / 2.0
+        } else if y < 0.0 {
+            return -pi / 2.0
+        }
+        return 0.0
+    }
+    let atan = y / x
+    if x > 0.0 {
+        return atan
+    } else if y >= 0.0 {
+        return atan + pi
+    }
+    return atan - pi
+}
+
+fn max_f32(a: f32, b: f32): f32 {
+    if a > b { return a }
+    return b
+}
+
+fn min_f32(a: f32, b: f32): f32 {
+    if a < b { return a }
+    return b
+}
+
+fn norm_angle(angle: f32): f32 {
+    let pi = 3.14159265
+    let mut a = angle
+    while a > pi {
+        a = a - 2.0 * pi
+    }
+    while a < -pi {
+        a = a + 2.0 * pi
+    }
+    return a
+}
+
+fn get_height_around_pos(x: f32, y: f32): f32 {
+    // In real implementation, sample terrain heights around position
+    // and return max height for camera clearance
+    return 0.0
+}

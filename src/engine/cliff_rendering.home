@@ -1,0 +1,635 @@
+// Cliff Rendering - Custom Edge and Cliff System
+// Based on original W3DCustomEdging.cpp
+// Handles terrain cliff edges, custom blend edges, and special terrain transitions
+
+// ============================================================================
+// Cliff Edge Types
+// ============================================================================
+
+enum CliffEdgeType {
+    None,                   // No edge
+    Horizontal,             // Horizontal edge (E-W running)
+    Vertical,               // Vertical edge (N-S running)
+    RightDiagonal,          // Diagonal from bottom-left to top-right
+    LeftDiagonal,           // Diagonal from bottom-right to top-left
+    LongRightDiagonal,      // Extended right diagonal
+    LongLeftDiagonal,       // Extended left diagonal
+    Corner,                 // Corner piece
+    TJunction,              // T-junction
+    CrossJunction,          // 4-way junction
+}
+
+enum CliffBlendClass {
+    Default = 0,
+    Rocky,
+    Sandy,
+    Grassy,
+    Snowy,
+    Muddy,
+    Concrete,
+}
+
+// ============================================================================
+// Cliff Edge Data
+// ============================================================================
+
+struct CliffEdge {
+    cell_x: i32,
+    cell_y: i32,
+    edge_type: CliffEdgeType,
+    inverted: bool,
+    blend_class: CliffBlendClass,
+
+    // UV coordinates for edge texture
+    u_offset: f64,
+    v_offset: f64,
+    u_scale: f64,
+    v_scale: f64,
+
+    // Height data for vertices
+    heights: [f64; 4],        // 4 corners of the cell
+
+    // Computed alpha values for blending
+    alpha: [i32; 4],
+}
+
+fn create_cliff_edge(x: i32, y: i32): CliffEdge {
+    return CliffEdge {
+        cell_x: x,
+        cell_y: y,
+        edge_type: CliffEdgeType.None,
+        inverted: false,
+        blend_class: CliffBlendClass.Default,
+        u_offset: 0.0,
+        v_offset: 0.0,
+        u_scale: 0.25,
+        v_scale: 0.25,
+        heights: [0.0, 0.0, 0.0, 0.0],
+        alpha: [255, 255, 255, 255],
+    }
+}
+
+// ============================================================================
+// Cliff Vertex Format (XYZDUVV)
+// ============================================================================
+
+struct CliffVertex {
+    x: f64,
+    y: f64,
+    z: f64,
+    diffuse: i32,           // ARGB color for lighting
+    u1: f64,                // Base texture UV
+    v1: f64,
+    u2: f64,                // Edge/blend texture UV
+    v2: f64,
+}
+
+fn create_cliff_vertex(): CliffVertex {
+    return CliffVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        diffuse: 0xFFFFFFFF,
+        u1: 0.0,
+        v1: 0.0,
+        u2: 0.0,
+        v2: 0.0,
+    }
+}
+
+// ============================================================================
+// Cliff Rendering System
+// ============================================================================
+
+const MAX_CLIFF_VERTICES: i32 = 65536
+const MAX_CLIFF_INDICES: i32 = 98304      // 1.5x vertices for index buffer
+const MAP_XY_FACTOR: f64 = 10.0           // World units per cell
+const MAP_HEIGHT_SCALE: f64 = 0.625       // Height scale factor
+
+struct CliffRenderingConfig {
+    enable_alpha_blending: bool,
+    enable_custom_edges: bool,
+    edge_height_threshold: f64,   // Min height diff for cliff detection
+    blend_distance: f64,          // Distance for edge blending
+    use_detail_textures: bool,
+}
+
+fn default_cliff_config(): CliffRenderingConfig {
+    return CliffRenderingConfig {
+        enable_alpha_blending: true,
+        enable_custom_edges: true,
+        edge_height_threshold: 5.0,
+        blend_distance: 2.0,
+        use_detail_textures: true,
+    }
+}
+
+struct CliffRenderSystem {
+    config: CliffRenderingConfig,
+
+    // Edge data
+    edges: Vec<CliffEdge>,
+    edges_dirty: bool,
+
+    // Vertex/Index buffers
+    vertices: Vec<CliffVertex>,
+    indices: Vec<i32>,
+    num_vertices: i32,
+    num_indices: i32,
+
+    // Map dimensions
+    map_width: i32,
+    map_height: i32,
+
+    // Texture regions for blend classes
+    blend_regions: HashMap<i32, (f64, f64, f64, f64)>,  // class -> (u, v, w, h)
+
+    // Edge texture atlas info
+    edge_texture_id: i32,
+    edge_texture_columns: i32,    // Columns in atlas
+    edge_texture_rows: i32,       // Rows in atlas
+}
+
+fn create_cliff_render_system(): CliffRenderSystem {
+    return CliffRenderSystem {
+        config: default_cliff_config(),
+        edges: Vec<CliffEdge>{},
+        edges_dirty: true,
+        vertices: Vec<CliffVertex>{},
+        indices: Vec<i32>{},
+        num_vertices: 0,
+        num_indices: 0,
+        map_width: 0,
+        map_height: 0,
+        blend_regions: HashMap<i32, (f64, f64, f64, f64)>{},
+        edge_texture_id: 0,
+        edge_texture_columns: 4,
+        edge_texture_rows: 4,
+    }
+}
+
+// Initialize for a specific map size
+fn cliff_init(system: CliffRenderSystem, width: i32, height: i32) {
+    system.map_width = width
+    system.map_height = height
+    system.edges = Vec<CliffEdge>{}
+    system.edges_dirty = true
+
+    // Set up default blend regions in texture atlas
+    // Each blend class occupies a region in the edge texture
+    system.blend_regions.set(CliffBlendClass.Default as i32, (0.0, 0.0, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Rocky as i32, (0.25, 0.0, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Sandy as i32, (0.5, 0.0, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Grassy as i32, (0.75, 0.0, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Snowy as i32, (0.0, 0.25, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Muddy as i32, (0.25, 0.25, 0.25, 0.25))
+    system.blend_regions.set(CliffBlendClass.Concrete as i32, (0.5, 0.25, 0.25, 0.25))
+}
+
+// Detect cliffs from heightmap data
+fn cliff_detect_edges(system: CliffRenderSystem, heightmap: Vec<f64>, blend_indices: Vec<i32>) {
+    system.edges = Vec<CliffEdge>{}
+
+    for y in 0..system.map_height - 1 {
+        for x in 0..system.map_width - 1 {
+            let idx = x + y * system.map_width
+            let blend = blend_indices.get(idx)
+
+            if blend == 0 {
+                continue  // No blend at this cell
+            }
+
+            // Get heights at corners
+            let h00 = heightmap.get(idx)
+            let h10 = heightmap.get(idx + 1)
+            let h01 = heightmap.get(idx + system.map_width)
+            let h11 = heightmap.get(idx + system.map_width + 1)
+
+            let edge = create_cliff_edge(x, y)
+            edge.heights[0] = h00
+            edge.heights[1] = h10
+            edge.heights[2] = h01
+            edge.heights[3] = h11
+
+            // Determine edge type based on blend data
+            let edge_type = classify_edge(blend)
+            edge.edge_type = edge_type.0
+            edge.inverted = edge_type.1
+
+            // Compute UV offsets based on edge type
+            compute_edge_uvs(system, edge, x, y)
+
+            if edge.edge_type != CliffEdgeType.None {
+                system.edges.add(edge)
+            }
+        }
+    }
+
+    system.edges_dirty = true
+}
+
+// Classify edge type from blend index
+fn classify_edge(blend: i32): (CliffEdgeType, bool) {
+    // Blend index encodes edge type in bits
+    // Bit 0: horizontal
+    // Bit 1: vertical
+    // Bit 2: right diagonal
+    // Bit 3: left diagonal
+    // Bit 4: long diagonal
+    // Bit 5: inverted
+
+    let inverted = (blend & 32) != 0
+
+    if (blend & 1) != 0 {
+        return (CliffEdgeType.Horizontal, inverted)
+    }
+    if (blend & 2) != 0 {
+        return (CliffEdgeType.Vertical, inverted)
+    }
+    if (blend & 4) != 0 {
+        if (blend & 16) != 0 {
+            return (CliffEdgeType.LongRightDiagonal, inverted)
+        }
+        return (CliffEdgeType.RightDiagonal, inverted)
+    }
+    if (blend & 8) != 0 {
+        if (blend & 16) != 0 {
+            return (CliffEdgeType.LongLeftDiagonal, inverted)
+        }
+        return (CliffEdgeType.LeftDiagonal, inverted)
+    }
+
+    return (CliffEdgeType.None, false)
+}
+
+// Compute UV coordinates for an edge
+fn compute_edge_uvs(system: CliffRenderSystem, edge: CliffEdge, x: i32, y: i32) {
+    // Get blend region for this edge's class
+    let region_key = edge.blend_class as i32
+    if !system.blend_regions.has(region_key) {
+        region_key = CliffBlendClass.Default as i32
+    }
+    let region = system.blend_regions.get(region_key)
+
+    // Base UV from region
+    let base_u = region.0
+    let base_v = region.1
+    let region_w = region.2
+    let region_h = region.3
+
+    // Offset within region based on edge type
+    let u_offset: f64 = 0.0
+    let v_offset: f64 = 0.0
+
+    if edge.edge_type == CliffEdgeType.Horizontal {
+        u_offset = 0.0
+        v_offset = 0.25 * (1.0 + ((y % 2) as f64))
+        if edge.inverted {
+            u_offset = 0.75
+        }
+    } else if edge.edge_type == CliffEdgeType.Vertical {
+        v_offset = 0.75
+        u_offset = 0.25 * (1.0 + ((x % 2) as f64))
+        if edge.inverted {
+            v_offset = 0.0
+        }
+    } else if edge.edge_type == CliffEdgeType.RightDiagonal {
+        v_offset = 0.75
+        u_offset = 0.0
+        if edge.inverted {
+            v_offset = 0.0
+        }
+    } else if edge.edge_type == CliffEdgeType.LongRightDiagonal {
+        v_offset = 0.25
+        u_offset = 0.5
+        if edge.inverted {
+            v_offset = 0.5
+        }
+    } else if edge.edge_type == CliffEdgeType.LeftDiagonal {
+        v_offset = 0.75
+        u_offset = 0.75
+        if edge.inverted {
+            v_offset = 0.0
+        }
+    } else if edge.edge_type == CliffEdgeType.LongLeftDiagonal {
+        u_offset = 0.25
+        v_offset = 0.25
+        if edge.inverted {
+            v_offset = 0.5
+        }
+    }
+
+    edge.u_offset = base_u + region_w * u_offset
+    edge.v_offset = base_v + region_h * v_offset
+    edge.u_scale = region_w * 0.25
+    edge.v_scale = region_h * 0.25
+}
+
+// Generate vertex/index buffers for rendering
+fn cliff_generate_buffers(system: CliffRenderSystem, get_diffuse: fn(i32, i32): i32) {
+    if !system.edges_dirty {
+        return
+    }
+
+    system.vertices = Vec<CliffVertex>{}
+    system.indices = Vec<i32>{}
+    system.num_vertices = 0
+    system.num_indices = 0
+
+    for i in 0..system.edges.len() {
+        let edge = system.edges.get(i)
+        generate_edge_geometry(system, edge, get_diffuse)
+    }
+
+    system.edges_dirty = false
+}
+
+// Generate geometry for a single edge
+fn generate_edge_geometry(system: CliffRenderSystem, edge: CliffEdge, get_diffuse: fn(i32, i32): i32) {
+    if system.num_vertices + 4 > MAX_CLIFF_VERTICES {
+        return
+    }
+    if system.num_indices + 6 > MAX_CLIFF_INDICES {
+        return
+    }
+
+    let start_vertex = system.num_vertices
+    let x = edge.cell_x
+    let y = edge.cell_y
+
+    // Generate 4 vertices for quad
+    for j in 0..2 {
+        for i in 0..2 {
+            let vx = (x + i) as f64
+            let vy = (y + j) as f64
+
+            let vertex = create_cliff_vertex()
+
+            // World position
+            vertex.x = vx * MAP_XY_FACTOR
+            vertex.y = vy * MAP_XY_FACTOR
+
+            // Height (from heightmap)
+            let corner_idx = i + j * 2
+            vertex.z = edge.heights[corner_idx] * MAP_HEIGHT_SCALE
+
+            // Diffuse from terrain lighting
+            let diffuse = get_diffuse(x + i, y + j)
+            vertex.diffuse = 0x80000000 | (diffuse & 0x00FFFFFF)  // Alpha = 0x80
+
+            // Edge texture UV
+            vertex.u2 = edge.u_offset + (i as f64) * edge.u_scale
+            vertex.v2 = edge.v_offset + ((1 - j) as f64) * edge.v_scale
+
+            // Base texture UV (from terrain)
+            let ndx: i32 = 0
+            if j == 0 { ndx = i }
+            if j == 1 { ndx = 3 - i }
+            vertex.u1 = (edge.alpha[ndx] as f64) / 255.0
+            vertex.v1 = (edge.alpha[ndx] as f64) / 255.0
+
+            system.vertices.add(vertex)
+            system.num_vertices = system.num_vertices + 1
+        }
+    }
+
+    // Generate 6 indices for 2 triangles
+    // Triangle 1: 0, 2, 1
+    system.indices.add(start_vertex)
+    system.indices.add(start_vertex + 2)
+    system.indices.add(start_vertex + 1)
+
+    // Triangle 2: 1, 2, 3
+    system.indices.add(start_vertex + 1)
+    system.indices.add(start_vertex + 2)
+    system.indices.add(start_vertex + 3)
+
+    system.num_indices = system.num_indices + 6
+}
+
+// Update alpha values for edges based on camera/terrain visibility
+fn cliff_update_alpha(system: CliffRenderSystem, heightmap: Vec<f64>) {
+    for i in 0..system.edges.len() {
+        let edge = system.edges.get(i)
+        let x = edge.cell_x
+        let y = edge.cell_y
+
+        // Compute alpha based on height difference
+        for j in 0..2 {
+            for k in 0..2 {
+                let idx = (x + k) + (y + j) * system.map_width
+                let height = heightmap.get(idx)
+
+                // Alpha is based on height gradient
+                let alpha: i32 = 255
+                if height > system.config.edge_height_threshold {
+                    alpha = 128 + (height * 2.0) as i32
+                    if alpha > 255 { alpha = 255 }
+                }
+
+                edge.alpha[k + j * 2] = alpha
+            }
+        }
+    }
+
+    system.edges_dirty = true
+}
+
+// Get vertices for rendering
+fn cliff_get_vertices(system: CliffRenderSystem): Vec<CliffVertex> {
+    return system.vertices
+}
+
+// Get indices for rendering
+fn cliff_get_indices(system: CliffRenderSystem): Vec<i32> {
+    return system.indices
+}
+
+// Get vertex count
+fn cliff_get_vertex_count(system: CliffRenderSystem): i32 {
+    return system.num_vertices
+}
+
+// Get index count
+fn cliff_get_index_count(system: CliffRenderSystem): i32 {
+    return system.num_indices
+}
+
+// Check if buffers need update
+fn cliff_needs_update(system: CliffRenderSystem): bool {
+    return system.edges_dirty
+}
+
+// Set edge texture
+fn cliff_set_edge_texture(system: CliffRenderSystem, texture_id: i32) {
+    system.edge_texture_id = texture_id
+}
+
+// ============================================================================
+// Cliff Detection Helpers
+// ============================================================================
+
+// Detect if a cell is a cliff based on height difference
+fn is_cliff_cell(heightmap: Vec<f64>, x: i32, y: i32, width: i32, threshold: f64): bool {
+    let idx = x + y * width
+
+    // Check all 4 neighbors
+    let h_center = heightmap.get(idx)
+    let max_diff: f64 = 0.0
+
+    if x > 0 {
+        let diff = abs_f64(heightmap.get(idx - 1) - h_center)
+        if diff > max_diff { max_diff = diff }
+    }
+    if x < width - 1 {
+        let diff = abs_f64(heightmap.get(idx + 1) - h_center)
+        if diff > max_diff { max_diff = diff }
+    }
+    if y > 0 {
+        let diff = abs_f64(heightmap.get(idx - width) - h_center)
+        if diff > max_diff { max_diff = diff }
+    }
+    if y < width - 1 {
+        let diff = abs_f64(heightmap.get(idx + width) - h_center)
+        if diff > max_diff { max_diff = diff }
+    }
+
+    return max_diff > threshold
+}
+
+// Get cliff direction (for orientation)
+fn get_cliff_direction(heightmap: Vec<f64>, x: i32, y: i32, width: i32): (f64, f64) {
+    let idx = x + y * width
+    let h_center = heightmap.get(idx)
+
+    let dx: f64 = 0.0
+    let dy: f64 = 0.0
+
+    if x > 0 && x < width - 1 {
+        dx = heightmap.get(idx + 1) - heightmap.get(idx - 1)
+    }
+    if y > 0 && y < width - 1 {
+        dy = heightmap.get(idx + width) - heightmap.get(idx - width)
+    }
+
+    // Normalize
+    let len = sqrt(dx * dx + dy * dy)
+    if len > 0.001 {
+        return (dx / len, dy / len)
+    }
+    return (0.0, 1.0)
+}
+
+fn abs_f64(x: f64): f64 {
+    if x < 0.0 { return -x }
+    return x
+}
+
+fn sqrt(x: f64): f64 {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    for i in 0..10 {
+        guess = (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn test_cliff_edge_creation(): bool {
+    let edge = create_cliff_edge(5, 10)
+    assert(edge.cell_x == 5, "Cell X should be 5")
+    assert(edge.cell_y == 10, "Cell Y should be 10")
+    assert(edge.edge_type == CliffEdgeType.None, "Should be no edge type")
+    return true
+}
+
+fn test_cliff_system_init(): bool {
+    let system = create_cliff_render_system()
+    cliff_init(system, 64, 64)
+
+    assert(system.map_width == 64, "Map width should be 64")
+    assert(system.map_height == 64, "Map height should be 64")
+    assert(system.blend_regions.has(0), "Should have default blend region")
+    return true
+}
+
+fn test_cliff_edge_classification(): bool {
+    // Test horizontal edge
+    let result = classify_edge(1)  // Bit 0 set
+    assert(result.0 == CliffEdgeType.Horizontal, "Should be horizontal")
+
+    // Test vertical edge
+    result = classify_edge(2)  // Bit 1 set
+    assert(result.0 == CliffEdgeType.Vertical, "Should be vertical")
+
+    // Test inverted
+    result = classify_edge(33)  // Bits 0 and 5 set
+    assert(result.0 == CliffEdgeType.Horizontal, "Should be horizontal")
+    assert(result.1 == true, "Should be inverted")
+
+    // Test diagonal
+    result = classify_edge(4)  // Bit 2 set
+    assert(result.0 == CliffEdgeType.RightDiagonal, "Should be right diagonal")
+
+    // Test long diagonal
+    result = classify_edge(20)  // Bits 2 and 4 set
+    assert(result.0 == CliffEdgeType.LongRightDiagonal, "Should be long right diagonal")
+
+    return true
+}
+
+fn test_cliff_detection(): bool {
+    // Create simple heightmap with a cliff
+    let heightmap = Vec<f64>{}
+    for i in 0..64 {
+        if i < 32 {
+            heightmap.add(0.0)
+        } else {
+            heightmap.add(10.0)  // Cliff at row 4
+        }
+    }
+
+    // Check cliff detection
+    assert(is_cliff_cell(heightmap, 3, 3, 8, 5.0) == false, "Should not be cliff at 3,3")
+    assert(is_cliff_cell(heightmap, 4, 3, 8, 5.0) == true, "Should be cliff at 4,3")
+
+    return true
+}
+
+fn test_cliff_buffer_generation(): bool {
+    let system = create_cliff_render_system()
+    cliff_init(system, 8, 8)
+
+    // Add a test edge
+    let edge = create_cliff_edge(2, 2)
+    edge.edge_type = CliffEdgeType.Horizontal
+    edge.heights[0] = 0.0
+    edge.heights[1] = 0.0
+    edge.heights[2] = 5.0
+    edge.heights[3] = 5.0
+    system.edges.add(edge)
+    system.edges_dirty = true
+
+    // Generate with dummy diffuse function
+    fn get_white(x: i32, y: i32): i32 {
+        return 0xFFFFFF
+    }
+    cliff_generate_buffers(system, get_white)
+
+    assert(system.num_vertices == 4, "Should have 4 vertices")
+    assert(system.num_indices == 6, "Should have 6 indices")
+
+    return true
+}
+
+fn run_all_tests(): bool {
+    assert(test_cliff_edge_creation(), "Cliff edge creation test failed")
+    assert(test_cliff_system_init(), "Cliff system init test failed")
+    assert(test_cliff_edge_classification(), "Cliff edge classification test failed")
+    assert(test_cliff_detection(), "Cliff detection test failed")
+    assert(test_cliff_buffer_generation(), "Cliff buffer generation test failed")
+    return true
+}

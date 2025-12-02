@@ -1,0 +1,870 @@
+// Framebuffer/Render Target Abstraction for C&C Generals Zero Hour
+// Based on Thyme: W3DDevice/W3DRenderTarget.cpp, D3DDevice/D3DRenderTarget.cpp
+// Implements multi-render target (MRT), shadow maps, reflections, post-processing
+// @feature H0-005 - Add render target/framebuffer abstractions
+
+// ============================================================================
+// TEXTURE FORMAT
+// ============================================================================
+
+enum FramebufferFormat {
+    // Color formats
+    RGBA8 = 0,          // 8-bit per channel, standard
+    RGBA16F = 1,        // 16-bit float per channel, HDR
+    RGBA32F = 2,        // 32-bit float per channel, precision
+    RGB10A2 = 3,        // 10-bit RGB + 2-bit alpha, HDR
+    RG16F = 4,          // 2 channel 16-bit float
+    R32F = 5,           // Single channel 32-bit float
+    R16F = 6,           // Single channel 16-bit float
+    R8 = 7,             // Single channel 8-bit
+
+    // Depth/Stencil formats
+    Depth16 = 100,
+    Depth24 = 101,
+    Depth32F = 102,
+    Depth24Stencil8 = 103,
+    Depth32FStencil8 = 104,
+
+    // Compressed formats (read-only)
+    BC1 = 200,          // DXT1
+    BC3 = 201,          // DXT5
+}
+
+// ============================================================================
+// ATTACHMENT TYPE
+// ============================================================================
+
+enum AttachmentType {
+    Color0 = 0,
+    Color1 = 1,
+    Color2 = 2,
+    Color3 = 3,
+    Color4 = 4,
+    Color5 = 5,
+    Color6 = 6,
+    Color7 = 7,
+    Depth = 8,
+    Stencil = 9,
+    DepthStencil = 10,
+}
+
+// ============================================================================
+// CLEAR FLAGS
+// ============================================================================
+
+enum ClearFlag {
+    None = 0,
+    Color = 1,
+    Depth = 2,
+    Stencil = 4,
+    All = 7,
+}
+
+// ============================================================================
+// FRAMEBUFFER ATTACHMENT
+// ============================================================================
+
+struct FramebufferAttachment {
+    attachment_type: AttachmentType,
+    format: FramebufferFormat,
+    width: i32,
+    height: i32,
+    mip_levels: i32,
+    samples: i32,           // MSAA samples (1 = no MSAA)
+    texture_handle: i32,    // GPU texture handle
+    is_renderbuffer: bool,  // Renderbuffer vs texture
+    name: string,
+}
+
+impl FramebufferAttachment {
+    fn init(attachment_type: AttachmentType, format: FramebufferFormat): FramebufferAttachment {
+        return FramebufferAttachment {
+            attachment_type: attachment_type,
+            format: format,
+            width: 0,
+            height: 0,
+            mip_levels: 1,
+            samples: 1,
+            texture_handle: -1,
+            is_renderbuffer: false,
+            name: "",
+        }
+    }
+
+    fn is_color(&self): bool {
+        let t = self.attachment_type
+        return t == AttachmentType::Color0 || t == AttachmentType::Color1 ||
+               t == AttachmentType::Color2 || t == AttachmentType::Color3 ||
+               t == AttachmentType::Color4 || t == AttachmentType::Color5 ||
+               t == AttachmentType::Color6 || t == AttachmentType::Color7
+    }
+
+    fn is_depth(&self): bool {
+        let t = self.attachment_type
+        return t == AttachmentType::Depth || t == AttachmentType::DepthStencil
+    }
+
+    fn is_stencil(&self): bool {
+        let t = self.attachment_type
+        return t == AttachmentType::Stencil || t == AttachmentType::DepthStencil
+    }
+
+    fn get_color_index(&self): i32 {
+        match self.attachment_type {
+            AttachmentType::Color0 => 0,
+            AttachmentType::Color1 => 1,
+            AttachmentType::Color2 => 2,
+            AttachmentType::Color3 => 3,
+            AttachmentType::Color4 => 4,
+            AttachmentType::Color5 => 5,
+            AttachmentType::Color6 => 6,
+            AttachmentType::Color7 => 7,
+            _ => -1,
+        }
+    }
+}
+
+// ============================================================================
+// FRAMEBUFFER DESCRIPTOR
+// ============================================================================
+
+struct FramebufferDescriptor {
+    width: i32,
+    height: i32,
+    samples: i32,                   // MSAA sample count
+    color_attachments: [FramebufferFormat],  // Up to 8 color attachments
+    depth_format: FramebufferFormat?,
+    has_stencil: bool,
+    generate_mipmaps: bool,
+    name: string,
+}
+
+impl FramebufferDescriptor {
+    fn init(width: i32, height: i32): FramebufferDescriptor {
+        return FramebufferDescriptor {
+            width: width,
+            height: height,
+            samples: 1,
+            color_attachments: [],
+            depth_format: null,
+            has_stencil: false,
+            generate_mipmaps: false,
+            name: "Framebuffer",
+        }
+    }
+
+    fn add_color_attachment(&self, format: FramebufferFormat) {
+        if self.color_attachments.length < 8 {
+            self.color_attachments = self.color_attachments + [format]
+        }
+    }
+
+    fn set_depth(&self, format: FramebufferFormat) {
+        self.depth_format = format
+    }
+
+    fn set_depth_stencil(&self) {
+        self.depth_format = FramebufferFormat::Depth24Stencil8
+        self.has_stencil = true
+    }
+
+    fn enable_msaa(&self, samples: i32) {
+        // Valid sample counts: 1, 2, 4, 8, 16
+        if samples == 1 || samples == 2 || samples == 4 || samples == 8 || samples == 16 {
+            self.samples = samples
+        }
+    }
+}
+
+// ============================================================================
+// FRAMEBUFFER
+// ============================================================================
+
+struct Framebuffer {
+    handle: i32,                    // GPU framebuffer handle
+    width: i32,
+    height: i32,
+    samples: i32,
+    attachments: [FramebufferAttachment],
+    color_count: i32,
+    has_depth: bool,
+    has_stencil: bool,
+    name: string,
+    is_default: bool,               // True for backbuffer
+}
+
+impl Framebuffer {
+    fn init(): Framebuffer {
+        return Framebuffer {
+            handle: -1,
+            width: 0,
+            height: 0,
+            samples: 1,
+            attachments: [],
+            color_count: 0,
+            has_depth: false,
+            has_stencil: false,
+            name: "",
+            is_default: false,
+        }
+    }
+
+    fn create(&self, desc: FramebufferDescriptor): bool {
+        self.width = desc.width
+        self.height = desc.height
+        self.samples = desc.samples
+        self.name = desc.name
+        self.attachments = []
+        self.color_count = 0
+
+        // Create color attachments
+        for i in 0..desc.color_attachments.length {
+            let format = desc.color_attachments[i]
+            let attach_type = match i {
+                0 => AttachmentType::Color0,
+                1 => AttachmentType::Color1,
+                2 => AttachmentType::Color2,
+                3 => AttachmentType::Color3,
+                4 => AttachmentType::Color4,
+                5 => AttachmentType::Color5,
+                6 => AttachmentType::Color6,
+                7 => AttachmentType::Color7,
+                _ => AttachmentType::Color0,
+            }
+
+            let attachment = FramebufferAttachment::init(attach_type, format)
+            attachment.width = desc.width
+            attachment.height = desc.height
+            attachment.samples = desc.samples
+            attachment.mip_levels = 1
+            if desc.generate_mipmaps {
+                attachment.mip_levels = calculate_mip_levels(desc.width, desc.height)
+            }
+
+            // In real implementation, create GPU texture here
+            attachment.texture_handle = i  // Placeholder
+
+            self.attachments = self.attachments + [attachment]
+            self.color_count = self.color_count + 1
+        }
+
+        // Create depth attachment
+        if desc.depth_format != null {
+            let attach_type = AttachmentType::Depth
+            if desc.has_stencil {
+                attach_type = AttachmentType::DepthStencil
+            }
+
+            let attachment = FramebufferAttachment::init(attach_type, desc.depth_format)
+            attachment.width = desc.width
+            attachment.height = desc.height
+            attachment.samples = desc.samples
+            attachment.is_renderbuffer = !desc.generate_mipmaps  // Depth usually doesn't need sampling
+
+            // In real implementation, create GPU depth buffer here
+            attachment.texture_handle = 100  // Placeholder
+
+            self.attachments = self.attachments + [attachment]
+            self.has_depth = true
+            self.has_stencil = desc.has_stencil
+        }
+
+        // In real implementation, create GPU framebuffer and attach textures
+        self.handle = 0  // Placeholder
+
+        return true
+    }
+
+    fn destroy(&self) {
+        // In real implementation, delete GPU framebuffer and textures
+        for i in 0..self.attachments.length {
+            self.attachments[i].texture_handle = -1
+        }
+        self.handle = -1
+        self.attachments = []
+    }
+
+    fn bind(&self) {
+        // In real implementation, bind framebuffer for rendering
+        // glBindFramebuffer(GL_FRAMEBUFFER, self.handle)
+    }
+
+    fn unbind(&self) {
+        // In real implementation, unbind and return to default framebuffer
+        // glBindFramebuffer(GL_FRAMEBUFFER, 0)
+    }
+
+    fn clear(&self, flags: i32, color: [f32], depth: f32, stencil: i32) {
+        // flags is bitmask of ClearFlag
+        let clear_color = (flags & 1) != 0
+        let clear_depth = (flags & 2) != 0
+        let clear_stencil = (flags & 4) != 0
+
+        // In real implementation:
+        // if clear_color && color.length >= 4 {
+        //     glClearColor(color[0], color[1], color[2], color[3])
+        //     glClear(GL_COLOR_BUFFER_BIT)
+        // }
+        // if clear_depth && self.has_depth {
+        //     glClearDepth(depth)
+        //     glClear(GL_DEPTH_BUFFER_BIT)
+        // }
+        // if clear_stencil && self.has_stencil {
+        //     glClearStencil(stencil)
+        //     glClear(GL_STENCIL_BUFFER_BIT)
+        // }
+    }
+
+    fn resize(&self, width: i32, height: i32): bool {
+        if width == self.width && height == self.height {
+            return true
+        }
+
+        // Store old values
+        let old_attachments = self.attachments
+
+        // Recreate with new size
+        let desc = FramebufferDescriptor::init(width, height)
+        desc.samples = self.samples
+        desc.name = self.name
+
+        // Copy attachment configurations
+        for i in 0..old_attachments.length {
+            let attach = old_attachments[i]
+            if attach.is_color() {
+                desc.add_color_attachment(attach.format)
+            } else if attach.is_depth() {
+                desc.depth_format = attach.format
+                desc.has_stencil = attach.is_stencil()
+            }
+        }
+
+        self.destroy()
+        return self.create(desc)
+    }
+
+    fn get_color_texture(&self, index: i32): i32 {
+        for i in 0..self.attachments.length {
+            if self.attachments[i].is_color() {
+                let color_idx = self.attachments[i].get_color_index()
+                if color_idx == index {
+                    return self.attachments[i].texture_handle
+                }
+            }
+        }
+        return -1
+    }
+
+    fn get_depth_texture(&self): i32 {
+        for i in 0..self.attachments.length {
+            if self.attachments[i].is_depth() {
+                return self.attachments[i].texture_handle
+            }
+        }
+        return -1
+    }
+
+    fn is_complete(&self): bool {
+        // In real implementation, check GL_FRAMEBUFFER_COMPLETE
+        return self.handle >= 0
+    }
+
+    fn get_aspect_ratio(&self): f32 {
+        if self.height <= 0 {
+            return 1.0
+        }
+        return (self.width as f32) / (self.height as f32)
+    }
+
+    fn blit_to(&self, dest: Framebuffer, src_rect: [i32], dst_rect: [i32], mask: i32, filter: i32) {
+        // Blit this framebuffer to another
+        // mask: 1 = color, 2 = depth, 4 = stencil
+        // filter: 0 = nearest, 1 = linear
+
+        // In real implementation:
+        // glBindFramebuffer(GL_READ_FRAMEBUFFER, self.handle)
+        // glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dest.handle)
+        // glBlitFramebuffer(src_rect[0], src_rect[1], src_rect[2], src_rect[3],
+        //                   dst_rect[0], dst_rect[1], dst_rect[2], dst_rect[3],
+        //                   mask, filter)
+    }
+
+    fn generate_mipmaps(&self, attachment_index: i32) {
+        if attachment_index >= 0 && attachment_index < self.attachments.length {
+            let attach = self.attachments[attachment_index]
+            if attach.mip_levels > 1 {
+                // In real implementation:
+                // glBindTexture(GL_TEXTURE_2D, attach.texture_handle)
+                // glGenerateMipmap(GL_TEXTURE_2D)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// RENDER TARGET POOL - Manages temporary render targets
+// ============================================================================
+
+struct RenderTargetPoolEntry {
+    framebuffer: Framebuffer,
+    last_used_frame: i32,
+    is_in_use: bool,
+    width: i32,
+    height: i32,
+    format: FramebufferFormat,
+    has_depth: bool,
+}
+
+impl RenderTargetPoolEntry {
+    fn init(): RenderTargetPoolEntry {
+        return RenderTargetPoolEntry {
+            framebuffer: Framebuffer::init(),
+            last_used_frame: 0,
+            is_in_use: false,
+            width: 0,
+            height: 0,
+            format: FramebufferFormat::RGBA8,
+            has_depth: false,
+        }
+    }
+
+    fn matches(&self, width: i32, height: i32, format: FramebufferFormat, has_depth: bool): bool {
+        return self.width == width && self.height == height &&
+               self.format == format && self.has_depth == has_depth
+    }
+}
+
+struct RenderTargetPool {
+    entries: [RenderTargetPoolEntry],
+    current_frame: i32,
+    max_idle_frames: i32,
+}
+
+impl RenderTargetPool {
+    fn init(): RenderTargetPool {
+        return RenderTargetPool {
+            entries: [],
+            current_frame: 0,
+            max_idle_frames: 60,  // Release after 60 frames of inactivity
+        }
+    }
+
+    fn acquire(&self, width: i32, height: i32, format: FramebufferFormat, has_depth: bool): Framebuffer? {
+        // Look for existing matching entry
+        for i in 0..self.entries.length {
+            if !self.entries[i].is_in_use && self.entries[i].matches(width, height, format, has_depth) {
+                self.entries[i].is_in_use = true
+                self.entries[i].last_used_frame = self.current_frame
+                return self.entries[i].framebuffer
+            }
+        }
+
+        // Create new entry
+        let entry = RenderTargetPoolEntry::init()
+        entry.width = width
+        entry.height = height
+        entry.format = format
+        entry.has_depth = has_depth
+        entry.is_in_use = true
+        entry.last_used_frame = self.current_frame
+
+        let desc = FramebufferDescriptor::init(width, height)
+        desc.add_color_attachment(format)
+        if has_depth {
+            desc.set_depth(FramebufferFormat::Depth24)
+        }
+        desc.name = "PooledRT"
+
+        entry.framebuffer.create(desc)
+        self.entries = self.entries + [entry]
+
+        return entry.framebuffer
+    }
+
+    fn release(&self, fb: Framebuffer) {
+        for i in 0..self.entries.length {
+            if self.entries[i].framebuffer.handle == fb.handle {
+                self.entries[i].is_in_use = false
+                return
+            }
+        }
+    }
+
+    fn update(&self) {
+        self.current_frame = self.current_frame + 1
+
+        // Clean up old unused entries
+        let new_entries: [RenderTargetPoolEntry] = []
+        for i in 0..self.entries.length {
+            let entry = self.entries[i]
+            if entry.is_in_use || (self.current_frame - entry.last_used_frame) < self.max_idle_frames {
+                new_entries = new_entries + [entry]
+            } else {
+                entry.framebuffer.destroy()
+            }
+        }
+        self.entries = new_entries
+    }
+
+    fn clear_all(&self) {
+        for i in 0..self.entries.length {
+            self.entries[i].framebuffer.destroy()
+        }
+        self.entries = []
+    }
+}
+
+// ============================================================================
+// MULTI-SAMPLE RESOLVE
+// ============================================================================
+
+struct MSAAResolver {
+    resolve_framebuffer: Framebuffer,
+}
+
+impl MSAAResolver {
+    fn init(): MSAAResolver {
+        return MSAAResolver {
+            resolve_framebuffer: Framebuffer::init(),
+        }
+    }
+
+    fn resolve(&self, msaa_fb: Framebuffer, target_fb: Framebuffer) {
+        if msaa_fb.samples <= 1 {
+            // No MSAA, just blit directly
+            let src_rect: [i32] = [0, 0, msaa_fb.width, msaa_fb.height]
+            let dst_rect: [i32] = [0, 0, target_fb.width, target_fb.height]
+            msaa_fb.blit_to(target_fb, src_rect, dst_rect, 1, 1)  // Color, linear filter
+            return
+        }
+
+        // MSAA resolve
+        let src_rect: [i32] = [0, 0, msaa_fb.width, msaa_fb.height]
+        let dst_rect: [i32] = [0, 0, target_fb.width, target_fb.height]
+        msaa_fb.blit_to(target_fb, src_rect, dst_rect, 1, 0)  // Color, nearest filter
+    }
+}
+
+// ============================================================================
+// SPECIAL PURPOSE FRAMEBUFFERS
+// ============================================================================
+
+// Shadow map framebuffer
+struct ShadowMapFramebuffer {
+    framebuffer: Framebuffer,
+    resolution: i32,
+    cascade_count: i32,
+    cascades: [Framebuffer],
+}
+
+impl ShadowMapFramebuffer {
+    fn init(resolution: i32, cascade_count: i32): ShadowMapFramebuffer {
+        let sm = ShadowMapFramebuffer {
+            framebuffer: Framebuffer::init(),
+            resolution: resolution,
+            cascade_count: cascade_count,
+            cascades: [],
+        }
+
+        // Create cascaded shadow maps
+        for i in 0..cascade_count {
+            let cascade_res = resolution >> i  // Each cascade is half resolution
+            if cascade_res < 256 {
+                cascade_res = 256
+            }
+
+            let desc = FramebufferDescriptor::init(cascade_res, cascade_res)
+            desc.set_depth(FramebufferFormat::Depth32F)
+            desc.name = "ShadowCascade" + (i as string)
+
+            let fb = Framebuffer::init()
+            fb.create(desc)
+            sm.cascades = sm.cascades + [fb]
+        }
+
+        return sm
+    }
+
+    fn destroy(&self) {
+        for i in 0..self.cascades.length {
+            self.cascades[i].destroy()
+        }
+        self.framebuffer.destroy()
+    }
+
+    fn get_cascade(&self, index: i32): Framebuffer? {
+        if index >= 0 && index < self.cascades.length {
+            return self.cascades[index]
+        }
+        return null
+    }
+}
+
+// Reflection framebuffer (for water, mirrors)
+struct ReflectionFramebuffer {
+    framebuffer: Framebuffer,
+    width: i32,
+    height: i32,
+    clip_plane: [f32],  // [A, B, C, D] for plane equation Ax + By + Cz + D = 0
+}
+
+impl ReflectionFramebuffer {
+    fn init(width: i32, height: i32): ReflectionFramebuffer {
+        let rf = ReflectionFramebuffer {
+            framebuffer: Framebuffer::init(),
+            width: width,
+            height: height,
+            clip_plane: [0.0, 1.0, 0.0, 0.0],
+        }
+
+        let desc = FramebufferDescriptor::init(width, height)
+        desc.add_color_attachment(FramebufferFormat::RGBA8)
+        desc.set_depth(FramebufferFormat::Depth24)
+        desc.name = "ReflectionBuffer"
+
+        rf.framebuffer.create(desc)
+        return rf
+    }
+
+    fn set_clip_plane(&self, a: f32, b: f32, c: f32, d: f32) {
+        self.clip_plane = [a, b, c, d]
+    }
+
+    fn destroy(&self) {
+        self.framebuffer.destroy()
+    }
+}
+
+// G-Buffer for deferred rendering
+struct GBuffer {
+    framebuffer: Framebuffer,
+    albedo_index: i32,      // Color 0: RGB = albedo, A = specular intensity
+    normal_index: i32,      // Color 1: RGB = world normal
+    position_index: i32,    // Color 2: RGB = world position (optional)
+    material_index: i32,    // Color 3: R = roughness, G = metallic, B = AO
+    depth_index: i32,
+}
+
+impl GBuffer {
+    fn init(width: i32, height: i32): GBuffer {
+        let gb = GBuffer {
+            framebuffer: Framebuffer::init(),
+            albedo_index: 0,
+            normal_index: 1,
+            position_index: 2,
+            material_index: 3,
+            depth_index: -1,
+        }
+
+        let desc = FramebufferDescriptor::init(width, height)
+        desc.add_color_attachment(FramebufferFormat::RGBA8)     // Albedo + specular
+        desc.add_color_attachment(FramebufferFormat::RGBA16F)   // Normal (need precision)
+        desc.add_color_attachment(FramebufferFormat::RGBA16F)   // Position
+        desc.add_color_attachment(FramebufferFormat::RGBA8)     // Material params
+        desc.set_depth_stencil()
+        desc.name = "GBuffer"
+
+        gb.framebuffer.create(desc)
+        return gb
+    }
+
+    fn destroy(&self) {
+        self.framebuffer.destroy()
+    }
+
+    fn get_albedo_texture(&self): i32 {
+        return self.framebuffer.get_color_texture(self.albedo_index)
+    }
+
+    fn get_normal_texture(&self): i32 {
+        return self.framebuffer.get_color_texture(self.normal_index)
+    }
+
+    fn get_position_texture(&self): i32 {
+        return self.framebuffer.get_color_texture(self.position_index)
+    }
+
+    fn get_material_texture(&self): i32 {
+        return self.framebuffer.get_color_texture(self.material_index)
+    }
+
+    fn get_depth_texture(&self): i32 {
+        return self.framebuffer.get_depth_texture()
+    }
+}
+
+// ============================================================================
+// POST-PROCESSING CHAIN
+// ============================================================================
+
+struct PostProcessBuffer {
+    ping: Framebuffer,
+    pong: Framebuffer,
+    current_is_ping: bool,
+}
+
+impl PostProcessBuffer {
+    fn init(width: i32, height: i32, format: FramebufferFormat): PostProcessBuffer {
+        let ppb = PostProcessBuffer {
+            ping: Framebuffer::init(),
+            pong: Framebuffer::init(),
+            current_is_ping: true,
+        }
+
+        let desc = FramebufferDescriptor::init(width, height)
+        desc.add_color_attachment(format)
+        desc.name = "PostProcessPing"
+        ppb.ping.create(desc)
+
+        desc.name = "PostProcessPong"
+        ppb.pong.create(desc)
+
+        return ppb
+    }
+
+    fn get_source(&self): Framebuffer {
+        if self.current_is_ping {
+            return self.ping
+        }
+        return self.pong
+    }
+
+    fn get_target(&self): Framebuffer {
+        if self.current_is_ping {
+            return self.pong
+        }
+        return self.ping
+    }
+
+    fn swap(&self) {
+        self.current_is_ping = !self.current_is_ping
+    }
+
+    fn resize(&self, width: i32, height: i32) {
+        self.ping.resize(width, height)
+        self.pong.resize(width, height)
+    }
+
+    fn destroy(&self) {
+        self.ping.destroy()
+        self.pong.destroy()
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn calculate_mip_levels(width: i32, height: i32): i32 {
+    let max_dim = width
+    if height > max_dim {
+        max_dim = height
+    }
+
+    let levels = 1
+    let size = max_dim
+    while size > 1 {
+        size = size >> 1
+        levels = levels + 1
+    }
+    return levels
+}
+
+fn get_format_bytes_per_pixel(format: FramebufferFormat): i32 {
+    match format {
+        FramebufferFormat::RGBA8 => 4,
+        FramebufferFormat::RGBA16F => 8,
+        FramebufferFormat::RGBA32F => 16,
+        FramebufferFormat::RGB10A2 => 4,
+        FramebufferFormat::RG16F => 4,
+        FramebufferFormat::R32F => 4,
+        FramebufferFormat::R16F => 2,
+        FramebufferFormat::R8 => 1,
+        FramebufferFormat::Depth16 => 2,
+        FramebufferFormat::Depth24 => 3,
+        FramebufferFormat::Depth32F => 4,
+        FramebufferFormat::Depth24Stencil8 => 4,
+        FramebufferFormat::Depth32FStencil8 => 5,
+        FramebufferFormat::BC1 => 0,  // Block compressed
+        FramebufferFormat::BC3 => 0,  // Block compressed
+        _ => 4,
+    }
+}
+
+fn is_depth_format(format: FramebufferFormat): bool {
+    match format {
+        FramebufferFormat::Depth16 => true,
+        FramebufferFormat::Depth24 => true,
+        FramebufferFormat::Depth32F => true,
+        FramebufferFormat::Depth24Stencil8 => true,
+        FramebufferFormat::Depth32FStencil8 => true,
+        _ => false,
+    }
+}
+
+fn is_hdr_format(format: FramebufferFormat): bool {
+    match format {
+        FramebufferFormat::RGBA16F => true,
+        FramebufferFormat::RGBA32F => true,
+        FramebufferFormat::RGB10A2 => true,
+        FramebufferFormat::RG16F => true,
+        FramebufferFormat::R32F => true,
+        FramebufferFormat::R16F => true,
+        _ => false,
+    }
+}
+
+// ============================================================================
+// GLOBAL FRAMEBUFFER MANAGER
+// ============================================================================
+
+struct FramebufferManager {
+    render_target_pool: RenderTargetPool,
+    msaa_resolver: MSAAResolver,
+    default_width: i32,
+    default_height: i32,
+}
+
+impl FramebufferManager {
+    fn init(width: i32, height: i32): FramebufferManager {
+        return FramebufferManager {
+            render_target_pool: RenderTargetPool::init(),
+            msaa_resolver: MSAAResolver::init(),
+            default_width: width,
+            default_height: height,
+        }
+    }
+
+    fn update(&self) {
+        self.render_target_pool.update()
+    }
+
+    fn shutdown(&self) {
+        self.render_target_pool.clear_all()
+    }
+
+    fn acquire_temporary(&self, width: i32, height: i32, format: FramebufferFormat, has_depth: bool): Framebuffer? {
+        return self.render_target_pool.acquire(width, height, format, has_depth)
+    }
+
+    fn release_temporary(&self, fb: Framebuffer) {
+        self.render_target_pool.release(fb)
+    }
+}
+
+let g_framebuffer_manager: FramebufferManager? = null
+
+fn init_framebuffer_manager(width: i32, height: i32) {
+    g_framebuffer_manager = FramebufferManager::init(width, height)
+}
+
+fn get_framebuffer_manager(): FramebufferManager? {
+    return g_framebuffer_manager
+}
+
+fn shutdown_framebuffer_manager() {
+    if g_framebuffer_manager != null {
+        g_framebuffer_manager.shutdown()
+        g_framebuffer_manager = null
+    }
+}

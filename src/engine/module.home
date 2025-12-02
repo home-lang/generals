@@ -1,0 +1,1082 @@
+// C&C Generals Zero Hour - Home Port
+// Module System
+//
+// Modules are the building blocks of behavior for Objects and Drawables.
+// They handle specific aspects like updates, damage, death, creation, etc.
+//
+// Key concepts:
+// - Module: The instance attached to a Thing (Object or Drawable)
+// - ModuleData: Static configuration data parsed from INI files
+// - ModuleFactory: Creates modules from registered templates
+//
+// Module types:
+// - Behavior modules (attached to Objects): Update, Die, Damage, Create, Collide, Body, Contain, Upgrade, SpecialPower, Destroy
+// - Drawable modules: Draw, ClientUpdate
+//
+// Based on original Module.h, ModuleFactory.h
+
+// ============================================================================
+// MODULE TYPE
+// ============================================================================
+enum ModuleType {
+    Behavior = 0      // Object modules
+    Draw = 1          // Drawable draw modules
+    ClientUpdate = 2  // Drawable update modules
+}
+
+const NUM_MODULE_TYPES: i32 = 3
+const FIRST_DRAWABLE_MODULE_TYPE: ModuleType = ModuleType::Draw
+const LAST_DRAWABLE_MODULE_TYPE: ModuleType = ModuleType::ClientUpdate
+const NUM_DRAWABLE_MODULE_TYPES: i32 = 2
+
+// ============================================================================
+// MODULE INTERFACE TYPE (bitmask)
+// ============================================================================
+const MODULEINTERFACE_UPDATE: i32 = 0x00000001
+const MODULEINTERFACE_DIE: i32 = 0x00000002
+const MODULEINTERFACE_DAMAGE: i32 = 0x00000004
+const MODULEINTERFACE_CREATE: i32 = 0x00000008
+const MODULEINTERFACE_COLLIDE: i32 = 0x00000010
+const MODULEINTERFACE_BODY: i32 = 0x00000020
+const MODULEINTERFACE_CONTAIN: i32 = 0x00000040
+const MODULEINTERFACE_UPGRADE: i32 = 0x00000080
+const MODULEINTERFACE_SPECIAL_POWER: i32 = 0x00000100
+const MODULEINTERFACE_DESTROY: i32 = 0x00000200
+const MODULEINTERFACE_DRAW: i32 = 0x00000400
+const MODULEINTERFACE_CLIENT_UPDATE: i32 = 0x00000800
+
+// ============================================================================
+// MODULE DATA - Static configuration parsed from INI
+// ============================================================================
+struct ModuleData {
+    module_tag_name_key: i32,  // Unique tag among all modules for an object instance
+
+    fn init(): ModuleData {
+        return ModuleData {
+            module_tag_name_key: 0,
+        }
+    }
+
+    fn set_module_tag_name_key(&self, key: i32) {
+        self.module_tag_name_key = key
+    }
+
+    fn get_module_tag_name_key(&self): i32 {
+        return self.module_tag_name_key
+    }
+
+    // Virtual method - override in subclasses
+    fn is_ai_module_data(&self): bool {
+        return false
+    }
+
+    // For save/load (Snapshot interface)
+    fn crc(&self) {
+        // Override in subclasses
+    }
+
+    fn xfer(&self) {
+        // Override in subclasses
+    }
+
+    fn load_post_process(&self) {
+        // Override in subclasses
+    }
+}
+
+// ============================================================================
+// MODULE - Base class for all modules
+// ============================================================================
+struct Module {
+    module_data: ?ModuleData,
+
+    fn init(data: ?ModuleData): Module {
+        return Module {
+            module_data: data,
+        }
+    }
+
+    fn get_module_data(&self): ?ModuleData {
+        return self.module_data
+    }
+
+    fn get_module_tag_name_key(&self): i32 {
+        if self.module_data {
+            return self.module_data.get_module_tag_name_key()
+        }
+        return 0
+    }
+
+    // Virtual method - should be overridden to return module name key
+    fn get_module_name_key(&self): i32 {
+        return 0
+    }
+
+    // Called after all modules for a Thing are created
+    // Allows modules to resolve inter-module dependencies
+    fn on_object_created(&self) {
+        // Override in subclasses
+    }
+
+    // Called whenever a drawable is bound to the object
+    fn on_drawable_bound_to_object(&self) {
+        // Override in subclasses
+    }
+
+    // Preload assets for time of day
+    fn preload_assets(&self, time_of_day: i32) {
+        // Override in subclasses
+    }
+
+    // Called before deletion
+    fn on_delete(&self) {
+        // Override in subclasses
+    }
+
+    // For save/load (Snapshot interface)
+    fn crc(&self) {
+        // Override in subclasses
+    }
+
+    fn xfer(&self) {
+        // Override in subclasses
+    }
+
+    fn load_post_process(&self) {
+        // Override in subclasses
+    }
+}
+
+// ============================================================================
+// OBJECT MODULE - Module specifically for Objects (game logic)
+// ============================================================================
+struct ObjectModule {
+    base: Module,
+    object_id: i32,  // ID of the owning Object
+
+    fn init(object_id: i32, data: ?ModuleData): ObjectModule {
+        return ObjectModule {
+            base: Module::init(data),
+            object_id: object_id,
+        }
+    }
+
+    fn get_object_id(&self): i32 {
+        return self.object_id
+    }
+
+    // Called when object is captured by another player
+    fn on_capture(&self, old_owner_id: i32, new_owner_id: i32) {
+        // Override in subclasses
+    }
+}
+
+// ============================================================================
+// DRAWABLE MODULE - Module specifically for Drawables (rendering)
+// ============================================================================
+struct DrawableModule {
+    base: Module,
+    drawable_id: i32,  // ID of the owning Drawable
+
+    fn init(drawable_id: i32, data: ?ModuleData): DrawableModule {
+        return DrawableModule {
+            base: Module::init(data),
+            drawable_id: drawable_id,
+        }
+    }
+
+    fn get_drawable_id(&self): i32 {
+        return self.drawable_id
+    }
+}
+
+// ============================================================================
+// UPDATE MODULE INTERFACE
+// ============================================================================
+struct UpdateModuleData {
+    base: ModuleData,
+
+    fn init(): UpdateModuleData {
+        return UpdateModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct UpdateModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?UpdateModuleData): UpdateModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return UpdateModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called every frame
+    fn update(&self): i32 {
+        // Return 0 to continue, positive for sleep frames, negative for done
+        return 0
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_UPDATE
+    }
+}
+
+// ============================================================================
+// DIE MODULE INTERFACE
+// ============================================================================
+enum DeathType {
+    Normal = 0
+    Fire = 1
+    Toxin = 2
+    Crushed = 3
+    Exploded = 4
+    Splatted = 5
+    Lasered = 6
+    Suicided = 7
+    Toppled = 8
+    Detonated = 9
+    Drowned = 10
+    Extra1 = 11
+    Extra2 = 12
+    Extra3 = 13
+    Extra4 = 14
+    Extra5 = 15
+    Extra6 = 16
+    Extra7 = 17
+    Extra8 = 18
+    Count = 19
+}
+
+struct DieModuleData {
+    base: ModuleData,
+    death_types: i32,  // Bitmask of DeathType flags
+    exempt_status: i32,
+    required_status: i32,
+    damage_amount_required: f64,
+
+    fn init(): DieModuleData {
+        return DieModuleData {
+            base: ModuleData::init(),
+            death_types: 0xFFFFFFFF,  // All death types by default
+            exempt_status: 0,
+            required_status: 0,
+            damage_amount_required: 0.0,
+        }
+    }
+}
+
+struct DieModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?DieModuleData): DieModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return DieModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called when object dies
+    fn on_die(&self, death_type: DeathType, source_id: i32): bool {
+        // Return true if handled
+        return false
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_DIE
+    }
+}
+
+// ============================================================================
+// DAMAGE MODULE INTERFACE
+// ============================================================================
+struct DamageInfo {
+    damage_type: i32,
+    damage_amount: f64,
+    source_id: i32,
+    death_type: DeathType,
+
+    fn init(): DamageInfo {
+        return DamageInfo {
+            damage_type: 0,
+            damage_amount: 0.0,
+            source_id: 0,
+            death_type: DeathType::Normal,
+        }
+    }
+}
+
+struct DamageModuleData {
+    base: ModuleData,
+
+    fn init(): DamageModuleData {
+        return DamageModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct DamageModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?DamageModuleData): DamageModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return DamageModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called when object takes damage
+    fn on_damage(&self, info: DamageInfo) {
+        // Override in subclasses
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_DAMAGE
+    }
+}
+
+// ============================================================================
+// CREATE MODULE INTERFACE
+// ============================================================================
+struct CreateModuleData {
+    base: ModuleData,
+
+    fn init(): CreateModuleData {
+        return CreateModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct CreateModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?CreateModuleData): CreateModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return CreateModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called when object is created
+    fn on_create(&self) {
+        // Override in subclasses
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_CREATE
+    }
+}
+
+// ============================================================================
+// BODY MODULE INTERFACE
+// ============================================================================
+enum BodyDamageState {
+    Pristine = 0
+    Damaged = 1
+    ReallyDamaged = 2
+    Rubble = 3
+}
+
+struct BodyModuleData {
+    base: ModuleData,
+    max_health: f64,
+    initial_health: f64,
+
+    fn init(): BodyModuleData {
+        return BodyModuleData {
+            base: ModuleData::init(),
+            max_health: 100.0,
+            initial_health: 100.0,
+        }
+    }
+}
+
+struct BodyModule {
+    base: ObjectModule,
+    current_health: f64,
+    max_health: f64,
+    damage_state: BodyDamageState,
+
+    fn init(object_id: i32, data: ?BodyModuleData): BodyModule {
+        let initial = 100.0
+        let max = 100.0
+        let mod_data: ?ModuleData = null
+        if data {
+            initial = data.initial_health
+            max = data.max_health
+            mod_data = data.base
+        }
+        return BodyModule {
+            base: ObjectModule::init(object_id, mod_data),
+            current_health: initial,
+            max_health: max,
+            damage_state: BodyDamageState::Pristine,
+        }
+    }
+
+    fn get_health(&self): f64 {
+        return self.current_health
+    }
+
+    fn get_max_health(&self): f64 {
+        return self.max_health
+    }
+
+    fn get_health_percent(&self): f64 {
+        if self.max_health > 0.0 {
+            return self.current_health / self.max_health
+        }
+        return 0.0
+    }
+
+    fn set_health(&self, health: f64) {
+        self.current_health = health
+        if self.current_health > self.max_health {
+            self.current_health = self.max_health
+        }
+        if self.current_health < 0.0 {
+            self.current_health = 0.0
+        }
+        self.update_damage_state()
+    }
+
+    fn apply_damage(&self, amount: f64) {
+        self.set_health(self.current_health - amount)
+    }
+
+    fn apply_healing(&self, amount: f64) {
+        self.set_health(self.current_health + amount)
+    }
+
+    fn is_dead(&self): bool {
+        return self.current_health <= 0.0
+    }
+
+    fn get_damage_state(&self): BodyDamageState {
+        return self.damage_state
+    }
+
+    fn update_damage_state(&self) {
+        let percent = self.get_health_percent()
+        if percent <= 0.0 {
+            self.damage_state = BodyDamageState::Rubble
+        } else if percent < 0.33 {
+            self.damage_state = BodyDamageState::ReallyDamaged
+        } else if percent < 0.66 {
+            self.damage_state = BodyDamageState::Damaged
+        } else {
+            self.damage_state = BodyDamageState::Pristine
+        }
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_BODY
+    }
+}
+
+// ============================================================================
+// CONTAIN MODULE INTERFACE - For units that can contain other units
+// ============================================================================
+struct ContainModuleData {
+    base: ModuleData,
+    max_passengers: i32,
+    damage_percent_to_units: f64,
+
+    fn init(): ContainModuleData {
+        return ContainModuleData {
+            base: ModuleData::init(),
+            max_passengers: 0,
+            damage_percent_to_units: 0.0,
+        }
+    }
+}
+
+struct ContainModule {
+    base: ObjectModule,
+    passenger_ids: [i32; 16],  // Max 16 passengers
+    passenger_count: i32,
+    max_passengers: i32,
+
+    fn init(object_id: i32, data: ?ContainModuleData): ContainModule {
+        let max = 0
+        let mod_data: ?ModuleData = null
+        if data {
+            max = data.max_passengers
+            mod_data = data.base
+        }
+        return ContainModule {
+            base: ObjectModule::init(object_id, mod_data),
+            passenger_ids: [0; 16],
+            passenger_count: 0,
+            max_passengers: max,
+        }
+    }
+
+    fn get_passenger_count(&self): i32 {
+        return self.passenger_count
+    }
+
+    fn get_max_passengers(&self): i32 {
+        return self.max_passengers
+    }
+
+    fn is_full(&self): bool {
+        return self.passenger_count >= self.max_passengers
+    }
+
+    fn can_add_passenger(&self, passenger_id: i32, passenger_slots: i32): bool {
+        if self.passenger_count + passenger_slots > self.max_passengers {
+            return false
+        }
+        return true
+    }
+
+    fn add_passenger(&self, passenger_id: i32): bool {
+        if self.is_full() {
+            return false
+        }
+        self.passenger_ids[self.passenger_count] = passenger_id
+        self.passenger_count = self.passenger_count + 1
+        return true
+    }
+
+    fn remove_passenger(&self, passenger_id: i32): bool {
+        for i in 0..self.passenger_count {
+            if self.passenger_ids[i] == passenger_id {
+                // Shift remaining passengers down
+                for j in i..(self.passenger_count - 1) {
+                    self.passenger_ids[j] = self.passenger_ids[j + 1]
+                }
+                self.passenger_count = self.passenger_count - 1
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get_passenger_at(&self, index: i32): i32 {
+        if index >= 0 and index < self.passenger_count {
+            return self.passenger_ids[index]
+        }
+        return 0
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_CONTAIN
+    }
+}
+
+// ============================================================================
+// COLLIDE MODULE INTERFACE
+// ============================================================================
+struct CollideModuleData {
+    base: ModuleData,
+
+    fn init(): CollideModuleData {
+        return CollideModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct CollideModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?CollideModuleData): CollideModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return CollideModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called when collision occurs
+    fn on_collide(&self, other_id: i32, info: i32): bool {
+        // Return true if handled
+        return false
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_COLLIDE
+    }
+}
+
+// ============================================================================
+// UPGRADE MODULE INTERFACE
+// ============================================================================
+struct UpgradeModuleData {
+    base: ModuleData,
+    triggered_by: [string; 8],
+    triggered_by_count: i32,
+    conflicts_with: [string; 8],
+    conflicts_with_count: i32,
+
+    fn init(): UpgradeModuleData {
+        return UpgradeModuleData {
+            base: ModuleData::init(),
+            triggered_by: [""; 8],
+            triggered_by_count: 0,
+            conflicts_with: [""; 8],
+            conflicts_with_count: 0,
+        }
+    }
+}
+
+struct UpgradeModule {
+    base: ObjectModule,
+    is_active: bool,
+
+    fn init(object_id: i32, data: ?UpgradeModuleData): UpgradeModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return UpgradeModule {
+            base: ObjectModule::init(object_id, mod_data),
+            is_active: false,
+        }
+    }
+
+    // Called when upgrade is acquired
+    fn on_upgrade(&self, upgrade_name: string): bool {
+        // Return true if upgrade was applied
+        return false
+    }
+
+    fn activate(&self) {
+        self.is_active = true
+    }
+
+    fn deactivate(&self) {
+        self.is_active = false
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_UPGRADE
+    }
+}
+
+// ============================================================================
+// SPECIAL POWER MODULE INTERFACE
+// ============================================================================
+struct SpecialPowerModuleData {
+    base: ModuleData,
+    special_power_template: string,
+
+    fn init(): SpecialPowerModuleData {
+        return SpecialPowerModuleData {
+            base: ModuleData::init(),
+            special_power_template: "",
+        }
+    }
+}
+
+struct SpecialPowerModule {
+    base: ObjectModule,
+    ready_frame: i32,
+
+    fn init(object_id: i32, data: ?SpecialPowerModuleData): SpecialPowerModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return SpecialPowerModule {
+            base: ObjectModule::init(object_id, mod_data),
+            ready_frame: 0,
+        }
+    }
+
+    // Check if power is ready
+    fn is_ready(&self, current_frame: i32): bool {
+        return current_frame >= self.ready_frame
+    }
+
+    // Called to activate power
+    fn activate(&self, target_x: f64, target_y: f64, target_z: f64): bool {
+        return false
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_SPECIAL_POWER
+    }
+}
+
+// ============================================================================
+// DESTROY MODULE INTERFACE
+// ============================================================================
+struct DestroyModuleData {
+    base: ModuleData,
+
+    fn init(): DestroyModuleData {
+        return DestroyModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct DestroyModule {
+    base: ObjectModule,
+
+    fn init(object_id: i32, data: ?DestroyModuleData): DestroyModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return DestroyModule {
+            base: ObjectModule::init(object_id, mod_data),
+        }
+    }
+
+    // Called when object is about to be destroyed
+    fn on_destroy(&self) {
+        // Override in subclasses
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_DESTROY
+    }
+}
+
+// ============================================================================
+// DRAW MODULE INTERFACE
+// ============================================================================
+struct DrawModuleData {
+    base: ModuleData,
+
+    fn init(): DrawModuleData {
+        return DrawModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct DrawModule {
+    base: DrawableModule,
+
+    fn init(drawable_id: i32, data: ?DrawModuleData): DrawModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return DrawModule {
+            base: DrawableModule::init(drawable_id, mod_data),
+        }
+    }
+
+    // Called to render
+    fn draw(&self) {
+        // Override in subclasses
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_DRAW
+    }
+}
+
+// ============================================================================
+// CLIENT UPDATE MODULE INTERFACE
+// ============================================================================
+struct ClientUpdateModuleData {
+    base: ModuleData,
+
+    fn init(): ClientUpdateModuleData {
+        return ClientUpdateModuleData {
+            base: ModuleData::init(),
+        }
+    }
+}
+
+struct ClientUpdateModule {
+    base: DrawableModule,
+
+    fn init(drawable_id: i32, data: ?ClientUpdateModuleData): ClientUpdateModule {
+        let mod_data: ?ModuleData = null
+        if data {
+            mod_data = data.base
+        }
+        return ClientUpdateModule {
+            base: DrawableModule::init(drawable_id, mod_data),
+        }
+    }
+
+    // Called every frame on client
+    fn client_update(&self) {
+        // Override in subclasses
+    }
+
+    fn get_interface_mask(): i32 {
+        return MODULEINTERFACE_CLIENT_UPDATE
+    }
+}
+
+// ============================================================================
+// MODULE INFO - Tracks modules attached to a template
+// ============================================================================
+struct ModuleInfoNugget {
+    name: string,
+    module_tag: string,
+    data: ?ModuleData,
+    interface_mask: i32,
+    copied_from_default: bool,
+    inheritable: bool,
+
+    fn init(name: string, tag: string, data: ?ModuleData, mask: i32, inheritable: bool): ModuleInfoNugget {
+        return ModuleInfoNugget {
+            name: name,
+            module_tag: tag,
+            data: data,
+            interface_mask: mask,
+            copied_from_default: false,
+            inheritable: inheritable,
+        }
+    }
+}
+
+struct ModuleInfo {
+    nuggets: [ModuleInfoNugget; 64],  // Max 64 modules per template
+    count: i32,
+
+    fn init(): ModuleInfo {
+        return ModuleInfo {
+            nuggets: [ModuleInfoNugget::init("", "", null, 0, false); 64],
+            count: 0,
+        }
+    }
+
+    fn add(&self, name: string, tag: string, data: ?ModuleData, interface_mask: i32, inheritable: bool) {
+        if self.count < 64 {
+            self.nuggets[self.count] = ModuleInfoNugget::init(name, tag, data, interface_mask, inheritable)
+            self.count = self.count + 1
+        }
+    }
+
+    fn get_count(&self): i32 {
+        return self.count
+    }
+
+    fn get_nth_name(&self, index: i32): string {
+        if index >= 0 and index < self.count {
+            return self.nuggets[index].name
+        }
+        return ""
+    }
+
+    fn get_nth_tag(&self, index: i32): string {
+        if index >= 0 and index < self.count {
+            return self.nuggets[index].module_tag
+        }
+        return ""
+    }
+
+    fn get_nth_data(&self, index: i32): ?ModuleData {
+        if index >= 0 and index < self.count {
+            return self.nuggets[index].data
+        }
+        return null
+    }
+
+    fn find_by_tag(&self, tag: string): ?ModuleInfoNugget {
+        for i in 0..self.count {
+            if self.nuggets[i].module_tag == tag {
+                return self.nuggets[i]
+            }
+        }
+        return null
+    }
+
+    fn clear(&self) {
+        self.count = 0
+    }
+
+    fn set_copied_from_default(&self, value: bool) {
+        for i in 0..self.count {
+            self.nuggets[i].copied_from_default = value
+        }
+    }
+
+    fn clear_module_with_tag(&self, tag: string): bool {
+        for i in 0..self.count {
+            if self.nuggets[i].module_tag == tag {
+                // Shift remaining entries
+                for j in i..(self.count - 1) {
+                    self.nuggets[j] = self.nuggets[j + 1]
+                }
+                self.count = self.count - 1
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ============================================================================
+// MODULE TEMPLATE - Registration info for a module type
+// ============================================================================
+struct ModuleTemplate {
+    name: string,
+    module_type: ModuleType,
+    interface_mask: i32,
+
+    fn init(name: string, module_type: ModuleType, interface_mask: i32): ModuleTemplate {
+        return ModuleTemplate {
+            name: name,
+            module_type: module_type,
+            interface_mask: interface_mask,
+        }
+    }
+}
+
+// ============================================================================
+// MODULE FACTORY - Creates module instances
+// ============================================================================
+struct ModuleFactory {
+    templates: [ModuleTemplate; 256],  // Max 256 registered module types
+    template_count: i32,
+
+    fn init(): ModuleFactory {
+        return ModuleFactory {
+            templates: [ModuleTemplate::init("", ModuleType::Behavior, 0); 256],
+            template_count: 0,
+        }
+    }
+
+    fn register_module(&self, name: string, module_type: ModuleType, interface_mask: i32) {
+        if self.template_count < 256 {
+            self.templates[self.template_count] = ModuleTemplate::init(name, module_type, interface_mask)
+            self.template_count = self.template_count + 1
+        }
+    }
+
+    fn find_template(&self, name: string, module_type: ModuleType): ?ModuleTemplate {
+        for i in 0..self.template_count {
+            if self.templates[i].name == name and self.templates[i].module_type == module_type {
+                return self.templates[i]
+            }
+        }
+        return null
+    }
+
+    fn find_interface_mask(&self, name: string, module_type: ModuleType): i32 {
+        let tmpl = self.find_template(name, module_type)
+        if tmpl {
+            return tmpl.interface_mask
+        }
+        return 0
+    }
+}
+
+// Global factory instance
+let TheModuleFactory = ModuleFactory::init()
+
+// ============================================================================
+// TESTS
+// ============================================================================
+test "Module: basic creation" {
+    let data = ModuleData::init()
+    data.set_module_tag_name_key(123)
+
+    let mod = Module::init(data)
+    assert mod.get_module_tag_name_key() == 123
+}
+
+test "BodyModule: health management" {
+    let data = BodyModuleData::init()
+    data.max_health = 100.0
+    data.initial_health = 100.0
+
+    let body = BodyModule::init(1, data)
+
+    assert body.get_health() == 100.0
+    assert body.get_max_health() == 100.0
+    assert body.get_health_percent() == 1.0
+    assert body.get_damage_state() == BodyDamageState::Pristine
+
+    body.apply_damage(40.0)
+    assert body.get_health() == 60.0
+    assert body.get_damage_state() == BodyDamageState::Damaged
+
+    body.apply_damage(30.0)
+    assert body.get_health() == 30.0
+    assert body.get_damage_state() == BodyDamageState::ReallyDamaged
+
+    body.apply_healing(20.0)
+    assert body.get_health() == 50.0
+}
+
+test "ContainModule: passenger management" {
+    let data = ContainModuleData::init()
+    data.max_passengers = 3
+
+    let contain = ContainModule::init(1, data)
+
+    assert contain.get_max_passengers() == 3
+    assert contain.get_passenger_count() == 0
+    assert !contain.is_full()
+
+    assert contain.add_passenger(10)
+    assert contain.add_passenger(20)
+    assert contain.get_passenger_count() == 2
+
+    assert contain.add_passenger(30)
+    assert contain.is_full()
+    assert !contain.add_passenger(40)  // Should fail - full
+
+    assert contain.remove_passenger(20)
+    assert contain.get_passenger_count() == 2
+    assert !contain.is_full()
+}
+
+test "ModuleInfo: module tracking" {
+    let info = ModuleInfo::init()
+
+    let data1 = ModuleData::init()
+    let data2 = ModuleData::init()
+
+    info.add("BodyModule", "ModuleTag_Body", data1, MODULEINTERFACE_BODY, false)
+    info.add("UpdateModule", "ModuleTag_Update", data2, MODULEINTERFACE_UPDATE, true)
+
+    assert info.get_count() == 2
+    assert info.get_nth_name(0) == "BodyModule"
+    assert info.get_nth_tag(1) == "ModuleTag_Update"
+
+    let found = info.find_by_tag("ModuleTag_Body")
+    assert found != null
+    assert found.interface_mask == MODULEINTERFACE_BODY
+}
+
+test "ModuleFactory: registration" {
+    let factory = ModuleFactory::init()
+
+    factory.register_module("ActiveBodyModule", ModuleType::Behavior, MODULEINTERFACE_BODY)
+    factory.register_module("W3DModelDraw", ModuleType::Draw, MODULEINTERFACE_DRAW)
+
+    let tmpl1 = factory.find_template("ActiveBodyModule", ModuleType::Behavior)
+    assert tmpl1 != null
+    assert tmpl1.interface_mask == MODULEINTERFACE_BODY
+
+    let tmpl2 = factory.find_template("W3DModelDraw", ModuleType::Draw)
+    assert tmpl2 != null
+    assert tmpl2.interface_mask == MODULEINTERFACE_DRAW
+
+    // Wrong type should not find
+    let tmpl3 = factory.find_template("ActiveBodyModule", ModuleType::Draw)
+    assert tmpl3 == null
+}
