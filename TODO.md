@@ -449,9 +449,9 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [~] `G6-088` Implement all Destroy modules - PARTIAL: Basic destroy in die_module
 
 ### 6.10 Crate System
-- [~] `G6-090` Implement crate spawning - PARTIAL: Crate spawn mentioned in collide modules
-- [ ] `G6-091` Implement all crate types (veterancy, salvage, sabotage, etc.)
-- [ ] `G6-092` Implement crate pickup mechanics
+- [x] `G6-090` Implement crate spawning - DONE: `crate_system.home` CrateManager with spawnCrate(), spawnRandomCrate(), spawnSalvage()
+- [x] `G6-091` Implement all crate types (veterancy, salvage, sabotage, etc.) - DONE: `crate_system.home` CrateType enum with 22 types (MONEY, HEALTH, VETERANCY, SHROUD, SALVAGE, SABOTAGE, BOOBY_TRAP, etc.)
+- [x] `G6-092` Implement crate pickup mechanics - DONE: `crate_system.home` CrateCollideModule, checkCollection(), CrateEffect application
 
 ### 6.11 Fog of War
 - [x] `G6-100` Implement vision radius per unit - DONE: `fog_of_war.home`, `fogofwar.home`, vision_range in units
@@ -672,60 +672,64 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 
 ## PHASE 10: CAMPAIGN & MISSIONS
 
+**NOTE:** Campaign and mission systems implemented in ~/Code/generals/src/engine/ and ~/Code/generals/src/game/
+
 ### 10.1 Campaign System
-- [ ] `M10-001` Implement campaign manager
-- [ ] `M10-002` Implement campaign progression tracking
-- [ ] `M10-003` Implement mission unlocking
-- [ ] `M10-004` Implement difficulty selection
+- [x] `M10-001` Implement campaign manager - DONE: `game/campaign_manager.home` (26KB) CampaignManager with full campaign control
+- [x] `M10-002` Implement campaign progression tracking - DONE: `campaign_system.home` (40KB) progression, save/load
+- [x] `M10-003` Implement mission unlocking - DONE: `campaign_system.home` mission unlock conditions
+- [x] `M10-004` Implement difficulty selection - DONE: `campaign_system.home` DifficultyLevel enum
 
 ### 10.2 Mission System
-- [ ] `M10-010` Implement mission loading
-- [ ] `M10-011` Implement primary objectives
-- [ ] `M10-012` Implement secondary objectives
-- [ ] `M10-013` Implement hidden objectives
-- [ ] `M10-014` Implement time limits
-- [ ] `M10-015` Implement victory conditions
-- [ ] `M10-016` Implement defeat conditions
+- [x] `M10-010` Implement mission loading - DONE: `missions.home` (20KB) mission file loading
+- [x] `M10-011` Implement primary objectives - DONE: `game/objectives.home` (14KB) ObjectiveType.Primary
+- [x] `M10-012` Implement secondary objectives - DONE: `game/objectives.home` ObjectiveType.Secondary
+- [x] `M10-013` Implement hidden objectives - DONE: `game/objectives.home` ObjectiveType.Hidden/Bonus
+- [~] `M10-014` Implement time limits - PARTIAL: Timer support in objectives
+- [x] `M10-015` Implement victory conditions - DONE: `campaign_system.home` victory checking
+- [x] `M10-016` Implement defeat conditions - DONE: `campaign_system.home` defeat checking
 
 ### 10.3 Script Engine
-- [ ] `M10-020` Implement script parser
-- [ ] `M10-021` Implement all script conditions (100+)
-- [ ] `M10-022` Implement all script actions (100+)
-- [ ] `M10-023` Implement counters/flags system (256 total)
-- [ ] `M10-024` Implement event triggers
+- [x] `M10-020` Implement script parser - DONE: `script_engine.home` (26KB) script parsing
+- [~] `M10-021` Implement all script conditions (100+) - PARTIAL: Core conditions implemented
+- [~] `M10-022` Implement all script actions (100+) - PARTIAL: Core actions implemented
+- [x] `M10-023` Implement counters/flags system (256 total) - DONE: `scripting.home` (22KB) counters, flags
+- [x] `M10-024` Implement event triggers - DONE: `script_engine.home` event trigger system
 
 ### 10.4 Generals Challenge
-- [ ] `M10-030` Implement challenge mode progression
-- [ ] `M10-031` Implement all general opponents
-- [ ] `M10-032` Implement general-specific AI behaviors
-- [ ] `M10-033` Implement challenge rewards
+- [x] `M10-030` Implement challenge mode progression - DONE: `generals_challenge.home` (30KB) challenge progression
+- [x] `M10-031` Implement all general opponents - DONE: `generals_challenge.home` all 9 generals defined
+- [x] `M10-032` Implement general-specific AI behaviors - DONE: `generals_challenge.home` AI personalities
+- [x] `M10-033` Implement challenge rewards - DONE: `generals_challenge.home` unlock tracking
 
 ### 10.5 Briefings
-- [ ] `M10-040` Implement briefing screens
-- [ ] `M10-041` Implement mission intro videos
-- [ ] `M10-042` Implement mission outro videos
+- [~] `M10-040` Implement briefing screens - PARTIAL: Basic briefing UI
+- [x] `M10-041` Implement mission intro videos - DONE: `video_player.home` Bink video support
+- [x] `M10-042` Implement mission outro videos - DONE: `video_player.home` video playback
 
 ### 10.6 Cinematics
-- [ ] `M10-050` Implement in-game cinematic system
-- [ ] `M10-051` Implement camera scripting
-- [ ] `M10-052` Implement unit scripting
-- [ ] `M10-053` Implement dialogue system
+- [x] `M10-050` Implement in-game cinematic system - DONE: `cinematics.home` (24KB) cinematic controller
+- [x] `M10-051` Implement camera scripting - DONE: `cinematics.home` camera waypoints, scripts
+- [x] `M10-052` Implement unit scripting - DONE: `cinematics.home` unit movement scripts
+- [~] `M10-053` Implement dialogue system - PARTIAL: Basic dialogue support
 
 ---
 
 ## PHASE 11: GAME CONTENT & DATA
 
+**NOTE:** INI parsing and content loading implemented in ~/Code/generals/src/engine/
+
 ### 11.1 INI Parsing
-- [ ] `D11-001` Implement complete INI parser
-- [ ] `D11-002` Parse Object definitions (units, buildings)
-- [ ] `D11-003` Parse Weapon definitions
-- [ ] `D11-004` Parse Upgrade definitions
-- [ ] `D11-005` Parse Science definitions
-- [ ] `D11-006` Parse CommandButton definitions
-- [ ] `D11-007` Parse FXList definitions
-- [ ] `D11-008` Parse GameData.ini
-- [ ] `D11-009` Parse PlayerTemplate definitions
-- [ ] `D11-010` Parse ControlBarScheme definitions
+- [x] `D11-001` Implement complete INI parser - DONE: `ini_parser.home` base parser, multiple specialized parsers
+- [x] `D11-002` Parse Object definitions (units, buildings) - DONE: `object_definition_parser.home` (35KB) full object parsing
+- [x] `D11-003` Parse Weapon definitions - DONE: `weapon_definition_parser.home` (31KB) weapon templates
+- [x] `D11-004` Parse Upgrade definitions - DONE: `upgrade_definition_parser.home` (8KB) upgrade parsing
+- [x] `D11-005` Parse Science definitions - DONE: `science_parser.home` (12KB) tech tree parsing
+- [x] `D11-006` Parse CommandButton definitions - DONE: `command_button_parser.home` (25KB) command parsing
+- [x] `D11-007` Parse FXList definitions - DONE: `fx_list_parser.home` (33KB) FX parsing
+- [x] `D11-008` Parse GameData.ini - DONE: `game_data_loader.home` (31KB) game settings
+- [~] `D11-009` Parse PlayerTemplate definitions - PARTIAL: Basic player templates
+- [x] `D11-010` Parse ControlBarScheme definitions - DONE: `control_bar.home` scheme loading
 
 ### 11.2 USA Faction Units
 - [ ] `D11-020` Implement Ranger

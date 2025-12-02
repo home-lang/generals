@@ -1,0 +1,757 @@
+// Crate System - Complete crate spawning and pickup mechanics for C&C Generals
+// Based on Crate.h, CrateCollide.cpp from original W3D engine
+// Implements all crate types: veterancy, money, health, shroud, salvage, sabotage, etc.
+
+const std = @import("std")
+const math = @import("math")
+
+// ============================================================================
+// Crate Types (All from original game)
+// ============================================================================
+
+pub const CrateType = enum {
+    // Common crates
+    MONEY,              // Cash bonus
+    HEALTH,             // Health/repair
+    VETERANCY,          // Experience/level up
+    SHROUD,             // Reveal map area
+
+    // GLA Salvage crates
+    SALVAGE,            // GLA unit upgrades from destroyed vehicles
+    SALVAGE_SMALL,      // Small salvage
+    SALVAGE_MEDIUM,     // Medium salvage
+    SALVAGE_LARGE,      // Large salvage
+
+    // Special crates
+    FREE_UNIT,          // Free unit spawn
+    FREE_CRUSADER,      // USA tank
+    FREE_BATTLEMASTER,  // China tank
+    FREE_SCORPION,      // GLA tank
+
+    // Tech upgrade crates
+    ARMOR_UPGRADE,      // Armor bonus
+    FIREPOWER_UPGRADE,  // Damage bonus
+    SPEED_UPGRADE,      // Speed bonus
+    RANGE_UPGRADE,      // Range bonus
+
+    // Map hazard crates
+    SHROUD_CLEAR,       // Clear all shroud
+    REVEAL_MAP,         // Full map reveal
+
+    // Sabotage crates (GLA)
+    SABOTAGE,           // Damage to picker-upper
+    BOOBY_TRAP,         // Explodes on pickup
+
+    // Hacker crates
+    CASH_HACK,          // Steal money
+    INTEL,              // Reveal enemy units
+
+    // Neutral/Special
+    MYSTERY,            // Random effect
+    EMPTY,              // No effect (decoy)
+}
+
+pub const CrateFaction = enum {
+    NEUTRAL,            // Any player can pick up
+    USA,                // USA-specific
+    CHINA,              // China-specific
+    GLA,                // GLA-specific (especially salvage)
+}
+
+// ============================================================================
+// Crate Definition
+// ============================================================================
+
+pub const CrateDefinition = struct {
+    crate_type: CrateType,
+    name: []const u8,
+    display_name: []const u8,
+    model_name: []const u8,
+    icon_name: []const u8,
+
+    // Effects
+    money_amount: i32,              // For MONEY type
+    health_amount: f32,             // For HEALTH type (percentage)
+    experience_points: i32,         // For VETERANCY type
+    shroud_radius: f32,             // For SHROUD reveal
+    damage_amount: f32,             // For SABOTAGE type
+
+    // Spawn settings
+    faction: CrateFaction,
+    spawn_chance: f32,              // 0.0 to 1.0
+    lifetime: f32,                  // Seconds before despawn (0 = permanent)
+    pickup_radius: f32,             // Collection radius
+
+    // Visual
+    scale: f32,
+    spin_rate: f32,                 // Degrees per second
+    bob_height: f32,                // Vertical bob amplitude
+    glow_color: [4]f32,             // RGBA glow
+
+    // Audio
+    spawn_sound: []const u8,
+    pickup_sound: []const u8,
+
+    pub fn init(crate_type: CrateType, name: []const u8) CrateDefinition {
+        return .{
+            .crate_type = crate_type,
+            .name = name,
+            .display_name = name,
+            .model_name = "NBCrate",
+            .icon_name = "Crate",
+            .money_amount = 0,
+            .health_amount = 0.0,
+            .experience_points = 0,
+            .shroud_radius = 0.0,
+            .damage_amount = 0.0,
+            .faction = .NEUTRAL,
+            .spawn_chance = 1.0,
+            .lifetime = 0.0,
+            .pickup_radius = 20.0,
+            .scale = 1.0,
+            .spin_rate = 45.0,
+            .bob_height = 5.0,
+            .glow_color = .{ 1.0, 1.0, 1.0, 0.5 },
+            .spawn_sound = "CrateSpawn",
+            .pickup_sound = "CratePickup",
+        }
+    }
+}
+
+// Pre-defined crate templates matching original game
+pub const CRATE_TEMPLATES = struct {
+    pub const MONEY_SMALL: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.MONEY, "CrateMoney")
+        def.money_amount = 500
+        def.display_name = "Cash Bonus"
+        def.glow_color = .{ 0.0, 1.0, 0.0, 0.6 }
+        def.pickup_sound = "CrateMoneyPickup"
+        break :blk def
+    }
+
+    pub const MONEY_MEDIUM: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.MONEY, "CrateMoneyMedium")
+        def.money_amount = 1500
+        def.display_name = "Large Cash Bonus"
+        def.glow_color = .{ 0.0, 1.0, 0.2, 0.7 }
+        def.scale = 1.2
+        break :blk def
+    }
+
+    pub const HEALTH: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.HEALTH, "CrateHealth")
+        def.health_amount = 0.5  // 50% heal
+        def.display_name = "Repair Crate"
+        def.glow_color = .{ 1.0, 0.0, 0.0, 0.6 }
+        def.pickup_sound = "CrateHealthPickup"
+        break :blk def
+    }
+
+    pub const VETERANCY: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.VETERANCY, "CrateVeterancy")
+        def.experience_points = 100
+        def.display_name = "Promotion Crate"
+        def.glow_color = .{ 1.0, 1.0, 0.0, 0.7 }
+        def.pickup_sound = "CrateVeterancyPickup"
+        break :blk def
+    }
+
+    pub const SHROUD: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.SHROUD, "CrateShroud")
+        def.shroud_radius = 300.0
+        def.display_name = "Recon Crate"
+        def.glow_color = .{ 0.5, 0.5, 1.0, 0.6 }
+        break :blk def
+    }
+
+    pub const SALVAGE_SMALL: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.SALVAGE_SMALL, "CrateSalvageSmall")
+        def.display_name = "Salvage"
+        def.faction = .GLA
+        def.lifetime = 60.0
+        def.glow_color = .{ 0.6, 0.4, 0.2, 0.5 }
+        def.model_name = "NBSalvage"
+        break :blk def
+    }
+
+    pub const SALVAGE_MEDIUM: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.SALVAGE_MEDIUM, "CrateSalvageMedium")
+        def.display_name = "Salvage"
+        def.faction = .GLA
+        def.lifetime = 60.0
+        def.scale = 1.3
+        def.glow_color = .{ 0.7, 0.5, 0.2, 0.6 }
+        def.model_name = "NBSalvage"
+        break :blk def
+    }
+
+    pub const SABOTAGE: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.SABOTAGE, "CrateSabotage")
+        def.damage_amount = 100.0
+        def.display_name = "Sabotage Crate"
+        def.glow_color = .{ 0.8, 0.0, 0.8, 0.5 }
+        break :blk def
+    }
+
+    pub const BOOBY_TRAP: CrateDefinition = blk: {
+        var def = CrateDefinition.init(.BOOBY_TRAP, "CrateBoobyTrap")
+        def.damage_amount = 200.0
+        def.display_name = "Crate"
+        def.glow_color = .{ 1.0, 1.0, 1.0, 0.5 }  // Looks normal
+        break :blk def
+    }
+}
+
+// ============================================================================
+// Crate Instance
+// ============================================================================
+
+pub const CrateState = enum {
+    SPAWNING,           // Fade in
+    ACTIVE,             // Can be collected
+    COLLECTED,          // Being picked up
+    DESPAWNING,         // Fading out
+    DEAD,               // Remove from game
+}
+
+pub const CrateInstance = struct {
+    id: u32,
+    definition: *const CrateDefinition,
+    position: math.Vec3,
+    rotation: f32,
+    state: CrateState,
+    spawn_time: f32,
+    lifetime_remaining: f32,
+
+    // Visual animation
+    bob_phase: f32,
+    spin_angle: f32,
+    alpha: f32,
+
+    // Collection tracking
+    collected_by: ?u32,         // Entity ID that collected this
+    collection_progress: f32,
+
+    pub fn init(id: u32, definition: *const CrateDefinition, position: math.Vec3) CrateInstance {
+        return .{
+            .id = id,
+            .definition = definition,
+            .position = position,
+            .rotation = 0.0,
+            .state = .SPAWNING,
+            .spawn_time = 0.0,
+            .lifetime_remaining = definition.lifetime,
+            .bob_phase = 0.0,
+            .spin_angle = 0.0,
+            .alpha = 0.0,
+            .collected_by = null,
+            .collection_progress = 0.0,
+        }
+    }
+
+    pub fn update(self: *CrateInstance, dt: f32) void {
+        switch (self.state) {
+            .SPAWNING => {
+                self.alpha = @min(1.0, self.alpha + dt * 2.0)
+                if (self.alpha >= 1.0) {
+                    self.state = .ACTIVE
+                }
+            },
+            .ACTIVE => {
+                // Spin animation
+                self.spin_angle += self.definition.spin_rate * dt
+                if (self.spin_angle >= 360.0) {
+                    self.spin_angle -= 360.0
+                }
+
+                // Bob animation
+                self.bob_phase += dt * 2.0
+                if (self.bob_phase >= 6.283185) {  // 2*PI
+                    self.bob_phase -= 6.283185
+                }
+
+                // Lifetime countdown
+                if (self.definition.lifetime > 0.0) {
+                    self.lifetime_remaining -= dt
+                    if (self.lifetime_remaining <= 0.0) {
+                        self.state = .DESPAWNING
+                    }
+
+                    // Start flashing when about to despawn
+                    if (self.lifetime_remaining < 5.0) {
+                        const flash_rate = 4.0 + (5.0 - self.lifetime_remaining) * 2.0
+                        self.alpha = 0.5 + 0.5 * @sin(self.lifetime_remaining * flash_rate)
+                    }
+                }
+            },
+            .COLLECTED => {
+                self.collection_progress += dt * 3.0
+                self.alpha = 1.0 - self.collection_progress
+                if (self.collection_progress >= 1.0) {
+                    self.state = .DEAD
+                }
+            },
+            .DESPAWNING => {
+                self.alpha = @max(0.0, self.alpha - dt * 2.0)
+                if (self.alpha <= 0.0) {
+                    self.state = .DEAD
+                }
+            },
+            .DEAD => {},
+        }
+    }
+
+    pub fn getVisualPosition(self: CrateInstance) math.Vec3 {
+        const bob_offset = @sin(self.bob_phase) * self.definition.bob_height
+        return math.Vec3.init(
+            self.position.x,
+            self.position.y + bob_offset,
+            self.position.z
+        )
+    }
+
+    pub fn canBeCollected(self: CrateInstance) bool {
+        return self.state == .ACTIVE
+    }
+
+    pub fn startCollection(self: *CrateInstance, collector_id: u32) void {
+        if (self.state == .ACTIVE) {
+            self.state = .COLLECTED
+            self.collected_by = collector_id
+            self.collection_progress = 0.0
+        }
+    }
+}
+
+// ============================================================================
+// Crate Effect Application
+// ============================================================================
+
+pub const CrateEffect = struct {
+    effect_type: CrateType,
+    target_entity: u32,
+    value: f32,
+    position: math.Vec3,
+
+    pub fn apply(self: CrateEffect, game_state: anytype) void {
+        switch (self.effect_type) {
+            .MONEY => {
+                // Add money to player
+                if (game_state.getPlayerForEntity(self.target_entity)) |player| {
+                    player.addMoney(@intFromFloat(self.value))
+                }
+            },
+            .HEALTH => {
+                // Heal the unit
+                if (game_state.getEntityHealth(self.target_entity)) |health| {
+                    const heal_amount = health.max_health * self.value
+                    health.current += heal_amount
+                    if (health.current > health.max_health) {
+                        health.current = health.max_health
+                    }
+                }
+            },
+            .VETERANCY => {
+                // Add experience
+                if (game_state.getEntityVeterancy(self.target_entity)) |vet| {
+                    vet.addExperience(@intFromFloat(self.value))
+                }
+            },
+            .SHROUD => {
+                // Reveal map area
+                if (game_state.getPlayerForEntity(self.target_entity)) |player| {
+                    game_state.revealShroud(player.id, self.position, self.value)
+                }
+            },
+            .SALVAGE_SMALL, .SALVAGE_MEDIUM, .SALVAGE_LARGE => {
+                // Apply salvage upgrade to GLA units
+                if (game_state.getEntityUpgrades(self.target_entity)) |upgrades| {
+                    upgrades.applySalvage(@intFromEnum(self.effect_type) - @intFromEnum(CrateType.SALVAGE_SMALL) + 1)
+                }
+            },
+            .SABOTAGE, .BOOBY_TRAP => {
+                // Damage the unit that picked it up
+                if (game_state.getEntityHealth(self.target_entity)) |health| {
+                    health.current -= self.value
+                    if (health.current < 0) {
+                        health.current = 0
+                    }
+                }
+                // Spawn explosion effect for booby trap
+                if (self.effect_type == .BOOBY_TRAP) {
+                    game_state.spawnEffect("ExplosionSmall", self.position)
+                }
+            },
+            .ARMOR_UPGRADE => {
+                if (game_state.getEntityStats(self.target_entity)) |stats| {
+                    stats.armor_modifier += self.value
+                }
+            },
+            .FIREPOWER_UPGRADE => {
+                if (game_state.getEntityStats(self.target_entity)) |stats| {
+                    stats.damage_modifier += self.value
+                }
+            },
+            .SPEED_UPGRADE => {
+                if (game_state.getEntityStats(self.target_entity)) |stats| {
+                    stats.speed_modifier += self.value
+                }
+            },
+            .REVEAL_MAP, .SHROUD_CLEAR => {
+                // Reveal entire map
+                if (game_state.getPlayerForEntity(self.target_entity)) |player| {
+                    game_state.revealAllMap(player.id)
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+// ============================================================================
+// Crate Manager
+// ============================================================================
+
+pub const MAX_CRATES: u32 = 256
+
+pub const CrateManager = struct {
+    crates: [MAX_CRATES]CrateInstance,
+    crate_count: u32,
+    next_crate_id: u32,
+
+    // Spawning settings
+    spawn_enabled: bool,
+    spawn_timer: f32,
+    spawn_interval: f32,
+    max_active_crates: u32,
+
+    // Random seed for crate spawning
+    rng_seed: u32,
+
+    pub fn init() CrateManager {
+        var manager = CrateManager{
+            .crates = undefined,
+            .crate_count = 0,
+            .next_crate_id = 1,
+            .spawn_enabled = true,
+            .spawn_timer = 0.0,
+            .spawn_interval = 120.0,  // 2 minutes
+            .max_active_crates = 10,
+            .rng_seed = 12345,
+        }
+        return manager
+    }
+
+    fn nextRandom(self: *CrateManager) f32 {
+        // Simple LCG random
+        self.rng_seed = self.rng_seed *% 1103515245 +% 12345
+        return @as(f32, @floatFromInt((self.rng_seed >> 16) & 0x7FFF)) / 32767.0
+    }
+
+    pub fn spawnCrate(self: *CrateManager, definition: *const CrateDefinition, position: math.Vec3) ?*CrateInstance {
+        if (self.crate_count >= MAX_CRATES) {
+            return null
+        }
+
+        const crate = &self.crates[self.crate_count]
+        crate.* = CrateInstance.init(self.next_crate_id, definition, position)
+        self.crate_count += 1
+        self.next_crate_id += 1
+
+        return crate
+    }
+
+    pub fn spawnRandomCrate(self: *CrateManager, position: math.Vec3) ?*CrateInstance {
+        const rand = self.nextRandom()
+
+        // Weighted random selection
+        const definition = if (rand < 0.30)
+            &CRATE_TEMPLATES.MONEY_SMALL
+        else if (rand < 0.50)
+            &CRATE_TEMPLATES.HEALTH
+        else if (rand < 0.65)
+            &CRATE_TEMPLATES.VETERANCY
+        else if (rand < 0.80)
+            &CRATE_TEMPLATES.SHROUD
+        else if (rand < 0.90)
+            &CRATE_TEMPLATES.MONEY_MEDIUM
+        else
+            &CRATE_TEMPLATES.SALVAGE_SMALL
+
+        return self.spawnCrate(definition, position)
+    }
+
+    pub fn spawnSalvage(self: *CrateManager, position: math.Vec3, unit_value: f32) void {
+        // Spawn salvage based on destroyed unit value
+        const salvage_def = if (unit_value >= 2000)
+            &CRATE_TEMPLATES.SALVAGE_MEDIUM
+        else
+            &CRATE_TEMPLATES.SALVAGE_SMALL
+
+        // Offset slightly for visual clarity
+        const offset_x = (self.nextRandom() - 0.5) * 20.0
+        const offset_z = (self.nextRandom() - 0.5) * 20.0
+        const spawn_pos = math.Vec3.init(
+            position.x + offset_x,
+            position.y,
+            position.z + offset_z
+        )
+
+        _ = self.spawnCrate(salvage_def, spawn_pos)
+    }
+
+    pub fn update(self: *CrateManager, dt: f32) void {
+        // Update all crates
+        var i: u32 = 0
+        while (i < self.crate_count) {
+            self.crates[i].update(dt)
+
+            // Remove dead crates
+            if (self.crates[i].state == .DEAD) {
+                // Swap with last crate
+                if (i < self.crate_count - 1) {
+                    self.crates[i] = self.crates[self.crate_count - 1]
+                }
+                self.crate_count -= 1
+            } else {
+                i += 1
+            }
+        }
+
+        // Auto-spawn timer (for maps with crate spawning enabled)
+        if (self.spawn_enabled and self.crate_count < self.max_active_crates) {
+            self.spawn_timer += dt
+            if (self.spawn_timer >= self.spawn_interval) {
+                self.spawn_timer = 0.0
+                // Spawn would happen here with random map position
+            }
+        }
+    }
+
+    pub fn checkCollection(self: *CrateManager, entity_id: u32, entity_position: math.Vec3) ?CrateEffect {
+        for (0..self.crate_count) |i| {
+            const crate = &self.crates[i]
+            if (!crate.canBeCollected()) continue
+
+            // Distance check
+            const dx = entity_position.x - crate.position.x
+            const dz = entity_position.z - crate.position.z
+            const dist_sq = dx * dx + dz * dz
+            const radius_sq = crate.definition.pickup_radius * crate.definition.pickup_radius
+
+            if (dist_sq <= radius_sq) {
+                // Collect the crate
+                crate.startCollection(entity_id)
+
+                // Create effect to apply
+                const value: f32 = switch (crate.definition.crate_type) {
+                    .MONEY => @floatFromInt(crate.definition.money_amount),
+                    .HEALTH => crate.definition.health_amount,
+                    .VETERANCY => @floatFromInt(crate.definition.experience_points),
+                    .SHROUD, .SHROUD_CLEAR, .REVEAL_MAP => crate.definition.shroud_radius,
+                    .SABOTAGE, .BOOBY_TRAP => crate.definition.damage_amount,
+                    else => 0.0,
+                }
+
+                return CrateEffect{
+                    .effect_type = crate.definition.crate_type,
+                    .target_entity = entity_id,
+                    .value = value,
+                    .position = crate.position,
+                }
+            }
+        }
+
+        return null
+    }
+
+    pub fn getCrateAt(self: *CrateManager, position: math.Vec3, radius: f32) ?*CrateInstance {
+        const radius_sq = radius * radius
+
+        for (0..self.crate_count) |i| {
+            const crate = &self.crates[i]
+            const dx = position.x - crate.position.x
+            const dz = position.z - crate.position.z
+            const dist_sq = dx * dx + dz * dz
+
+            if (dist_sq <= radius_sq) {
+                return crate
+            }
+        }
+
+        return null
+    }
+
+    pub fn removeCrate(self: *CrateManager, crate_id: u32) void {
+        for (0..self.crate_count) |i| {
+            if (self.crates[i].id == crate_id) {
+                self.crates[i].state = .DEAD
+                return
+            }
+        }
+    }
+
+    pub fn setSpawnEnabled(self: *CrateManager, enabled: bool) void {
+        self.spawn_enabled = enabled
+    }
+
+    pub fn setSpawnInterval(self: *CrateManager, interval: f32) void {
+        self.spawn_interval = @max(10.0, interval)
+    }
+
+    pub fn getActiveCrateCount(self: CrateManager) u32 {
+        return self.crate_count
+    }
+}
+
+// ============================================================================
+// Crate Collide Module (for entity collision)
+// ============================================================================
+
+pub const CrateCollideModuleData = struct {
+    // Which crate types this unit can collect
+    can_collect_money: bool,
+    can_collect_health: bool,
+    can_collect_veterancy: bool,
+    can_collect_shroud: bool,
+    can_collect_salvage: bool,
+
+    // Modifiers
+    money_multiplier: f32,
+    health_multiplier: f32,
+    experience_multiplier: f32,
+
+    pub const DEFAULT: CrateCollideModuleData = .{
+        .can_collect_money = true,
+        .can_collect_health = true,
+        .can_collect_veterancy = true,
+        .can_collect_shroud = true,
+        .can_collect_salvage = false,  // Only GLA units by default
+        .money_multiplier = 1.0,
+        .health_multiplier = 1.0,
+        .experience_multiplier = 1.0,
+    }
+
+    pub const GLA_UNIT: CrateCollideModuleData = .{
+        .can_collect_money = true,
+        .can_collect_health = true,
+        .can_collect_veterancy = true,
+        .can_collect_shroud = true,
+        .can_collect_salvage = true,  // GLA can collect salvage
+        .money_multiplier = 1.0,
+        .health_multiplier = 1.0,
+        .experience_multiplier = 1.0,
+    }
+}
+
+pub const CrateCollideModule = struct {
+    data: CrateCollideModuleData,
+
+    pub fn init(data: CrateCollideModuleData) CrateCollideModule {
+        return .{ .data = data }
+    }
+
+    pub fn canCollect(self: CrateCollideModule, crate_type: CrateType) bool {
+        return switch (crate_type) {
+            .MONEY, .MONEY_MEDIUM => self.data.can_collect_money,
+            .HEALTH => self.data.can_collect_health,
+            .VETERANCY => self.data.can_collect_veterancy,
+            .SHROUD, .SHROUD_CLEAR, .REVEAL_MAP => self.data.can_collect_shroud,
+            .SALVAGE, .SALVAGE_SMALL, .SALVAGE_MEDIUM, .SALVAGE_LARGE => self.data.can_collect_salvage,
+            else => true,
+        }
+    }
+
+    pub fn modifyEffect(self: CrateCollideModule, effect: *CrateEffect) void {
+        switch (effect.effect_type) {
+            .MONEY => {
+                effect.value *= self.data.money_multiplier
+            },
+            .HEALTH => {
+                effect.value *= self.data.health_multiplier
+            },
+            .VETERANCY => {
+                effect.value *= self.data.experience_multiplier
+            },
+            else => {},
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "crate spawning" {
+    var manager = CrateManager.init()
+
+    const pos = math.Vec3.init(100.0, 0.0, 100.0)
+    const crate = manager.spawnCrate(&CRATE_TEMPLATES.MONEY_SMALL, pos)
+
+    try std.testing.expect(crate != null)
+    try std.testing.expect(manager.getActiveCrateCount() == 1)
+}
+
+test "crate collection" {
+    var manager = CrateManager.init()
+
+    const crate_pos = math.Vec3.init(100.0, 0.0, 100.0)
+    const crate = manager.spawnCrate(&CRATE_TEMPLATES.MONEY_SMALL, crate_pos)
+    try std.testing.expect(crate != null)
+
+    // Simulate spawn complete
+    crate.?.state = .ACTIVE
+
+    // Entity close to crate
+    const entity_pos = math.Vec3.init(105.0, 0.0, 100.0)
+    const effect = manager.checkCollection(1, entity_pos)
+
+    try std.testing.expect(effect != null)
+    try std.testing.expect(effect.?.effect_type == .MONEY)
+    try std.testing.expect(effect.?.value == 500.0)
+}
+
+test "crate lifetime" {
+    var manager = CrateManager.init()
+
+    const pos = math.Vec3.init(100.0, 0.0, 100.0)
+    const crate = manager.spawnCrate(&CRATE_TEMPLATES.SALVAGE_SMALL, pos)
+    try std.testing.expect(crate != null)
+
+    // Salvage has 60 second lifetime
+    try std.testing.expect(crate.?.definition.lifetime == 60.0)
+
+    // Fast forward past lifetime
+    crate.?.state = .ACTIVE
+    crate.?.lifetime_remaining = 0.0
+    crate.?.update(0.1)
+
+    try std.testing.expect(crate.?.state == .DESPAWNING)
+}
+
+test "salvage spawning" {
+    var manager = CrateManager.init()
+
+    const pos = math.Vec3.init(100.0, 0.0, 100.0)
+
+    // Spawn small salvage for cheap unit
+    manager.spawnSalvage(pos, 500.0)
+    try std.testing.expect(manager.getActiveCrateCount() == 1)
+
+    // Spawn medium salvage for expensive unit
+    manager.spawnSalvage(pos, 2500.0)
+    try std.testing.expect(manager.getActiveCrateCount() == 2)
+}
+
+test "crate collide module" {
+    const normal_unit = CrateCollideModule.init(CrateCollideModuleData.DEFAULT)
+    const gla_unit = CrateCollideModule.init(CrateCollideModuleData.GLA_UNIT)
+
+    // Normal units can't collect salvage
+    try std.testing.expect(!normal_unit.canCollect(.SALVAGE))
+    try std.testing.expect(normal_unit.canCollect(.MONEY))
+
+    // GLA units can collect salvage
+    try std.testing.expect(gla_unit.canCollect(.SALVAGE))
+    try std.testing.expect(gla_unit.canCollect(.MONEY))
+}
