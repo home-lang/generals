@@ -361,9 +361,275 @@ fn clamp_camera_to_bounds(camera: Camera, bounds: CameraBounds) {
 }
 
 // ============================================================================
-// CAMERA SHAKE
+// CAMERA SHAKE SYSTEM - Authentic Westwood/EA Implementation
+// Based on CameraShakeSystem.cpp from the original game
 // ============================================================================
 
+// Constants matching original game (converted from degrees to radians)
+const MIN_OMEGA: f32 = 78.5398  // 12.5 * 360 * PI/180 = 78.54 rad/s
+const MAX_OMEGA: f32 = 94.2478  // 15.0 * 360 * PI/180 = 94.25 rad/s
+const END_OMEGA: f32 = 6.28318  // 360 * PI/180 = 2*PI rad/s
+const MIN_PHI: f32 = 0.0
+const MAX_PHI: f32 = 6.28318   // 360 degrees in radians
+
+// Axis rotation amplitudes (X=pitch, Y=yaw, Z=roll)
+// Pitch (Y) has 2x the amplitude of others for more dramatic vertical movement
+const AXIS_ROTATION_X: f32 = 0.1309  // 7.5 degrees
+const AXIS_ROTATION_Y: f32 = 0.2618  // 15 degrees
+const AXIS_ROTATION_Z: f32 = 0.0873  // 5 degrees
+
+// Individual shaker instance - represents one source of camera shake
+struct CameraShaker {
+    // Position of the shake source in world space
+    position: Vec3,
+    // Radius of effect - shake fades with distance
+    radius: f32,
+    // Total duration of shake effect
+    duration: f32,
+    // Intensity multiplier (power in degrees converted to radians)
+    intensity: f32,
+    // Elapsed time since shake started
+    elapsed_time: f32,
+    // Random angular frequencies for X, Y, Z axes
+    omega_x: f32,
+    omega_y: f32,
+    omega_z: f32,
+    // Random phase shifts for X, Y, Z axes
+    phi_x: f32,
+    phi_y: f32,
+    phi_z: f32,
+    // Is this shaker still active?
+    active: bool,
+}
+
+// System that manages multiple simultaneous camera shakers
+struct CameraShakeSystem {
+    // Pool of shakers (max 16 simultaneous shakes)
+    shakers: [CameraShaker],
+    shaker_count: i32,
+    max_shakers: i32,
+    // Global random seed for deterministic randomness
+    random_seed: i32,
+}
+
+// Simple pseudo-random number generator for shake parameters
+fn shake_random(seed: i32): f32 {
+    // Linear congruential generator
+    let new_seed: i32 = (seed * 1103515245 + 12345) % 2147483647
+    return (new_seed as f32) / 2147483647.0
+}
+
+fn shake_random_range(min_val: f32, max_val: f32, seed: i32): f32 {
+    return min_val + shake_random(seed) * (max_val - min_val)
+}
+
+fn create_camera_shake_system(): CameraShakeSystem {
+    let shakers: [CameraShaker] = []
+    for i in 0..16 {
+        shakers = shakers + [CameraShaker {
+            position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            radius: 0.0,
+            duration: 0.0,
+            intensity: 0.0,
+            elapsed_time: 0.0,
+            omega_x: 0.0,
+            omega_y: 0.0,
+            omega_z: 0.0,
+            phi_x: 0.0,
+            phi_y: 0.0,
+            phi_z: 0.0,
+            active: false,
+        }]
+    }
+    return CameraShakeSystem {
+        shakers: shakers,
+        shaker_count: 0,
+        max_shakers: 16,
+        random_seed: 42,
+    }
+}
+
+// Add a new camera shake at a world position
+// position: world position of shake source
+// radius: effective radius (default 50.0)
+// duration: shake duration in seconds (default 1.5)
+// power: shake intensity in degrees (default 1.0)
+fn add_camera_shake(system: CameraShakeSystem, position: Vec3, radius: f32, duration: f32, power: f32) {
+    // Find an inactive slot
+    let slot: i32 = -1
+    for i in 0..system.max_shakers {
+        if !system.shakers[i].active {
+            slot = i
+            break
+        }
+    }
+
+    if slot < 0 {
+        // No free slots - find oldest and replace it
+        let oldest_time: f32 = 0.0
+        slot = 0
+        for i in 0..system.max_shakers {
+            if system.shakers[i].elapsed_time > oldest_time {
+                oldest_time = system.shakers[i].elapsed_time
+                slot = i
+            }
+        }
+    }
+
+    // Convert power from degrees to radians
+    let intensity: f32 = power * 0.0174533
+
+    // Initialize shaker with random frequencies and phases
+    system.random_seed = system.random_seed + 1
+    let seed1: i32 = system.random_seed * 17
+    let seed2: i32 = system.random_seed * 31
+    let seed3: i32 = system.random_seed * 47
+
+    system.shakers[slot] = CameraShaker {
+        position: position,
+        radius: radius,
+        duration: duration,
+        intensity: intensity,
+        elapsed_time: 0.0,
+        omega_x: shake_random_range(MIN_OMEGA, MAX_OMEGA, seed1),
+        omega_y: shake_random_range(MIN_OMEGA, MAX_OMEGA, seed2),
+        omega_z: shake_random_range(MIN_OMEGA, MAX_OMEGA, seed3),
+        phi_x: shake_random_range(MIN_PHI, MAX_PHI, seed1 + 100),
+        phi_y: shake_random_range(MIN_PHI, MAX_PHI, seed2 + 100),
+        phi_z: shake_random_range(MIN_PHI, MAX_PHI, seed3 + 100),
+        active: true,
+    }
+}
+
+// Update all active shakers (call once per frame)
+fn timestep_camera_shake_system(system: CameraShakeSystem, delta_time: f32) {
+    for i in 0..system.max_shakers {
+        if system.shakers[i].active {
+            system.shakers[i].elapsed_time = system.shakers[i].elapsed_time + delta_time
+
+            // Check if expired
+            if system.shakers[i].elapsed_time >= system.shakers[i].duration {
+                system.shakers[i].active = false
+            }
+        }
+    }
+}
+
+// Compute rotation angles from a single shaker
+fn compute_shaker_rotations(shaker: CameraShaker, camera_position: Vec3): Vec3 {
+    if !shaker.active {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    // Calculate distance squared from camera to shake source
+    let dx: f32 = camera_position.x - shaker.position.x
+    let dy: f32 = camera_position.y - shaker.position.y
+    let dz: f32 = camera_position.z - shaker.position.z
+    let len2: f32 = dx*dx + dy*dy + dz*dz
+
+    // Outside radius - no effect
+    if len2 > shaker.radius * shaker.radius {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    // Calculate intensity based on distance and time remaining
+    // intensity(t,pos) = intensity * (1 - distance/radius) * (1 - elapsed/duration)
+    let distance: f32 = sqrt(len2)
+    let distance_factor: f32 = 1.0 - distance / shaker.radius
+    let time_factor: f32 = 1.0 - shaker.elapsed_time / shaker.duration
+    let current_intensity: f32 = shaker.intensity * distance_factor * time_factor
+
+    // Calculate angular frequency that decreases over time
+    // omega(t) = start_omega + (end_omega - start_omega) * t
+    let t: f32 = shaker.elapsed_time
+    let omega_x: f32 = shaker.omega_x + (END_OMEGA - shaker.omega_x) * shaker.elapsed_time / shaker.duration
+    let omega_y: f32 = shaker.omega_y + (END_OMEGA - shaker.omega_y) * shaker.elapsed_time / shaker.duration
+    let omega_z: f32 = shaker.omega_z + (END_OMEGA - shaker.omega_z) * shaker.elapsed_time / shaker.duration
+
+    // Calculate rotation angles using sinusoidal motion
+    // f(t) = axis_amplitude * intensity * sin(omega * t + phi)
+    let angle_x: f32 = AXIS_ROTATION_X * current_intensity * sin(omega_x * t + shaker.phi_x)
+    let angle_y: f32 = AXIS_ROTATION_Y * current_intensity * sin(omega_y * t + shaker.phi_y)
+    let angle_z: f32 = AXIS_ROTATION_Z * current_intensity * sin(omega_z * t + shaker.phi_z)
+
+    // Add secondary random fudge (matching original WST 11/14/2002 addition)
+    let minor_intensity: f32 = current_intensity * 0.5
+    let fudge_x: f32 = (shake_random(shaker.random_seed_x()) - 0.5) * 2.0 * minor_intensity
+    let fudge_y: f32 = (shake_random(shaker.random_seed_y()) - 0.5) * 2.0 * minor_intensity
+    let fudge_z: f32 = (shake_random(shaker.random_seed_z()) - 0.5) * 2.0 * minor_intensity
+
+    return Vec3 {
+        x: angle_x + fudge_x,
+        y: angle_y + fudge_y,
+        z: angle_z + fudge_z,
+    }
+}
+
+// Helper to generate random seed from shaker
+fn random_seed_x(shaker: CameraShaker): i32 {
+    return (shaker.elapsed_time * 12345.0) as i32
+}
+
+fn random_seed_y(shaker: CameraShaker): i32 {
+    return (shaker.elapsed_time * 23456.0) as i32
+}
+
+fn random_seed_z(shaker: CameraShaker): i32 {
+    return (shaker.elapsed_time * 34567.0) as i32
+}
+
+// Compute combined shake angles from all active shakers
+fn update_camera_shaker(system: CameraShakeSystem, camera_position: Vec3): Vec3 {
+    let total_angles: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+
+    // Accumulate effects from all active shakers
+    for i in 0..system.max_shakers {
+        if system.shakers[i].active {
+            let angles: Vec3 = compute_shaker_rotations(system.shakers[i], camera_position)
+            total_angles.x = total_angles.x + angles.x
+            total_angles.y = total_angles.y + angles.y
+            total_angles.z = total_angles.z + angles.z
+        }
+    }
+
+    // Clamp result to max axis rotation amplitudes
+    if total_angles.x > AXIS_ROTATION_X { total_angles.x = AXIS_ROTATION_X }
+    if total_angles.x < -AXIS_ROTATION_X { total_angles.x = -AXIS_ROTATION_X }
+    if total_angles.y > AXIS_ROTATION_Y { total_angles.y = AXIS_ROTATION_Y }
+    if total_angles.y < -AXIS_ROTATION_Y { total_angles.y = -AXIS_ROTATION_Y }
+    if total_angles.z > AXIS_ROTATION_Z { total_angles.z = AXIS_ROTATION_Z }
+    if total_angles.z < -AXIS_ROTATION_Z { total_angles.z = -AXIS_ROTATION_Z }
+
+    return total_angles
+}
+
+// Check if any shakes are currently active
+fn is_camera_shaking(system: CameraShakeSystem): bool {
+    for i in 0..system.max_shakers {
+        if system.shakers[i].active {
+            return true
+        }
+    }
+    return false
+}
+
+// Apply shake rotations to camera (using rotation rather than translation)
+fn apply_shake_to_camera(camera: Camera, shake_angles: Vec3) {
+    // Apply as rotation offset (more effective than position offset per original artists)
+    // Pitch (X) and Roll (Z) affect the up vector, Yaw (Y) affects the look direction
+    let pitch_offset: f32 = shake_angles.x
+    let yaw_offset: f32 = shake_angles.y
+    let roll_offset: f32 = shake_angles.z
+
+    // Modify the smooth position slightly based on angles (simplified translation fallback)
+    // In a full implementation this would rotate the view matrix
+    let shake_dist: f32 = camera.distance * 0.02  // Scale shake with camera distance
+    camera.smooth_position.x = camera.smooth_position.x + sin(yaw_offset) * shake_dist
+    camera.smooth_position.y = camera.smooth_position.y + sin(pitch_offset) * shake_dist
+    camera.smooth_position.z = camera.smooth_position.z + sin(roll_offset) * shake_dist * 0.5
+}
+
+// Legacy simple shake for backwards compatibility
 struct CameraShake {
     intensity: f32,
     duration: f32,
@@ -404,7 +670,7 @@ fn update_camera_shake(shake: CameraShake, delta_time: f32, time: f32) {
     shake.offset_z = sin(time * shake.frequency * 19.0) * current_intensity
 }
 
-fn apply_shake_to_camera(camera: Camera, shake: CameraShake) {
+fn apply_simple_shake_to_camera(camera: Camera, shake: CameraShake) {
     camera.smooth_position.x = camera.smooth_position.x + shake.offset_x
     camera.smooth_position.y = camera.smooth_position.y + shake.offset_y
     camera.smooth_position.z = camera.smooth_position.z + shake.offset_z

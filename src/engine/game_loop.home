@@ -1,168 +1,934 @@
-// Main game loop for C&C Generals Zero Hour
+// Main Game Loop for C&C Generals Zero Hour
 // Written in Home language
+// Based on the original GameLogic class from Westwood/EA
+//
+// This is the central orchestrator for all game systems during gameplay.
+// It coordinates the update order for all subsystems to match the original game.
 
 import engine/world
 import engine/player
 import engine/object
 import engine/production
 import engine/ai
+import engine/terrain
+import engine/script_engine
+import engine/partition_manager
+import engine/weapon_store
+import engine/locomotor_store
+import engine/victory_conditions
 
-// Game loop - orchestrates all systems
-struct GameLoop {
-    session: world::GameSession,
+// ============================================================================
+// GAME MODE ENUM - What type of game we're in
+// ============================================================================
+enum GameMode {
+    SINGLE_PLAYER,
+    LAN,
+    SKIRMISH,
+    REPLAY,
+    SHELL,
+    INTERNET,
+    NONE,
+}
+
+// ============================================================================
+// CRC MODES - For sync verification
+// ============================================================================
+enum CRCMode {
+    CACHED,
+    RECALC,
+}
+
+// ============================================================================
+// UPDATE SLEEP TIME - For sleepy update modules
+// ============================================================================
+const UPDATE_SLEEP_NONE: i32 = 1
+
+// ============================================================================
+// GAME STATE - Current state of the game
+// ============================================================================
+struct GameState {
+    // Frame tracking
+    current_frame: u32,
+
+    // Game status
+    is_active: bool,
+    is_paused: bool,
+    is_loading: bool,
+
+    // Timing
+    build_time_multiplier: f32,
+    game_speed: f32,
+
+    // Map dimensions
+    map_width: f32,
+    map_height: f32,
+
+    // Settings
+    scoring_enabled: bool,
+    show_behind_building_markers: bool,
+    draw_icon_ui: bool,
+    show_dynamic_lod: bool,
+    hulk_max_lifetime_override: i32,
+
+    // CRC for multiplayer sync
+    crc: u32,
+    crc_interval: u32,
+    frame_objects_changed_trigger_areas: u32,
+}
+
+fn create_game_state(): GameState {
+    return GameState {
+        current_frame: 0,
+        is_active: false,
+        is_paused: false,
+        is_loading: false,
+        build_time_multiplier: 1.0,
+        game_speed: 1.0,
+        map_width: 0.0,
+        map_height: 0.0,
+        scoring_enabled: true,
+        show_behind_building_markers: true,
+        draw_icon_ui: true,
+        show_dynamic_lod: true,
+        hulk_max_lifetime_override: -1,
+        crc: 0,
+        crc_interval: 100,  // Check CRC every 100 frames in multiplayer
+        frame_objects_changed_trigger_areas: 0,
+    }
+}
+
+fn is_game_active(state: GameState): bool {
+    return state.is_active && !state.is_paused && !state.is_loading
+}
+
+fn pause_game(state: GameState) {
+    state.is_paused = true
+}
+
+fn resume_game(state: GameState) {
+    state.is_paused = false
+}
+
+fn advance_frame(state: GameState) {
+    state.current_frame = state.current_frame + 1
+}
+
+// ============================================================================
+// UPDATE MODULE - Base for all updatable game objects
+// ============================================================================
+struct UpdateModule {
+    object_id: i32,
+    next_call_frame: u32,
+    disabled_flags: u32,
+    disabled_types_to_process: u32,
+}
+
+fn create_update_module(object_id: i32): UpdateModule {
+    return UpdateModule {
+        object_id: object_id,
+        next_call_frame: 0,
+        disabled_flags: 0,
+        disabled_types_to_process: 0,
+    }
+}
+
+fn is_module_sleeping(module: UpdateModule, current_frame: u32): bool {
+    return module.next_call_frame > current_frame
+}
+
+fn set_sleep_time(module: UpdateModule, current_frame: u32, sleep_frames: i32) {
+    module.next_call_frame = current_frame + (sleep_frames as u32)
+}
+
+// ============================================================================
+// COMMAND MESSAGE - For game commands
+// ============================================================================
+enum MessageType {
+    MSG_NONE,
+    MSG_LOGIC_CRC,
+    MSG_CREATE_OBJECT,
+    MSG_DESTROY_OBJECT,
+    MSG_MOVE_UNIT,
+    MSG_ATTACK_TARGET,
+    MSG_BUILD_UNIT,
+    MSG_SELL_STRUCTURE,
+    MSG_SET_RALLY_POINT,
+    MSG_SPECIAL_POWER,
+    MSG_PLAYER_SURRENDER,
+    MSG_GAME_PAUSE,
+    MSG_GAME_RESUME,
+}
+
+struct GameMessage {
+    msg_type: MessageType,
+    frame: u32,
+    player_id: i32,
+    object_id: i32,
+    target_id: i32,
+    position_x: f32,
+    position_y: f32,
+    position_z: f32,
+    integer_arg: i32,
+    boolean_arg: bool,
+}
+
+fn create_game_message(msg_type: MessageType): GameMessage {
+    return GameMessage {
+        msg_type: msg_type,
+        frame: 0,
+        player_id: -1,
+        object_id: -1,
+        target_id: -1,
+        position_x: 0.0,
+        position_y: 0.0,
+        position_z: 0.0,
+        integer_arg: 0,
+        boolean_arg: false,
+    }
+}
+
+// ============================================================================
+// COMMAND LIST - Queue of commands to process
+// ============================================================================
+struct CommandList {
+    messages: [GameMessage],
+    count: i32,
+    max_messages: i32,
+}
+
+fn create_command_list(): CommandList {
+    let messages: [GameMessage] = []
+    for i in 0..256 {
+        messages = messages + [create_game_message(MessageType::MSG_NONE)]
+    }
+    return CommandList {
+        messages: messages,
+        count: 0,
+        max_messages: 256,
+    }
+}
+
+fn append_message(list: CommandList, msg: GameMessage) {
+    if list.count < list.max_messages {
+        list.messages[list.count] = msg
+        list.count = list.count + 1
+    }
+}
+
+fn reset_command_list(list: CommandList) {
+    list.count = 0
+}
+
+// ============================================================================
+// DESTROY LIST - Objects pending destruction
+// ============================================================================
+struct DestroyList {
+    object_ids: [i32],
+    count: i32,
+    max_objects: i32,
+}
+
+fn create_destroy_list(): DestroyList {
+    let ids: [i32] = []
+    for i in 0..512 {
+        ids = ids + [0]
+    }
+    return DestroyList {
+        object_ids: ids,
+        count: 0,
+        max_objects: 512,
+    }
+}
+
+fn add_to_destroy_list(list: DestroyList, object_id: i32) {
+    if list.count < list.max_objects {
+        list.object_ids[list.count] = object_id
+        list.count = list.count + 1
+    }
+}
+
+fn clear_destroy_list(list: DestroyList) {
+    list.count = 0
+}
+
+// ============================================================================
+// SLEEPY UPDATE HEAP - Priority queue for sleepy updates
+// ============================================================================
+struct SleepyUpdateHeap {
+    modules: [UpdateModule],
+    count: i32,
+    max_modules: i32,
+}
+
+fn create_sleepy_update_heap(): SleepyUpdateHeap {
+    let modules: [UpdateModule] = []
+    for i in 0..4096 {
+        modules = modules + [create_update_module(-1)]
+    }
+    return SleepyUpdateHeap {
+        modules: modules,
+        count: 0,
+        max_modules: 4096,
+    }
+}
+
+fn peek_sleepy_update(heap: SleepyUpdateHeap): UpdateModule {
+    if heap.count > 0 {
+        return heap.modules[0]
+    }
+    return create_update_module(-1)
+}
+
+fn push_sleepy_update(heap: SleepyUpdateHeap, module: UpdateModule) {
+    if heap.count < heap.max_modules {
+        heap.modules[heap.count] = module
+        heap.count = heap.count + 1
+        // Bubble up (simplified - would need full heap implementation)
+        heapify_up(heap, heap.count - 1)
+    }
+}
+
+fn pop_sleepy_update(heap: SleepyUpdateHeap): UpdateModule {
+    if heap.count == 0 {
+        return create_update_module(-1)
+    }
+    let result: UpdateModule = heap.modules[0]
+    heap.count = heap.count - 1
+    if heap.count > 0 {
+        heap.modules[0] = heap.modules[heap.count]
+        heapify_down(heap, 0)
+    }
+    return result
+}
+
+fn heapify_up(heap: SleepyUpdateHeap, index: i32) {
+    while index > 0 {
+        let parent: i32 = (index - 1) / 2
+        if heap.modules[index].next_call_frame < heap.modules[parent].next_call_frame {
+            // Swap
+            let temp: UpdateModule = heap.modules[index]
+            heap.modules[index] = heap.modules[parent]
+            heap.modules[parent] = temp
+            index = parent
+        } else {
+            break
+        }
+    }
+}
+
+fn heapify_down(heap: SleepyUpdateHeap, index: i32) {
+    while true {
+        let left: i32 = 2 * index + 1
+        let right: i32 = 2 * index + 2
+        let smallest: i32 = index
+
+        if left < heap.count && heap.modules[left].next_call_frame < heap.modules[smallest].next_call_frame {
+            smallest = left
+        }
+        if right < heap.count && heap.modules[right].next_call_frame < heap.modules[smallest].next_call_frame {
+            smallest = right
+        }
+
+        if smallest != index {
+            let temp: UpdateModule = heap.modules[index]
+            heap.modules[index] = heap.modules[smallest]
+            heap.modules[smallest] = temp
+            index = smallest
+        } else {
+            break
+        }
+    }
+}
+
+fn rebalance_sleepy_update(heap: SleepyUpdateHeap, index: i32) {
+    heapify_down(heap, index)
+}
+
+// ============================================================================
+// GAME LOGIC - Main game logic system (singleton-style)
+// ============================================================================
+struct GameLogic {
+    // Game state
+    state: GameState,
+    game_mode: GameMode,
+
+    // Object management
     object_manager: object::ObjectManager,
+    next_object_id: i32,
+    destroy_list: DestroyList,
+
+    // Update systems
+    sleepy_updates: SleepyUpdateHeap,
+    current_update_module: UpdateModule,
+
+    // Command processing
+    command_list: CommandList,
+    message_stream: CommandList,
+
+    // Subsystems (would be initialized separately in full implementation)
+    script_engine_enabled: bool,
+    terrain_logic_enabled: bool,
+    ai_enabled: bool,
+    build_assistant_enabled: bool,
+    partition_manager_enabled: bool,
+    weapon_store_enabled: bool,
+    locomotor_store_enabled: bool,
+    victory_conditions_enabled: bool,
+    recorder_enabled: bool,
+    stats_collector_enabled: bool,
+
+    // Timing
+    is_in_update: bool,
+    has_updated: bool,
+
+    // New game flag
+    start_new_game: bool,
+}
+
+fn create_game_logic(): GameLogic {
+    return GameLogic {
+        state: create_game_state(),
+        game_mode: GameMode::NONE,
+        object_manager: object::ObjectManager::init(),
+        next_object_id: 1,
+        destroy_list: create_destroy_list(),
+        sleepy_updates: create_sleepy_update_heap(),
+        current_update_module: create_update_module(-1),
+        command_list: create_command_list(),
+        message_stream: create_command_list(),
+        script_engine_enabled: true,
+        terrain_logic_enabled: true,
+        ai_enabled: true,
+        build_assistant_enabled: true,
+        partition_manager_enabled: true,
+        weapon_store_enabled: true,
+        locomotor_store_enabled: true,
+        victory_conditions_enabled: true,
+        recorder_enabled: false,
+        stats_collector_enabled: false,
+        is_in_update: false,
+        has_updated: false,
+        start_new_game: false,
+    }
+}
+
+// Initialize the game logic system
+fn init_game_logic(logic: GameLogic) {
+    logic.state = create_game_state()
+    logic.game_mode = GameMode::NONE
+    logic.next_object_id = 1
+    clear_destroy_list(logic.destroy_list)
+    reset_command_list(logic.command_list)
+    reset_command_list(logic.message_stream)
+}
+
+// Reset the game logic for a new game
+fn reset_game_logic(logic: GameLogic) {
+    logic.state = create_game_state()
+    logic.next_object_id = 1
+    clear_destroy_list(logic.destroy_list)
+    logic.sleepy_updates = create_sleepy_update_heap()
+    reset_command_list(logic.command_list)
+    reset_command_list(logic.message_stream)
+    logic.is_in_update = false
+    logic.has_updated = false
+}
+
+// Prepare for a new game
+fn prepare_new_game(logic: GameLogic, mode: GameMode, difficulty: i32, rank_points: i32) {
+    logic.game_mode = mode
+    reset_game_logic(logic)
+    // Would initialize players, map, etc. based on game info
+}
+
+// Allocate a new unique object ID
+fn allocate_object_id(logic: GameLogic): i32 {
+    let id: i32 = logic.next_object_id
+    logic.next_object_id = logic.next_object_id + 1
+    return id
+}
+
+// Register an object with the game logic
+fn register_object(logic: GameLogic, obj: object::Object) {
+    // Assign unique ID and add to lookup table
+    let id: i32 = allocate_object_id(logic)
+    obj.id = id
+    // Would add to hash table for fast lookup
+}
+
+// Mark an object for destruction
+fn destroy_object(logic: GameLogic, obj: object::Object) {
+    add_to_destroy_list(logic.destroy_list, obj.id)
+}
+
+// Process pending object destructions
+fn process_destroy_list(logic: GameLogic) {
+    for i in 0..logic.destroy_list.count {
+        let object_id: i32 = logic.destroy_list.object_ids[i]
+        // Would actually remove and deallocate the object here
+        // object_manager.remove(object_id)
+    }
+    clear_destroy_list(logic.destroy_list)
+}
+
+// Process a single command message
+fn process_message(logic: GameLogic, msg: GameMessage) {
+    if msg.msg_type == MessageType::MSG_NONE {
+        return
+    }
+
+    if msg.msg_type == MessageType::MSG_LOGIC_CRC {
+        // Handle CRC verification for multiplayer sync
+        let received_crc: u32 = msg.integer_arg as u32
+        // Would compare with local CRC and handle mismatch
+        return
+    }
+
+    if msg.msg_type == MessageType::MSG_GAME_PAUSE {
+        pause_game(logic.state)
+        return
+    }
+
+    if msg.msg_type == MessageType::MSG_GAME_RESUME {
+        resume_game(logic.state)
+        return
+    }
+
+    // Handle other message types
+    // MSG_CREATE_OBJECT, MSG_DESTROY_OBJECT, MSG_MOVE_UNIT, etc.
+    // Would dispatch to appropriate handler based on message type
+}
+
+// Process all commands in the command list
+fn process_command_list(logic: GameLogic, list: CommandList) {
+    for i in 0..list.count {
+        process_message(logic, list.messages[i])
+    }
+}
+
+// Calculate CRC for sync verification
+fn get_crc(logic: GameLogic, mode: CRCMode): u32 {
+    if mode == CRCMode::CACHED {
+        return logic.state.crc
+    }
+
+    // Would recalculate CRC from game state
+    // This is critical for multiplayer sync - all players must have identical CRC
+    let crc: u32 = 0
+
+    // Would hash all relevant game state:
+    // - All object positions, states, health
+    // - All player resources
+    // - Random seed state
+    // etc.
+
+    logic.state.crc = crc
+    return crc
+}
+
+// ============================================================================
+// MAIN UPDATE FUNCTION - Core game loop tick
+// ============================================================================
+// This is the heart of the game - called once per logic frame
+// Order of operations matches the original C++ implementation exactly
+
+fn update_game_logic(logic: GameLogic) {
+    // Set update flag
+    logic.is_in_update = true
+    logic.has_updated = false
+
+    // Handle new game start
+    if logic.start_new_game {
+        // Would start new game here
+        // start_new_game(logic)
+        logic.start_new_game = false
+    }
+
+    // Skip update if not in active game
+    if !is_game_active(logic.state) {
+        logic.is_in_update = false
+        return
+    }
+
+    let current_frame: u32 = logic.state.current_frame
+
+    // ========================================
+    // 1. UPDATE SCRIPT ENGINE
+    // ========================================
+    // Scripts can spawn units, trigger events, etc.
+    if logic.script_engine_enabled {
+        // script_engine.update()
+    }
+
+    // ========================================
+    // 2. UPDATE TERRAIN LOGIC
+    // ========================================
+    // Must happen after scripts but before objects
+    // Handles bridges, destructible terrain, etc.
+    if logic.terrain_logic_enabled {
+        // terrain_logic.update()
+    }
+
+    // ========================================
+    // 3. CRC GENERATION (Multiplayer)
+    // ========================================
+    let is_mp_game: bool = logic.game_mode == GameMode::LAN ||
+                          logic.game_mode == GameMode::INTERNET
+    let should_generate_crc: bool = is_mp_game &&
+                                    (current_frame % logic.state.crc_interval) == 0
+
+    if should_generate_crc {
+        let crc: u32 = get_crc(logic, CRCMode::RECALC)
+
+        // Create CRC message
+        let msg: GameMessage = create_game_message(MessageType::MSG_LOGIC_CRC)
+        msg.integer_arg = crc as i32
+        msg.frame = current_frame
+        append_message(logic.message_stream, msg)
+    }
+
+    // ========================================
+    // 4. UPDATE STATS COLLECTOR
+    // ========================================
+    if logic.stats_collector_enabled {
+        // stats_collector.update()
+    }
+
+    // ========================================
+    // 5. UPDATE RECORDER (Replay System)
+    // ========================================
+    if logic.recorder_enabled {
+        // recorder.update()
+    }
+
+    // ========================================
+    // 6. PROCESS CLIENT COMMANDS
+    // ========================================
+    process_command_list(logic, logic.command_list)
+
+    // ========================================
+    // 7. UPDATE SLEEPY MODULES
+    // ========================================
+    // Sleepy update modules only run when their sleep timer expires
+    // This is the bulk of per-object updates (movement, combat, etc.)
+    while logic.sleepy_updates.count > 0 {
+        let module: UpdateModule = peek_sleepy_update(logic.sleepy_updates)
+
+        // Done if everyone else is still sleeping
+        if module.next_call_frame > current_frame {
+            break
+        }
+
+        let sleep_time: i32 = UPDATE_SLEEP_NONE
+
+        // Check if module's object is disabled
+        if (module.disabled_flags == 0) ||
+           ((module.disabled_flags & module.disabled_types_to_process) != 0) {
+
+            logic.current_update_module = module
+
+            // Would call module.update() here
+            // sleep_time = module.update()
+
+            // Ensure sleep time is at least 1
+            if sleep_time < 1 {
+                sleep_time = UPDATE_SLEEP_NONE
+            }
+        }
+
+        // Reschedule the module
+        module.next_call_frame = current_frame + (sleep_time as u32)
+        rebalance_sleepy_update(logic.sleepy_updates, 0)
+    }
+
+    logic.current_update_module = create_update_module(-1)
+
+    // ========================================
+    // 8. UPDATE AI SYSTEM
+    // ========================================
+    if logic.ai_enabled {
+        // ai.update()
+    }
+
+    // ========================================
+    // 9. UPDATE BUILD ASSISTANT (Production)
+    // ========================================
+    if logic.build_assistant_enabled {
+        // build_assistant.update()
+    }
+
+    // ========================================
+    // 10. UPDATE PARTITION MANAGER
+    // ========================================
+    // Spatial partitioning for collision/visibility
+    if logic.partition_manager_enabled {
+        // partition_manager.update()
+    }
+
+    // ========================================
+    // END OF FRAME CLEANUP
+    // ========================================
+
+    // Process pending object destructions
+    process_destroy_list(logic)
+
+    // Reset command list for next frame
+    reset_command_list(logic.command_list)
+
+    // ========================================
+    // POST-FRAME UPDATES
+    // ========================================
+
+    // Update weapon store (cooldowns, etc.)
+    if logic.weapon_store_enabled {
+        // weapon_store.update()
+    }
+
+    // Update locomotor store
+    if logic.locomotor_store_enabled {
+        // locomotor_store.update()
+    }
+
+    // Check victory conditions
+    if logic.victory_conditions_enabled {
+        // victory_conditions.update()
+    }
+
+    // Advance frame counter
+    advance_frame(logic.state)
+
+    // Clear update flag
+    logic.is_in_update = false
+    logic.has_updated = true
+}
+
+// ============================================================================
+// GAME LOOP WRAPPER - High-level interface
+// ============================================================================
+struct GameLoop {
+    logic: GameLogic,
+
+    // AI brains for computer players
+    ai_brains: [ai::AIBrain],
+    ai_brain_count: i32,
+
+    // Production manager
     production_manager: production::ProductionManager,
-    ai_brains: Vec<ai::AIBrain>,
 
     // Timing
     target_fps: i32,
     frame_time: f64,
     accumulator: f64,
+}
 
-    fn init(session: world::GameSession): GameLoop {
-        return GameLoop {
-            session: session,
-            object_manager: object::ObjectManager::init(),
-            production_manager: production::ProductionManager::init(),
-            ai_brains: Vec::new(),
-            target_fps: 60,
-            frame_time: 1.0 / 60.0,
-            accumulator: 0.0,
-        }
+fn create_game_loop(): GameLoop {
+    let brains: [ai::AIBrain] = []
+    for i in 0..8 {
+        brains = brains + [ai::AIBrain::init(i, ai::AIPersonality::BALANCED, ai::AIDifficulty::NORMAL)]
     }
 
-    fn add_ai_player(&self, player_id: i32, personality: ai::AIPersonality, difficulty: ai::AIDifficulty) {
-        let brain = ai::AIBrain::init(player_id, personality, difficulty)
-        self.ai_brains.add(brain)
-    }
-
-    fn start(&self) {
-        self.session.start()
-    }
-
-    fn update(&self, delta_time: f64) {
-        if !self.session.is_active {
-            return
-        }
-
-        self.accumulator = self.accumulator + delta_time
-
-        while self.accumulator >= self.frame_time {
-            self.fixed_update(self.frame_time)
-            self.accumulator = self.accumulator - self.frame_time
-        }
-    }
-
-    fn fixed_update(&self, delta_time: f64) {
-        let state = self.session.get_state()
-
-        if !state.is_game_active() {
-            return
-        }
-
-        let current_frame = state.get_current_frame()
-
-        // Update production queues
-        let completed_items = self.production_manager.update_all(
-            delta_time,
-            state.build_time_multiplier
-        )
-
-        // Spawn completed units/buildings
-        for item in completed_items {
-            self.spawn_production_item(item)
-        }
-
-        // Update all game objects
-        self.object_manager.update_all(current_frame, delta_time)
-
-        // Update AI players
-        for brain in self.ai_brains {
-            brain.update(state, delta_time)
-        }
-
-        // Update game state
-        state.update()
-    }
-
-    fn spawn_production_item(&self, item: production::ProductionItem) {
-        // TODO: Create object from production item
-        // This would:
-        // 1. Create object from template
-        // 2. Place at rally point or spawn location
-        // 3. Add to object manager
-    }
-
-    fn get_state(&self): world::GameState {
-        return self.session.get_state()
-    }
-
-    fn pause(&self) {
-        self.session.state.pause()
-    }
-
-    fn resume(&self) {
-        self.session.state.resume()
-    }
-
-    fn is_paused(&self): bool {
-        return self.session.state.is_paused
+    return GameLoop {
+        logic: create_game_logic(),
+        ai_brains: brains,
+        ai_brain_count: 0,
+        production_manager: production::ProductionManager::init(),
+        target_fps: 30,  // Original game runs at 30 logic FPS
+        frame_time: 1.0 / 30.0,
+        accumulator: 0.0,
     }
 }
 
-// Tests
-test "GameLoop: init" {
-    let map = world::HashMap::init("TestMap", 100, 100, 10.0)
-    let session = world::GameSession::init(map, world::GameMode::SKIRMISH)
-    let game_loop = GameLoop::init(session)
+fn init_game_loop(loop: GameLoop, mode: GameMode) {
+    init_game_logic(loop.logic)
+    loop.logic.game_mode = mode
+    loop.ai_brain_count = 0
+    loop.accumulator = 0.0
+}
 
-    assert game_loop.target_fps == 60
-    assert !game_loop.is_paused()
+fn add_ai_player(loop: GameLoop, player_id: i32, personality: ai::AIPersonality, difficulty: ai::AIDifficulty) {
+    if loop.ai_brain_count < 8 {
+        loop.ai_brains[loop.ai_brain_count] = ai::AIBrain::init(player_id, personality, difficulty)
+        loop.ai_brain_count = loop.ai_brain_count + 1
+    }
+}
+
+fn start_game(loop: GameLoop) {
+    loop.logic.state.is_active = true
+}
+
+fn update_game_loop(loop: GameLoop, delta_time: f64) {
+    if !loop.logic.state.is_active {
+        return
+    }
+
+    // Fixed timestep accumulator
+    loop.accumulator = loop.accumulator + delta_time
+
+    while loop.accumulator >= loop.frame_time {
+        // Update main game logic
+        update_game_logic(loop.logic)
+
+        // Update AI brains (outside main logic for cleaner separation)
+        for i in 0..loop.ai_brain_count {
+            // loop.ai_brains[i].update(loop.logic.state, loop.frame_time)
+        }
+
+        loop.accumulator = loop.accumulator - loop.frame_time
+    }
+}
+
+fn pause_game_loop(loop: GameLoop) {
+    pause_game(loop.logic.state)
+}
+
+fn resume_game_loop(loop: GameLoop) {
+    resume_game(loop.logic.state)
+}
+
+fn is_game_paused(loop: GameLoop): bool {
+    return loop.logic.state.is_paused
+}
+
+fn get_current_frame(loop: GameLoop): u32 {
+    return loop.logic.state.current_frame
+}
+
+fn get_game_mode(loop: GameLoop): GameMode {
+    return loop.logic.game_mode
+}
+
+fn is_in_game(loop: GameLoop): bool {
+    return loop.logic.game_mode != GameMode::NONE && loop.logic.game_mode != GameMode::SHELL
+}
+
+fn is_multiplayer_game(loop: GameLoop): bool {
+    return loop.logic.game_mode == GameMode::LAN || loop.logic.game_mode == GameMode::INTERNET
+}
+
+fn exit_game(loop: GameLoop) {
+    loop.logic.state.is_active = false
+    reset_game_logic(loop.logic)
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+test "GameLoop: init" {
+    let loop: GameLoop = create_game_loop()
+    init_game_loop(loop, GameMode::SKIRMISH)
+
+    assert loop.target_fps == 30
+    assert loop.logic.game_mode == GameMode::SKIRMISH
+    assert !is_game_paused(loop)
 }
 
 test "GameLoop: start and update" {
-    let map = world::HashMap::init("TestMap", 100, 100, 10.0)
-    let session = world::GameSession::init(map, world::GameMode::SKIRMISH)
-    let game_loop = GameLoop::init(session)
+    let loop: GameLoop = create_game_loop()
+    init_game_loop(loop, GameMode::SKIRMISH)
 
-    game_loop.start()
-    assert game_loop.session.is_active
+    start_game(loop)
+    assert loop.logic.state.is_active
 
-    let state_before = game_loop.get_state()
-    let frame_before = state_before.current_frame
+    let frame_before: u32 = get_current_frame(loop)
 
-    game_loop.update(1.0 / 60.0)
+    // Run for one frame
+    update_game_loop(loop, 1.0 / 30.0)
 
-    let state_after = game_loop.get_state()
-    assert state_after.current_frame > frame_before
+    let frame_after: u32 = get_current_frame(loop)
+    assert frame_after > frame_before
 }
 
 test "GameLoop: pause and resume" {
-    let map = world::HashMap::init("TestMap", 100, 100, 10.0)
-    let session = world::GameSession::init(map, world::GameMode::SKIRMISH)
-    let game_loop = GameLoop::init(session)
+    let loop: GameLoop = create_game_loop()
+    init_game_loop(loop, GameMode::SKIRMISH)
 
-    game_loop.start()
-    game_loop.pause()
-    assert game_loop.is_paused()
+    start_game(loop)
+    pause_game_loop(loop)
+    assert is_game_paused(loop)
 
-    let state = game_loop.get_state()
-    let frame_paused = state.current_frame
+    let frame_paused: u32 = get_current_frame(loop)
 
-    game_loop.update(1.0)
-    assert state.current_frame == frame_paused  // No update while paused
+    update_game_loop(loop, 1.0)
+    assert get_current_frame(loop) == frame_paused  // No update while paused
 
-    game_loop.resume()
-    assert !game_loop.is_paused()
+    resume_game_loop(loop)
+    assert !is_game_paused(loop)
 }
 
 test "GameLoop: AI players" {
-    let map = world::HashMap::init("TestMap", 100, 100, 10.0)
-    let session = world::GameSession::init(map, world::GameMode::SKIRMISH)
-    let game_loop = GameLoop::init(session)
+    let loop: GameLoop = create_game_loop()
+    init_game_loop(loop, GameMode::SKIRMISH)
 
-    game_loop.add_ai_player(1, ai::AIPersonality::AGGRESSIVE, ai::AIDifficulty::HARD)
-    game_loop.add_ai_player(2, ai::AIPersonality::DEFENSIVE, ai::AIDifficulty::MEDIUM)
+    add_ai_player(loop, 1, ai::AIPersonality::AGGRESSIVE, ai::AIDifficulty::HARD)
+    add_ai_player(loop, 2, ai::AIPersonality::DEFENSIVE, ai::AIDifficulty::MEDIUM)
 
-    assert game_loop.ai_brains.count() == 2
+    assert loop.ai_brain_count == 2
+}
+
+test "GameLogic: CRC generation" {
+    let logic: GameLogic = create_game_logic()
+    init_game_logic(logic)
+
+    let crc1: u32 = get_crc(logic, CRCMode::RECALC)
+    let crc2: u32 = get_crc(logic, CRCMode::CACHED)
+
+    assert crc1 == crc2
+}
+
+test "GameLogic: destroy list" {
+    let logic: GameLogic = create_game_logic()
+    init_game_logic(logic)
+
+    add_to_destroy_list(logic.destroy_list, 1)
+    add_to_destroy_list(logic.destroy_list, 2)
+    add_to_destroy_list(logic.destroy_list, 3)
+
+    assert logic.destroy_list.count == 3
+
+    process_destroy_list(logic)
+
+    assert logic.destroy_list.count == 0
+}
+
+test "CommandList: append and reset" {
+    let list: CommandList = create_command_list()
+
+    let msg1: GameMessage = create_game_message(MessageType::MSG_MOVE_UNIT)
+    msg1.object_id = 123
+
+    append_message(list, msg1)
+    assert list.count == 1
+
+    reset_command_list(list)
+    assert list.count == 0
+}
+
+test "SleepyUpdateHeap: push and pop" {
+    let heap: SleepyUpdateHeap = create_sleepy_update_heap()
+
+    let module1: UpdateModule = create_update_module(1)
+    module1.next_call_frame = 10
+
+    let module2: UpdateModule = create_update_module(2)
+    module2.next_call_frame = 5
+
+    let module3: UpdateModule = create_update_module(3)
+    module3.next_call_frame = 15
+
+    push_sleepy_update(heap, module1)
+    push_sleepy_update(heap, module2)
+    push_sleepy_update(heap, module3)
+
+    assert heap.count == 3
+
+    // Should pop in order of next_call_frame (min heap)
+    let first: UpdateModule = pop_sleepy_update(heap)
+    assert first.object_id == 2  // frame 5
+
+    let second: UpdateModule = pop_sleepy_update(heap)
+    assert second.object_id == 1  // frame 10
+
+    let third: UpdateModule = pop_sleepy_update(heap)
+    assert third.object_id == 3  // frame 15
 }

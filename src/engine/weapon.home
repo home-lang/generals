@@ -413,6 +413,105 @@ struct WeaponSet {
     }
 }
 
+// Object status flags for weapon FX visibility checks
+enum ObjectStatus {
+    STEALTHED = 1,           // Unit is using stealth
+    HIDDEN = 2,              // Unit is hidden (fog of war, etc.)
+    DISGUISED = 4,           // Unit is disguised as another unit
+}
+
+// Kind-of flags for special unit types
+enum KindOf {
+    MINE = 1,                // Unit is a mine
+    PROJECTILE = 2,          // Unit is a projectile
+}
+
+// Fire weapon and handle effects
+// @bugfix Stubbjax 28/11/2025 (#1918) - Weapon effects now show for hidden non-stealthed objects
+// The original bug was that weapon FX (muzzle flash, etc.) were suppressed for all hidden objects,
+// but they should only be suppressed for stealthed objects (like Pathfinder in sniper mode).
+// Hidden-but-not-stealthed objects (like units in fog) should still show their weapon FX.
+fn fire_weapon_template(
+    weapon_template: WeaponTemplate,
+    source_obj_id: i32,
+    source_position: Vec3,
+    target_position: Vec3,
+    is_drawable_visible: bool,
+    object_status_mask: i32,
+    kind_of_mask: i32
+): bool {
+
+    // Determine if we should play weapon FX
+    let should_play_fx = true
+
+    // Check visibility and stealth status for FX
+    // @bugfix (#1918): Only suppress FX if BOTH not visible AND stealthed
+    // Original retail bug: if (!isVisible && !isMine && !playFXWhenStealthed) skip FX
+    // Fixed: if (!isVisible && isStealthed && !isMine && !playFXWhenStealthed) skip FX
+    let is_stealthed = (object_status_mask & (ObjectStatus::STEALTHED as i32)) != 0
+    let is_mine = (kind_of_mask & (KindOf::MINE as i32)) != 0
+
+    if !is_drawable_visible                            // if user watching cannot see us
+       && is_stealthed                                 // AND if unit is stealthed (like a Pathfinder)
+       && !is_mine                                     // and not a mine (which always do the FX, even if hidden)
+       && !weapon_template.play_fx_when_stealthed      // and not a weapon marked to playwhenstealthed
+    {
+        // Skip weapon fire FX
+        should_play_fx = false
+    }
+
+    // TODO: Actually spawn projectile, play sound, do FX
+    // This would call into the particle system, audio system, etc.
+
+    if should_play_fx {
+        // Play fire FX at source position
+        // spawn_fx(weapon_template.fire_fx_name, source_position)
+
+        // Play fire sound
+        // play_sound(weapon_template.fire_sound_name, source_position)
+    }
+
+    // Create projectile if this weapon uses one
+    if weapon_template.projectile_template_name != "" {
+        // create_projectile(weapon_template.projectile_template_name, source_position, target_position)
+    }
+
+    return true
+}
+
+// Helper to check if weapon effects should be visible
+// @bugfix (#1918): Effects only hidden if object is explicitly stealthed
+fn should_show_weapon_effects(
+    is_visible: bool,
+    is_stealthed: bool,
+    is_mine: bool,
+    play_fx_when_stealthed: bool
+): bool {
+    // Always show if visible
+    if is_visible {
+        return true
+    }
+
+    // Always show for mines (they reveal themselves when firing)
+    if is_mine {
+        return true
+    }
+
+    // Always show if weapon explicitly plays FX when stealthed
+    if play_fx_when_stealthed {
+        return true
+    }
+
+    // @bugfix (#1918): Only hide FX if the unit is explicitly stealthed
+    // Hidden-but-not-stealthed units (in fog, behind buildings, etc.) should show FX
+    if is_stealthed {
+        return false
+    }
+
+    // Not visible, not stealthed - show the FX
+    return true
+}
+
 // Tests
 test "WeaponBonus: init and apply" {
     let bonus1 = WeaponBonus::init()

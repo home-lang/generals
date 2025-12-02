@@ -123,6 +123,35 @@ struct VisionProvider {
     }
 }
 
+// Radar object - represents an object on the minimap radar
+// @bugfix xezon 22/11/2025 (#1893) - Heroes now stored in separate list
+// to prevent dangling cached hero data causing undefined behavior
+struct RadarObject {
+    object_id: u32
+    position: Vec3
+    player_id: u32
+    is_active: bool
+    is_hero: bool           // Is this object a hero unit?
+    is_local_player: bool   // Belongs to local player?
+    icon_type: i32          // Radar icon to display
+    color: u32              // RGBA color for radar blip
+    next: ?*RadarObject     // Linked list pointer
+}
+
+fn create_radar_object(object_id: u32, position: Vec3, player_id: u32, is_hero: bool): RadarObject {
+    return RadarObject {
+        object_id: object_id,
+        position: position,
+        player_id: player_id,
+        is_active: true,
+        is_hero: is_hero,
+        is_local_player: false,
+        icon_type: 0,
+        color: 0xFFFFFFFF,
+        next: null,
+    }
+}
+
 // Radar system
 struct RadarSystem {
     // Fog of war map
@@ -133,10 +162,33 @@ struct RadarSystem {
     vision_provider_count: u32
     next_provider_id: u32
 
+    // Radar object lists
+    // @bugfix xezon 22/11/2025 (#1893) - Separate lists for different object types
+    // to prevent hero cache dangling issues from retail version
+    object_list: ?*RadarObject           // All non-local objects
+    local_object_list: ?*RadarObject     // Local player objects (non-hero)
+    local_hero_object_list: ?*RadarObject // Local player hero objects (NEW - fixes #1893)
+
+    // Radar objects pool
+    radar_objects: [RadarObject]
+    radar_object_count: u32
+    max_radar_objects: u32
+
+    // Local player tracking
+    local_player_id: u32
+
     // Map bounds
     map_min: Vec3
     map_max: Vec3
     tile_size: f32
+
+    // Radar state
+    radar_hidden: [bool]     // Per-player radar visibility
+    radar_force_on: [bool]   // Per-player forced radar
+
+    // Terrain data for radar rendering
+    terrain_average_z: f32
+    water_average_z: f32
 
     allocator: Allocator
 
@@ -146,11 +198,139 @@ struct RadarSystem {
             vision_providers: []
             vision_provider_count: 0
             next_provider_id: 1
+            object_list: null
+            local_object_list: null
+            local_hero_object_list: null
+            radar_objects: []
+            radar_object_count: 0
+            max_radar_objects: 4096
+            local_player_id: 0
             map_min: Vec3.init(0.0, 0.0, 0.0)
             map_max: Vec3.init(map_size, map_size, 0.0)
             tile_size: @intToFloat(f32, FOG_TILE_SIZE)
+            radar_hidden: []
+            radar_force_on: []
+            terrain_average_z: 0.0
+            water_average_z: 0.0
             allocator: allocator
         }
+    }
+
+    // Add object to radar
+    // @bugfix xezon 22/11/2025 (#1893) - Heroes go to separate list
+    // Returns true if object was added to radar
+    fn add_object(self, object_id: u32, position: Vec3, player_id: u32, is_hero: bool): bool {
+        if self.radar_object_count >= self.max_radar_objects {
+            return false
+        }
+
+        let is_local = player_id == self.local_player_id
+
+        // Create radar object
+        let radar_obj = create_radar_object(object_id, position, player_id, is_hero)
+        radar_obj.is_local_player = is_local
+
+        // Store in pool
+        self.radar_objects[self.radar_object_count] = radar_obj
+        let obj_ptr = &self.radar_objects[self.radar_object_count]
+        self.radar_object_count += 1
+
+        // Add to appropriate list based on type
+        // @bugfix (#1893): Local heroes go to their own list to prevent cache issues
+        if is_local {
+            if is_hero {
+                // Add to local hero list (NEW - fixes dangling cache bug)
+                obj_ptr.next = self.local_hero_object_list
+                self.local_hero_object_list = obj_ptr
+            } else {
+                // Add to local non-hero list
+                obj_ptr.next = self.local_object_list
+                self.local_object_list = obj_ptr
+            }
+        } else {
+            // Add to general object list
+            obj_ptr.next = self.object_list
+            self.object_list = obj_ptr
+        }
+
+        return true
+    }
+
+    // Remove object from radar
+    // @bugfix xezon 22/11/2025 (#1893) - Properly removes from hero list
+    fn remove_object(self, object_id: u32): bool {
+        // Try to remove from each list
+        if self.remove_from_list(&self.object_list, object_id) {
+            return true
+        }
+        if self.remove_from_list(&self.local_object_list, object_id) {
+            return true
+        }
+        // @bugfix (#1893): Also check hero list
+        if self.remove_from_list(&self.local_hero_object_list, object_id) {
+            return true
+        }
+        return false
+    }
+
+    fn remove_from_list(self, list: *?*RadarObject, object_id: u32): bool {
+        let prev: ?*RadarObject = null
+        let current = list.*
+
+        while current != null {
+            if current.?.object_id == object_id {
+                // Remove from list
+                if prev != null {
+                    prev.?.next = current.?.next
+                } else {
+                    list.* = current.?.next
+                }
+                current.?.is_active = false
+                return true
+            }
+            prev = current
+            current = current.?.next
+        }
+        return false
+    }
+
+    // Delete all radar object resources
+    // @bugfix xezon 22/11/2025 (#1893) - Simplified version
+    fn delete_list_resources(self) {
+        self.object_list = null
+        self.local_object_list = null
+        self.local_hero_object_list = null
+        self.radar_object_count = 0
+    }
+
+    // Set local player for radar
+    fn set_local_player(self, player_id: u32) {
+        self.local_player_id = player_id
+    }
+
+    // Hide/show radar for a player
+    fn hide_radar(self, player_index: u32, hide: bool) {
+        if player_index < 8 {
+            self.radar_hidden[player_index] = hide
+        }
+    }
+
+    // Force radar on for a player
+    fn force_radar_on(self, player_index: u32, force: bool) {
+        if player_index < 8 {
+            self.radar_force_on[player_index] = force
+        }
+    }
+
+    // Check if radar is visible for player
+    fn is_radar_visible(self, player_index: u32): bool {
+        if player_index >= 8 {
+            return false
+        }
+        if self.radar_force_on[player_index] {
+            return true
+        }
+        return !self.radar_hidden[player_index]
     }
 
     fn world_to_fog_coords(&self, world_pos: Vec3): (u32, u32) {

@@ -1,0 +1,675 @@
+// C&C Generals Zero Hour - Home Port
+// W3D Shader Manager
+//
+// Original: W3DShaderManager.cpp / W3DShaderManager.h (EA/Westwood)
+// Custom shader system for terrain, roads, shroud, clouds, and screen filters.
+//
+// @unify xezon 28/11/2025 (#1920) - Move W3DShaderManager to Core
+
+import graphics/shader
+import graphics/renderer
+
+// W3D Shader types - matches original EA implementation
+enum W3DShaderType {
+    Invalid              // ST_INVALID - invalid shader type
+    TerrainBase          // ST_TERRAIN_BASE - base terrain texture only
+    TerrainBaseNoise1    // ST_TERRAIN_BASE_NOISE1 - base + cloud/noise 1
+    TerrainBaseNoise2    // ST_TERRAIN_BASE_NOISE2 - base + cloud/noise 2
+    TerrainBaseNoise12   // ST_TERRAIN_BASE_NOISE12 - base + both cloud/noise
+    ShroudTexture        // ST_SHROUD_TEXTURE - shroud texture projection
+    MaskTexture          // ST_MASK_TEXTURE - alpha mask texture projection
+    RoadBase             // ST_ROAD_BASE - road base texture only
+    RoadBaseNoise1       // ST_ROAD_BASE_NOISE1 - road + cloud/noise 1
+    RoadBaseNoise2       // ST_ROAD_BASE_NOISE2 - road + cloud/noise 2
+    RoadBaseNoise12      // ST_ROAD_BASE_NOISE12 - road + both cloud/noise
+    CloudTexture         // ST_CLOUD_TEXTURE - cloud projection
+    FlatTerrainBase      // ST_FLAT_TERRAIN_BASE - flat terrain base
+    FlatTerrainBaseNoise1   // ST_FLAT_TERRAIN_BASE_NOISE1
+    FlatTerrainBaseNoise2   // ST_FLAT_TERRAIN_BASE_NOISE2
+    FlatTerrainBaseNoise12  // ST_FLAT_TERRAIN_BASE_NOISE12
+    FlatShroudTexture    // ST_FLAT_SHROUD_TEXTURE
+    Max                  // ST_MAX
+}
+
+// Filter types for post-processing effects
+enum FilterType {
+    None
+    MotionBlur      // Screen motion blur effect
+    BlackAndWhite   // B&W conversion (nuke detonation)
+    CrossFade       // Fade between frames
+}
+
+// Filter modes for controlling effect parameters
+enum FilterMode {
+    Off
+    On
+    FadeIn
+    FadeOut
+    Hold
+}
+
+// Custom scene pass modes
+enum CustomScenePassMode {
+    Normal
+    RenderToTexture
+    CombineTextures
+}
+
+// Graphics chipset type (for capability detection)
+enum ChipsetType {
+    Unknown
+    Generic
+    NVidia
+    ATI
+    Intel
+    Apple // For Metal on macOS
+}
+
+// Graphics vendor ID
+enum GraphicsVendorID {
+    Unknown
+    NVidia
+    AMD
+    Intel
+    Apple
+}
+
+// Static game LOD level (for performance tiering)
+enum StaticGameLODLevel {
+    Low
+    Medium
+    High
+    Ultra
+}
+
+// Texture reference (placeholder - would be actual texture handle)
+struct TextureRef {
+    handle: u64
+    width: u32
+    height: u32
+}
+
+// Coord2D for scroll deltas
+struct Coord2D {
+    x: f32
+    y: f32
+}
+
+// Coord3D for zoom positions
+struct Coord3D {
+    x: f32
+    y: f32
+    z: f32
+}
+
+// W3D Filter Interface - base class for filter effects
+trait W3DFilterInterface {
+    fn init(self): bool
+    fn shutdown(self)
+    fn pre_render(self, skip_render: &mut bool, scene_pass_mode: &mut CustomScenePassMode): bool
+    fn post_render(self, mode: FilterMode, scroll_delta: &mut Coord2D, do_extra_render: &mut bool): bool
+    fn setup(self, mode: FilterMode): bool
+}
+
+// Screen motion blur filter
+struct ScreenMotionBlurFilter {
+    max_count: i32
+    last_frame: i32
+    decrement: bool
+    skip_render: bool
+    additive: bool
+    do_zoom_to: bool
+    prior_delta: Coord2D
+    pan_factor: i32
+
+    // Static members
+    zoom_to_pos: Coord3D
+    zoom_to_valid: bool
+}
+
+const MOTION_BLUR_MAX_COUNT: i32 = 60
+const MOTION_BLUR_MAX_LIMIT: i32 = 30
+const MOTION_BLUR_COUNT_STEP: i32 = 5
+const MOTION_BLUR_DEFAULT_PAN_FACTOR: i32 = 30
+
+impl ScreenMotionBlurFilter {
+    fn init(): ScreenMotionBlurFilter {
+        return ScreenMotionBlurFilter {
+            max_count: MOTION_BLUR_MAX_COUNT
+            last_frame: 0
+            decrement: false
+            skip_render: false
+            additive: false
+            do_zoom_to: false
+            prior_delta: Coord2D { x: 0.0, y: 0.0 }
+            pan_factor: MOTION_BLUR_DEFAULT_PAN_FACTOR
+            zoom_to_pos: Coord3D { x: 0.0, y: 0.0, z: 0.0 }
+            zoom_to_valid: false
+        }
+    }
+
+    fn set_zoom_to_pos(mut self, pos: Coord3D) {
+        self.zoom_to_pos = pos
+        self.zoom_to_valid = true
+    }
+
+    fn filter_init(self): bool {
+        // Initialize motion blur filter
+        return true
+    }
+
+    fn filter_shutdown(self) {
+        // Cleanup motion blur resources
+    }
+
+    fn filter_pre_render(mut self, skip_render: &mut bool, scene_pass_mode: &mut CustomScenePassMode): bool {
+        *skip_render = self.skip_render
+        return true
+    }
+
+    fn filter_post_render(mut self, mode: FilterMode, scroll_delta: &mut Coord2D, do_extra_render: &mut bool): bool {
+        // Apply motion blur based on scroll delta
+        *do_extra_render = false
+        return true
+    }
+
+    fn filter_setup(self, mode: FilterMode): bool {
+        return true
+    }
+}
+
+// Screen black & white filter (for nuke detonations)
+struct ScreenBWFilter {
+    bw_pixel_shader: u64  // D3D handle to B&W pixel shader
+
+    // Static fade parameters
+    fade_frames: i32
+    fade_direction: i32
+    cur_fade_frame: i32
+    cur_fade_value: f32
+}
+
+impl ScreenBWFilter {
+    fn init(): ScreenBWFilter {
+        return ScreenBWFilter {
+            bw_pixel_shader: 0
+            fade_frames: 0
+            fade_direction: 0
+            cur_fade_frame: 0
+            cur_fade_value: 0.0
+        }
+    }
+
+    fn set_fade_parameters(mut self, fade_frames: i32, direction: i32) {
+        self.cur_fade_frame = 0
+        self.fade_frames = fade_frames
+        self.fade_direction = direction
+    }
+
+    fn filter_init(self): bool {
+        // Load B&W pixel shader
+        return true
+    }
+
+    fn filter_shutdown(self) {
+        // Release shader
+        self.bw_pixel_shader = 0
+    }
+
+    fn filter_pre_render(self, skip_render: &mut bool, scene_pass_mode: &mut CustomScenePassMode): bool {
+        *skip_render = false
+        *scene_pass_mode = CustomScenePassMode.RenderToTexture
+        return true
+    }
+
+    fn filter_post_render(mut self, mode: FilterMode, scroll_delta: &mut Coord2D, do_extra_render: &mut bool): bool {
+        // Apply B&W conversion
+        *do_extra_render = false
+
+        // Update fade
+        if self.fade_frames > 0 {
+            self.cur_fade_frame += 1
+            self.cur_fade_value = self.cur_fade_frame as f32 / self.fade_frames as f32
+
+            if self.fade_direction < 0 {
+                self.cur_fade_value = 1.0 - self.cur_fade_value
+            }
+        }
+
+        return true
+    }
+
+    fn filter_setup(self, mode: FilterMode): bool {
+        return true
+    }
+}
+
+// Screen cross-fade filter
+struct ScreenCrossFadeFilter {
+    fade_frames: i32
+    fade_direction: i32
+    cur_fade_frame: i32
+    cur_fade_value: f32
+    skip_render: bool
+    fade_pattern_texture: ?TextureRef
+}
+
+impl ScreenCrossFadeFilter {
+    fn init(): ScreenCrossFadeFilter {
+        return ScreenCrossFadeFilter {
+            fade_frames: 0
+            fade_direction: 0
+            cur_fade_frame: 0
+            cur_fade_value: 0.0
+            skip_render: false
+            fade_pattern_texture: null
+        }
+    }
+
+    fn set_fade_parameters(mut self, fade_frames: i32, direction: i32) {
+        self.cur_fade_frame = 0
+        self.fade_frames = fade_frames
+        self.fade_direction = direction
+    }
+
+    fn get_current_fade_value(self): f32 {
+        return self.cur_fade_value
+    }
+
+    fn get_current_mask_texture(self): ?TextureRef {
+        return self.fade_pattern_texture
+    }
+
+    fn update_fade_level(mut self): bool {
+        if self.fade_frames <= 0 {
+            return false
+        }
+
+        self.cur_fade_frame += 1
+        self.cur_fade_value = self.cur_fade_frame as f32 / self.fade_frames as f32
+
+        if self.fade_direction < 0 {
+            self.cur_fade_value = 1.0 - self.cur_fade_value
+        }
+
+        return self.cur_fade_frame < self.fade_frames
+    }
+
+    fn filter_init(self): bool {
+        return true
+    }
+
+    fn filter_shutdown(self) {
+        self.fade_pattern_texture = null
+    }
+
+    fn filter_pre_render(mut self, skip_render: &mut bool, scene_pass_mode: &mut CustomScenePassMode): bool {
+        *skip_render = self.skip_render
+        *scene_pass_mode = CustomScenePassMode.RenderToTexture
+        return true
+    }
+
+    fn filter_post_render(mut self, mode: FilterMode, scroll_delta: &mut Coord2D, do_extra_render: &mut bool): bool {
+        *do_extra_render = self.update_fade_level()
+        return true
+    }
+
+    fn filter_setup(self, mode: FilterMode): bool {
+        return true
+    }
+}
+
+// W3D Shader Manager - main shader management system
+struct W3DShaderManager {
+    // Textures assigned to each stage (up to 8)
+    textures: [?TextureRef; 8]
+
+    // Current state
+    current_chipset: ChipsetType
+    current_vendor: GraphicsVendorID
+    driver_version: i64
+    current_shader: W3DShaderType
+    current_shader_pass: i32
+    current_filter: FilterType
+
+    // Render-to-texture support
+    rendering_to_texture: bool
+    old_render_surface: u64
+    render_texture: u64
+    new_render_surface: u64
+    old_depth_surface: u64
+
+    // Filter instances
+    motion_blur_filter: ScreenMotionBlurFilter
+    bw_filter: ScreenBWFilter
+    cross_fade_filter: ScreenCrossFadeFilter
+
+    // Cloud animation state
+    cloud_offset_u: f32
+    cloud_offset_v: f32
+}
+
+impl W3DShaderManager {
+    fn init(): W3DShaderManager {
+        return W3DShaderManager {
+            textures: [null; 8]
+            current_chipset: ChipsetType.Unknown
+            current_vendor: GraphicsVendorID.Unknown
+            driver_version: 0
+            current_shader: W3DShaderType.Invalid
+            current_shader_pass: 0
+            current_filter: FilterType.None
+            rendering_to_texture: false
+            old_render_surface: 0
+            render_texture: 0
+            new_render_surface: 0
+            old_depth_surface: 0
+            motion_blur_filter: ScreenMotionBlurFilter.init()
+            bw_filter: ScreenBWFilter.init()
+            cross_fade_filter: ScreenCrossFadeFilter.init()
+            cloud_offset_u: 0.0
+            cloud_offset_v: 0.0
+        }
+    }
+
+    // Initialize shader system - detect optimal shaders for device
+    fn initialize(mut self) {
+        println("W3DShaderManager: Initializing...")
+
+        // Detect chipset and vendor
+        self.detect_hardware()
+
+        // Initialize filters
+        self.motion_blur_filter.filter_init()
+        self.bw_filter.filter_init()
+        self.cross_fade_filter.filter_init()
+
+        println("W3DShaderManager: Initialized with chipset={self.current_chipset}")
+    }
+
+    // Shutdown shader system
+    fn shutdown(mut self) {
+        println("W3DShaderManager: Shutting down...")
+
+        self.motion_blur_filter.filter_shutdown()
+        self.bw_filter.filter_shutdown()
+        self.cross_fade_filter.filter_shutdown()
+
+        self.reset_textures()
+
+        println("W3DShaderManager: Shutdown complete")
+    }
+
+    // Detect hardware capabilities
+    fn detect_hardware(mut self) {
+        // On macOS, we're using Metal, so set to Apple chipset
+        self.current_chipset = ChipsetType.Apple
+        self.current_vendor = GraphicsVendorID.Apple
+
+        // TODO: Query actual hardware via Metal/Vulkan/OpenGL
+    }
+
+    // Update cloud position (called once per frame)
+    fn update_cloud(mut self, delta_time: f32) {
+        // Move cloud texture coordinates
+        let cloud_speed = 0.002  // Adjust for desired speed
+        self.cloud_offset_u += cloud_speed * delta_time
+        self.cloud_offset_v += cloud_speed * 0.5 * delta_time
+
+        // Wrap around
+        if self.cloud_offset_u > 1.0 {
+            self.cloud_offset_u -= 1.0
+        }
+        if self.cloud_offset_v > 1.0 {
+            self.cloud_offset_v -= 1.0
+        }
+    }
+
+    // Get current chipset
+    fn get_chipset(self): ChipsetType {
+        return self.current_chipset
+    }
+
+    // Get current vendor
+    fn get_current_vendor(self): GraphicsVendorID {
+        return self.current_vendor
+    }
+
+    // Get current driver version
+    fn get_current_driver_version(self): i64 {
+        return self.driver_version
+    }
+
+    // Get number of passes required for a shader
+    fn get_shader_passes(self, shader: W3DShaderType): i32 {
+        match shader {
+            W3DShaderType.Invalid => 0
+            W3DShaderType.TerrainBase => 1
+            W3DShaderType.TerrainBaseNoise1 => 1
+            W3DShaderType.TerrainBaseNoise2 => 1
+            W3DShaderType.TerrainBaseNoise12 => 1
+            W3DShaderType.ShroudTexture => 1
+            W3DShaderType.MaskTexture => 1
+            W3DShaderType.RoadBase => 1
+            W3DShaderType.RoadBaseNoise1 => 1
+            W3DShaderType.RoadBaseNoise2 => 1
+            W3DShaderType.RoadBaseNoise12 => 1
+            W3DShaderType.CloudTexture => 1
+            W3DShaderType.FlatTerrainBase => 1
+            W3DShaderType.FlatTerrainBaseNoise1 => 1
+            W3DShaderType.FlatTerrainBaseNoise2 => 1
+            W3DShaderType.FlatTerrainBaseNoise12 => 1
+            W3DShaderType.FlatShroudTexture => 1
+            _ => 1
+        }
+    }
+
+    // Set a specific shader pass
+    fn set_shader(mut self, shader: W3DShaderType, pass: i32): bool {
+        if shader == W3DShaderType.Invalid {
+            return false
+        }
+
+        self.current_shader = shader
+        self.current_shader_pass = pass
+
+        // Apply shader-specific state
+        match shader {
+            W3DShaderType.TerrainBase => self.apply_terrain_base()
+            W3DShaderType.TerrainBaseNoise1 => self.apply_terrain_noise(true, false)
+            W3DShaderType.TerrainBaseNoise2 => self.apply_terrain_noise(false, true)
+            W3DShaderType.TerrainBaseNoise12 => self.apply_terrain_noise(true, true)
+            W3DShaderType.ShroudTexture => self.apply_shroud()
+            W3DShaderType.CloudTexture => self.apply_cloud()
+            W3DShaderType.RoadBase => self.apply_road_base()
+            _ => {}
+        }
+
+        return true
+    }
+
+    // Set shroud texture in a specific stage
+    fn set_shroud_tex(self, stage: i32): bool {
+        if stage < 0 || stage >= 8 {
+            return false
+        }
+
+        // TODO: Apply shroud texture to stage
+        return true
+    }
+
+    // Reset shader state for W3D2 compatibility
+    fn reset_shader(mut self, shader: W3DShaderType) {
+        self.current_shader = W3DShaderType.Invalid
+        self.current_shader_pass = 0
+
+        // TODO: Reset W3D2 state
+    }
+
+    // Set texture for a stage
+    fn set_texture(mut self, stage: i32, texture: TextureRef) {
+        if stage >= 0 && stage < 8 {
+            self.textures[stage] = texture
+        }
+    }
+
+    // Get texture from a stage
+    fn get_shader_texture(self, stage: i32): ?TextureRef {
+        if stage >= 0 && stage < 8 {
+            return self.textures[stage]
+        }
+        return null
+    }
+
+    // Get current shader
+    fn get_current_shader(self): W3DShaderType {
+        return self.current_shader
+    }
+
+    fn reset_textures(mut self) {
+        for i in 0..8 {
+            self.textures[i] = null
+        }
+    }
+
+    // Apply terrain base shader
+    fn apply_terrain_base(self) {
+        // TODO: Set up terrain base rendering state
+    }
+
+    // Apply terrain noise shader(s)
+    fn apply_terrain_noise(self, noise1: bool, noise2: bool) {
+        // TODO: Set up terrain + noise rendering state
+        // noise1 = cloud layer 1
+        // noise2 = cloud layer 2
+    }
+
+    // Apply shroud shader
+    fn apply_shroud(self) {
+        // TODO: Set up shroud projection rendering state
+    }
+
+    // Apply cloud shader
+    fn apply_cloud(self) {
+        // TODO: Set up cloud projection rendering state
+    }
+
+    // Apply road base shader
+    fn apply_road_base(self) {
+        // TODO: Set up road base rendering state
+    }
+
+    // Test minimum hardware requirements
+    fn test_minimum_requirements(self): bool {
+        // Modern hardware easily exceeds original requirements
+        return true
+    }
+
+    // Get GPU performance index for LOD selection
+    fn get_gpu_performance_index(self): StaticGameLODLevel {
+        // For modern hardware, default to high
+        return StaticGameLODLevel.High
+    }
+
+    // Filter pre-render setup
+    fn filter_pre_render(mut self, filter: FilterType, skip_render: &mut bool, scene_pass_mode: &mut CustomScenePassMode): bool {
+        match filter {
+            FilterType.MotionBlur =>
+                self.motion_blur_filter.filter_pre_render(skip_render, scene_pass_mode)
+            FilterType.BlackAndWhite =>
+                self.bw_filter.filter_pre_render(skip_render, scene_pass_mode)
+            FilterType.CrossFade =>
+                self.cross_fade_filter.filter_pre_render(skip_render, scene_pass_mode)
+            _ => false
+        }
+    }
+
+    // Filter post-render apply
+    fn filter_post_render(mut self, filter: FilterType, mode: FilterMode, scroll_delta: &mut Coord2D, do_extra_render: &mut bool): bool {
+        match filter {
+            FilterType.MotionBlur =>
+                self.motion_blur_filter.filter_post_render(mode, scroll_delta, do_extra_render)
+            FilterType.BlackAndWhite =>
+                self.bw_filter.filter_post_render(mode, scroll_delta, do_extra_render)
+            FilterType.CrossFade =>
+                self.cross_fade_filter.filter_post_render(mode, scroll_delta, do_extra_render)
+            _ => false
+        }
+    }
+
+    // Filter setup
+    fn filter_setup(mut self, filter: FilterType, mode: FilterMode): bool {
+        self.current_filter = filter
+
+        match filter {
+            FilterType.MotionBlur =>
+                self.motion_blur_filter.filter_setup(mode)
+            FilterType.BlackAndWhite =>
+                self.bw_filter.filter_setup(mode)
+            FilterType.CrossFade =>
+                self.cross_fade_filter.filter_setup(mode)
+            _ => false
+        }
+    }
+
+    // Check if we can render to texture
+    fn can_render_to_texture(self): bool {
+        return self.old_render_surface != 0 && self.new_render_surface != 0
+    }
+
+    // Start render to texture
+    fn start_render_to_texture(mut self) {
+        self.rendering_to_texture = true
+        // TODO: Save current render target, set new target
+    }
+
+    // End render to texture
+    fn end_render_to_texture(mut self): u64 {
+        self.rendering_to_texture = false
+        // TODO: Restore previous render target
+        return self.render_texture
+    }
+
+    // Get last render texture
+    fn get_render_texture(self): u64 {
+        return self.render_texture
+    }
+
+    // Check if currently rendering to texture
+    fn is_rendering_to_texture(self): bool {
+        return self.rendering_to_texture
+    }
+
+    // Draw viewport quad for post-processing
+    fn draw_viewport(self, color: u32) {
+        // TODO: Draw fullscreen quad with specified color
+    }
+}
+
+// Global W3D shader manager instance
+var g_w3d_shader_manager: ?W3DShaderManager = null
+
+export fn init_w3d_shader_manager() {
+    g_w3d_shader_manager = W3DShaderManager.init()
+    g_w3d_shader_manager.?.initialize()
+}
+
+export fn shutdown_w3d_shader_manager() {
+    if g_w3d_shader_manager != null {
+        g_w3d_shader_manager.?.shutdown()
+        g_w3d_shader_manager = null
+    }
+}
+
+export fn get_w3d_shader_manager(): ?*W3DShaderManager {
+    if g_w3d_shader_manager != null {
+        return &g_w3d_shader_manager.?
+    }
+    return null
+}
+
+export fn update_w3d_clouds(delta_time: f32) {
+    if g_w3d_shader_manager != null {
+        g_w3d_shader_manager.?.update_cloud(delta_time)
+    }
+}

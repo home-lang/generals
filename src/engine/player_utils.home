@@ -1,0 +1,268 @@
+// C&C Generals Zero Hour - Home Port
+// Player Utilities
+//
+// @refactor Stubbjax 26/11/2025 (#1861) - Utility logic for handling observed player behaviour
+//
+// This module provides utility functions for determining which player's perspective
+// to use for UI elements, effects visibility, and other player-specific behavior.
+// Supports both local player and observed player modes (for replays/spectating).
+
+import engine/game_state
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_PLAYERS: i32 = 8
+
+// ============================================================================
+// Player Reference
+// ============================================================================
+
+// Player reference - can point to local or observed player
+struct PlayerRef {
+    player_index: i32
+    is_valid: bool
+}
+
+impl PlayerRef {
+    fn init(): PlayerRef {
+        return PlayerRef {
+            player_index: -1
+            is_valid: false
+        }
+    }
+
+    fn from_index(index: i32): PlayerRef {
+        return PlayerRef {
+            player_index: index
+            is_valid: index >= 0 && index < MAX_PLAYERS
+        }
+    }
+
+    fn get_player_index(self): i32 {
+        return self.player_index
+    }
+
+    fn is_local_player(self): bool {
+        if !self.is_valid {
+            return false
+        }
+        return self.player_index == g_local_player_index
+    }
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+// Local player index (the actual player controlling this instance)
+var g_local_player_index: i32 = 0
+
+// Currently observed player index (for replays/spectating)
+var g_observed_player_index: i32 = -1
+
+// Whether we're in observation mode
+var g_is_observing: bool = false
+
+// Player states
+var g_player_states: [PlayerState; MAX_PLAYERS]
+var g_player_count: i32 = 0
+
+// ============================================================================
+// RTS Namespace Functions
+// ============================================================================
+
+// @refactor (#1861) - Get the observed player or fall back to local player
+// This replaces TheControlBar->getCurrentlyViewedPlayer() calls throughout the codebase
+// Used for:
+// - Selecting idle workers
+// - Drawing unit UI (ammo, contained units, etc.)
+// - Drawing carbomb indicators
+// - Waypoint buffer rendering
+// - EVA announcements
+export fn get_observed_or_local_player(): PlayerRef {
+    if g_is_observing && g_observed_player_index >= 0 {
+        return PlayerRef.from_index(g_observed_player_index)
+    }
+    return PlayerRef.from_index(g_local_player_index)
+}
+
+// Get strictly the local player (for actions that require actual control)
+export fn get_local_player(): PlayerRef {
+    return PlayerRef.from_index(g_local_player_index)
+}
+
+// Get the currently observed player (may be null if not observing)
+export fn get_observed_player(): ?PlayerRef {
+    if g_is_observing && g_observed_player_index >= 0 {
+        return PlayerRef.from_index(g_observed_player_index)
+    }
+    return null
+}
+
+// Check if we're in observation mode (replay/spectator)
+export fn is_observing(): bool {
+    return g_is_observing
+}
+
+// Check if a specific player is the currently viewed player
+export fn is_viewed_player(player_index: i32): bool {
+    let viewed = get_observed_or_local_player()
+    return viewed.is_valid && viewed.player_index == player_index
+}
+
+// Check if an object belongs to the currently viewed player
+export fn is_owned_by_viewed_player(object_player_index: i32): bool {
+    return is_viewed_player(object_player_index)
+}
+
+// ============================================================================
+// State Management
+// ============================================================================
+
+// Set the local player index
+export fn set_local_player(index: i32) {
+    if index >= 0 && index < MAX_PLAYERS {
+        g_local_player_index = index
+    }
+}
+
+// Set the observed player index (for replays/spectating)
+export fn set_observed_player(index: i32) {
+    if index >= 0 && index < MAX_PLAYERS {
+        g_observed_player_index = index
+        g_is_observing = true
+    } else {
+        g_observed_player_index = -1
+        g_is_observing = false
+    }
+}
+
+// Clear observation mode (return to local player view)
+export fn clear_observation() {
+    g_observed_player_index = -1
+    g_is_observing = false
+}
+
+// Cycle to next observed player (for spectator mode)
+export fn cycle_observed_player() {
+    if !g_is_observing {
+        return
+    }
+
+    let start = g_observed_player_index
+    var next = (start + 1) % g_player_count
+
+    // Find next active player
+    while next != start {
+        if g_player_states[next].is_human && !g_player_states[next].is_defeated {
+            g_observed_player_index = next
+            return
+        }
+        next = (next + 1) % g_player_count
+    }
+}
+
+// ============================================================================
+// Player State Access
+// ============================================================================
+
+// Get player state by index
+export fn get_player_state(index: i32): ?PlayerState {
+    if index >= 0 && index < g_player_count {
+        return g_player_states[index]
+    }
+    return null
+}
+
+// Get viewed player's state
+export fn get_viewed_player_state(): ?PlayerState {
+    let viewed = get_observed_or_local_player()
+    if viewed.is_valid {
+        return get_player_state(viewed.player_index)
+    }
+    return null
+}
+
+// Get player display name
+export fn get_player_display_name(index: i32): string {
+    if index >= 0 && index < g_player_count {
+        return g_player_states[index].name
+    }
+    return "Unknown"
+}
+
+// Check if player is ally of viewed player
+export fn is_ally_of_viewed_player(player_index: i32): bool {
+    let viewed = get_observed_or_local_player()
+    if !viewed.is_valid {
+        return false
+    }
+
+    if viewed.player_index == player_index {
+        return true  // Same player is always ally
+    }
+
+    // Check team
+    if viewed.player_index < g_player_count && player_index < g_player_count {
+        return g_player_states[viewed.player_index].team == g_player_states[player_index].team
+    }
+
+    return false
+}
+
+// Check if player is enemy of viewed player
+export fn is_enemy_of_viewed_player(player_index: i32): bool {
+    let viewed = get_observed_or_local_player()
+    if !viewed.is_valid {
+        return false
+    }
+
+    if viewed.player_index == player_index {
+        return false  // Same player is never enemy
+    }
+
+    // Different teams are enemies
+    if viewed.player_index < g_player_count && player_index < g_player_count {
+        return g_player_states[viewed.player_index].team != g_player_states[player_index].team
+    }
+
+    return true
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn init_player_utils() {
+    g_local_player_index = 0
+    g_observed_player_index = -1
+    g_is_observing = false
+    g_player_count = 0
+
+    for i in 0..MAX_PLAYERS {
+        g_player_states[i] = create_player_state(i)
+    }
+
+    println("PlayerUtils: Initialized")
+}
+
+export fn shutdown_player_utils() {
+    clear_observation()
+    println("PlayerUtils: Shutdown")
+}
+
+// Register a player
+export fn register_player(index: i32, name: string, faction: string, team: i32, is_human: bool) {
+    if index >= 0 && index < MAX_PLAYERS {
+        g_player_states[index].name = name
+        g_player_states[index].faction = faction
+        g_player_states[index].team = team
+        g_player_states[index].is_human = is_human
+
+        if index >= g_player_count {
+            g_player_count = index + 1
+        }
+    }
+}
