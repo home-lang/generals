@@ -1,0 +1,792 @@
+// C&C Generals Zero Hour - Shader Types System
+// All 16 shader types from the original W3DShaderManager
+//
+// Original shader types from EA's Westwood renderer:
+// - Terrain shaders (base, blend, roads, cliffs)
+// - Object shaders (vehicles, infantry, buildings)
+// - Effect shaders (particles, decals, water, shroud)
+// - Post-process shaders (blur, color correction)
+
+import graphics/shader
+
+// ============================================================================
+// SHADER TYPE ENUMERATION
+// ============================================================================
+
+enum W3DShaderType {
+    // Terrain shaders
+    TerrainBase = 0         // Base terrain rendering
+    TerrainBlend = 1        // Terrain texture blending (4 layers)
+    TerrainRoad = 2         // Road overlay rendering
+    TerrainCliff = 3        // Cliff face rendering
+    TerrainWater = 4        // Water surface with reflection/refraction
+
+    // Object shaders
+    ObjectDefault = 5       // Default W3D object shader
+    ObjectSkinned = 6       // Skinned mesh (infantry, animated)
+    ObjectBuilding = 7      // Building with construction states
+    ObjectVehicle = 8       // Vehicle with tracks/wheels
+
+    // Effect shaders
+    ParticleBillboard = 9   // Billboard particle sprites
+    ParticleStreak = 10     // Streak/trail particles
+    DecalProjected = 11     // Projected decals (scorch marks, shadows)
+    LaserBeam = 12          // Laser/beam weapons
+
+    // Overlay shaders
+    Shroud = 13             // Fog of war shroud
+    Cloud = 14              // Cloud shadow overlay
+
+    // Post-process
+    PostProcess = 15        // Post-processing effects
+}
+
+// ============================================================================
+// SHADER VARIANT FLAGS
+// ============================================================================
+
+enum ShaderVariantFlags {
+    None = 0
+    Textured = 1            // Has diffuse texture
+    NormalMapped = 2        // Has normal map
+    Specular = 4            // Has specular map
+    Emissive = 8            // Has emissive/glow
+    Skinned = 16            // Has bone weights
+    Instanced = 32          // Supports instancing
+    AlphaTest = 64          // Uses alpha testing
+    AlphaBlend = 128        // Uses alpha blending
+    DoubleSided = 256       // Render both sides
+    Fog = 512               // Affected by fog
+    Shadows = 1024          // Casts/receives shadows
+    Reflection = 2048       // Has environment reflection
+}
+
+// ============================================================================
+// SHADER MATERIAL PROPERTIES
+// ============================================================================
+
+struct ShaderMaterialProps {
+    diffuse_color: [f32; 4]
+    specular_color: [f32; 4]
+    emissive_color: [f32; 4]
+    ambient_color: [f32; 4]
+    shininess: f32
+    opacity: f32
+    alpha_test_ref: f32
+    uv_offset: [f32; 2]
+    uv_scale: [f32; 2]
+    time: f32
+
+    fn default(): ShaderMaterialProps {
+        return ShaderMaterialProps {
+            diffuse_color: [1.0, 1.0, 1.0, 1.0]
+            specular_color: [0.5, 0.5, 0.5, 1.0]
+            emissive_color: [0.0, 0.0, 0.0, 1.0]
+            ambient_color: [0.2, 0.2, 0.2, 1.0]
+            shininess: 32.0
+            opacity: 1.0
+            alpha_test_ref: 0.5
+            uv_offset: [0.0, 0.0]
+            uv_scale: [1.0, 1.0]
+            time: 0.0
+        }
+    }
+}
+
+// ============================================================================
+// TERRAIN SHADER PARAMS
+// ============================================================================
+
+struct TerrainShaderParams {
+    // Texture layers
+    layer0_scale: f32
+    layer1_scale: f32
+    layer2_scale: f32
+    layer3_scale: f32
+
+    // Blend weights
+    blend_sharpness: f32
+
+    // Lighting
+    sun_direction: [f32; 3]
+    sun_color: [f32; 3]
+    ambient_color: [f32; 3]
+
+    // Fog
+    fog_start: f32
+    fog_end: f32
+    fog_color: [f32; 4]
+
+    fn default(): TerrainShaderParams {
+        return TerrainShaderParams {
+            layer0_scale: 16.0
+            layer1_scale: 16.0
+            layer2_scale: 16.0
+            layer3_scale: 16.0
+            blend_sharpness: 2.0
+            sun_direction: [0.5, 0.8, 0.3]
+            sun_color: [1.0, 0.95, 0.85]
+            ambient_color: [0.3, 0.35, 0.4]
+            fog_start: 500.0
+            fog_end: 2000.0
+            fog_color: [0.7, 0.75, 0.8, 1.0]
+        }
+    }
+}
+
+// ============================================================================
+// WATER SHADER PARAMS
+// ============================================================================
+
+struct WaterShaderParams {
+    // Wave animation
+    wave_speed: f32
+    wave_scale: f32
+    wave_amplitude: f32
+
+    // Colors
+    shallow_color: [f32; 4]
+    deep_color: [f32; 4]
+
+    // Reflection/refraction
+    reflection_strength: f32
+    refraction_strength: f32
+    fresnel_bias: f32
+    fresnel_scale: f32
+    fresnel_power: f32
+
+    // Flow
+    flow_direction: [f32; 2]
+    flow_speed: f32
+
+    fn default(): WaterShaderParams {
+        return WaterShaderParams {
+            wave_speed: 0.5
+            wave_scale: 8.0
+            wave_amplitude: 0.1
+            shallow_color: [0.2, 0.4, 0.5, 0.6]
+            deep_color: [0.1, 0.15, 0.3, 0.9]
+            reflection_strength: 0.4
+            refraction_strength: 0.3
+            fresnel_bias: 0.1
+            fresnel_scale: 1.0
+            fresnel_power: 2.0
+            flow_direction: [1.0, 0.0]
+            flow_speed: 0.1
+        }
+    }
+}
+
+// ============================================================================
+// SHROUD SHADER PARAMS
+// ============================================================================
+
+struct ShroudShaderParams {
+    // Shroud colors
+    unexplored_color: [f32; 4]
+    explored_color: [f32; 4]
+    visible_color: [f32; 4]
+
+    // Transition
+    edge_softness: f32
+    transition_speed: f32
+
+    // Texture
+    noise_scale: f32
+    noise_intensity: f32
+
+    fn default(): ShroudShaderParams {
+        return ShroudShaderParams {
+            unexplored_color: [0.0, 0.0, 0.0, 1.0]
+            explored_color: [0.0, 0.0, 0.0, 0.5]
+            visible_color: [0.0, 0.0, 0.0, 0.0]
+            edge_softness: 0.1
+            transition_speed: 2.0
+            noise_scale: 4.0
+            noise_intensity: 0.1
+        }
+    }
+}
+
+// ============================================================================
+// PARTICLE SHADER PARAMS
+// ============================================================================
+
+struct ParticleShaderParams {
+    // Color modulation
+    start_color: [f32; 4]
+    end_color: [f32; 4]
+
+    // Size
+    start_size: f32
+    end_size: f32
+
+    // Soft particles
+    soft_particle_depth_scale: f32
+
+    // Animation
+    sprite_sheet_rows: i32
+    sprite_sheet_cols: i32
+    animation_speed: f32
+
+    fn default(): ParticleShaderParams {
+        return ParticleShaderParams {
+            start_color: [1.0, 1.0, 1.0, 1.0]
+            end_color: [1.0, 1.0, 1.0, 0.0]
+            start_size: 1.0
+            end_size: 2.0
+            soft_particle_depth_scale: 0.5
+            sprite_sheet_rows: 1
+            sprite_sheet_cols: 1
+            animation_speed: 1.0
+        }
+    }
+}
+
+// ============================================================================
+// DECAL SHADER PARAMS
+// ============================================================================
+
+struct DecalShaderParams {
+    // Decal properties
+    decal_color: [f32; 4]
+    decal_opacity: f32
+    decal_size: f32
+
+    // Fading
+    fade_start_distance: f32
+    fade_end_distance: f32
+    lifetime: f32
+    fade_time: f32
+
+    // Projection
+    projection_bias: f32
+
+    fn default(): DecalShaderParams {
+        return DecalShaderParams {
+            decal_color: [1.0, 1.0, 1.0, 1.0]
+            decal_opacity: 1.0
+            decal_size: 1.0
+            fade_start_distance: 100.0
+            fade_end_distance: 200.0
+            lifetime: 10.0
+            fade_time: 2.0
+            projection_bias: 0.001
+        }
+    }
+}
+
+// ============================================================================
+// LASER BEAM SHADER PARAMS
+// ============================================================================
+
+struct LaserShaderParams {
+    // Beam properties
+    beam_color: [f32; 4]
+    core_color: [f32; 4]
+    glow_color: [f32; 4]
+
+    // Size
+    beam_width: f32
+    core_width: f32
+    glow_radius: f32
+
+    // Animation
+    pulse_speed: f32
+    pulse_intensity: f32
+    noise_scale: f32
+    scroll_speed: f32
+
+    fn default(): LaserShaderParams {
+        return LaserShaderParams {
+            beam_color: [1.0, 0.2, 0.2, 0.8]
+            core_color: [1.0, 1.0, 1.0, 1.0]
+            glow_color: [1.0, 0.5, 0.5, 0.3]
+            beam_width: 0.5
+            core_width: 0.1
+            glow_radius: 2.0
+            pulse_speed: 5.0
+            pulse_intensity: 0.2
+            noise_scale: 10.0
+            scroll_speed: 2.0
+        }
+    }
+}
+
+// ============================================================================
+// CLOUD SHADOW SHADER PARAMS
+// ============================================================================
+
+struct CloudShaderParams {
+    // Cloud properties
+    cloud_color: [f32; 4]
+    shadow_intensity: f32
+
+    // Movement
+    wind_direction: [f32; 2]
+    wind_speed: f32
+
+    // Scale
+    cloud_scale: f32
+    detail_scale: f32
+
+    // Coverage
+    coverage: f32
+    softness: f32
+
+    fn default(): CloudShaderParams {
+        return CloudShaderParams {
+            cloud_color: [0.0, 0.0, 0.0, 0.3]
+            shadow_intensity: 0.3
+            wind_direction: [1.0, 0.5]
+            wind_speed: 0.02
+            cloud_scale: 0.001
+            detail_scale: 0.01
+            coverage: 0.5
+            softness: 0.3
+        }
+    }
+}
+
+// ============================================================================
+// SHADER TYPE INFO
+// ============================================================================
+
+struct ShaderTypeInfo {
+    shader_type: W3DShaderType
+    name: string
+    vertex_shader: string
+    fragment_shader: string
+    supported_variants: i32
+    required_textures: i32
+
+    fn init(shader_type: W3DShaderType, name: string, vs: string, fs: string): ShaderTypeInfo {
+        return ShaderTypeInfo {
+            shader_type: shader_type
+            name: name
+            vertex_shader: vs
+            fragment_shader: fs
+            supported_variants: 0
+            required_textures: 1
+        }
+    }
+}
+
+// ============================================================================
+// ALL 16 SHADER TYPE DEFINITIONS
+// ============================================================================
+
+const SHADER_TYPE_INFO: [ShaderTypeInfo; 16] = [
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::TerrainBase
+        name: "TerrainBase"
+        vertex_shader: "shaders/terrain_base.vs"
+        fragment_shader: "shaders/terrain_base.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Fog as i32 | ShaderVariantFlags::Shadows as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::TerrainBlend
+        name: "TerrainBlend"
+        vertex_shader: "shaders/terrain_blend.vs"
+        fragment_shader: "shaders/terrain_blend.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::NormalMapped as i32 | ShaderVariantFlags::Fog as i32
+        required_textures: 5  // 4 layers + blend map
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::TerrainRoad
+        name: "TerrainRoad"
+        vertex_shader: "shaders/terrain_road.vs"
+        fragment_shader: "shaders/terrain_road.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::TerrainCliff
+        name: "TerrainCliff"
+        vertex_shader: "shaders/terrain_cliff.vs"
+        fragment_shader: "shaders/terrain_cliff.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::NormalMapped as i32
+        required_textures: 2
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::TerrainWater
+        name: "TerrainWater"
+        vertex_shader: "shaders/water.vs"
+        fragment_shader: "shaders/water.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Reflection as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 4  // normal, reflection, refraction, foam
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ObjectDefault
+        name: "ObjectDefault"
+        vertex_shader: "shaders/object_default.vs"
+        fragment_shader: "shaders/object_default.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Specular as i32 | ShaderVariantFlags::Fog as i32 | ShaderVariantFlags::Shadows as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ObjectSkinned
+        name: "ObjectSkinned"
+        vertex_shader: "shaders/object_skinned.vs"
+        fragment_shader: "shaders/object_skinned.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Skinned as i32 | ShaderVariantFlags::Fog as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ObjectBuilding
+        name: "ObjectBuilding"
+        vertex_shader: "shaders/object_building.vs"
+        fragment_shader: "shaders/object_building.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Specular as i32 | ShaderVariantFlags::Emissive as i32 | ShaderVariantFlags::Shadows as i32
+        required_textures: 2  // diffuse + damage
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ObjectVehicle
+        name: "ObjectVehicle"
+        vertex_shader: "shaders/object_vehicle.vs"
+        fragment_shader: "shaders/object_vehicle.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::Specular as i32 | ShaderVariantFlags::NormalMapped as i32 | ShaderVariantFlags::Reflection as i32
+        required_textures: 3  // diffuse, normal, spec
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ParticleBillboard
+        name: "ParticleBillboard"
+        vertex_shader: "shaders/particle_billboard.vs"
+        fragment_shader: "shaders/particle_billboard.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32 | ShaderVariantFlags::Instanced as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::ParticleStreak
+        name: "ParticleStreak"
+        vertex_shader: "shaders/particle_streak.vs"
+        fragment_shader: "shaders/particle_streak.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::DecalProjected
+        name: "DecalProjected"
+        vertex_shader: "shaders/decal_projected.vs"
+        fragment_shader: "shaders/decal_projected.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 1
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::LaserBeam
+        name: "LaserBeam"
+        vertex_shader: "shaders/laser_beam.vs"
+        fragment_shader: "shaders/laser_beam.fs"
+        supported_variants: ShaderVariantFlags::AlphaBlend as i32 | ShaderVariantFlags::Emissive as i32
+        required_textures: 2  // beam texture, noise
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::Shroud
+        name: "Shroud"
+        vertex_shader: "shaders/shroud.vs"
+        fragment_shader: "shaders/shroud.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 2  // shroud map, noise
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::Cloud
+        name: "Cloud"
+        vertex_shader: "shaders/cloud.vs"
+        fragment_shader: "shaders/cloud.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32 | ShaderVariantFlags::AlphaBlend as i32
+        required_textures: 2  // cloud texture, detail
+    }
+    ShaderTypeInfo {
+        shader_type: W3DShaderType::PostProcess
+        name: "PostProcess"
+        vertex_shader: "shaders/post_process.vs"
+        fragment_shader: "shaders/post_process.fs"
+        supported_variants: ShaderVariantFlags::Textured as i32
+        required_textures: 1  // screen texture
+    }
+]
+
+// ============================================================================
+// SHADER TYPE MANAGER
+// ============================================================================
+
+struct ShaderTypeManager {
+    // Loaded shaders by type
+    shaders: [?*Shader; 16]
+    shader_params: [*anyopaque; 16]
+
+    // GPU feature detection
+    supports_instancing: bool
+    supports_geometry_shaders: bool
+    supports_compute_shaders: bool
+    max_texture_units: i32
+    max_uniform_buffer_size: i32
+
+    fn init(): ShaderTypeManager {
+        return ShaderTypeManager {
+            shaders: [null; 16]
+            shader_params: [null as *anyopaque; 16]
+            supports_instancing: true
+            supports_geometry_shaders: false
+            supports_compute_shaders: false
+            max_texture_units: 16
+            max_uniform_buffer_size: 65536
+        }
+    }
+
+    fn detect_gpu_features(&self) {
+        // Query GPU capabilities
+        // This would use platform-specific APIs
+        // Metal: MTLDevice.supportsFeatureSet()
+        // Vulkan: vkGetPhysicalDeviceFeatures()
+        // OpenGL: glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS)
+    }
+
+    fn load_shader_type(&self, shader_type: W3DShaderType): bool {
+        let index = shader_type as i32
+        if index < 0 or index >= 16 {
+            return false
+        }
+
+        let info = SHADER_TYPE_INFO[index]
+
+        // Load shader from files
+        let shader = load_shader(info.name, info.vertex_shader, info.fragment_shader, RendererAPI::Metal)
+        if shader == null {
+            return false
+        }
+
+        self.shaders[index] = shader
+
+        return true
+    }
+
+    fn get_shader(&self, shader_type: W3DShaderType): ?*Shader {
+        let index = shader_type as i32
+        if index < 0 or index >= 16 {
+            return null
+        }
+
+        return self.shaders[index]
+    }
+
+    fn set_terrain_params(&self, params: TerrainShaderParams) {
+        let shader = self.get_shader(W3DShaderType::TerrainBlend)
+        if shader != null {
+            shader.?.set_uniform_float("u_Layer0Scale", params.layer0_scale)
+            shader.?.set_uniform_float("u_Layer1Scale", params.layer1_scale)
+            shader.?.set_uniform_float("u_Layer2Scale", params.layer2_scale)
+            shader.?.set_uniform_float("u_Layer3Scale", params.layer3_scale)
+            shader.?.set_uniform_vec3("u_SunDirection", Vec3 { x: params.sun_direction[0], y: params.sun_direction[1], z: params.sun_direction[2] })
+            shader.?.set_uniform_float("u_FogStart", params.fog_start)
+            shader.?.set_uniform_float("u_FogEnd", params.fog_end)
+        }
+    }
+
+    fn set_water_params(&self, params: WaterShaderParams) {
+        let shader = self.get_shader(W3DShaderType::TerrainWater)
+        if shader != null {
+            shader.?.set_uniform_float("u_WaveSpeed", params.wave_speed)
+            shader.?.set_uniform_float("u_WaveScale", params.wave_scale)
+            shader.?.set_uniform_float("u_WaveAmplitude", params.wave_amplitude)
+            shader.?.set_uniform_float("u_ReflectionStrength", params.reflection_strength)
+            shader.?.set_uniform_float("u_RefractionStrength", params.refraction_strength)
+        }
+    }
+
+    fn set_shroud_params(&self, params: ShroudShaderParams) {
+        let shader = self.get_shader(W3DShaderType::Shroud)
+        if shader != null {
+            shader.?.set_uniform_float("u_EdgeSoftness", params.edge_softness)
+            shader.?.set_uniform_float("u_TransitionSpeed", params.transition_speed)
+            shader.?.set_uniform_float("u_NoiseScale", params.noise_scale)
+            shader.?.set_uniform_float("u_NoiseIntensity", params.noise_intensity)
+        }
+    }
+
+    fn set_particle_params(&self, params: ParticleShaderParams) {
+        let shader = self.get_shader(W3DShaderType::ParticleBillboard)
+        if shader != null {
+            shader.?.set_uniform_float("u_StartSize", params.start_size)
+            shader.?.set_uniform_float("u_EndSize", params.end_size)
+            shader.?.set_uniform_float("u_SoftParticleScale", params.soft_particle_depth_scale)
+        }
+    }
+
+    fn set_cloud_params(&self, params: CloudShaderParams) {
+        let shader = self.get_shader(W3DShaderType::Cloud)
+        if shader != null {
+            shader.?.set_uniform_float("u_ShadowIntensity", params.shadow_intensity)
+            shader.?.set_uniform_float("u_WindSpeed", params.wind_speed)
+            shader.?.set_uniform_float("u_CloudScale", params.cloud_scale)
+            shader.?.set_uniform_float("u_Coverage", params.coverage)
+            shader.?.set_uniform_float("u_Softness", params.softness)
+        }
+    }
+
+    fn load_all_shaders(&self): bool {
+        let mut success = true
+
+        for i in 0..16 {
+            let shader_type = i as W3DShaderType
+            if !self.load_shader_type(shader_type) {
+                success = false
+            }
+        }
+
+        return success
+    }
+
+    fn reload_all_shaders(&self): bool {
+        // Hot-reload support for development
+        return self.load_all_shaders()
+    }
+}
+
+// ============================================================================
+// GLOBAL SHADER TYPE MANAGER
+// ============================================================================
+
+var g_shader_type_manager: ?ShaderTypeManager = null
+
+export fn init_shader_types() {
+    g_shader_type_manager = ShaderTypeManager.init()
+    g_shader_type_manager.?.detect_gpu_features()
+}
+
+export fn shutdown_shader_types() {
+    g_shader_type_manager = null
+}
+
+export fn load_all_shader_types(): bool {
+    if g_shader_type_manager == null {
+        return false
+    }
+
+    return g_shader_type_manager.?.load_all_shaders()
+}
+
+export fn get_shader_by_type(shader_type: W3DShaderType): ?*Shader {
+    if g_shader_type_manager == null {
+        return null
+    }
+
+    return g_shader_type_manager.?.get_shader(shader_type)
+}
+
+export fn reload_shader_types(): bool {
+    if g_shader_type_manager == null {
+        return false
+    }
+
+    return g_shader_type_manager.?.reload_all_shaders()
+}
+
+export fn get_shader_type_info(shader_type: W3DShaderType): ShaderTypeInfo {
+    let index = shader_type as i32
+    if index >= 0 and index < 16 {
+        return SHADER_TYPE_INFO[index]
+    }
+
+    return ShaderTypeInfo.init(W3DShaderType::ObjectDefault, "Unknown", "", "")
+}
+
+// ============================================================================
+// SHADER PRESET CONFIGURATIONS
+// ============================================================================
+
+struct ShaderPreset {
+    name: string
+    terrain_params: TerrainShaderParams
+    water_params: WaterShaderParams
+    shroud_params: ShroudShaderParams
+    cloud_params: CloudShaderParams
+}
+
+const PRESET_DESERT: ShaderPreset = ShaderPreset {
+    name: "Desert"
+    terrain_params: TerrainShaderParams {
+        layer0_scale: 16.0
+        layer1_scale: 16.0
+        layer2_scale: 16.0
+        layer3_scale: 16.0
+        blend_sharpness: 2.0
+        sun_direction: [0.6, 0.7, 0.4]
+        sun_color: [1.0, 0.9, 0.75]
+        ambient_color: [0.4, 0.35, 0.3]
+        fog_start: 800.0
+        fog_end: 3000.0
+        fog_color: [0.85, 0.8, 0.7, 1.0]
+    }
+    water_params: WaterShaderParams.default()
+    shroud_params: ShroudShaderParams.default()
+    cloud_params: CloudShaderParams {
+        cloud_color: [0.0, 0.0, 0.0, 0.2]
+        shadow_intensity: 0.2
+        wind_direction: [0.8, 0.6]
+        wind_speed: 0.015
+        cloud_scale: 0.0008
+        detail_scale: 0.008
+        coverage: 0.3
+        softness: 0.4
+    }
+}
+
+const PRESET_TEMPERATE: ShaderPreset = ShaderPreset {
+    name: "Temperate"
+    terrain_params: TerrainShaderParams {
+        layer0_scale: 16.0
+        layer1_scale: 16.0
+        layer2_scale: 16.0
+        layer3_scale: 16.0
+        blend_sharpness: 2.0
+        sun_direction: [0.5, 0.8, 0.3]
+        sun_color: [1.0, 0.95, 0.9]
+        ambient_color: [0.35, 0.4, 0.45]
+        fog_start: 600.0
+        fog_end: 2500.0
+        fog_color: [0.7, 0.75, 0.8, 1.0]
+    }
+    water_params: WaterShaderParams.default()
+    shroud_params: ShroudShaderParams.default()
+    cloud_params: CloudShaderParams.default()
+}
+
+const PRESET_URBAN: ShaderPreset = ShaderPreset {
+    name: "Urban"
+    terrain_params: TerrainShaderParams {
+        layer0_scale: 8.0
+        layer1_scale: 8.0
+        layer2_scale: 8.0
+        layer3_scale: 8.0
+        blend_sharpness: 3.0
+        sun_direction: [0.4, 0.6, 0.5]
+        sun_color: [0.95, 0.95, 1.0]
+        ambient_color: [0.3, 0.3, 0.35]
+        fog_start: 400.0
+        fog_end: 1500.0
+        fog_color: [0.6, 0.6, 0.65, 1.0]
+    }
+    water_params: WaterShaderParams.default()
+    shroud_params: ShroudShaderParams.default()
+    cloud_params: CloudShaderParams {
+        cloud_color: [0.0, 0.0, 0.0, 0.25]
+        shadow_intensity: 0.25
+        wind_direction: [1.0, 0.2]
+        wind_speed: 0.01
+        cloud_scale: 0.0012
+        detail_scale: 0.012
+        coverage: 0.6
+        softness: 0.25
+    }
+}
+
+export fn apply_shader_preset(preset: *ShaderPreset) {
+    if g_shader_type_manager != null {
+        g_shader_type_manager.?.set_terrain_params(preset.terrain_params)
+        g_shader_type_manager.?.set_water_params(preset.water_params)
+        g_shader_type_manager.?.set_shroud_params(preset.shroud_params)
+        g_shader_type_manager.?.set_cloud_params(preset.cloud_params)
+    }
+}
