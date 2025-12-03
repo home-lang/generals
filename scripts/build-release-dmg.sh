@@ -74,7 +74,9 @@ HOME_DIR="$PROJECT_DIR/../home"
 if [ -d "$HOME_DIR" ]; then
     cd "$HOME_DIR"
     echo "   Building via Home compiler..."
-    zig build generals -Doptimize=ReleaseFast 2>&1 || {
+    # Use 'zig build' to install the executable without running it
+    # The generals executable is installed via b.installArtifact()
+    zig build -Doptimize=ReleaseFast 2>&1 || {
         echo -e "${YELLOW}   Warning: Fresh build had issues, using existing binary...${NC}"
     }
     cd "$PROJECT_DIR"
