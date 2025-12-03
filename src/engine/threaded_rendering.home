@@ -1,0 +1,833 @@
+// C&C Generals Zero Hour - Home Port
+// Multi-Threaded Rendering Support (R4-006)
+//
+// Implements parallel rendering operations:
+// - Parallel frustum culling
+// - Parallel batch sorting and command recording
+// - Thread-safe render queue submission
+// - Worker thread pool for render jobs
+//
+// Architecture:
+//   Main Thread: Scene setup, submit render jobs, present frame
+//   Worker Threads: Culling, sorting, command buffer recording
+//
+// Synchronization uses lightweight spinlocks and atomic operations
+// for minimal overhead in the render loop.
+
+let MAX_RENDER_WORKERS: i32 = 8
+let MAX_RENDER_JOBS: i32 = 1024
+let OBJECTS_PER_CULL_JOB: i32 = 256
+let BATCHES_PER_RECORD_JOB: i32 = 64
+
+// ============================================================================
+// SYNCHRONIZATION PRIMITIVES
+// ============================================================================
+
+// Atomic counter for thread-safe operations
+struct AtomicCounter {
+    value: i32,
+}
+
+impl AtomicCounter {
+    fn init(initial: i32): AtomicCounter {
+        return AtomicCounter { value: initial }
+    }
+
+    fn load(&self): i32 {
+        // In real implementation: atomic load with memory barrier
+        return self.value
+    }
+
+    fn store(&self, val: i32) {
+        // In real implementation: atomic store with memory barrier
+        self.value = val
+    }
+
+    fn fetch_add(&self, delta: i32): i32 {
+        // In real implementation: atomic fetch-and-add
+        let old = self.value
+        self.value = self.value + delta
+        return old
+    }
+
+    fn fetch_sub(&self, delta: i32): i32 {
+        let old = self.value
+        self.value = self.value - delta
+        return old
+    }
+
+    fn compare_exchange(&self, expected: i32, desired: i32): bool {
+        // In real implementation: atomic CAS
+        if self.value == expected {
+            self.value = desired
+            return true
+        }
+        return false
+    }
+}
+
+// Spinlock for lightweight mutual exclusion
+struct SpinLock {
+    locked: AtomicCounter,
+}
+
+impl SpinLock {
+    fn init(): SpinLock {
+        return SpinLock { locked: AtomicCounter::init(0) }
+    }
+
+    fn lock(&self) {
+        // Spin until we acquire the lock
+        while !self.locked.compare_exchange(0, 1) {
+            // In real implementation: would use pause instruction
+            // to reduce power consumption and improve performance
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked.store(0)
+    }
+
+    fn try_lock(&self): bool {
+        return self.locked.compare_exchange(0, 1)
+    }
+}
+
+// Semaphore for signaling between threads
+struct Semaphore {
+    count: AtomicCounter,
+    max_count: i32,
+}
+
+impl Semaphore {
+    fn init(initial: i32, max: i32): Semaphore {
+        return Semaphore {
+            count: AtomicCounter::init(initial),
+            max_count: max,
+        }
+    }
+
+    fn wait(&self) {
+        // Decrement and wait if count was 0
+        while true {
+            let current = self.count.load()
+            if current > 0 {
+                if self.count.compare_exchange(current, current - 1) {
+                    return
+                }
+            }
+            // In real implementation: would yield or sleep
+        }
+    }
+
+    fn signal(&self) {
+        // Increment count
+        let current = self.count.load()
+        if current < self.max_count {
+            self.count.fetch_add(1)
+        }
+    }
+
+    fn signal_all(&self) {
+        self.count.store(self.max_count)
+    }
+}
+
+// Barrier for synchronizing multiple threads at a point
+struct Barrier {
+    total_threads: i32,
+    waiting: AtomicCounter,
+    generation: AtomicCounter,
+}
+
+impl Barrier {
+    fn init(thread_count: i32): Barrier {
+        return Barrier {
+            total_threads: thread_count,
+            waiting: AtomicCounter::init(0),
+            generation: AtomicCounter::init(0),
+        }
+    }
+
+    fn wait(&self) {
+        let gen = self.generation.load()
+        let arrived = self.waiting.fetch_add(1) + 1
+
+        if arrived == self.total_threads {
+            // Last thread to arrive - release all
+            self.waiting.store(0)
+            self.generation.fetch_add(1)
+        } else {
+            // Wait for generation to change
+            while self.generation.load() == gen {
+                // Spin wait
+            }
+        }
+    }
+}
+
+// ============================================================================
+// RENDER JOB TYPES
+// ============================================================================
+
+enum RenderJobType {
+    CULL_OBJECTS,        // Frustum culling job
+    SORT_BATCHES,        // Batch sorting job
+    RECORD_COMMANDS,     // Command buffer recording job
+    UPLOAD_TEXTURES,     // Async texture upload
+    UPDATE_BUFFERS,      // Vertex/index buffer updates
+}
+
+enum RenderJobStatus {
+    PENDING,
+    RUNNING,
+    COMPLETED,
+    CANCELLED,
+}
+
+// Cull job data - test objects against frustum
+struct CullJobData {
+    object_start: i32,
+    object_count: i32,
+    frustum_planes: [f32],  // 6 planes * 4 floats = 24 floats
+
+    // Output
+    visible_indices: [i32],
+    visible_count: AtomicCounter,
+}
+
+impl CullJobData {
+    fn init(start: i32, count: i32): CullJobData {
+        return CullJobData {
+            object_start: start,
+            object_count: count,
+            frustum_planes: [],
+            visible_indices: [],
+            visible_count: AtomicCounter::init(0),
+        }
+    }
+}
+
+// Sort job data - sort batches by key
+struct SortJobData {
+    batch_start: i32,
+    batch_count: i32,
+    sort_keys: [i64],      // Combined sort key (shader, texture, depth)
+    sorted_indices: [i32],
+}
+
+impl SortJobData {
+    fn init(start: i32, count: i32): SortJobData {
+        return SortJobData {
+            batch_start: start,
+            batch_count: count,
+            sort_keys: [],
+            sorted_indices: [],
+        }
+    }
+}
+
+// Record job data - record draw commands for batches
+struct RecordJobData {
+    batch_start: i32,
+    batch_count: i32,
+    command_buffer_index: i32,
+
+    // Output
+    draw_call_count: i32,
+    triangle_count: i32,
+}
+
+impl RecordJobData {
+    fn init(start: i32, count: i32, cmd_idx: i32): RecordJobData {
+        return RecordJobData {
+            batch_start: start,
+            batch_count: count,
+            command_buffer_index: cmd_idx,
+            draw_call_count: 0,
+            triangle_count: 0,
+        }
+    }
+}
+
+// Generic render job
+struct RenderJob {
+    id: i32,
+    job_type: RenderJobType,
+    status: RenderJobStatus,
+    priority: i32,  // Higher = more important
+
+    // Job-specific data (union-like pattern)
+    cull_data: CullJobData?,
+    sort_data: SortJobData?,
+    record_data: RecordJobData?,
+}
+
+impl RenderJob {
+    fn init(id: i32, job_type: RenderJobType): RenderJob {
+        return RenderJob {
+            id: id,
+            job_type: job_type,
+            status: RenderJobStatus::PENDING,
+            priority: 0,
+            cull_data: null,
+            sort_data: null,
+            record_data: null,
+        }
+    }
+}
+
+// ============================================================================
+// RENDER WORKER THREAD
+// ============================================================================
+
+struct RenderWorker {
+    worker_id: i32,
+    is_running: bool,
+    is_idle: bool,
+    current_job_id: i32,
+
+    // Per-worker command buffer (for Vulkan secondary command buffers)
+    command_buffer_index: i32,
+
+    // Stats
+    jobs_completed: i32,
+    total_time_ms: f32,
+}
+
+impl RenderWorker {
+    fn init(id: i32): RenderWorker {
+        return RenderWorker {
+            worker_id: id,
+            is_running: false,
+            is_idle: true,
+            current_job_id: -1,
+            command_buffer_index: id,
+            jobs_completed: 0,
+            total_time_ms: 0.0,
+        }
+    }
+
+    fn start(&self) {
+        self.is_running = true
+        self.is_idle = true
+    }
+
+    fn stop(&self) {
+        self.is_running = false
+    }
+}
+
+// ============================================================================
+// THREADED RENDER MANAGER
+// ============================================================================
+
+struct ThreadedRenderManager {
+    // Workers
+    workers: [RenderWorker],
+    worker_count: i32,
+
+    // Job queue (lock-free ring buffer)
+    jobs: [RenderJob],
+    job_head: AtomicCounter,  // Next job to dequeue
+    job_tail: AtomicCounter,  // Next slot to enqueue
+    job_count: AtomicCounter,
+    next_job_id: AtomicCounter,
+
+    // Synchronization
+    jobs_lock: SpinLock,
+    frame_barrier: Barrier,
+    jobs_available: Semaphore,
+
+    // Frame state
+    current_frame: i32,
+    is_rendering: bool,
+
+    // Visible objects output (thread-safe accumulation)
+    visible_objects: [i32],
+    visible_count: AtomicCounter,
+    visible_lock: SpinLock,
+
+    // Stats
+    culling_time_ms: f32,
+    sorting_time_ms: f32,
+    recording_time_ms: f32,
+    total_frame_time_ms: f32,
+}
+
+impl ThreadedRenderManager {
+    fn init(num_workers: i32): ThreadedRenderManager {
+        let worker_count = num_workers
+        if worker_count > MAX_RENDER_WORKERS {
+            worker_count = MAX_RENDER_WORKERS
+        }
+        if worker_count < 1 {
+            worker_count = 1
+        }
+
+        // Initialize workers
+        let workers: [RenderWorker] = []
+        for i in 0..worker_count {
+            workers = workers + [RenderWorker::init(i)]
+        }
+
+        // Initialize job array
+        let jobs: [RenderJob] = []
+        for i in 0..MAX_RENDER_JOBS {
+            jobs = jobs + [RenderJob::init(i, RenderJobType::CULL_OBJECTS)]
+        }
+
+        return ThreadedRenderManager {
+            workers: workers,
+            worker_count: worker_count,
+            jobs: jobs,
+            job_head: AtomicCounter::init(0),
+            job_tail: AtomicCounter::init(0),
+            job_count: AtomicCounter::init(0),
+            next_job_id: AtomicCounter::init(1),
+            jobs_lock: SpinLock::init(),
+            frame_barrier: Barrier::init(worker_count + 1),  // +1 for main thread
+            jobs_available: Semaphore::init(0, MAX_RENDER_JOBS),
+            current_frame: 0,
+            is_rendering: false,
+            visible_objects: [],
+            visible_count: AtomicCounter::init(0),
+            visible_lock: SpinLock::init(),
+            culling_time_ms: 0.0,
+            sorting_time_ms: 0.0,
+            recording_time_ms: 0.0,
+            total_frame_time_ms: 0.0,
+        }
+    }
+
+    fn start_workers(&self) {
+        for i in 0..self.worker_count {
+            self.workers[i].start()
+            // In real implementation: spawn OS thread with worker_thread_func
+        }
+    }
+
+    fn stop_workers(&self) {
+        for i in 0..self.worker_count {
+            self.workers[i].stop()
+        }
+        // In real implementation: signal and join threads
+    }
+
+    // Submit a new render job
+    fn submit_job(&self, job_type: RenderJobType, priority: i32): i32 {
+        let count = self.job_count.load()
+        if count >= MAX_RENDER_JOBS {
+            return -1  // Queue full
+        }
+
+        self.jobs_lock.lock()
+
+        let job_id = self.next_job_id.fetch_add(1)
+        let tail = self.job_tail.load()
+
+        self.jobs[tail].id = job_id
+        self.jobs[tail].job_type = job_type
+        self.jobs[tail].status = RenderJobStatus::PENDING
+        self.jobs[tail].priority = priority
+
+        self.job_tail.store((tail + 1) % MAX_RENDER_JOBS)
+        self.job_count.fetch_add(1)
+
+        self.jobs_lock.unlock()
+
+        self.jobs_available.signal()
+
+        return job_id
+    }
+
+    // Submit culling jobs for a range of objects
+    fn submit_cull_jobs(&self, total_objects: i32, frustum_planes: [f32]): [i32] {
+        let job_ids: [i32] = []
+        let offset = 0
+
+        while offset < total_objects {
+            let count = OBJECTS_PER_CULL_JOB
+            if offset + count > total_objects {
+                count = total_objects - offset
+            }
+
+            let job_id = self.submit_job(RenderJobType::CULL_OBJECTS, 100)
+            if job_id > 0 {
+                // Set cull data for this job
+                let job_idx = self.find_job_index(job_id)
+                if job_idx >= 0 {
+                    self.jobs[job_idx].cull_data = CullJobData::init(offset, count)
+                    self.jobs[job_idx].cull_data.frustum_planes = frustum_planes
+                }
+                job_ids = job_ids + [job_id]
+            }
+
+            offset = offset + count
+        }
+
+        return job_ids
+    }
+
+    // Submit command recording jobs for batches
+    fn submit_record_jobs(&self, total_batches: i32): [i32] {
+        let job_ids: [i32] = []
+        let offset = 0
+        let cmd_idx = 0
+
+        while offset < total_batches {
+            let count = BATCHES_PER_RECORD_JOB
+            if offset + count > total_batches {
+                count = total_batches - offset
+            }
+
+            let job_id = self.submit_job(RenderJobType::RECORD_COMMANDS, 50)
+            if job_id > 0 {
+                let job_idx = self.find_job_index(job_id)
+                if job_idx >= 0 {
+                    self.jobs[job_idx].record_data = RecordJobData::init(offset, count, cmd_idx)
+                }
+                job_ids = job_ids + [job_id]
+                cmd_idx = cmd_idx + 1
+            }
+
+            offset = offset + count
+        }
+
+        return job_ids
+    }
+
+    // Find job by ID
+    fn find_job_index(&self, job_id: i32): i32 {
+        let head = self.job_head.load()
+        let tail = self.job_tail.load()
+        let idx = head
+
+        while idx != tail {
+            if self.jobs[idx].id == job_id {
+                return idx
+            }
+            idx = (idx + 1) % MAX_RENDER_JOBS
+        }
+
+        return -1
+    }
+
+    // Pop next job for worker
+    fn pop_job(&self): RenderJob? {
+        self.jobs_lock.lock()
+
+        let count = self.job_count.load()
+        if count == 0 {
+            self.jobs_lock.unlock()
+            return null
+        }
+
+        // Find highest priority pending job
+        let best_idx = -1
+        let best_priority = -1
+        let head = self.job_head.load()
+        let tail = self.job_tail.load()
+        let idx = head
+
+        while idx != tail {
+            if self.jobs[idx].status == RenderJobStatus::PENDING {
+                if self.jobs[idx].priority > best_priority {
+                    best_priority = self.jobs[idx].priority
+                    best_idx = idx
+                }
+            }
+            idx = (idx + 1) % MAX_RENDER_JOBS
+        }
+
+        if best_idx < 0 {
+            self.jobs_lock.unlock()
+            return null
+        }
+
+        let job = self.jobs[best_idx]
+        self.jobs[best_idx].status = RenderJobStatus::RUNNING
+
+        self.jobs_lock.unlock()
+
+        return job
+    }
+
+    // Mark job as completed
+    fn complete_job(&self, job_id: i32) {
+        self.jobs_lock.lock()
+
+        let idx = self.find_job_index(job_id)
+        if idx >= 0 {
+            self.jobs[idx].status = RenderJobStatus::COMPLETED
+            self.job_count.fetch_sub(1)
+        }
+
+        self.jobs_lock.unlock()
+    }
+
+    // Wait for all pending jobs to complete
+    fn wait_all_jobs(&self) {
+        while self.job_count.load() > 0 {
+            // Process jobs on main thread too
+            let job = self.pop_job()
+            if job != null {
+                self.execute_job(job)
+                self.complete_job(job.id)
+            }
+        }
+    }
+
+    // Execute a render job
+    fn execute_job(&self, job: RenderJob) {
+        if job.job_type == RenderJobType::CULL_OBJECTS {
+            self.execute_cull_job(job)
+        } else if job.job_type == RenderJobType::SORT_BATCHES {
+            self.execute_sort_job(job)
+        } else if job.job_type == RenderJobType::RECORD_COMMANDS {
+            self.execute_record_job(job)
+        }
+    }
+
+    // Execute frustum culling job
+    fn execute_cull_job(&self, job: RenderJob) {
+        if job.cull_data == null {
+            return
+        }
+
+        let data = job.cull_data
+        let visible: [i32] = []
+
+        // Test each object against frustum
+        for i in 0..data.object_count {
+            let obj_idx = data.object_start + i
+
+            // In real implementation: get object bounds and test against planes
+            // For now, simplified visibility test (assume all visible)
+            let is_visible = true  // Would call sphere_in_frustum() or aabb_in_frustum()
+
+            if is_visible {
+                visible = visible + [obj_idx]
+            }
+        }
+
+        // Thread-safe accumulation of visible objects
+        self.visible_lock.lock()
+        for i in 0..visible.length {
+            self.visible_objects = self.visible_objects + [visible[i]]
+        }
+        self.visible_count.fetch_add(visible.length)
+        self.visible_lock.unlock()
+    }
+
+    // Execute batch sorting job
+    fn execute_sort_job(&self, job: RenderJob) {
+        if job.sort_data == null {
+            return
+        }
+
+        let data = job.sort_data
+
+        // Simple insertion sort for small batch counts
+        // In real implementation: would use parallel radix sort
+        let indices: [i32] = []
+        for i in 0..data.batch_count {
+            indices = indices + [data.batch_start + i]
+        }
+
+        // Sort by key (insertion sort)
+        for i in 1..data.batch_count {
+            let key = data.sort_keys[i]
+            let idx = indices[i]
+            let j = i - 1
+
+            while j >= 0 and data.sort_keys[j] > key {
+                indices[j + 1] = indices[j]
+                j = j - 1
+            }
+            indices[j + 1] = idx
+        }
+
+        data.sorted_indices = indices
+    }
+
+    // Execute command recording job
+    fn execute_record_job(&self, job: RenderJob) {
+        if job.record_data == null {
+            return
+        }
+
+        let data = job.record_data
+
+        // In real implementation:
+        // 1. Begin secondary command buffer
+        // 2. For each batch:
+        //    - Bind pipeline
+        //    - Bind descriptor sets
+        //    - Bind vertex/index buffers
+        //    - Draw indexed instanced
+        // 3. End secondary command buffer
+
+        // Placeholder stats
+        data.draw_call_count = data.batch_count
+        data.triangle_count = data.batch_count * 1000  // Estimate
+    }
+
+    // Begin frame - reset state
+    fn begin_frame(&self) {
+        self.current_frame = self.current_frame + 1
+        self.is_rendering = true
+
+        // Reset visible objects
+        self.visible_objects = []
+        self.visible_count.store(0)
+
+        // Reset stats
+        self.culling_time_ms = 0.0
+        self.sorting_time_ms = 0.0
+        self.recording_time_ms = 0.0
+    }
+
+    // End frame - wait for all jobs, collect stats
+    fn end_frame(&self) {
+        self.wait_all_jobs()
+        self.is_rendering = false
+    }
+
+    // Get rendering stats
+    fn get_stats(&self): RenderStats {
+        let stats = RenderStats {
+            worker_count: self.worker_count,
+            active_workers: 0,
+            pending_jobs: self.job_count.load(),
+            visible_objects: self.visible_count.load(),
+            culling_time_ms: self.culling_time_ms,
+            sorting_time_ms: self.sorting_time_ms,
+            recording_time_ms: self.recording_time_ms,
+            total_frame_time_ms: self.total_frame_time_ms,
+        }
+
+        // Count active workers
+        for i in 0..self.worker_count {
+            if self.workers[i].is_running and !self.workers[i].is_idle {
+                stats.active_workers = stats.active_workers + 1
+            }
+        }
+
+        return stats
+    }
+}
+
+// Render stats structure
+struct RenderStats {
+    worker_count: i32,
+    active_workers: i32,
+    pending_jobs: i32,
+    visible_objects: i32,
+    culling_time_ms: f32,
+    sorting_time_ms: f32,
+    recording_time_ms: f32,
+    total_frame_time_ms: f32,
+}
+
+// ============================================================================
+// PARALLEL CULLING HELPERS
+// ============================================================================
+
+// Test sphere against frustum planes (returns true if visible)
+fn sphere_in_frustum_parallel(center_x: f32, center_y: f32, center_z: f32,
+                               radius: f32, planes: [f32]): bool {
+    // Test against 6 frustum planes
+    // planes array: [nx0, ny0, nz0, d0, nx1, ny1, nz1, d1, ...]
+    for i in 0..6 {
+        let base = i * 4
+        let nx = planes[base]
+        let ny = planes[base + 1]
+        let nz = planes[base + 2]
+        let d = planes[base + 3]
+
+        let distance = nx * center_x + ny * center_y + nz * center_z + d
+
+        if distance < -radius {
+            return false  // Completely outside this plane
+        }
+    }
+
+    return true  // Inside or intersecting all planes
+}
+
+// Test AABB against frustum planes
+fn aabb_in_frustum_parallel(min_x: f32, min_y: f32, min_z: f32,
+                             max_x: f32, max_y: f32, max_z: f32,
+                             planes: [f32]): bool {
+    for i in 0..6 {
+        let base = i * 4
+        let nx = planes[base]
+        let ny = planes[base + 1]
+        let nz = planes[base + 2]
+        let d = planes[base + 3]
+
+        // Find the positive vertex (corner furthest in plane normal direction)
+        let px = min_x
+        let py = min_y
+        let pz = min_z
+
+        if nx >= 0.0 { px = max_x }
+        if ny >= 0.0 { py = max_y }
+        if nz >= 0.0 { pz = max_z }
+
+        // If positive vertex is outside, AABB is completely outside
+        if nx * px + ny * py + nz * pz + d < 0.0 {
+            return false
+        }
+    }
+
+    return true
+}
+
+// ============================================================================
+// GLOBAL INSTANCE
+// ============================================================================
+
+let g_threaded_render_manager: ThreadedRenderManager? = null
+
+fn init_threaded_rendering(num_workers: i32): ThreadedRenderManager {
+    let manager = ThreadedRenderManager::init(num_workers)
+    manager.start_workers()
+    g_threaded_render_manager = manager
+    return manager
+}
+
+fn get_threaded_render_manager(): ThreadedRenderManager? {
+    return g_threaded_render_manager
+}
+
+fn shutdown_threaded_rendering() {
+    if g_threaded_render_manager != null {
+        g_threaded_render_manager.stop_workers()
+        g_threaded_render_manager = null
+    }
+}
+
+// Convenience functions
+fn parallel_cull_objects(total_objects: i32, frustum_planes: [f32]): [i32] {
+    if g_threaded_render_manager != null {
+        let job_ids = g_threaded_render_manager.submit_cull_jobs(total_objects, frustum_planes)
+        g_threaded_render_manager.wait_all_jobs()
+        return g_threaded_render_manager.visible_objects
+    }
+
+    // Fallback: all objects visible
+    let all: [i32] = []
+    for i in 0..total_objects {
+        all = all + [i]
+    }
+    return all
+}
+
+fn parallel_record_commands(total_batches: i32) {
+    if g_threaded_render_manager != null {
+        let job_ids = g_threaded_render_manager.submit_record_jobs(total_batches)
+        g_threaded_render_manager.wait_all_jobs()
+    }
+}

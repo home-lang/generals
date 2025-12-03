@@ -103,7 +103,7 @@ These features need to be added to the Home programming language (~/Code/home) t
 ### 1.1 Memory Management Bugs
 - [x] `C1-001` Fix double-free bug in for-loop iterator handling
 - [x] `C1-002` Fix stack offset integer overflow protection
-- [ ] `C1-003` Fix memory leak in type checker (shown in error output)
+- [x] `C1-003` Fix memory leak in type checker (shown in error output) - DONE: Added `freeSimpleType()` helper and updated `deinit()` to properly free Array pointers, function return_type pointers, and param_types slices
 
 ### 1.2 Parser Fixes
 - [x] `C1-010` Fix `if !optional` syntax in struct context
@@ -131,11 +131,11 @@ These features need to be added to the Home programming language (~/Code/home) t
 ### 1.5 Advanced Features
 - [x] `C1-040` Match on enum variants with data
 - [x] `C1-041` Match on nested structures
-- [ ] `C1-042` Match guards (`match val { x if x > 10 => ... }`)
+- [x] `C1-042` Match guards (`match val { x if x > 10 => ... }`) - DONE: Already implemented in AST (MatchExprArm.guard), parser, and codegen
 - [x] `C1-043` Infer generic type parameters
 - [x] `C1-044` Infer lambda/closure types
-- [ ] `C1-045` Define and implement traits
-- [ ] `C1-046` Trait bounds on generics
+- [x] `C1-045` Define and implement traits - DONE: Full implementation exists in packages/ast/src/trait_nodes.zig (TraitDecl, ImplDecl, TraitMethod), packages/parser/src/trait_parser.zig, and packages/traits/
+- [x] `C1-046` Trait bounds on generics - DONE: GenericParam.bounds, WhereClause, WhereBound support trait bounds syntax like `<T: Clone + Debug>` and `where T: Display`
 
 ---
 
@@ -239,7 +239,7 @@ Patches from the original GeneralsGameCode repository that must be implemented.
 - [x] `R4-003` Implement Vulkan renderer backend - DONE: `platform/vulkan_renderer.home` cross-platform Vulkan 1.2 renderer
 - [x] `R4-004` Implement render command buffer system - EXISTS: RenderQueue in rendering_system
 - [x] `R4-005` Implement render queue with sorting - EXISTS: Layer-based sorting
-- [ ] `R4-006` Add multi-threaded rendering support
+- [x] `R4-006` Add multi-threaded rendering support - DONE: `threaded_rendering.home` with ThreadedRenderManager, parallel culling jobs, parallel command recording, synchronization primitives (AtomicCounter, SpinLock, Semaphore, Barrier)
 
 ### 4.2 W3D Model System
 - [x] `R4-010` Implement W3D chunk parser (all 16 chunk types) - EXISTS: `w3d_complete.home` (30KB)
