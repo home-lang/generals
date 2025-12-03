@@ -1,0 +1,711 @@
+// Auto-Update System
+// C&C Generals Zero Hour - Home Port
+// Sparkle-compatible auto-update for macOS, cross-platform update checking
+
+// Update status
+enum UpdateStatus {
+    Idle
+    CheckingForUpdates
+    UpdateAvailable
+    Downloading
+    ReadyToInstall
+    Installing
+    UpToDate
+    Error
+}
+
+// Platform types
+enum Platform {
+    MacOS
+    Windows
+    Linux
+}
+
+// Release channel
+enum ReleaseChannel {
+    Stable
+    Beta
+    Nightly
+}
+
+// Version info
+struct Version {
+    major: u32
+    minor: u32
+    patch: u32
+    build: u32
+    channel: ReleaseChannel
+
+    fn to_string(self): string {
+        return @intToString(self.major) + "." +
+               @intToString(self.minor) + "." +
+               @intToString(self.patch)
+    }
+
+    fn compare(self, other: Version): i32 {
+        if self.major != other.major {
+            return if self.major > other.major { 1 } else { -1 }
+        }
+        if self.minor != other.minor {
+            return if self.minor > other.minor { 1 } else { -1 }
+        }
+        if self.patch != other.patch {
+            return if self.patch > other.patch { 1 } else { -1 }
+        }
+        if self.build != other.build {
+            return if self.build > other.build { 1 } else { -1 }
+        }
+        return 0
+    }
+
+    fn is_newer_than(self, other: Version): bool {
+        return self.compare(other) > 0
+    }
+
+    fn parse(version_str: string): ?Version {
+        // Parse version string like "1.2.3" or "1.2.3-beta.4"
+        let parts = split(version_str, ".")
+        if parts.len < 3 {
+            return null
+        }
+
+        let major = parse_int(parts[0]) orelse return null
+        let minor = parse_int(parts[1]) orelse return null
+
+        // Handle channel suffix in patch
+        var patch_str = parts[2]
+        var channel = ReleaseChannel.Stable
+        var build: u32 = 0
+
+        if contains(patch_str, "-beta") {
+            channel = ReleaseChannel.Beta
+            let beta_parts = split(patch_str, "-beta.")
+            patch_str = beta_parts[0]
+            if beta_parts.len > 1 {
+                build = parse_int(beta_parts[1]) orelse 0
+            }
+        } else if contains(patch_str, "-nightly") {
+            channel = ReleaseChannel.Nightly
+            let nightly_parts = split(patch_str, "-nightly.")
+            patch_str = nightly_parts[0]
+            if nightly_parts.len > 1 {
+                build = parse_int(nightly_parts[1]) orelse 0
+            }
+        }
+
+        let patch = parse_int(patch_str) orelse return null
+
+        return Version {
+            major: @intCast(u32, major)
+            minor: @intCast(u32, minor)
+            patch: @intCast(u32, patch)
+            build: build
+            channel: channel
+        }
+    }
+}
+
+// Update info from server
+struct UpdateInfo {
+    version: Version
+    release_date: string
+    release_notes: string
+    release_notes_html: string
+    download_url: string
+    download_size: u64
+    signature: string  // EdDSA signature for Sparkle
+    min_system_version: string
+    is_critical: bool
+    platform: Platform
+}
+
+// Sparkle appcast item (for macOS)
+struct SparkleAppcastItem {
+    title: string
+    pubDate: string
+    description: string
+    enclosure_url: string
+    enclosure_length: u64
+    enclosure_type: string
+    sparkle_version: string
+    sparkle_short_version: string
+    sparkle_minimum_system_version: string
+    sparkle_ed_signature: string
+}
+
+// Update manager
+struct UpdateManager {
+    current_version: Version
+    latest_version: ?Version
+    update_info: ?UpdateInfo
+    status: UpdateStatus
+    channel: ReleaseChannel
+    platform: Platform
+
+    // Update server configuration
+    appcast_url: string
+    update_server_url: string
+
+    // Download state
+    download_progress: f32
+    download_bytes_received: u64
+    download_bytes_total: u64
+    download_path: string
+
+    // Settings
+    auto_check_enabled: bool
+    auto_download_enabled: bool
+    check_interval_hours: u32
+    last_check_time: u64
+
+    fn init(current_version: Version): UpdateManager {
+        return UpdateManager {
+            current_version: current_version
+            latest_version: null
+            update_info: null
+            status: UpdateStatus.Idle
+            channel: ReleaseChannel.Stable
+            platform: detect_platform()
+            appcast_url: "https://updates.generals-home.com/appcast.xml"
+            update_server_url: "https://updates.generals-home.com/api"
+            download_progress: 0.0
+            download_bytes_received: 0
+            download_bytes_total: 0
+            download_path: ""
+            auto_check_enabled: true
+            auto_download_enabled: false
+            check_interval_hours: 24
+            last_check_time: 0
+        }
+    }
+
+    fn set_channel(self, channel: ReleaseChannel) {
+        self.channel = channel
+    }
+
+    fn check_for_updates(self): bool {
+        if self.status == UpdateStatus.CheckingForUpdates {
+            return false  // Already checking
+        }
+
+        self.status = UpdateStatus.CheckingForUpdates
+        log_info("Checking for updates...")
+
+        // Platform-specific update check
+        match self.platform {
+            Platform.MacOS => {
+                return self.check_sparkle_appcast()
+            }
+            Platform.Windows => {
+                return self.check_windows_update()
+            }
+            Platform.Linux => {
+                return self.check_linux_update()
+            }
+        }
+    }
+
+    fn check_sparkle_appcast(self): bool {
+        // Fetch appcast.xml for macOS Sparkle updates
+        let appcast_data = http_get(self.appcast_url)
+        if appcast_data == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        // Parse appcast XML
+        let item = parse_appcast(appcast_data.?)
+        if item == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        let sparkle_item = item.?
+
+        // Parse version
+        let new_version = Version::parse(sparkle_item.sparkle_short_version)
+        if new_version == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        self.latest_version = new_version
+
+        // Compare versions
+        if new_version.?.is_newer_than(self.current_version) {
+            self.update_info = UpdateInfo {
+                version: new_version.?
+                release_date: sparkle_item.pubDate
+                release_notes: ""
+                release_notes_html: sparkle_item.description
+                download_url: sparkle_item.enclosure_url
+                download_size: sparkle_item.enclosure_length
+                signature: sparkle_item.sparkle_ed_signature
+                min_system_version: sparkle_item.sparkle_minimum_system_version
+                is_critical: false
+                platform: Platform.MacOS
+            }
+
+            self.status = UpdateStatus.UpdateAvailable
+            log_info("Update available: " + new_version.?.to_string())
+            return true
+        }
+
+        self.status = UpdateStatus.UpToDate
+        log_info("Already up to date")
+        return false
+    }
+
+    fn check_windows_update(self): bool {
+        // Fetch update info from JSON API
+        let url = self.update_server_url + "/check?platform=windows&channel=" +
+                  channel_to_string(self.channel) + "&version=" + self.current_version.to_string()
+
+        let response = http_get(url)
+        if response == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        // Parse JSON response
+        let update = parse_update_json(response.?)
+        if update == null {
+            self.status = UpdateStatus.UpToDate
+            return false
+        }
+
+        self.update_info = update
+        self.latest_version = update.?.version
+        self.status = UpdateStatus.UpdateAvailable
+        return true
+    }
+
+    fn check_linux_update(self): bool {
+        // Similar to Windows but with Linux platform
+        let url = self.update_server_url + "/check?platform=linux&channel=" +
+                  channel_to_string(self.channel) + "&version=" + self.current_version.to_string()
+
+        let response = http_get(url)
+        if response == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        let update = parse_update_json(response.?)
+        if update == null {
+            self.status = UpdateStatus.UpToDate
+            return false
+        }
+
+        self.update_info = update
+        self.latest_version = update.?.version
+        self.status = UpdateStatus.UpdateAvailable
+        return true
+    }
+
+    fn download_update(self): bool {
+        if self.update_info == null {
+            return false
+        }
+
+        if self.status == UpdateStatus.Downloading {
+            return false  // Already downloading
+        }
+
+        self.status = UpdateStatus.Downloading
+        self.download_progress = 0.0
+        self.download_bytes_received = 0
+        self.download_bytes_total = self.update_info.?.download_size
+
+        let update = self.update_info.?
+        log_info("Downloading update: " + update.version.to_string())
+
+        // Get temp directory for download
+        self.download_path = get_temp_dir() + "/generals_update"
+
+        match self.platform {
+            Platform.MacOS => {
+                self.download_path += ".dmg"
+            }
+            Platform.Windows => {
+                self.download_path += ".exe"
+            }
+            Platform.Linux => {
+                self.download_path += ".tar.gz"
+            }
+        }
+
+        // Start async download
+        // download_file_async(update.download_url, self.download_path, self.on_download_progress)
+
+        return true
+    }
+
+    fn on_download_progress(self, bytes_received: u64, bytes_total: u64) {
+        self.download_bytes_received = bytes_received
+        self.download_bytes_total = bytes_total
+        self.download_progress = @intToFloat(f32, bytes_received) / @intToFloat(f32, bytes_total)
+
+        if bytes_received >= bytes_total {
+            self.on_download_complete()
+        }
+    }
+
+    fn on_download_complete(self) {
+        log_info("Download complete: " + self.download_path)
+
+        // Verify signature
+        if self.update_info {
+            let signature = self.update_info.?.signature
+            if !verify_ed25519_signature(self.download_path, signature) {
+                log_error("Update signature verification failed!")
+                self.status = UpdateStatus.Error
+                delete_file(self.download_path)
+                return
+            }
+        }
+
+        self.status = UpdateStatus.ReadyToInstall
+    }
+
+    fn install_update(self): bool {
+        if self.status != UpdateStatus.ReadyToInstall {
+            return false
+        }
+
+        self.status = UpdateStatus.Installing
+        log_info("Installing update...")
+
+        match self.platform {
+            Platform.MacOS => {
+                return self.install_macos_update()
+            }
+            Platform.Windows => {
+                return self.install_windows_update()
+            }
+            Platform.Linux => {
+                return self.install_linux_update()
+            }
+        }
+    }
+
+    fn install_macos_update(self): bool {
+        // Mount DMG and copy new app
+        let mount_point = mount_dmg(self.download_path)
+        if mount_point == null {
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        // Find .app in mounted DMG
+        let app_path = find_app_in_directory(mount_point.?)
+        if app_path == null {
+            unmount_dmg(mount_point.?)
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        // Get current app path
+        let current_app = get_current_app_path()
+
+        // Create update script that runs after app quits
+        let script = "#!/bin/bash\n" +
+                     "sleep 2\n" +
+                     "rm -rf \"" + current_app + "\"\n" +
+                     "cp -R \"" + app_path.? + "\" \"" + current_app + "\"\n" +
+                     "hdiutil detach \"" + mount_point.? + "\"\n" +
+                     "rm \"" + self.download_path + "\"\n" +
+                     "open \"" + current_app + "\"\n"
+
+        let script_path = get_temp_dir() + "/generals_update.sh"
+        write_file(script_path, script)
+        chmod(script_path, 0o755)
+
+        // Launch script and quit app
+        spawn_process(script_path)
+
+        return true
+    }
+
+    fn install_windows_update(self): bool {
+        // Run installer EXE
+        // The installer will handle replacing the current executable
+
+        let installer_path = self.download_path
+
+        // Launch installer with arguments to auto-restart
+        let args = ["/SILENT", "/RESTARTAPPLICATION"]
+        spawn_process_with_args(installer_path, args)
+
+        return true
+    }
+
+    fn install_linux_update(self): bool {
+        // Extract tar.gz and replace files
+
+        let current_dir = get_current_app_dir()
+        let backup_dir = current_dir + ".backup"
+
+        // Backup current installation
+        rename_directory(current_dir, backup_dir)
+
+        // Extract new version
+        if !extract_tar_gz(self.download_path, current_dir) {
+            // Restore backup on failure
+            rename_directory(backup_dir, current_dir)
+            self.status = UpdateStatus.Error
+            return false
+        }
+
+        // Remove backup
+        delete_directory(backup_dir)
+
+        // Restart application
+        restart_application()
+
+        return true
+    }
+
+    fn cancel_download(self) {
+        if self.status == UpdateStatus.Downloading {
+            // Cancel async download
+            // cancel_download_async()
+
+            if file_exists(self.download_path) {
+                delete_file(self.download_path)
+            }
+
+            self.status = UpdateStatus.UpdateAvailable
+            self.download_progress = 0.0
+        }
+    }
+
+    fn get_release_notes(self): ?string {
+        if self.update_info {
+            if self.update_info.?.release_notes_html.len > 0 {
+                return self.update_info.?.release_notes_html
+            }
+            return self.update_info.?.release_notes
+        }
+        return null
+    }
+
+    fn should_auto_check(self): bool {
+        if !self.auto_check_enabled {
+            return false
+        }
+
+        let current_time = get_current_time()
+        let interval_seconds = @intCast(u64, self.check_interval_hours) * 3600
+
+        return current_time - self.last_check_time >= interval_seconds
+    }
+
+    fn update(self) {
+        // Called each frame or periodically
+        if self.should_auto_check() {
+            self.check_for_updates()
+            self.last_check_time = get_current_time()
+        }
+    }
+}
+
+// Helper functions
+fn detect_platform(): Platform {
+    // Compile-time platform detection
+    #if target_os == "macos" {
+        return Platform.MacOS
+    } #elif target_os == "windows" {
+        return Platform.Windows
+    } #else {
+        return Platform.Linux
+    }
+}
+
+fn channel_to_string(channel: ReleaseChannel): string {
+    match channel {
+        ReleaseChannel.Stable => return "stable"
+        ReleaseChannel.Beta => return "beta"
+        ReleaseChannel.Nightly => return "nightly"
+    }
+}
+
+fn parse_appcast(xml: string): ?SparkleAppcastItem {
+    // Parse Sparkle appcast XML format
+    // <rss><channel><item>...</item></channel></rss>
+
+    // Find first <item> element
+    let item_start = find(xml, "<item>")
+    if item_start < 0 {
+        return null
+    }
+
+    let item_end = find_from(xml, "</item>", @intCast(usize, item_start))
+    if item_end < 0 {
+        return null
+    }
+
+    let item_xml = substring(xml, @intCast(usize, item_start), @intCast(usize, item_end + 7))
+
+    return SparkleAppcastItem {
+        title: extract_xml_tag(item_xml, "title") orelse ""
+        pubDate: extract_xml_tag(item_xml, "pubDate") orelse ""
+        description: extract_xml_cdata(item_xml, "description") orelse ""
+        enclosure_url: extract_xml_attribute(item_xml, "enclosure", "url") orelse ""
+        enclosure_length: parse_int(extract_xml_attribute(item_xml, "enclosure", "length") orelse "0") orelse 0
+        enclosure_type: extract_xml_attribute(item_xml, "enclosure", "type") orelse ""
+        sparkle_version: extract_xml_attribute(item_xml, "enclosure", "sparkle:version") orelse ""
+        sparkle_short_version: extract_xml_attribute(item_xml, "enclosure", "sparkle:shortVersionString") orelse ""
+        sparkle_minimum_system_version: extract_xml_tag(item_xml, "sparkle:minimumSystemVersion") orelse "10.13"
+        sparkle_ed_signature: extract_xml_attribute(item_xml, "enclosure", "sparkle:edSignature") orelse ""
+    }
+}
+
+fn parse_update_json(json: string): ?UpdateInfo {
+    // Parse JSON update response
+    // {"version": "1.2.3", "url": "...", "size": 123456, ...}
+
+    // Simple JSON parsing
+    let version_str = extract_json_string(json, "version") orelse return null
+    let version = Version::parse(version_str) orelse return null
+
+    return UpdateInfo {
+        version: version
+        release_date: extract_json_string(json, "release_date") orelse ""
+        release_notes: extract_json_string(json, "release_notes") orelse ""
+        release_notes_html: extract_json_string(json, "release_notes_html") orelse ""
+        download_url: extract_json_string(json, "download_url") orelse ""
+        download_size: @intCast(u64, extract_json_int(json, "download_size") orelse 0)
+        signature: extract_json_string(json, "signature") orelse ""
+        min_system_version: extract_json_string(json, "min_system_version") orelse ""
+        is_critical: extract_json_bool(json, "is_critical") orelse false
+        platform: Platform.MacOS  // Will be set by caller
+    }
+}
+
+// Platform utility stubs (implemented by platform layer)
+fn http_get(url: string): ?string { return null }
+fn get_temp_dir(): string { return "/tmp" }
+fn get_current_app_path(): string { return "" }
+fn get_current_app_dir(): string { return "" }
+fn get_current_time(): u64 { return 0 }
+fn file_exists(path: string): bool { return false }
+fn delete_file(path: string) {}
+fn write_file(path: string, content: string) {}
+fn chmod(path: string, mode: u32) {}
+fn mount_dmg(path: string): ?string { return null }
+fn unmount_dmg(path: string) {}
+fn find_app_in_directory(path: string): ?string { return null }
+fn spawn_process(path: string) {}
+fn spawn_process_with_args(path: string, args: []string) {}
+fn extract_tar_gz(archive: string, dest: string): bool { return false }
+fn rename_directory(from: string, to: string) {}
+fn delete_directory(path: string) {}
+fn restart_application() {}
+fn verify_ed25519_signature(file: string, signature: string): bool { return true }
+fn log_info(msg: string) {}
+fn log_error(msg: string) {}
+
+// String utilities stubs
+fn split(s: string, delim: string): []string { return [] }
+fn contains(s: string, needle: string): bool { return false }
+fn find(s: string, needle: string): i64 { return -1 }
+fn find_from(s: string, needle: string, start: usize): i64 { return -1 }
+fn substring(s: string, start: usize, end: usize): string { return "" }
+fn parse_int(s: string): ?i64 { return null }
+
+// XML parsing stubs
+fn extract_xml_tag(xml: string, tag: string): ?string { return null }
+fn extract_xml_cdata(xml: string, tag: string): ?string { return null }
+fn extract_xml_attribute(xml: string, tag: string, attr: string): ?string { return null }
+
+// JSON parsing stubs
+fn extract_json_string(json: string, key: string): ?string { return null }
+fn extract_json_int(json: string, key: string): ?i64 { return null }
+fn extract_json_bool(json: string, key: string): ?bool { return null }
+
+// Current game version
+const CURRENT_VERSION = Version {
+    major: 1
+    minor: 0
+    patch: 0
+    build: 0
+    channel: ReleaseChannel.Stable
+}
+
+// Global update manager
+var g_update_manager: ?UpdateManager = null
+
+// Exported functions
+export fn update_init(): bool {
+    g_update_manager = UpdateManager::init(CURRENT_VERSION)
+    return true
+}
+
+export fn update_shutdown() {
+    if g_update_manager {
+        g_update_manager.?.cancel_download()
+    }
+    g_update_manager = null
+}
+
+export fn update_check(): bool {
+    if g_update_manager {
+        return g_update_manager.?.check_for_updates()
+    }
+    return false
+}
+
+export fn update_download(): bool {
+    if g_update_manager {
+        return g_update_manager.?.download_update()
+    }
+    return false
+}
+
+export fn update_install(): bool {
+    if g_update_manager {
+        return g_update_manager.?.install_update()
+    }
+    return false
+}
+
+export fn update_get_status(): i32 {
+    if g_update_manager {
+        return @enumToInt(g_update_manager.?.status)
+    }
+    return @enumToInt(UpdateStatus.Idle)
+}
+
+export fn update_get_progress(): f32 {
+    if g_update_manager {
+        return g_update_manager.?.download_progress
+    }
+    return 0.0
+}
+
+export fn update_get_latest_version(): string {
+    if g_update_manager and g_update_manager.?.latest_version {
+        return g_update_manager.?.latest_version.?.to_string()
+    }
+    return ""
+}
+
+export fn update_get_release_notes(): string {
+    if g_update_manager {
+        return g_update_manager.?.get_release_notes() orelse ""
+    }
+    return ""
+}
+
+export fn update_set_channel(channel: i32) {
+    if g_update_manager {
+        g_update_manager.?.set_channel(@intToEnum(ReleaseChannel, channel))
+    }
+}
+
+export fn update_set_auto_check(enabled: bool) {
+    if g_update_manager {
+        g_update_manager.?.auto_check_enabled = enabled
+    }
+}

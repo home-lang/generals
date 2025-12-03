@@ -1,0 +1,775 @@
+// Steam Integration
+// C&C Generals Zero Hour - Home Port
+// Steamworks SDK wrapper for achievements, cloud saves, multiplayer
+
+// Steam API types
+type HSteamPipe = i32
+type HSteamUser = i32
+type AppId_t = u32
+type SteamAPICall_t = u64
+type CSteamID = u64
+type HAuthTicket = u32
+type DepotId_t = u32
+type PublishedFileId_t = u64
+
+// Steam result codes
+enum EResult {
+    OK = 1
+    Fail = 2
+    NoConnection = 3
+    InvalidPassword = 5
+    LoggedInElsewhere = 6
+    InvalidProtocolVer = 7
+    InvalidParam = 8
+    FileNotFound = 9
+    Busy = 10
+    InvalidState = 11
+    InvalidName = 12
+    InvalidEmail = 13
+    DuplicateName = 14
+    AccessDenied = 15
+    Timeout = 16
+    Banned = 17
+    AccountNotFound = 18
+    InvalidSteamID = 19
+    ServiceUnavailable = 20
+    NotLoggedOn = 21
+    Pending = 22
+    EncryptionFailure = 23
+    InsufficientPrivilege = 24
+    LimitExceeded = 25
+}
+
+// Lobby types
+enum ELobbyType {
+    Private = 0
+    FriendsOnly = 1
+    Public = 2
+    Invisible = 3
+}
+
+// Achievement display type
+enum AchievementDisplayType {
+    Hidden = 0
+    Progress = 1
+    Complete = 2
+}
+
+// Steam persona state
+enum EPersonaState {
+    Offline = 0
+    Online = 1
+    Busy = 2
+    Away = 3
+    Snooze = 4
+    LookingToTrade = 5
+    LookingToPlay = 6
+    Invisible = 7
+}
+
+// Leaderboard data request type
+enum ELeaderboardDataRequest {
+    Global = 0
+    GlobalAroundUser = 1
+    Friends = 2
+    Users = 3
+}
+
+// Steam achievement definition
+struct Achievement {
+    id: string
+    name: string
+    description: string
+    icon_name: string
+    unlocked: bool
+    unlock_time: u32
+    progress: f32
+    max_progress: f32
+}
+
+// Steam friend info
+struct FriendInfo {
+    steam_id: CSteamID
+    persona_name: string
+    persona_state: EPersonaState
+    is_playing_this_game: bool
+    game_lobby_id: CSteamID
+}
+
+// Lobby info
+struct LobbyInfo {
+    lobby_id: CSteamID
+    owner_id: CSteamID
+    max_members: u32
+    current_members: u32
+    lobby_type: ELobbyType
+    data: [32]LobbyDataPair
+    data_count: u32
+}
+
+struct LobbyDataPair {
+    key: string
+    value: string
+}
+
+// Leaderboard entry
+struct LeaderboardEntry {
+    steam_id: CSteamID
+    global_rank: i32
+    score: i32
+    details: [64]i32
+    detail_count: i32
+}
+
+// Cloud file info
+struct CloudFileInfo {
+    filename: string
+    size: i32
+    timestamp: u64
+}
+
+// External function declarations (Steamworks SDK)
+extern "steam_api" fn SteamAPI_Init(): bool
+extern "steam_api" fn SteamAPI_Shutdown()
+extern "steam_api" fn SteamAPI_RunCallbacks()
+extern "steam_api" fn SteamAPI_RestartAppIfNecessary(appId: AppId_t): bool
+extern "steam_api" fn SteamAPI_GetHSteamPipe(): HSteamPipe
+extern "steam_api" fn SteamAPI_GetHSteamUser(): HSteamUser
+
+// User interface
+extern "steam_api" fn SteamUser(): *ISteamUser
+extern "steam_api" fn SteamFriends(): *ISteamFriends
+extern "steam_api" fn SteamUtils(): *ISteamUtils
+extern "steam_api" fn SteamMatchmaking(): *ISteamMatchmaking
+extern "steam_api" fn SteamUserStats(): *ISteamUserStats
+extern "steam_api" fn SteamApps(): *ISteamApps
+extern "steam_api" fn SteamNetworking(): *ISteamNetworking
+extern "steam_api" fn SteamRemoteStorage(): *ISteamRemoteStorage
+
+// Interface types (opaque pointers)
+type ISteamUser = void
+type ISteamFriends = void
+type ISteamUtils = void
+type ISteamMatchmaking = void
+type ISteamUserStats = void
+type ISteamApps = void
+type ISteamNetworking = void
+type ISteamRemoteStorage = void
+
+// C&C Generals Steam App ID
+const GENERALS_STEAM_APP_ID: AppId_t = 0  // Replace with actual Steam App ID when available
+
+// Steam integration singleton
+struct Steam {
+    is_initialized: bool
+    steam_id: CSteamID
+    persona_name: string
+
+    // Cached data
+    achievements: [64]Achievement
+    achievement_count: u32
+    friends: [256]FriendInfo
+    friend_count: u32
+
+    // Active lobby
+    current_lobby: CSteamID
+    is_in_lobby: bool
+
+    // Cloud save state
+    cloud_enabled: bool
+    cloud_quota: u64
+    cloud_used: u64
+
+    fn init(): ?Steam {
+        // Check if we need to restart through Steam
+        if SteamAPI_RestartAppIfNecessary(GENERALS_STEAM_APP_ID) {
+            // Steam will restart the application through the Steam client
+            return null
+        }
+
+        // Initialize Steam API
+        if !SteamAPI_Init() {
+            log_error("Steam API initialization failed")
+            return null
+        }
+
+        // Get user info
+        let user = SteamUser()
+        if user == null {
+            SteamAPI_Shutdown()
+            return null
+        }
+
+        let steam = Steam {
+            is_initialized: true
+            steam_id: get_steam_id()
+            persona_name: get_persona_name()
+            achievements: undefined
+            achievement_count: 0
+            friends: undefined
+            friend_count: 0
+            current_lobby: 0
+            is_in_lobby: false
+            cloud_enabled: false
+            cloud_quota: 0
+            cloud_used: 0
+        }
+
+        // Load achievements
+        steam.load_achievements()
+
+        // Load friends list
+        steam.load_friends()
+
+        // Check cloud status
+        steam.check_cloud_status()
+
+        log_info("Steam initialized: " + steam.persona_name)
+
+        return steam
+    }
+
+    fn update(self) {
+        if !self.is_initialized {
+            return
+        }
+
+        // Process Steam callbacks
+        SteamAPI_RunCallbacks()
+    }
+
+    fn shutdown(self) {
+        if self.is_initialized {
+            // Leave any active lobby
+            if self.is_in_lobby {
+                self.leave_lobby()
+            }
+
+            SteamAPI_Shutdown()
+            self.is_initialized = false
+            log_info("Steam shutdown")
+        }
+    }
+
+    // --- Achievements ---
+
+    fn load_achievements(self) {
+        // Request achievement data from Steam
+        let stats = SteamUserStats()
+        if stats == null {
+            return
+        }
+
+        // Define game achievements
+        let achievement_defs = [
+            ("ACH_FIRST_VICTORY", "First Victory", "Win your first skirmish match"),
+            ("ACH_CAMPAIGN_USA", "American Hero", "Complete the USA campaign"),
+            ("ACH_CAMPAIGN_CHINA", "Dragon's Fury", "Complete the China campaign"),
+            ("ACH_CAMPAIGN_GLA", "Liberation", "Complete the GLA campaign"),
+            ("ACH_CAMPAIGN_ALL", "World Dominator", "Complete all campaigns"),
+            ("ACH_ONLINE_10", "Online Warrior", "Win 10 online matches"),
+            ("ACH_ONLINE_100", "Online Commander", "Win 100 online matches"),
+            ("ACH_GENERAL_POINTS", "Five Star General", "Earn all General's points in a match"),
+            ("ACH_NUKE", "Nuclear Option", "Build and use a nuclear missile"),
+            ("ACH_SUPERWEAPON_ALL", "Arsenal", "Use every superweapon in the game"),
+            ("ACH_SPEEDRUN", "Blitzkrieg", "Complete a campaign mission in under 10 minutes"),
+            ("ACH_NO_CASUALTIES", "Perfect Commander", "Win a match with no unit losses"),
+            ("ACH_ARMY_SIZE", "Overwhelming Force", "Build an army of 200+ units"),
+            ("ACH_ECONOMY", "War Profiteer", "Accumulate 100,000 credits in a single match"),
+            ("ACH_DEFENSE", "Fortress", "Survive for 30 minutes against AI on Brutal"),
+        ]
+
+        for i in 0..achievement_defs.len {
+            let (id, name, desc) = achievement_defs[i]
+            self.achievements[i] = Achievement {
+                id: id
+                name: name
+                description: desc
+                icon_name: id + "_icon"
+                unlocked: false
+                unlock_time: 0
+                progress: 0.0
+                max_progress: 1.0
+            }
+        }
+        self.achievement_count = @intCast(u32, achievement_defs.len)
+
+        // Sync with Steam
+        // request_user_stats() would be called here
+    }
+
+    fn unlock_achievement(self, achievement_id: string): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // Find achievement
+        for i in 0..self.achievement_count {
+            if self.achievements[i].id == achievement_id {
+                if self.achievements[i].unlocked {
+                    return true  // Already unlocked
+                }
+
+                // Unlock through Steam
+                // SteamUserStats()->SetAchievement(achievement_id)
+                // SteamUserStats()->StoreStats()
+
+                self.achievements[i].unlocked = true
+                self.achievements[i].unlock_time = get_current_time()
+
+                log_info("Achievement unlocked: " + self.achievements[i].name)
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn set_achievement_progress(self, achievement_id: string, progress: f32, max_progress: f32): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        for i in 0..self.achievement_count {
+            if self.achievements[i].id == achievement_id {
+                self.achievements[i].progress = progress
+                self.achievements[i].max_progress = max_progress
+
+                // Update Steam
+                // SteamUserStats()->SetStat(achievement_id + "_progress", progress)
+
+                // Check if complete
+                if progress >= max_progress {
+                    self.unlock_achievement(achievement_id)
+                }
+
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn get_achievement(self, achievement_id: string): ?*Achievement {
+        for i in 0..self.achievement_count {
+            if self.achievements[i].id == achievement_id {
+                return &self.achievements[i]
+            }
+        }
+        return null
+    }
+
+    // --- Friends ---
+
+    fn load_friends(self) {
+        let friends_api = SteamFriends()
+        if friends_api == null {
+            return
+        }
+
+        // Get friend count
+        // let count = SteamFriends()->GetFriendCount(k_EFriendFlagImmediate)
+
+        // For now, initialize empty list
+        self.friend_count = 0
+    }
+
+    fn get_friends_playing(self): []FriendInfo {
+        var playing: [64]FriendInfo = undefined
+        var count: u32 = 0
+
+        for i in 0..self.friend_count {
+            if self.friends[i].is_playing_this_game {
+                playing[count] = self.friends[i]
+                count += 1
+            }
+        }
+
+        return playing[0..count]
+    }
+
+    fn invite_friend(self, steam_id: CSteamID): bool {
+        if !self.is_initialized or !self.is_in_lobby {
+            return false
+        }
+
+        // SteamMatchmaking()->InviteUserToLobby(self.current_lobby, steam_id)
+        return true
+    }
+
+    // --- Matchmaking / Lobbies ---
+
+    fn create_lobby(self, lobby_type: ELobbyType, max_members: u32): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // SteamMatchmaking()->CreateLobby(lobby_type, max_members)
+        // Result comes through callback
+
+        return true
+    }
+
+    fn join_lobby(self, lobby_id: CSteamID): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // SteamMatchmaking()->JoinLobby(lobby_id)
+        // Result comes through callback
+
+        return true
+    }
+
+    fn leave_lobby(self) {
+        if !self.is_initialized or !self.is_in_lobby {
+            return
+        }
+
+        // SteamMatchmaking()->LeaveLobby(self.current_lobby)
+        self.current_lobby = 0
+        self.is_in_lobby = false
+    }
+
+    fn set_lobby_data(self, key: string, value: string): bool {
+        if !self.is_in_lobby {
+            return false
+        }
+
+        // SteamMatchmaking()->SetLobbyData(self.current_lobby, key, value)
+        return true
+    }
+
+    fn get_lobby_data(self, key: string): ?string {
+        if !self.is_in_lobby {
+            return null
+        }
+
+        // return SteamMatchmaking()->GetLobbyData(self.current_lobby, key)
+        return null
+    }
+
+    fn search_lobbies(self, filters: []LobbyDataPair): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // Apply filters
+        for filter in filters {
+            // SteamMatchmaking()->AddRequestLobbyListStringFilter(filter.key, filter.value, ...)
+        }
+
+        // SteamMatchmaking()->RequestLobbyList()
+        // Results come through callback
+
+        return true
+    }
+
+    // --- Cloud Saves ---
+
+    fn check_cloud_status(self) {
+        let storage = SteamRemoteStorage()
+        if storage == null {
+            return
+        }
+
+        // Check if cloud is enabled
+        // self.cloud_enabled = SteamRemoteStorage()->IsCloudEnabledForAccount() &&
+        //                      SteamRemoteStorage()->IsCloudEnabledForApp()
+
+        // Get quota
+        // SteamRemoteStorage()->GetQuota(&self.cloud_quota, &self.cloud_used)
+    }
+
+    fn cloud_save(self, filename: string, data: []u8): bool {
+        if !self.is_initialized or !self.cloud_enabled {
+            return false
+        }
+
+        // SteamRemoteStorage()->FileWrite(filename, data.ptr, data.len)
+        return true
+    }
+
+    fn cloud_load(self, filename: string): ?[]u8 {
+        if !self.is_initialized or !self.cloud_enabled {
+            return null
+        }
+
+        // Check if file exists
+        // if !SteamRemoteStorage()->FileExists(filename) {
+        //     return null
+        // }
+
+        // Get file size
+        // let size = SteamRemoteStorage()->GetFileSize(filename)
+
+        // Read file
+        // var buffer = @alloc(u8, size)
+        // SteamRemoteStorage()->FileRead(filename, buffer.ptr, size)
+
+        return null
+    }
+
+    fn cloud_delete(self, filename: string): bool {
+        if !self.is_initialized or !self.cloud_enabled {
+            return false
+        }
+
+        // SteamRemoteStorage()->FileDelete(filename)
+        return true
+    }
+
+    fn cloud_list_files(self): []CloudFileInfo {
+        if !self.is_initialized or !self.cloud_enabled {
+            return []
+        }
+
+        // let count = SteamRemoteStorage()->GetFileCount()
+        // var files: [256]CloudFileInfo = undefined
+        // ...
+
+        return []
+    }
+
+    // --- Leaderboards ---
+
+    fn find_leaderboard(self, name: string): SteamAPICall_t {
+        if !self.is_initialized {
+            return 0
+        }
+
+        // return SteamUserStats()->FindLeaderboard(name)
+        return 0
+    }
+
+    fn upload_score(self, leaderboard_name: string, score: i32, details: []i32): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // First find leaderboard, then upload in callback
+        // SteamUserStats()->FindLeaderboard(leaderboard_name)
+        // In callback: SteamUserStats()->UploadLeaderboardScore(handle, method, score, details, count)
+
+        return true
+    }
+
+    fn download_scores(self, leaderboard_name: string, request_type: ELeaderboardDataRequest, start: i32, end: i32): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // SteamUserStats()->DownloadLeaderboardEntries(handle, request_type, start, end)
+        return true
+    }
+
+    // --- Rich Presence ---
+
+    fn set_rich_presence(self, key: string, value: string) {
+        if !self.is_initialized {
+            return
+        }
+
+        // SteamFriends()->SetRichPresence(key, value)
+    }
+
+    fn clear_rich_presence(self) {
+        if !self.is_initialized {
+            return
+        }
+
+        // SteamFriends()->ClearRichPresence()
+    }
+
+    fn set_game_status(self, status: string) {
+        self.set_rich_presence("status", status)
+    }
+
+    fn set_game_state(self, map_name: string, player_count: u32, max_players: u32) {
+        self.set_rich_presence("map", map_name)
+        self.set_rich_presence("players", @intToString(player_count) + "/" + @intToString(max_players))
+    }
+
+    // --- Overlay ---
+
+    fn activate_overlay(self, dialog: string) {
+        if !self.is_initialized {
+            return
+        }
+
+        // dialog can be: "Friends", "Community", "Players", "Settings", "OfficialGameGroup", "Stats", "Achievements"
+        // SteamFriends()->ActivateGameOverlay(dialog)
+    }
+
+    fn activate_overlay_web(self, url: string) {
+        if !self.is_initialized {
+            return
+        }
+
+        // SteamFriends()->ActivateGameOverlayToWebPage(url)
+    }
+
+    fn activate_overlay_store(self, app_id: AppId_t) {
+        if !self.is_initialized {
+            return
+        }
+
+        // SteamFriends()->ActivateGameOverlayToStore(app_id, k_EOverlayToStoreFlag_None)
+    }
+
+    fn is_overlay_enabled(self): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // return SteamUtils()->IsOverlayEnabled()
+        return true
+    }
+
+    // --- DLC ---
+
+    fn is_dlc_installed(self, dlc_app_id: AppId_t): bool {
+        if !self.is_initialized {
+            return false
+        }
+
+        // return SteamApps()->BIsDlcInstalled(dlc_app_id)
+        return false
+    }
+
+    fn get_installed_depots(self): []DepotId_t {
+        if !self.is_initialized {
+            return []
+        }
+
+        // var depots: [32]DepotId_t = undefined
+        // let count = SteamApps()->GetInstalledDepots(GENERALS_STEAM_APP_ID, &depots[0], 32)
+
+        return []
+    }
+}
+
+// Helper functions
+fn get_steam_id(): CSteamID {
+    let user = SteamUser()
+    if user == null {
+        return 0
+    }
+
+    // return SteamUser()->GetSteamID().ConvertToUint64()
+    return 0
+}
+
+fn get_persona_name(): string {
+    let friends = SteamFriends()
+    if friends == null {
+        return "Unknown"
+    }
+
+    // return SteamFriends()->GetPersonaName()
+    return "Player"
+}
+
+fn get_current_time(): u32 {
+    // Return current Unix timestamp
+    return 0
+}
+
+fn log_info(msg: string) {
+    // Log to console/file
+}
+
+fn log_error(msg: string) {
+    // Log error to console/file
+}
+
+// Global Steam instance
+var g_steam: ?Steam = null
+
+// Exported functions
+export fn steam_init(): bool {
+    let steam = Steam::init()
+    if steam {
+        g_steam = steam
+        return true
+    }
+    return false
+}
+
+export fn steam_shutdown() {
+    if g_steam {
+        g_steam.?.shutdown()
+        g_steam = null
+    }
+}
+
+export fn steam_update() {
+    if g_steam {
+        g_steam.?.update()
+    }
+}
+
+export fn steam_unlock_achievement(id: string): bool {
+    if g_steam {
+        return g_steam.?.unlock_achievement(id)
+    }
+    return false
+}
+
+export fn steam_create_lobby(lobby_type: i32, max_members: u32): bool {
+    if g_steam {
+        return g_steam.?.create_lobby(@intToEnum(ELobbyType, lobby_type), max_members)
+    }
+    return false
+}
+
+export fn steam_join_lobby(lobby_id: u64): bool {
+    if g_steam {
+        return g_steam.?.join_lobby(lobby_id)
+    }
+    return false
+}
+
+export fn steam_leave_lobby() {
+    if g_steam {
+        g_steam.?.leave_lobby()
+    }
+}
+
+export fn steam_cloud_save(filename: string, data: []u8): bool {
+    if g_steam {
+        return g_steam.?.cloud_save(filename, data)
+    }
+    return false
+}
+
+export fn steam_cloud_load(filename: string): ?[]u8 {
+    if g_steam {
+        return g_steam.?.cloud_load(filename)
+    }
+    return null
+}
+
+export fn steam_set_rich_presence(key: string, value: string) {
+    if g_steam {
+        g_steam.?.set_rich_presence(key, value)
+    }
+}
+
+export fn steam_is_initialized(): bool {
+    return g_steam != null and g_steam.?.is_initialized
+}
+
+export fn steam_get_persona_name(): string {
+    if g_steam {
+        return g_steam.?.persona_name
+    }
+    return "Unknown"
+}
+
+export fn steam_get_steam_id(): u64 {
+    if g_steam {
+        return g_steam.?.steam_id
+    }
+    return 0
+}

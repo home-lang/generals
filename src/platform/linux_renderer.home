@@ -1,0 +1,412 @@
+// Linux Platform Layer - Renderer (OpenGL/Vulkan)
+// C&C Generals Zero Hour - Home Port
+// GLX (OpenGL on X11) renderer implementation
+
+// GLX types
+type Display = *void
+type Window = u64
+type GLXContext = *void
+type GLXDrawable = u64
+type GLXFBConfig = *void
+type XVisualInfo = *void
+
+// OpenGL types (shared with Windows)
+type GLuint = u32
+type GLint = i32
+type GLenum = u32
+type GLsizei = i32
+type GLfloat = f32
+type GLboolean = u8
+type GLchar = u8
+type GLbitfield = u32
+type GLclampf = f32
+
+// OpenGL constants (shared with Windows renderer)
+const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000
+const GL_DEPTH_BUFFER_BIT: GLbitfield = 0x00000100
+const GL_STENCIL_BUFFER_BIT: GLbitfield = 0x00000400
+
+const GL_TRIANGLES: GLenum = 0x0004
+const GL_LINES: GLenum = 0x0001
+
+const GL_TEXTURE_2D: GLenum = 0x0DE1
+const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801
+const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800
+const GL_LINEAR: GLint = 0x2601
+const GL_LINEAR_MIPMAP_LINEAR: GLint = 0x2703
+
+const GL_RGBA: GLenum = 0x1908
+const GL_UNSIGNED_BYTE: GLenum = 0x1401
+const GL_FLOAT: GLenum = 0x1406
+
+const GL_ARRAY_BUFFER: GLenum = 0x8892
+const GL_ELEMENT_ARRAY_BUFFER: GLenum = 0x8893
+const GL_STATIC_DRAW: GLenum = 0x88E4
+
+const GL_VERTEX_SHADER: GLenum = 0x8B31
+const GL_FRAGMENT_SHADER: GLenum = 0x8B30
+const GL_COMPILE_STATUS: GLenum = 0x8B81
+const GL_LINK_STATUS: GLenum = 0x8B82
+
+const GL_DEPTH_TEST: GLenum = 0x0B71
+const GL_BLEND: GLenum = 0x0BE2
+const GL_SRC_ALPHA: GLenum = 0x0302
+const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303
+
+// GLX constants
+const GLX_RGBA: i32 = 4
+const GLX_DOUBLEBUFFER: i32 = 5
+const GLX_RED_SIZE: i32 = 8
+const GLX_GREEN_SIZE: i32 = 9
+const GLX_BLUE_SIZE: i32 = 10
+const GLX_ALPHA_SIZE: i32 = 11
+const GLX_DEPTH_SIZE: i32 = 12
+const GLX_STENCIL_SIZE: i32 = 13
+
+const GLX_RENDER_TYPE: i32 = 0x8011
+const GLX_RGBA_BIT: i32 = 0x00000001
+const GLX_DRAWABLE_TYPE: i32 = 0x8010
+const GLX_WINDOW_BIT: i32 = 0x00000001
+const GLX_X_VISUAL_TYPE: i32 = 0x22
+const GLX_TRUE_COLOR: i32 = 0x8002
+
+const GLX_CONTEXT_MAJOR_VERSION_ARB: i32 = 0x2091
+const GLX_CONTEXT_MINOR_VERSION_ARB: i32 = 0x2092
+const GLX_CONTEXT_PROFILE_MASK_ARB: i32 = 0x9126
+const GLX_CONTEXT_CORE_PROFILE_BIT_ARB: i32 = 0x00000001
+
+// GLX API declarations
+extern "GL" fn glXQueryExtension(display: Display, error_base: *i32, event_base: *i32): i32
+extern "GL" fn glXChooseVisual(display: Display, screen: i32, attrib_list: *i32): XVisualInfo
+extern "GL" fn glXChooseFBConfig(display: Display, screen: i32, attrib_list: *const i32, nelements: *i32): *GLXFBConfig
+extern "GL" fn glXGetVisualFromFBConfig(display: Display, config: GLXFBConfig): XVisualInfo
+extern "GL" fn glXCreateContext(display: Display, vis: XVisualInfo, share_list: GLXContext, direct: i32): GLXContext
+extern "GL" fn glXCreateNewContext(display: Display, config: GLXFBConfig, render_type: i32, share_list: GLXContext, direct: i32): GLXContext
+extern "GL" fn glXDestroyContext(display: Display, ctx: GLXContext)
+extern "GL" fn glXMakeCurrent(display: Display, drawable: GLXDrawable, ctx: GLXContext): i32
+extern "GL" fn glXSwapBuffers(display: Display, drawable: GLXDrawable)
+extern "GL" fn glXGetProcAddress(procname: *const u8): *void
+extern "GL" fn glXGetProcAddressARB(procname: *const u8): *void
+
+// OpenGL function pointers (loaded at runtime)
+var glClear: fn(GLbitfield) = null
+var glClearColor: fn(GLclampf, GLclampf, GLclampf, GLclampf) = null
+var glViewport: fn(GLint, GLint, GLsizei, GLsizei) = null
+var glEnable: fn(GLenum) = null
+var glDisable: fn(GLenum) = null
+var glBlendFunc: fn(GLenum, GLenum) = null
+
+var glGenBuffers: fn(GLsizei, *GLuint) = null
+var glBindBuffer: fn(GLenum, GLuint) = null
+var glBufferData: fn(GLenum, isize, *const void, GLenum) = null
+var glDeleteBuffers: fn(GLsizei, *const GLuint) = null
+
+var glGenVertexArrays: fn(GLsizei, *GLuint) = null
+var glBindVertexArray: fn(GLuint) = null
+var glDeleteVertexArrays: fn(GLsizei, *const GLuint) = null
+var glEnableVertexAttribArray: fn(GLuint) = null
+var glVertexAttribPointer: fn(GLuint, GLint, GLenum, GLboolean, GLsizei, *const void) = null
+
+var glGenTextures: fn(GLsizei, *GLuint) = null
+var glBindTexture: fn(GLenum, GLuint) = null
+var glTexImage2D: fn(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, *const void) = null
+var glTexParameteri: fn(GLenum, GLenum, GLint) = null
+var glDeleteTextures: fn(GLsizei, *const GLuint) = null
+var glGenerateMipmap: fn(GLenum) = null
+var glActiveTexture: fn(GLenum) = null
+
+var glCreateShader: fn(GLenum): GLuint = null
+var glShaderSource: fn(GLuint, GLsizei, **const GLchar, *const GLint) = null
+var glCompileShader: fn(GLuint) = null
+var glGetShaderiv: fn(GLuint, GLenum, *GLint) = null
+var glDeleteShader: fn(GLuint) = null
+
+var glCreateProgram: fn(): GLuint = null
+var glAttachShader: fn(GLuint, GLuint) = null
+var glLinkProgram: fn(GLuint) = null
+var glUseProgram: fn(GLuint) = null
+var glGetProgramiv: fn(GLuint, GLenum, *GLint) = null
+var glDeleteProgram: fn(GLuint) = null
+var glGetUniformLocation: fn(GLuint, *const GLchar): GLint = null
+var glUniform1i: fn(GLint, GLint) = null
+var glUniform1f: fn(GLint, GLfloat) = null
+var glUniform4f: fn(GLint, GLfloat, GLfloat, GLfloat, GLfloat) = null
+var glUniformMatrix4fv: fn(GLint, GLsizei, GLboolean, *const GLfloat) = null
+
+var glDrawArrays: fn(GLenum, GLint, GLsizei) = null
+var glDrawElements: fn(GLenum, GLsizei, GLenum, *const void) = null
+
+// GLX context creation function (for OpenGL 3.3+ core profile)
+type PFNGLXCREATECONTEXTATTRIBSARBPROC = fn(Display, GLXFBConfig, GLXContext, i32, *const i32): GLXContext
+var glXCreateContextAttribsARB: PFNGLXCREATECONTEXTATTRIBSARBPROC = null
+
+// Linux OpenGL Renderer
+struct LinuxRenderer {
+    display: Display
+    window: Window
+    context: GLXContext
+    width: u32
+    height: u32
+    is_initialized: bool
+
+    fn init(display: Display, window: Window, width: u32, height: u32): ?LinuxRenderer {
+        // Check for GLX extension
+        var error_base: i32 = 0
+        var event_base: i32 = 0
+        if glXQueryExtension(display, &error_base, &event_base) == 0 {
+            return null
+        }
+
+        // Choose framebuffer config
+        let fb_attribs = [
+            GLX_RENDER_TYPE, GLX_RGBA_BIT,
+            GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
+            GLX_DOUBLEBUFFER, 1,
+            GLX_RED_SIZE, 8,
+            GLX_GREEN_SIZE, 8,
+            GLX_BLUE_SIZE, 8,
+            GLX_ALPHA_SIZE, 8,
+            GLX_DEPTH_SIZE, 24,
+            GLX_STENCIL_SIZE, 8,
+            0  // Terminate list
+        ]
+
+        var num_configs: i32 = 0
+        let configs = glXChooseFBConfig(display, 0, &fb_attribs[0], &num_configs)
+        if configs == null or num_configs == 0 {
+            return null
+        }
+
+        let fb_config = configs[0]
+
+        // Load glXCreateContextAttribsARB for modern context creation
+        glXCreateContextAttribsARB = @ptrCast(PFNGLXCREATECONTEXTATTRIBSARBPROC,
+            glXGetProcAddressARB("glXCreateContextAttribsARB"))
+
+        var context: GLXContext = null
+
+        if glXCreateContextAttribsARB {
+            // Create OpenGL 4.1 core profile context (max on macOS, good for Linux)
+            let context_attribs = [
+                GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
+                GLX_CONTEXT_MINOR_VERSION_ARB, 1,
+                GLX_CONTEXT_PROFILE_MASK_ARB, GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
+                0
+            ]
+            context = glXCreateContextAttribsARB(display, fb_config, null, 1, &context_attribs[0])
+        }
+
+        if context == null {
+            // Fallback to legacy context creation
+            let vis = glXGetVisualFromFBConfig(display, fb_config)
+            if vis == null {
+                return null
+            }
+            context = glXCreateContext(display, vis, null, 1)
+        }
+
+        if context == null {
+            return null
+        }
+
+        // Make context current
+        if glXMakeCurrent(display, window, context) == 0 {
+            glXDestroyContext(display, context)
+            return null
+        }
+
+        // Load OpenGL functions
+        load_gl_functions()
+
+        // Set up default state
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glViewport(0, 0, @intCast(GLsizei, width), @intCast(GLsizei, height))
+
+        return LinuxRenderer {
+            display: display
+            window: window
+            context: context
+            width: width
+            height: height
+            is_initialized: true
+        }
+    }
+
+    fn begin_frame(self) {
+        glClearColor(0.0, 0.0, 0.0, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    }
+
+    fn end_frame(self) {
+        glXSwapBuffers(self.display, self.window)
+    }
+
+    fn resize(self, width: u32, height: u32) {
+        self.width = width
+        self.height = height
+        glViewport(0, 0, @intCast(GLsizei, width), @intCast(GLsizei, height))
+    }
+
+    fn create_shader(self, vertex_source: string, fragment_source: string): GLuint {
+        // Create vertex shader
+        let vertex_shader = glCreateShader(GL_VERTEX_SHADER)
+        let vertex_src_ptr = vertex_source.ptr
+        let vertex_src_len = @intCast(GLint, vertex_source.len)
+        glShaderSource(vertex_shader, 1, &vertex_src_ptr, &vertex_src_len)
+        glCompileShader(vertex_shader)
+
+        var success: GLint = 0
+        glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success)
+        if success == 0 {
+            glDeleteShader(vertex_shader)
+            return 0
+        }
+
+        // Create fragment shader
+        let fragment_shader = glCreateShader(GL_FRAGMENT_SHADER)
+        let fragment_src_ptr = fragment_source.ptr
+        let fragment_src_len = @intCast(GLint, fragment_source.len)
+        glShaderSource(fragment_shader, 1, &fragment_src_ptr, &fragment_src_len)
+        glCompileShader(fragment_shader)
+
+        glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success)
+        if success == 0 {
+            glDeleteShader(vertex_shader)
+            glDeleteShader(fragment_shader)
+            return 0
+        }
+
+        // Link program
+        let program = glCreateProgram()
+        glAttachShader(program, vertex_shader)
+        glAttachShader(program, fragment_shader)
+        glLinkProgram(program)
+
+        glGetProgramiv(program, GL_LINK_STATUS, &success)
+        if success == 0 {
+            glDeleteProgram(program)
+            glDeleteShader(vertex_shader)
+            glDeleteShader(fragment_shader)
+            return 0
+        }
+
+        glDeleteShader(vertex_shader)
+        glDeleteShader(fragment_shader)
+
+        return program
+    }
+
+    fn create_texture(self, width: u32, height: u32, data: []u8): GLuint {
+        var texture: GLuint = 0
+        glGenTextures(1, &texture)
+        glBindTexture(GL_TEXTURE_2D, texture)
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            @intCast(GLint, GL_RGBA),
+            @intCast(GLsizei, width),
+            @intCast(GLsizei, height),
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            data.ptr
+        )
+
+        glGenerateMipmap(GL_TEXTURE_2D)
+
+        return texture
+    }
+
+    fn create_vertex_buffer(self, vertices: []f32): GLuint {
+        var vbo: GLuint = 0
+        glGenBuffers(1, &vbo)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, @intCast(isize, vertices.len * @sizeOf(f32)), vertices.ptr, GL_STATIC_DRAW)
+        return vbo
+    }
+
+    fn draw_elements(self, vao: GLuint, count: u32, shader: GLuint) {
+        glUseProgram(shader)
+        glBindVertexArray(vao)
+        glDrawElements(GL_TRIANGLES, @intCast(GLsizei, count), GL_UNSIGNED_INT, null)
+    }
+
+    fn shutdown(self) {
+        if self.context {
+            glXMakeCurrent(self.display, 0, null)
+            glXDestroyContext(self.display, self.context)
+        }
+        self.is_initialized = false
+    }
+}
+
+fn load_gl_functions() {
+    // Load OpenGL functions via glXGetProcAddress
+    glClear = @ptrCast(fn(GLbitfield), glXGetProcAddress("glClear"))
+    glClearColor = @ptrCast(fn(GLclampf, GLclampf, GLclampf, GLclampf), glXGetProcAddress("glClearColor"))
+    glViewport = @ptrCast(fn(GLint, GLint, GLsizei, GLsizei), glXGetProcAddress("glViewport"))
+    glEnable = @ptrCast(fn(GLenum), glXGetProcAddress("glEnable"))
+    glDisable = @ptrCast(fn(GLenum), glXGetProcAddress("glDisable"))
+    glBlendFunc = @ptrCast(fn(GLenum, GLenum), glXGetProcAddress("glBlendFunc"))
+
+    glGenBuffers = @ptrCast(fn(GLsizei, *GLuint), glXGetProcAddress("glGenBuffers"))
+    glBindBuffer = @ptrCast(fn(GLenum, GLuint), glXGetProcAddress("glBindBuffer"))
+    glBufferData = @ptrCast(fn(GLenum, isize, *const void, GLenum), glXGetProcAddress("glBufferData"))
+    glDeleteBuffers = @ptrCast(fn(GLsizei, *const GLuint), glXGetProcAddress("glDeleteBuffers"))
+
+    glGenVertexArrays = @ptrCast(fn(GLsizei, *GLuint), glXGetProcAddress("glGenVertexArrays"))
+    glBindVertexArray = @ptrCast(fn(GLuint), glXGetProcAddress("glBindVertexArray"))
+    glDeleteVertexArrays = @ptrCast(fn(GLsizei, *const GLuint), glXGetProcAddress("glDeleteVertexArrays"))
+    glEnableVertexAttribArray = @ptrCast(fn(GLuint), glXGetProcAddress("glEnableVertexAttribArray"))
+    glVertexAttribPointer = @ptrCast(fn(GLuint, GLint, GLenum, GLboolean, GLsizei, *const void), glXGetProcAddress("glVertexAttribPointer"))
+
+    glGenTextures = @ptrCast(fn(GLsizei, *GLuint), glXGetProcAddress("glGenTextures"))
+    glBindTexture = @ptrCast(fn(GLenum, GLuint), glXGetProcAddress("glBindTexture"))
+    glTexImage2D = @ptrCast(fn(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, *const void), glXGetProcAddress("glTexImage2D"))
+    glTexParameteri = @ptrCast(fn(GLenum, GLenum, GLint), glXGetProcAddress("glTexParameteri"))
+    glDeleteTextures = @ptrCast(fn(GLsizei, *const GLuint), glXGetProcAddress("glDeleteTextures"))
+    glGenerateMipmap = @ptrCast(fn(GLenum), glXGetProcAddress("glGenerateMipmap"))
+    glActiveTexture = @ptrCast(fn(GLenum), glXGetProcAddress("glActiveTexture"))
+
+    glCreateShader = @ptrCast(fn(GLenum): GLuint, glXGetProcAddress("glCreateShader"))
+    glShaderSource = @ptrCast(fn(GLuint, GLsizei, **const GLchar, *const GLint), glXGetProcAddress("glShaderSource"))
+    glCompileShader = @ptrCast(fn(GLuint), glXGetProcAddress("glCompileShader"))
+    glGetShaderiv = @ptrCast(fn(GLuint, GLenum, *GLint), glXGetProcAddress("glGetShaderiv"))
+    glDeleteShader = @ptrCast(fn(GLuint), glXGetProcAddress("glDeleteShader"))
+
+    glCreateProgram = @ptrCast(fn(): GLuint, glXGetProcAddress("glCreateProgram"))
+    glAttachShader = @ptrCast(fn(GLuint, GLuint), glXGetProcAddress("glAttachShader"))
+    glLinkProgram = @ptrCast(fn(GLuint), glXGetProcAddress("glLinkProgram"))
+    glUseProgram = @ptrCast(fn(GLuint), glXGetProcAddress("glUseProgram"))
+    glGetProgramiv = @ptrCast(fn(GLuint, GLenum, *GLint), glXGetProcAddress("glGetProgramiv"))
+    glDeleteProgram = @ptrCast(fn(GLuint), glXGetProcAddress("glDeleteProgram"))
+    glGetUniformLocation = @ptrCast(fn(GLuint, *const GLchar): GLint, glXGetProcAddress("glGetUniformLocation"))
+    glUniform1i = @ptrCast(fn(GLint, GLint), glXGetProcAddress("glUniform1i"))
+    glUniform1f = @ptrCast(fn(GLint, GLfloat), glXGetProcAddress("glUniform1f"))
+    glUniform4f = @ptrCast(fn(GLint, GLfloat, GLfloat, GLfloat, GLfloat), glXGetProcAddress("glUniform4f"))
+    glUniformMatrix4fv = @ptrCast(fn(GLint, GLsizei, GLboolean, *const GLfloat), glXGetProcAddress("glUniformMatrix4fv"))
+
+    glDrawArrays = @ptrCast(fn(GLenum, GLint, GLsizei), glXGetProcAddress("glDrawArrays"))
+    glDrawElements = @ptrCast(fn(GLenum, GLsizei, GLenum, *const void), glXGetProcAddress("glDrawElements"))
+}
+
+// Export functions
+export fn create_renderer(display: Display, window: Window, width: u32, height: u32): ?*LinuxRenderer {
+    let renderer = LinuxRenderer::init(display, window, width, height)
+    if renderer {
+        let ptr = @alloc(LinuxRenderer, 1)
+        ptr.* = renderer.?
+        return ptr
+    }
+    return null
+}
+
+export fn destroy_renderer(renderer: *LinuxRenderer) {
+    renderer.shutdown()
+}

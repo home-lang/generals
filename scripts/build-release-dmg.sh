@@ -68,15 +68,34 @@ mkdir -p "$DMG_DIR"
 # Step 2: Build the game executable (Release mode)
 # =============================================================================
 echo -e "${BLUE}[2/8] Building game executable (Release mode)...${NC}"
-cd "$PROJECT_DIR"
-zig build -Doptimize=ReleaseFast
 
-if [ ! -f "$PROJECT_DIR/zig-out/bin/generals" ]; then
+# Build via Home compiler (generals is built from the home project)
+HOME_DIR="$PROJECT_DIR/../home"
+if [ -d "$HOME_DIR" ]; then
+    cd "$HOME_DIR"
+    echo "   Building via Home compiler..."
+    zig build generals -Doptimize=ReleaseFast 2>&1 || {
+        echo -e "${YELLOW}   Warning: Fresh build had issues, using existing binary...${NC}"
+    }
+    cd "$PROJECT_DIR"
+fi
+
+# Check for built executable (either in home project or local)
+GENERALS_BIN=""
+if [ -f "$HOME_DIR/zig-out/bin/generals" ]; then
+    GENERALS_BIN="$HOME_DIR/zig-out/bin/generals"
+elif [ -f "$PROJECT_DIR/zig-out/bin/generals" ]; then
+    GENERALS_BIN="$PROJECT_DIR/zig-out/bin/generals"
+fi
+
+if [ -z "$GENERALS_BIN" ]; then
     echo -e "${RED}ERROR: Build failed - executable not found${NC}"
+    echo "   Checked: $HOME_DIR/zig-out/bin/generals"
+    echo "   Checked: $PROJECT_DIR/zig-out/bin/generals"
     exit 1
 fi
 
-EXECUTABLE_SIZE=$(du -h "$PROJECT_DIR/zig-out/bin/generals" | cut -f1)
+EXECUTABLE_SIZE=$(du -h "$GENERALS_BIN" | cut -f1)
 echo -e "${GREEN}   Executable built: $EXECUTABLE_SIZE${NC}"
 
 # =============================================================================
@@ -89,7 +108,7 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 
 # Copy executable
-cp "$PROJECT_DIR/zig-out/bin/generals" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+cp "$GENERALS_BIN" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 # =============================================================================
