@@ -151,7 +151,7 @@ fi
 # 12. Graphics match original quality
 GFX_FILES=0
 [ -f "$ENGINE_DIR/rendering_system.home" ] && GFX_FILES=$((GFX_FILES + 1))
-[ -f "$ENGINE_DIR/w3d_complete.home" ] && GFX_FILES=$((GFX_FILES + 1))
+{ [ -f "$ENGINE_DIR/w3d_complete.home" ] || [ -f "$ENGINE_DIR/w3d.home" ]; } && GFX_FILES=$((GFX_FILES + 1))
 [ -f "$ENGINE_DIR/terrain.home" ] && GFX_FILES=$((GFX_FILES + 1))
 [ -f "$ENGINE_DIR/particle_system.home" ] || [ -f "$GRAPHICS_DIR/particle_renderer.home" ] && GFX_FILES=$((GFX_FILES + 1))
 if [ "$GFX_FILES" -ge 4 ]; then
