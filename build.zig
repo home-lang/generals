@@ -4,20 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create modules
-    const collections_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../home/packages/collections/src/lib.zig" },
-    });
-
-    const io_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../home/packages/io/src/lib.zig" },
-    });
-    io_mod.addImport("collections", collections_mod);
-
-    const math_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../home/packages/math/src/math.zig" },
-    });
-
     // Main Generals game executable
     const generals = b.addExecutable(.{
         .name = "generals",
@@ -27,10 +13,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
-    generals.root_module.addImport("io", io_mod);
-    generals.root_module.addImport("collections", collections_mod);
-    generals.root_module.addImport("math", math_mod);
 
     // Add platform-specific sources for macOS
     generals.addCSourceFile(.{
@@ -70,9 +52,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
-    test_ini.root_module.addImport("io", io_mod);
-    test_ini.root_module.addImport("collections", collections_mod);
 
     b.installArtifact(test_ini);
 
@@ -171,10 +150,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
-    test_w3d.root_module.addImport("math", math_mod);
-    test_w3d.root_module.addImport("io", io_mod);
-    test_w3d.root_module.addImport("collections", collections_mod);
 
     b.installArtifact(test_w3d);
 
