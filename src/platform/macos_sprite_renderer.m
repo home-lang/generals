@@ -337,6 +337,16 @@ RenderContext sprite_renderer_begin_frame(SpriteRenderer *renderer) {
         NSLog(@"First frame rendering successfully - viewport: %.0f x %.0f", renderer->viewport_width, renderer->viewport_height);
     }
 
+    // Set viewport to match our coordinate system (in points, not pixels)
+    MTLViewport viewport;
+    viewport.originX = 0;
+    viewport.originY = 0;
+    viewport.width = drawableSize.width;
+    viewport.height = drawableSize.height;
+    viewport.znear = 0.0;
+    viewport.zfar = 1.0;
+    [renderEncoder setViewport:viewport];
+
     // Retain all objects for the frame - these will be released in end_frame
     // Using __bridge_retained transfers ownership to the void* pointer
     ctx.drawable = (__bridge_retained void *)drawable;
@@ -416,13 +426,43 @@ void sprite_renderer_draw_sprite_batched(SpriteRenderer *renderer, RenderContext
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
+// Static counter for draw_rect logging
+static int drawRectCount = 0;
+
 // Draw a filled rectangle
 void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, float x, float y, float width, float height, float r, float g, float b, float a) {
-    if (!ctx->render_encoder) return;
+    if (!ctx->render_encoder) {
+        if (drawRectCount < 5) {
+            NSLog(@"draw_rect: render_encoder is NULL!");
+        }
+        return;
+    }
 
     id<MTLRenderCommandEncoder> renderEncoder = (__bridge id<MTLRenderCommandEncoder>)ctx->render_encoder;
     id<MTLRenderPipelineState> colorPipelineState = (__bridge id<MTLRenderPipelineState>)renderer->color_pipeline_state;
     id<MTLBuffer> colorVertexBuffer = (__bridge id<MTLBuffer>)renderer->color_vertex_buffer;
+
+    if (!colorPipelineState) {
+        if (drawRectCount < 5) {
+            NSLog(@"draw_rect: colorPipelineState is NULL!");
+        }
+        drawRectCount++;
+        return;
+    }
+
+    if (!colorVertexBuffer) {
+        if (drawRectCount < 5) {
+            NSLog(@"draw_rect: colorVertexBuffer is NULL!");
+        }
+        drawRectCount++;
+        return;
+    }
+
+    // Log first few draw calls
+    if (drawRectCount < 3) {
+        NSLog(@"draw_rect[%d]: pos=(%.0f,%.0f) size=(%.0f,%.0f) color=(%.2f,%.2f,%.2f,%.2f) viewport=(%.0f,%.0f)",
+              drawRectCount, x, y, width, height, r, g, b, a, renderer->viewport_width, renderer->viewport_height);
+    }
 
     // Generate rectangle vertices (2 triangles)
     ColorVertex *vertices = (ColorVertex *)[colorVertexBuffer contents];
@@ -440,10 +480,17 @@ void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, flo
     [renderEncoder setRenderPipelineState:colorPipelineState];
     [renderEncoder setVertexBuffer:colorVertexBuffer offset:0 atIndex:0];
 
+    // Use actual viewport size (in points, not pixels) for coordinate transform
     float viewport[] = {renderer->viewport_width, renderer->viewport_height};
     [renderEncoder setVertexBytes:viewport length:sizeof(viewport) atIndex:1];
 
+    if (drawRectCount < 5) {
+        NSLog(@"draw_rect: drawing 6 vertices, pipeline=%p, buffer=%p", colorPipelineState, colorVertexBuffer);
+    }
+
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+
+    drawRectCount++;
 }
 
 // Draw a selection circle

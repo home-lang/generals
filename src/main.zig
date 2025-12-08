@@ -324,36 +324,48 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState) void {
     var ctx = sprite_renderer_begin_frame(renderer);
     if (ctx.render_encoder == null) return;
 
-    // Render terrain grid (simple placeholder)
+    // DEBUG: Draw a bright red test rectangle in the center to verify rendering works
+    sprite_renderer_draw_rect(renderer, &ctx, 500, 300, 200, 100, 1.0, 0.0, 0.0, 1.0);
+
+    // DEBUG: Draw a bright green rectangle in top-left
+    sprite_renderer_draw_rect(renderer, &ctx, 50, 50, 100, 100, 0.0, 1.0, 0.0, 1.0);
+
+    // DEBUG: Draw a bright blue rectangle in bottom-right
+    sprite_renderer_draw_rect(renderer, &ctx, 1000, 500, 150, 100, 0.0, 0.0, 1.0, 1.0);
+
+    // Render terrain grid (use BLACK lines for maximum visibility)
     const grid_size: f32 = 50;
     var y: f32 = 0;
     while (y < 720) : (y += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.6, 0.5, 0.35, 0.3);
+        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 2, 0.0, 0.0, 0.0, 1.0);
     }
     var x: f32 = 0;
     while (x < 1280) : (x += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.6, 0.5, 0.35, 0.3);
+        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 2, 720, 0.0, 0.0, 0.0, 1.0);
     }
 
     // Render buildings
     for (state.buildings[0..state.building_count]) |building| {
-        // Building color based on faction
+        // Building color based on faction - brighter colors for visibility
         const r: f32 = switch (building.faction) {
-            .USA => 0.2,
-            .China => 0.8,
-            .GLA => 0.6,
+            .USA => 0.1,
+            .China => 0.9,
+            .GLA => 0.7,
         };
         const g: f32 = switch (building.faction) {
-            .USA => 0.4,
-            .China => 0.2,
+            .USA => 0.3,
+            .China => 0.1,
             .GLA => 0.5,
         };
         const b: f32 = switch (building.faction) {
-            .USA => 0.8,
-            .China => 0.2,
-            .GLA => 0.2,
+            .USA => 0.9,
+            .China => 0.1,
+            .GLA => 0.1,
         };
 
+        // Draw building outline (dark border)
+        sprite_renderer_draw_rect(renderer, &ctx, building.x - 2, building.y - 2, building.width + 4, building.height + 4, 0.0, 0.0, 0.0, 1.0);
+        // Draw building fill
         sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y, building.width, building.height, r, g, b, 1.0);
 
         // Building health bar
@@ -364,25 +376,28 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState) void {
 
     // Render units
     for (state.units[0..state.unit_count]) |unit| {
-        // Unit color based on faction
+        // Unit color based on faction - bright distinct colors
         const r: f32 = switch (unit.faction) {
-            .USA => 0.3,
-            .China => 0.9,
-            .GLA => 0.7,
+            .USA => 0.2,
+            .China => 1.0,
+            .GLA => 0.8,
         };
         const g: f32 = switch (unit.faction) {
             .USA => 0.5,
-            .China => 0.3,
+            .China => 0.2,
             .GLA => 0.6,
         };
         const b_col: f32 = switch (unit.faction) {
-            .USA => 0.9,
-            .China => 0.3,
-            .GLA => 0.3,
+            .USA => 1.0,
+            .China => 0.2,
+            .GLA => 0.2,
         };
 
-        // Draw unit body
+        // Draw unit body with outline
         const half_size = unit.size / 2;
+        // Draw outline first (black border)
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size - 2, unit.y - half_size - 2, unit.size + 4, unit.size + 4, 0.0, 0.0, 0.0, 1.0);
+        // Draw unit fill
         sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size, unit.size, unit.size, r, g, b_col, 1.0);
 
         // Selection circle
