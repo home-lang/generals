@@ -324,24 +324,15 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState) void {
     var ctx = sprite_renderer_begin_frame(renderer);
     if (ctx.render_encoder == null) return;
 
-    // DEBUG: Draw a bright red test rectangle in the center to verify rendering works
-    sprite_renderer_draw_rect(renderer, &ctx, 500, 300, 200, 100, 1.0, 0.0, 0.0, 1.0);
-
-    // DEBUG: Draw a bright green rectangle in top-left
-    sprite_renderer_draw_rect(renderer, &ctx, 50, 50, 100, 100, 0.0, 1.0, 0.0, 1.0);
-
-    // DEBUG: Draw a bright blue rectangle in bottom-right
-    sprite_renderer_draw_rect(renderer, &ctx, 1000, 500, 150, 100, 0.0, 0.0, 1.0, 1.0);
-
-    // Render terrain grid (use BLACK lines for maximum visibility)
-    const grid_size: f32 = 50;
+    // Render terrain grid (subtle dark lines)
+    const grid_size: f32 = 64;
     var y: f32 = 0;
     while (y < 720) : (y += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 2, 0.0, 0.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.4, 0.35, 0.25, 0.5);
     }
     var x: f32 = 0;
     while (x < 1280) : (x += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 2, 720, 0.0, 0.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.4, 0.35, 0.25, 0.5);
     }
 
     // Render buildings

@@ -444,43 +444,14 @@ void sprite_renderer_draw_sprite_batched(SpriteRenderer *renderer, RenderContext
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
-// Static counter for draw_rect logging
-static int drawRectCount = 0;
-
 // Draw a filled rectangle
 void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, float x, float y, float width, float height, float r, float g, float b, float a) {
-    if (!ctx->render_encoder) {
-        if (drawRectCount < 5) {
-            NSLog(@"draw_rect: render_encoder is NULL!");
-        }
-        return;
-    }
+    if (!ctx->render_encoder) return;
 
     id<MTLRenderCommandEncoder> renderEncoder = (__bridge id<MTLRenderCommandEncoder>)ctx->render_encoder;
     id<MTLRenderPipelineState> colorPipelineState = (__bridge id<MTLRenderPipelineState>)renderer->color_pipeline_state;
-    id<MTLBuffer> colorVertexBuffer = (__bridge id<MTLBuffer>)renderer->color_vertex_buffer;
 
-    if (!colorPipelineState) {
-        if (drawRectCount < 5) {
-            NSLog(@"draw_rect: colorPipelineState is NULL!");
-        }
-        drawRectCount++;
-        return;
-    }
-
-    if (!colorVertexBuffer) {
-        if (drawRectCount < 5) {
-            NSLog(@"draw_rect: colorVertexBuffer is NULL!");
-        }
-        drawRectCount++;
-        return;
-    }
-
-    // Log first few draw calls
-    if (drawRectCount < 3) {
-        NSLog(@"draw_rect[%d]: pos=(%.0f,%.0f) size=(%.0f,%.0f) color=(%.2f,%.2f,%.2f,%.2f) viewport=(%.0f,%.0f)",
-              drawRectCount, x, y, width, height, r, g, b, a, renderer->viewport_width, renderer->viewport_height);
-    }
+    if (!colorPipelineState) return;
 
     // Generate rectangle vertices as raw floats: 6 vertices * 6 floats each = 36 floats
     // Each vertex: x, y, r, g, b, a
@@ -514,15 +485,7 @@ void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, flo
     float viewport[] = {renderer->viewport_width, renderer->viewport_height};
     [renderEncoder setVertexBytes:viewport length:sizeof(viewport) atIndex:1];
 
-    if (drawRectCount < 3) {
-        NSLog(@"draw_rect: v0=(%.0f,%.0f) v1=(%.0f,%.0f) v2=(%.0f,%.0f) color=(%.1f,%.1f,%.1f)",
-              vertices[0], vertices[1], vertices[6], vertices[7], vertices[12], vertices[13],
-              vertices[2], vertices[3], vertices[4]);
-    }
-
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-
-    drawRectCount++;
 }
 
 // Draw a selection circle
@@ -531,12 +494,12 @@ void sprite_renderer_draw_selection_circle(SpriteRenderer *renderer, RenderConte
 
     id<MTLRenderCommandEncoder> renderEncoder = (__bridge id<MTLRenderCommandEncoder>)ctx->render_encoder;
     id<MTLRenderPipelineState> colorPipelineState = (__bridge id<MTLRenderPipelineState>)renderer->color_pipeline_state;
-    id<MTLBuffer> colorVertexBuffer = (__bridge id<MTLBuffer>)renderer->color_vertex_buffer;
 
-    // Generate circle vertices
-    const int segments = 64;
-    const float thickness = 3.0f; // Circle thickness in pixels
-    ColorVertex *vertices = (ColorVertex *)[colorVertexBuffer contents];
+    // Generate circle vertices as raw floats
+    // 32 segments, 6 vertices per segment, 6 floats per vertex = 1152 floats
+    const int segments = 32;
+    const float thickness = 3.0f;
+    float vertices[32 * 6 * 6]; // segments * vertices_per_segment * floats_per_vertex
 
     for (int i = 0; i < segments; i++) {
         float angle1 = (float)i / segments * 2.0f * M_PI;
@@ -552,19 +515,31 @@ void sprite_renderer_draw_selection_circle(SpriteRenderer *renderer, RenderConte
         float x2_inner = center_x + cosf(angle2) * (radius - thickness/2);
         float y2_inner = center_y + sinf(angle2) * (radius - thickness/2);
 
-        // First triangle
-        vertices[i * 6 + 0] = (ColorVertex){{x1_outer, y1_outer}, {r, g, b, a}};
-        vertices[i * 6 + 1] = (ColorVertex){{x2_outer, y2_outer}, {r, g, b, a}};
-        vertices[i * 6 + 2] = (ColorVertex){{x1_inner, y1_inner}, {r, g, b, a}};
+        int base = i * 36; // 6 vertices * 6 floats
 
-        // Second triangle
-        vertices[i * 6 + 3] = (ColorVertex){{x2_outer, y2_outer}, {r, g, b, a}};
-        vertices[i * 6 + 4] = (ColorVertex){{x2_inner, y2_inner}, {r, g, b, a}};
-        vertices[i * 6 + 5] = (ColorVertex){{x1_inner, y1_inner}, {r, g, b, a}};
+        // First triangle (outer1, outer2, inner1)
+        vertices[base + 0] = x1_outer; vertices[base + 1] = y1_outer;
+        vertices[base + 2] = r; vertices[base + 3] = g; vertices[base + 4] = b; vertices[base + 5] = a;
+
+        vertices[base + 6] = x2_outer; vertices[base + 7] = y2_outer;
+        vertices[base + 8] = r; vertices[base + 9] = g; vertices[base + 10] = b; vertices[base + 11] = a;
+
+        vertices[base + 12] = x1_inner; vertices[base + 13] = y1_inner;
+        vertices[base + 14] = r; vertices[base + 15] = g; vertices[base + 16] = b; vertices[base + 17] = a;
+
+        // Second triangle (outer2, inner2, inner1)
+        vertices[base + 18] = x2_outer; vertices[base + 19] = y2_outer;
+        vertices[base + 20] = r; vertices[base + 21] = g; vertices[base + 22] = b; vertices[base + 23] = a;
+
+        vertices[base + 24] = x2_inner; vertices[base + 25] = y2_inner;
+        vertices[base + 26] = r; vertices[base + 27] = g; vertices[base + 28] = b; vertices[base + 29] = a;
+
+        vertices[base + 30] = x1_inner; vertices[base + 31] = y1_inner;
+        vertices[base + 32] = r; vertices[base + 33] = g; vertices[base + 34] = b; vertices[base + 35] = a;
     }
 
     [renderEncoder setRenderPipelineState:colorPipelineState];
-    [renderEncoder setVertexBuffer:colorVertexBuffer offset:0 atIndex:0];
+    [renderEncoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
 
     float viewport[] = {renderer->viewport_width, renderer->viewport_height};
     [renderEncoder setVertexBytes:viewport length:sizeof(viewport) atIndex:1];
