@@ -158,6 +158,193 @@ const GameState = struct {
 };
 
 // =============================================================================
+// Texture Generation (Procedural sprites)
+// =============================================================================
+
+const TEXTURE_SIZE: u32 = 64;
+
+// Game textures
+const GameTextures = struct {
+    tank_usa: ?*anyopaque,
+    tank_china: ?*anyopaque,
+    tank_gla: ?*anyopaque,
+    building_usa: ?*anyopaque,
+    building_china: ?*anyopaque,
+    building_gla: ?*anyopaque,
+};
+
+fn createTankTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base_b: u8) ?*anyopaque {
+    var data: [TEXTURE_SIZE * TEXTURE_SIZE * 4]u8 = undefined;
+
+    const size = TEXTURE_SIZE;
+    const center = size / 2;
+
+    for (0..size) |y_idx| {
+        for (0..size) |x_idx| {
+            const x = @as(i32, @intCast(x_idx));
+            const y = @as(i32, @intCast(y_idx));
+            const idx = (y_idx * size + x_idx) * 4;
+
+            // Default: transparent
+            data[idx] = 0; // B
+            data[idx + 1] = 0; // G
+            data[idx + 2] = 0; // R
+            data[idx + 3] = 0; // A
+
+            const cx = @as(i32, @intCast(center));
+            const cy = @as(i32, @intCast(center));
+
+            // Tank body (rounded rectangle)
+            const body_w: i32 = 24;
+            const body_h: i32 = 16;
+            const in_body = (x >= cx - body_w / 2 and x < cx + body_w / 2 and
+                y >= cy - body_h / 2 + 4 and y < cy + body_h / 2 + 4);
+
+            // Tank turret (circle on top)
+            const turret_dx = x - cx;
+            const turret_dy = y - cy + 2;
+            const turret_dist_sq = turret_dx * turret_dx + turret_dy * turret_dy;
+            const in_turret = turret_dist_sq < 10 * 10;
+
+            // Tank barrel (rectangle extending from turret)
+            const in_barrel = (x >= cx - 2 and x < cx + 2 and y >= cy - 20 and y < cy - 5);
+
+            // Track left
+            const in_track_l = (x >= cx - body_w / 2 - 4 and x < cx - body_w / 2 + 2 and
+                y >= cy - body_h / 2 + 2 and y < cy + body_h / 2 + 6);
+
+            // Track right
+            const in_track_r = (x >= cx + body_w / 2 - 2 and x < cx + body_w / 2 + 4 and
+                y >= cy - body_h / 2 + 2 and y < cy + body_h / 2 + 6);
+
+            if (in_barrel) {
+                // Dark barrel
+                data[idx] = 40; // B
+                data[idx + 1] = 40; // G
+                data[idx + 2] = 50; // R
+                data[idx + 3] = 255; // A
+            } else if (in_turret) {
+                // Turret - slightly darker than body
+                data[idx] = @as(u8, @intCast(@max(0, @as(i32, base_b) - 30))); // B
+                data[idx + 1] = @as(u8, @intCast(@max(0, @as(i32, base_g) - 30))); // G
+                data[idx + 2] = @as(u8, @intCast(@max(0, @as(i32, base_r) - 30))); // R
+                data[idx + 3] = 255; // A
+            } else if (in_body) {
+                // Main body color
+                data[idx] = base_b; // B
+                data[idx + 1] = base_g; // G
+                data[idx + 2] = base_r; // R
+                data[idx + 3] = 255; // A
+            } else if (in_track_l or in_track_r) {
+                // Dark tracks
+                data[idx] = 30; // B
+                data[idx + 1] = 30; // G
+                data[idx + 2] = 35; // R
+                data[idx + 3] = 255; // A
+            }
+        }
+    }
+
+    return sprite_renderer_create_texture(renderer, TEXTURE_SIZE, TEXTURE_SIZE, &data);
+}
+
+fn createBuildingTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base_b: u8) ?*anyopaque {
+    var data: [TEXTURE_SIZE * TEXTURE_SIZE * 4]u8 = undefined;
+
+    const size = TEXTURE_SIZE;
+
+    for (0..size) |y_idx| {
+        for (0..size) |x_idx| {
+            const x = @as(i32, @intCast(x_idx));
+            const y = @as(i32, @intCast(y_idx));
+            const idx = (y_idx * size + x_idx) * 4;
+
+            // Default: transparent
+            data[idx] = 0;
+            data[idx + 1] = 0;
+            data[idx + 2] = 0;
+            data[idx + 3] = 0;
+
+            // Building base (large square with beveled edges)
+            const margin: i32 = 4;
+            const s = @as(i32, @intCast(size));
+            const in_base = (x >= margin and x < s - margin and y >= margin + 8 and y < s - margin);
+
+            // Roof (triangle/pyramid top)
+            const roof_start: i32 = 4;
+            const roof_end: i32 = 16;
+            const in_roof = (y >= roof_start and y < roof_end and
+                x >= margin + @divTrunc((y - roof_start) * 2, 3) and
+                x < s - margin - @divTrunc((y - roof_start) * 2, 3));
+
+            // Windows (small dark rectangles)
+            const win_row1 = (y >= 24 and y < 32);
+            const win_row2 = (y >= 40 and y < 48);
+            const win_col1 = (x >= 12 and x < 20);
+            const win_col2 = (x >= 28 and x < 36);
+            const win_col3 = (x >= 44 and x < 52);
+            const in_window = ((win_row1 or win_row2) and (win_col1 or win_col2 or win_col3));
+
+            // Door
+            const in_door = (x >= 26 and x < 38 and y >= 48 and y < s - margin);
+
+            if (in_roof) {
+                // Darker roof
+                data[idx] = @as(u8, @intCast(@max(0, @as(i32, base_b) - 50)));
+                data[idx + 1] = @as(u8, @intCast(@max(0, @as(i32, base_g) - 50)));
+                data[idx + 2] = @as(u8, @intCast(@max(0, @as(i32, base_r) - 50)));
+                data[idx + 3] = 255;
+            } else if (in_window) {
+                // Dark windows
+                data[idx] = 60;
+                data[idx + 1] = 60;
+                data[idx + 2] = 80;
+                data[idx + 3] = 255;
+            } else if (in_door) {
+                // Brown door
+                data[idx] = 40;
+                data[idx + 1] = 60;
+                data[idx + 2] = 100;
+                data[idx + 3] = 255;
+            } else if (in_base) {
+                // Main building color
+                data[idx] = base_b;
+                data[idx + 1] = base_g;
+                data[idx + 2] = base_r;
+                data[idx + 3] = 255;
+            }
+        }
+    }
+
+    return sprite_renderer_create_texture(renderer, TEXTURE_SIZE, TEXTURE_SIZE, &data);
+}
+
+fn createGameTextures(renderer: *SpriteRenderer) GameTextures {
+    return GameTextures{
+        // USA: Blue theme (RGB: 60, 120, 200)
+        .tank_usa = createTankTexture(renderer, 60, 120, 200),
+        .building_usa = createBuildingTexture(renderer, 80, 130, 180),
+
+        // China: Red theme (RGB: 200, 50, 50)
+        .tank_china = createTankTexture(renderer, 200, 50, 50),
+        .building_china = createBuildingTexture(renderer, 180, 60, 60),
+
+        // GLA: Tan/brown theme (RGB: 160, 130, 80)
+        .tank_gla = createTankTexture(renderer, 160, 130, 80),
+        .building_gla = createBuildingTexture(renderer, 140, 110, 70),
+    };
+}
+
+fn destroyGameTextures(textures: *GameTextures) void {
+    if (textures.tank_usa) |t| sprite_renderer_destroy_texture(t);
+    if (textures.tank_china) |t| sprite_renderer_destroy_texture(t);
+    if (textures.tank_gla) |t| sprite_renderer_destroy_texture(t);
+    if (textures.building_usa) |t| sprite_renderer_destroy_texture(t);
+    if (textures.building_china) |t| sprite_renderer_destroy_texture(t);
+    if (textures.building_gla) |t| sprite_renderer_destroy_texture(t);
+}
+
+// =============================================================================
 // Game Logic
 // =============================================================================
 
@@ -320,7 +507,7 @@ fn updateGameState(state: *GameState, window: *MacOSWindow, dt: f32) void {
     state.frame_count += 1;
 }
 
-fn renderGame(renderer: *SpriteRenderer, state: *const GameState) void {
+fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *const GameTextures) void {
     var ctx = sprite_renderer_begin_frame(renderer);
     if (ctx.render_encoder == null) return;
 
@@ -328,88 +515,83 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState) void {
     const grid_size: f32 = 64;
     var y: f32 = 0;
     while (y < 720) : (y += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.4, 0.35, 0.25, 0.5);
+        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.5, 0.4, 0.3, 0.4);
     }
     var x: f32 = 0;
     while (x < 1280) : (x += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.4, 0.35, 0.25, 0.5);
+        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.5, 0.4, 0.3, 0.4);
     }
 
-    // Render buildings
+    // Render buildings using sprites
     for (state.buildings[0..state.building_count]) |building| {
-        // Building color based on faction - brighter colors for visibility
-        const r: f32 = switch (building.faction) {
-            .USA => 0.1,
-            .China => 0.9,
-            .GLA => 0.7,
-        };
-        const g: f32 = switch (building.faction) {
-            .USA => 0.3,
-            .China => 0.1,
-            .GLA => 0.5,
-        };
-        const b: f32 = switch (building.faction) {
-            .USA => 0.9,
-            .China => 0.1,
-            .GLA => 0.1,
+        // Get building texture based on faction
+        const texture = switch (building.faction) {
+            .USA => textures.building_usa,
+            .China => textures.building_china,
+            .GLA => textures.building_gla,
         };
 
-        // Draw building outline (dark border)
-        sprite_renderer_draw_rect(renderer, &ctx, building.x - 2, building.y - 2, building.width + 4, building.height + 4, 0.0, 0.0, 0.0, 1.0);
-        // Draw building fill
-        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y, building.width, building.height, r, g, b, 1.0);
+        // Draw building sprite
+        if (texture) |tex| {
+            sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, building.x, building.y, building.width, building.height);
+        }
 
         // Building health bar
         const health_pct = building.health / building.max_health;
-        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y - 8, building.width, 4, 0.2, 0.2, 0.2, 1.0);
-        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y - 8, building.width * health_pct, 4, 0.0, 1.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y - 10, building.width, 6, 0.1, 0.1, 0.1, 0.9);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x + 1, building.y - 9, (building.width - 2) * health_pct, 4, 0.0, 0.9, 0.0, 1.0);
     }
 
-    // Render units
+    // Render units using sprites
     for (state.units[0..state.unit_count]) |unit| {
-        // Unit color based on faction - bright distinct colors
-        const r: f32 = switch (unit.faction) {
-            .USA => 0.2,
-            .China => 1.0,
-            .GLA => 0.8,
-        };
-        const g: f32 = switch (unit.faction) {
-            .USA => 0.5,
-            .China => 0.2,
-            .GLA => 0.6,
-        };
-        const b_col: f32 = switch (unit.faction) {
-            .USA => 1.0,
-            .China => 0.2,
-            .GLA => 0.2,
+        // Get tank texture based on faction
+        const texture = switch (unit.faction) {
+            .USA => textures.tank_usa,
+            .China => textures.tank_china,
+            .GLA => textures.tank_gla,
         };
 
-        // Draw unit body with outline
         const half_size = unit.size / 2;
-        // Draw outline first (black border)
-        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size - 2, unit.y - half_size - 2, unit.size + 4, unit.size + 4, 0.0, 0.0, 0.0, 1.0);
-        // Draw unit fill
-        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size, unit.size, unit.size, r, g, b_col, 1.0);
 
-        // Selection circle
+        // Draw unit sprite
+        if (texture) |tex| {
+            sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, unit.x - half_size, unit.y - half_size, unit.size, unit.size);
+        }
+
+        // Selection circle (draw UNDER the unit for better visibility)
         if (unit.selected) {
-            sprite_renderer_draw_selection_circle(renderer, &ctx, unit.x, unit.y, unit.size * 0.7, 0.0, 1.0, 0.0, 1.0);
+            sprite_renderer_draw_selection_circle(renderer, &ctx, unit.x, unit.y, unit.size * 0.6, 0.0, 1.0, 0.0, 1.0);
         }
 
         // Health bar
         const health_pct = unit.health / unit.max_health;
-        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size - 8, unit.size, 4, 0.2, 0.2, 0.2, 1.0);
-        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size - 8, unit.size * health_pct, 4, 0.0, 1.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size - 10, unit.size, 6, 0.1, 0.1, 0.1, 0.9);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size + 1, unit.y - half_size - 9, (unit.size - 2) * health_pct, 4, 0.0, 0.9, 0.0, 1.0);
     }
 
-    // Render UI - Resource display
-    sprite_renderer_draw_rect(renderer, &ctx, 10, 10, 200, 30, 0.1, 0.1, 0.1, 0.8);
+    // Render UI - Top bar with resources
+    sprite_renderer_draw_rect(renderer, &ctx, 0, 0, 1280, 40, 0.1, 0.1, 0.15, 0.95);
+    // Money icon area
+    sprite_renderer_draw_rect(renderer, &ctx, 10, 8, 24, 24, 0.9, 0.8, 0.0, 1.0);
+    // Power icon area
+    sprite_renderer_draw_rect(renderer, &ctx, 150, 8, 24, 24, 0.0, 0.8, 0.9, 1.0);
 
-    // Render minimap placeholder
-    sprite_renderer_draw_rect(renderer, &ctx, 1280 - 160 - 10, 720 - 120 - 10, 160, 120, 0.0, 0.2, 0.0, 0.8);
+    // Render minimap background
+    sprite_renderer_draw_rect(renderer, &ctx, 1280 - 180, 720 - 150, 170, 140, 0.05, 0.1, 0.05, 0.95);
+    // Minimap terrain
+    sprite_renderer_draw_rect(renderer, &ctx, 1280 - 175, 720 - 145, 160, 130, 0.3, 0.4, 0.2, 1.0);
 
-    // Render control bar placeholder
-    sprite_renderer_draw_rect(renderer, &ctx, 0, 720 - 180, 1280, 180, 0.15, 0.15, 0.15, 0.9);
+    // Render control bar at bottom
+    sprite_renderer_draw_rect(renderer, &ctx, 0, 720 - 100, 1280, 100, 0.12, 0.12, 0.15, 0.95);
+    // Command buttons placeholder
+    for (0..6) |i| {
+        const btn_x: f32 = 20 + @as(f32, @floatFromInt(i)) * 70;
+        sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.25, 0.25, 0.3, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.15, 0.2, 1.0);
+    }
+
+    // Unit portrait area (when unit selected)
+    sprite_renderer_draw_rect(renderer, &ctx, 500, 720 - 95, 90, 85, 0.2, 0.2, 0.25, 1.0);
 
     sprite_renderer_end_frame(renderer, &ctx);
 }
@@ -452,6 +634,12 @@ pub fn main() !void {
     }
     print("Renderer created successfully\n", .{});
 
+    // Create game textures
+    print("Creating game textures...\n", .{});
+    var textures = createGameTextures(&renderer);
+    defer destroyGameTextures(&textures);
+    print("Game textures created\n", .{});
+
     // Initialize game state
     var game_state = initGameState();
     print("Game state initialized\n", .{});
@@ -486,7 +674,7 @@ pub fn main() !void {
         updateGameState(&game_state, &window, dt);
 
         // Render
-        renderGame(&renderer, &game_state);
+        renderGame(&renderer, &game_state, &textures);
 
         // Frame rate limiting
         const frame_end = std.time.Instant.now() catch current_instant;
