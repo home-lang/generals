@@ -156,22 +156,47 @@ SpriteRenderer sprite_renderer_create(void *ns_window) {
                                                          options:MTLResourceStorageModeShared];
 
         // Create color shaders for selection indicators
+        // SIMPLE TEST: Use hardcoded NDC coordinates to verify pipeline works
         NSString *colorShaderSource = @
             "#include <metal_stdlib>\n"
             "using namespace metal;\n"
-            "struct ColorVertex { float2 position; float4 color; };\n"
-            "struct ColorRasterizerData { float4 position [[position]]; float4 color; };\n"
-            "vertex ColorRasterizerData color_vertex_main(uint vertexID [[vertex_id]], constant ColorVertex *vertices [[buffer(0)]], constant float2 *viewportSize [[buffer(1)]]) {\n"
+            "\n"
+            "struct ColorRasterizerData {\n"
+            "    float4 position [[position]];\n"
+            "    float4 color;\n"
+            "};\n"
+            "\n"
+            "// Hardcoded triangle vertices in NDC for testing\n"
+            "constant float2 testPositions[] = {\n"
+            "    float2(-0.5, -0.5),\n"
+            "    float2( 0.5, -0.5),\n"
+            "    float2( 0.0,  0.5),\n"
+            "    float2(-0.5, -0.5),\n"
+            "    float2( 0.5, -0.5),\n"
+            "    float2( 0.0,  0.5),\n"
+            "};\n"
+            "\n"
+            "constant float4 testColors[] = {\n"
+            "    float4(1.0, 0.0, 0.0, 1.0),\n"
+            "    float4(0.0, 1.0, 0.0, 1.0),\n"
+            "    float4(0.0, 0.0, 1.0, 1.0),\n"
+            "    float4(1.0, 0.0, 0.0, 1.0),\n"
+            "    float4(0.0, 1.0, 0.0, 1.0),\n"
+            "    float4(0.0, 0.0, 1.0, 1.0),\n"
+            "};\n"
+            "\n"
+            "vertex ColorRasterizerData color_vertex_main(\n"
+            "    uint vertexID [[vertex_id]],\n"
+            "    constant float *vertices [[buffer(0)]],\n"
+            "    constant float *viewportSize [[buffer(1)]]) {\n"
+            "    \n"
             "    ColorRasterizerData out;\n"
-            "    float2 pos = vertices[vertexID].position;\n"
-            "    out.color = vertices[vertexID].color;\n"
-            "    float2 viewport = *viewportSize;\n"
-            "    float2 ndc;\n"
-            "    ndc.x = (pos.x / viewport.x) * 2.0 - 1.0;\n"
-            "    ndc.y = 1.0 - (pos.y / viewport.y) * 2.0;\n"
-            "    out.position = float4(ndc, 0.0, 1.0);\n"
+            "    // Use hardcoded test data to verify shader works\n"
+            "    out.position = float4(testPositions[vertexID % 6], 0.0, 1.0);\n"
+            "    out.color = testColors[vertexID % 6];\n"
             "    return out;\n"
             "}\n"
+            "\n"
             "fragment float4 color_fragment_main(ColorRasterizerData in [[stage_in]]) {\n"
             "    return in.color;\n"
             "}\n";
@@ -464,8 +489,8 @@ void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, flo
               drawRectCount, x, y, width, height, r, g, b, a, renderer->viewport_width, renderer->viewport_height);
     }
 
-    // Generate rectangle vertices (2 triangles)
-    ColorVertex *vertices = (ColorVertex *)[colorVertexBuffer contents];
+    // Generate rectangle vertices (2 triangles) - use setVertexBytes for immediate mode
+    ColorVertex vertices[6];
 
     // Triangle 1
     vertices[0] = (ColorVertex){{x, y}, {r, g, b, a}};                    // Top-left
@@ -478,14 +503,20 @@ void sprite_renderer_draw_rect(SpriteRenderer *renderer, RenderContext *ctx, flo
     vertices[5] = (ColorVertex){{x, y + height}, {r, g, b, a}};          // Bottom-left
 
     [renderEncoder setRenderPipelineState:colorPipelineState];
-    [renderEncoder setVertexBuffer:colorVertexBuffer offset:0 atIndex:0];
+
+    // Use setVertexBytes for small vertex data (more reliable than shared buffer)
+    [renderEncoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
 
     // Use actual viewport size (in points, not pixels) for coordinate transform
     float viewport[] = {renderer->viewport_width, renderer->viewport_height};
     [renderEncoder setVertexBytes:viewport length:sizeof(viewport) atIndex:1];
 
     if (drawRectCount < 5) {
-        NSLog(@"draw_rect: drawing 6 vertices, pipeline=%p, buffer=%p", colorPipelineState, colorVertexBuffer);
+        NSLog(@"draw_rect: vertex[0] pos=(%.1f,%.1f) color=(%.2f,%.2f,%.2f,%.2f)",
+              vertices[0].position[0], vertices[0].position[1],
+              vertices[0].color[0], vertices[0].color[1], vertices[0].color[2], vertices[0].color[3]);
+        NSLog(@"draw_rect: vertex[1] pos=(%.1f,%.1f)", vertices[1].position[0], vertices[1].position[1]);
+        NSLog(@"draw_rect: vertex[2] pos=(%.1f,%.1f)", vertices[2].position[0], vertices[2].position[1]);
     }
 
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
