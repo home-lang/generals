@@ -165,6 +165,18 @@ const MainState = struct {
     current_mouse_x: f32,
     current_mouse_y: f32,
 
+    // Fog of War
+    fog_of_war: game.FogOfWar,
+    fog_enabled: bool,
+
+    // AI Controllers (for enemy factions)
+    ai_china: game.AIController,
+    ai_gla: game.AIController,
+    ai_china_money: i32,
+    ai_gla_money: i32,
+    ai_china_production: game.ProductionQueue,
+    ai_gla_production: game.ProductionQueue,
+
     // Timing
     is_running: bool,
     frame_count: u64,
@@ -184,6 +196,14 @@ const MainState = struct {
             .unit_groups = [_]UnitGroup{UnitGroup.init()} ** 10,
             .current_mouse_x = 0,
             .current_mouse_y = 0,
+            .fog_of_war = game.FogOfWar.init(),
+            .fog_enabled = true,
+            .ai_china = game.AIController.init(.China),
+            .ai_gla = game.AIController.init(.GLA),
+            .ai_china_money = 2000,
+            .ai_gla_money = 2000,
+            .ai_china_production = game.ProductionQueue.init(),
+            .ai_gla_production = game.ProductionQueue.init(),
             .is_running = true,
             .frame_count = 0,
         };
@@ -517,14 +537,92 @@ fn updateGame(state: *MainState, dt: f32) void {
     // Combat system
     processCombat(state, dt);
 
-    // Update production
+    // Update production (player)
     state.game_state.updateProduction(dt);
+
+    // Update AI production queues
+    updateAIProduction(state, dt);
+
+    // Update AI controllers
+    state.ai_china.update(
+        dt,
+        &state.game_state.unit_manager,
+        &state.game_state.building_manager,
+        &state.ai_china_production,
+        &state.ai_china_money,
+    );
+    state.ai_gla.update(
+        dt,
+        &state.game_state.unit_manager,
+        &state.game_state.building_manager,
+        &state.ai_gla_production,
+        &state.ai_gla_money,
+    );
+
+    // Give AI income over time
+    if (state.frame_count % 120 == 0) { // Every 2 seconds at 60fps
+        state.ai_china_money += 100;
+        state.ai_gla_money += 100;
+    }
+
+    // Update fog of war
+    updateFogOfWar(state);
 
     // Update visual effects
     updateExplosions(state, dt);
     updateMuzzleFlashes(state, dt);
 
     state.frame_count += 1;
+}
+
+fn updateAIProduction(state: *MainState, dt: f32) void {
+    // Update China AI production
+    if (state.ai_china_production.update(dt)) |completed_type| {
+        // Find spawn point from building
+        const bld_idx = state.ai_china_production.building_idx;
+        if (state.game_state.building_manager.getBuilding(bld_idx)) |building| {
+            const spawn = building.getSpawnPoint();
+            _ = state.game_state.unit_manager.addUnit(game.Unit.create(spawn.x, spawn.y, .China, completed_type));
+            std.debug.print("[AI China] Produced unit: {any}\n", .{completed_type});
+        }
+    }
+
+    // Update GLA AI production
+    if (state.ai_gla_production.update(dt)) |completed_type| {
+        const bld_idx = state.ai_gla_production.building_idx;
+        if (state.game_state.building_manager.getBuilding(bld_idx)) |building| {
+            const spawn = building.getSpawnPoint();
+            _ = state.game_state.unit_manager.addUnit(game.Unit.create(spawn.x, spawn.y, .GLA, completed_type));
+            std.debug.print("[AI GLA] Produced unit: {any}\n", .{completed_type});
+        }
+    }
+}
+
+fn updateFogOfWar(state: *MainState) void {
+    if (!state.fog_enabled) return;
+
+    // Reset visibility to explored state
+    state.fog_of_war.resetVisibility();
+
+    // Reveal areas around player units
+    const vision_radius: f32 = 150.0; // Default unit vision
+    for (state.game_state.unit_manager.units[0..state.game_state.unit_manager.count]) |unit| {
+        if (unit.faction == state.game_state.player_faction and unit.is_alive) {
+            state.fog_of_war.revealArea(unit.x, unit.y, vision_radius);
+        }
+    }
+
+    // Reveal areas around player buildings
+    const building_vision: f32 = 200.0;
+    for (state.game_state.building_manager.buildings[0..state.game_state.building_manager.count]) |building| {
+        if (building.faction == state.game_state.player_faction) {
+            state.fog_of_war.revealArea(
+                building.x + building.width / 2,
+                building.y + building.height / 2,
+                building_vision,
+            );
+        }
+    }
 }
 
 fn processCombat(state: *MainState, dt: f32) void {
@@ -680,14 +778,17 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     // Terrain
     renderTerrain(renderer, &ctx);
 
-    // Buildings
+    // Buildings (with fog check)
     renderBuildings(renderer, &ctx, state);
 
-    // Units
+    // Units (with fog check)
     renderUnits(renderer, &ctx, state);
 
     // Selection box (if dragging)
     renderSelectionBox(renderer, &ctx, state);
+
+    // Fog of War overlay
+    renderFogOfWar(renderer, &ctx, state);
 
     // Effects
     renderEffects(renderer, &ctx, state);
@@ -696,6 +797,34 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     renderUI(renderer, &ctx, state);
 
     sprite_renderer_end_frame(renderer, &ctx);
+}
+
+fn renderFogOfWar(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    if (!state.fog_enabled) return;
+
+    const tile_size = game.FOG_TILE_SIZE;
+
+    for (0..game.FOG_MAP_HEIGHT) |ty| {
+        for (0..game.FOG_MAP_WIDTH) |tx| {
+            const fog_state = state.fog_of_war.getState(tx, ty);
+            const px = @as(f32, @floatFromInt(tx)) * tile_size;
+            const py = @as(f32, @floatFromInt(ty)) * tile_size;
+
+            switch (fog_state) {
+                .Unexplored => {
+                    // Completely black
+                    sprite_renderer_draw_rect(renderer, ctx, px, py, tile_size, tile_size, 0.0, 0.0, 0.0, 1.0);
+                },
+                .Explored => {
+                    // Semi-transparent dark
+                    sprite_renderer_draw_rect(renderer, ctx, px, py, tile_size, tile_size, 0.0, 0.0, 0.0, 0.6);
+                },
+                .Visible => {
+                    // No overlay - fully visible
+                },
+            }
+        }
+    }
 }
 
 fn renderSelectionBox(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
@@ -798,6 +927,11 @@ fn renderBuildings(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const
 fn renderUnits(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
     for (state.game_state.unit_manager.units[0..state.game_state.unit_manager.count]) |unit| {
         if (!unit.is_alive) continue;
+
+        // Skip enemy units not in visible area (fog of war)
+        if (state.fog_enabled and unit.faction != state.game_state.player_faction) {
+            if (!state.fog_of_war.isVisible(unit.x, unit.y)) continue;
+        }
 
         const half_size = unit.size / 2;
         const colors = getFactionColors(unit.faction);
