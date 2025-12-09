@@ -20,6 +20,23 @@ const MacOSWindow = extern struct {
     key_a: bool,
     key_s: bool,
     key_d: bool,
+    // Number keys (for unit groups)
+    key_1: bool,
+    key_2: bool,
+    key_3: bool,
+    key_4: bool,
+    key_5: bool,
+    key_6: bool,
+    key_7: bool,
+    key_8: bool,
+    key_9: bool,
+    key_0: bool,
+    // Modifier keys
+    key_ctrl: bool,
+    key_shift: bool,
+    // Number key pressed this frame
+    number_key_pressed: i8,
+    // Mouse button state
     mouse_left_down: bool,
     mouse_right_down: bool,
     mouse_left_clicked: bool,
@@ -32,6 +49,7 @@ extern fn macos_window_poll_events(window: *MacOSWindow) bool;
 extern fn macos_window_get_mouse_position(window: *MacOSWindow, x: *f32, y: *f32) void;
 extern fn macos_window_get_keyboard_state(window: *MacOSWindow, up: *bool, down: *bool, left: *bool, right: *bool, w: *bool, a: *bool, s: *bool, d: *bool) void;
 extern fn macos_window_get_mouse_button_state(window: *MacOSWindow, left_down: *bool, right_down: *bool, left_clicked: *bool, right_clicked: *bool) void;
+extern fn macos_window_get_modifier_state(window: *MacOSWindow, ctrl: *bool, shift: *bool, number_pressed: *i8) void;
 extern fn macos_window_destroy(window: *MacOSWindow) void;
 
 // Sprite Renderer
@@ -99,6 +117,30 @@ const MuzzleFlash = struct {
 // Main Game State (combines modules with rendering state)
 // =============================================================================
 
+// Unit group (stores unit indices)
+const UnitGroup = struct {
+    unit_indices: [game.MAX_UNITS]usize,
+    count: usize,
+
+    pub fn init() UnitGroup {
+        return UnitGroup{
+            .unit_indices = undefined,
+            .count = 0,
+        };
+    }
+
+    pub fn clear(self: *UnitGroup) void {
+        self.count = 0;
+    }
+
+    pub fn add(self: *UnitGroup, idx: usize) void {
+        if (self.count < game.MAX_UNITS) {
+            self.unit_indices[self.count] = idx;
+            self.count += 1;
+        }
+    }
+};
+
 const MainState = struct {
     // Game logic state (from module)
     game_state: game.GameState,
@@ -108,6 +150,20 @@ const MainState = struct {
     explosion_count: usize,
     muzzle_flashes: [32]MuzzleFlash,
     muzzle_flash_count: usize,
+
+    // Selection box (drag selection)
+    selection_start_x: f32,
+    selection_start_y: f32,
+    is_selecting: bool,
+    selected_units: [game.MAX_UNITS]usize,
+    selected_unit_count: usize,
+
+    // Unit groups (1-9 hotkeys, index 0 = group 1, etc.)
+    unit_groups: [10]UnitGroup,
+
+    // Current mouse position (for rendering selection box)
+    current_mouse_x: f32,
+    current_mouse_y: f32,
 
     // Timing
     is_running: bool,
@@ -120,6 +176,14 @@ const MainState = struct {
             .explosion_count = 0,
             .muzzle_flashes = undefined,
             .muzzle_flash_count = 0,
+            .selection_start_x = 0,
+            .selection_start_y = 0,
+            .is_selecting = false,
+            .selected_units = undefined,
+            .selected_unit_count = 0,
+            .unit_groups = [_]UnitGroup{UnitGroup.init()} ** 10,
+            .current_mouse_x = 0,
+            .current_mouse_y = 0,
             .is_running = true,
             .frame_count = 0,
         };
@@ -170,6 +234,110 @@ const MainState = struct {
             self.muzzle_flash_count += 1;
         }
     }
+
+    // Clear multi-selection
+    pub fn clearMultiSelection(self: *MainState) void {
+        // Deselect all previously selected units
+        for (self.selected_units[0..self.selected_unit_count]) |idx| {
+            if (self.game_state.unit_manager.getUnit(idx)) |unit| {
+                unit.selected = false;
+            }
+        }
+        self.selected_unit_count = 0;
+        self.game_state.selected_unit_index = null;
+    }
+
+    // Add a unit to multi-selection
+    pub fn addToSelection(self: *MainState, unit_idx: usize) void {
+        // Check if already selected
+        for (self.selected_units[0..self.selected_unit_count]) |idx| {
+            if (idx == unit_idx) return;
+        }
+        if (self.selected_unit_count < game.MAX_UNITS) {
+            self.selected_units[self.selected_unit_count] = unit_idx;
+            self.selected_unit_count += 1;
+            if (self.game_state.unit_manager.getUnit(unit_idx)) |unit| {
+                unit.selected = true;
+            }
+            // Set first selected as the main selection for UI purposes
+            if (self.selected_unit_count == 1) {
+                self.game_state.selected_unit_index = unit_idx;
+            }
+        }
+    }
+
+    // Select units in a rectangle
+    pub fn selectUnitsInRect(self: *MainState, x1: f32, y1: f32, x2: f32, y2: f32) void {
+        const min_x = @min(x1, x2);
+        const max_x = @max(x1, x2);
+        const min_y = @min(y1, y2);
+        const max_y = @max(y1, y2);
+
+        for (self.game_state.unit_manager.getUnits(), 0..) |*unit, i| {
+            if (!unit.is_alive) continue;
+            // Only select player's units
+            if (unit.faction != self.game_state.player_faction) continue;
+
+            if (unit.x >= min_x and unit.x <= max_x and
+                unit.y >= min_y and unit.y <= max_y)
+            {
+                self.addToSelection(i);
+            }
+        }
+    }
+
+    // Move all selected units
+    pub fn moveSelectedUnits(self: *MainState, target_x: f32, target_y: f32) void {
+        if (self.selected_unit_count == 0) return;
+
+        // Calculate formation offsets for multiple units
+        const spacing: f32 = 30.0;
+        var col: usize = 0;
+        var row: usize = 0;
+        const units_per_row: usize = 5;
+
+        for (self.selected_units[0..self.selected_unit_count]) |idx| {
+            if (self.game_state.unit_manager.getUnit(idx)) |unit| {
+                const offset_x = @as(f32, @floatFromInt(col)) * spacing - @as(f32, @floatFromInt(units_per_row / 2)) * spacing;
+                const offset_y = @as(f32, @floatFromInt(row)) * spacing;
+                unit.moveTo(target_x + offset_x, target_y + offset_y);
+
+                col += 1;
+                if (col >= units_per_row) {
+                    col = 0;
+                    row += 1;
+                }
+            }
+        }
+    }
+
+    // Assign selected units to a group
+    pub fn assignGroup(self: *MainState, group_num: usize) void {
+        if (group_num >= 10) return;
+        self.unit_groups[group_num].clear();
+        for (self.selected_units[0..self.selected_unit_count]) |idx| {
+            self.unit_groups[group_num].add(idx);
+        }
+        std.debug.print("[GROUP] Assigned {d} units to group {d}\n", .{ self.selected_unit_count, group_num + 1 });
+    }
+
+    // Recall a unit group
+    pub fn recallGroup(self: *MainState, group_num: usize) void {
+        if (group_num >= 10) return;
+        const group = &self.unit_groups[group_num];
+        if (group.count == 0) return;
+
+        self.clearMultiSelection();
+        for (group.unit_indices[0..group.count]) |idx| {
+            // Verify unit is still alive
+            if (self.game_state.unit_manager.getUnit(idx)) |unit| {
+                if (unit.is_alive) {
+                    self.addToSelection(idx);
+                }
+            }
+        }
+        std.debug.print("[GROUP] Recalled group {d} ({d} units)\n", .{ group_num + 1, self.selected_unit_count });
+    }
 };
 
 // =============================================================================
@@ -191,66 +359,121 @@ fn handleInput(state: *MainState, window: *MacOSWindow, dt: f32) void {
     var mouse_y: f32 = 0;
     macos_window_get_mouse_position(window, &mouse_x, &mouse_y);
 
+    // Store current mouse position for rendering
+    state.current_mouse_x = mouse_x;
+    state.current_mouse_y = mouse_y;
+
     var left_down: bool = false;
     var right_down: bool = false;
     var left_clicked: bool = false;
     var right_clicked: bool = false;
     macos_window_get_mouse_button_state(window, &left_down, &right_down, &left_clicked, &right_clicked);
 
+    // Get modifier keys and number key pressed
+    var ctrl: bool = false;
+    var shift: bool = false;
+    var number_pressed: i8 = -1;
+    macos_window_get_modifier_state(window, &ctrl, &shift, &number_pressed);
+
     // Camera movement
     const camera_speed: f32 = 300.0;
-    var dx: f32 = 0;
-    var dy: f32 = 0;
-    if (up or w) dy -= camera_speed * dt;
-    if (down or s) dy += camera_speed * dt;
-    if (left or a) dx -= camera_speed * dt;
-    if (right or d) dx += camera_speed * dt;
-    state.game_state.moveCamera(dx, dy);
+    var cam_dx: f32 = 0;
+    var cam_dy: f32 = 0;
+    if (up or w) cam_dy -= camera_speed * dt;
+    if (down or s) cam_dy += camera_speed * dt;
+    if (left or a) cam_dx -= camera_speed * dt;
+    if (right or d) cam_dx += camera_speed * dt;
+    state.game_state.moveCamera(cam_dx, cam_dy);
 
-    // Selection handling
-    if (left_clicked) {
-        state.game_state.clearSelection();
+    // Handle unit group hotkeys (1-9)
+    if (number_pressed >= 0 and number_pressed <= 9) {
+        const group_idx: usize = @intCast(number_pressed);
+        // Map: 1-9 -> groups 0-8, 0 -> group 9
+        const actual_group = if (group_idx == 0) 9 else group_idx - 1;
 
-        // Check units first
-        var found_unit = false;
-        for (state.game_state.unit_manager.getUnits(), 0..) |*unit, i| {
-            const ux = mouse_x - unit.x;
-            const uy = mouse_y - unit.y;
-            const dist_sq = ux * ux + uy * uy;
-            const radius = unit.size / 2;
-            if (dist_sq < radius * radius and unit.is_alive) {
-                state.game_state.selectUnit(i);
-                found_unit = true;
-                break;
-            }
+        if (ctrl) {
+            // Ctrl+number: Assign selected units to group
+            state.assignGroup(actual_group);
+        } else {
+            // Number only: Recall group
+            state.recallGroup(actual_group);
         }
+    }
 
-        // Check buildings if no unit found
-        if (!found_unit) {
-            for (state.game_state.building_manager.getBuildings(), 0..) |building, i| {
-                if (building.faction != state.game_state.player_faction) continue;
-                if (mouse_x >= building.x and mouse_x < building.x + building.width and
-                    mouse_y >= building.y and mouse_y < building.y + building.height)
-                {
-                    state.game_state.selectBuilding(i);
+    // Drag selection - start
+    if (left_clicked and !state.is_selecting) {
+        // Skip if clicking on UI area
+        if (mouse_y < 720 - 100 and mouse_y > 40) {
+            // Check if clicking directly on a unit first
+            var clicked_on_unit = false;
+            for (state.game_state.unit_manager.getUnits(), 0..) |*unit, i| {
+                if (!unit.is_alive) continue;
+                const ux = mouse_x - unit.x;
+                const uy = mouse_y - unit.y;
+                const dist_sq = ux * ux + uy * uy;
+                const radius = unit.size / 2;
+                if (dist_sq < radius * radius) {
+                    // Direct click on a unit - select just this one (unless shift)
+                    if (!shift) {
+                        state.clearMultiSelection();
+                        state.game_state.clearSelection();
+                    }
+                    state.addToSelection(i);
+                    clicked_on_unit = true;
                     break;
                 }
             }
-        }
 
-        // Check build buttons
-        if (state.game_state.selected_building_index) |bld_idx| {
-            if (state.game_state.building_manager.getBuilding(bld_idx)) |building| {
-                if (mouse_y >= 720 - 100) {
+            if (!clicked_on_unit) {
+                // Check buildings
+                var clicked_on_building = false;
+                for (state.game_state.building_manager.getBuildings(), 0..) |building, i| {
+                    if (building.faction != state.game_state.player_faction) continue;
+                    if (mouse_x >= building.x and mouse_x < building.x + building.width and
+                        mouse_y >= building.y and mouse_y < building.y + building.height)
+                    {
+                        state.clearMultiSelection();
+                        state.game_state.clearSelection();
+                        state.game_state.selectBuilding(i);
+                        clicked_on_building = true;
+                        break;
+                    }
+                }
+
+                if (!clicked_on_building) {
+                    // Start drag selection
+                    state.selection_start_x = mouse_x;
+                    state.selection_start_y = mouse_y;
+                    state.is_selecting = true;
+                    if (!shift) {
+                        state.clearMultiSelection();
+                        state.game_state.clearSelection();
+                    }
+                }
+            }
+        } else if (mouse_y >= 720 - 100) {
+            // Check build buttons
+            if (state.game_state.selected_building_index) |bld_idx| {
+                if (state.game_state.building_manager.getBuilding(bld_idx)) |building| {
                     handleBuildButtonClick(state, building, bld_idx, mouse_x);
                 }
             }
         }
     }
 
-    // Unit movement
+    // Drag selection - end
+    if (!left_down and state.is_selecting) {
+        state.is_selecting = false;
+        // Select units in the rectangle
+        state.selectUnitsInRect(state.selection_start_x, state.selection_start_y, mouse_x, mouse_y);
+    }
+
+    // Unit movement - right click moves all selected units
     if (right_clicked) {
-        if (state.game_state.selected_unit_index) |idx| {
+        if (state.selected_unit_count > 0) {
+            state.moveSelectedUnits(mouse_x, mouse_y);
+        } else if (state.game_state.selected_unit_index) |idx| {
+            // Fallback to single selection
             if (state.game_state.unit_manager.getUnit(idx)) |unit| {
                 unit.moveTo(mouse_x, mouse_y);
             }
@@ -463,6 +686,9 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     // Units
     renderUnits(renderer, &ctx, state);
 
+    // Selection box (if dragging)
+    renderSelectionBox(renderer, &ctx, state);
+
     // Effects
     renderEffects(renderer, &ctx, state);
 
@@ -470,6 +696,37 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     renderUI(renderer, &ctx, state);
 
     sprite_renderer_end_frame(renderer, &ctx);
+}
+
+fn renderSelectionBox(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    if (!state.is_selecting) return;
+
+    const x1 = state.selection_start_x;
+    const y1 = state.selection_start_y;
+    const x2 = state.current_mouse_x;
+    const y2 = state.current_mouse_y;
+
+    const min_x = @min(x1, x2);
+    const max_x = @max(x1, x2);
+    const min_y = @min(y1, y2);
+    const max_y = @max(y1, y2);
+    const box_w = max_x - min_x;
+    const box_h = max_y - min_y;
+
+    // Draw selection box outline (green semi-transparent)
+    const line_thickness: f32 = 2;
+
+    // Top line
+    sprite_renderer_draw_rect(renderer, ctx, min_x, min_y, box_w, line_thickness, 0.0, 1.0, 0.0, 0.8);
+    // Bottom line
+    sprite_renderer_draw_rect(renderer, ctx, min_x, max_y - line_thickness, box_w, line_thickness, 0.0, 1.0, 0.0, 0.8);
+    // Left line
+    sprite_renderer_draw_rect(renderer, ctx, min_x, min_y, line_thickness, box_h, 0.0, 1.0, 0.0, 0.8);
+    // Right line
+    sprite_renderer_draw_rect(renderer, ctx, max_x - line_thickness, min_y, line_thickness, box_h, 0.0, 1.0, 0.0, 0.8);
+
+    // Draw semi-transparent fill
+    sprite_renderer_draw_rect(renderer, ctx, min_x, min_y, box_w, box_h, 0.0, 1.0, 0.0, 0.15);
 }
 
 fn renderTerrain(renderer: *SpriteRenderer, ctx: *RenderContext) void {
@@ -784,7 +1041,11 @@ pub fn main() !void {
     print("Controls:\n", .{});
     print("  - Arrow keys or WASD: Move camera\n", .{});
     print("  - Left click: Select unit/building\n", .{});
-    print("  - Right click: Move selected unit\n", .{});
+    print("  - Left drag: Box select multiple units\n", .{});
+    print("  - Shift+click: Add to selection\n", .{});
+    print("  - Right click: Move selected unit(s)\n", .{});
+    print("  - Ctrl+1-9: Assign units to group\n", .{});
+    print("  - 1-9: Recall unit group\n", .{});
     print("  - Click build buttons when building selected\n", .{});
     print("  - Cmd+Q: Quit\n\n", .{});
 

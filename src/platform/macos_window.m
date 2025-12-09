@@ -18,6 +18,22 @@ typedef struct {
     bool key_a;
     bool key_s;
     bool key_d;
+    // Number keys (for unit groups)
+    bool key_1;
+    bool key_2;
+    bool key_3;
+    bool key_4;
+    bool key_5;
+    bool key_6;
+    bool key_7;
+    bool key_8;
+    bool key_9;
+    bool key_0;
+    // Modifier keys
+    bool key_ctrl;
+    bool key_shift;
+    // Number key pressed this frame (for one-shot detection)
+    int8_t number_key_pressed;  // -1 if none, 0-9 if pressed this frame
     // Mouse button state
     bool mouse_left_down;
     bool mouse_right_down;
@@ -144,6 +160,19 @@ MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t heig
         result.key_a = false;
         result.key_s = false;
         result.key_d = false;
+        result.key_1 = false;
+        result.key_2 = false;
+        result.key_3 = false;
+        result.key_4 = false;
+        result.key_5 = false;
+        result.key_6 = false;
+        result.key_7 = false;
+        result.key_8 = false;
+        result.key_9 = false;
+        result.key_0 = false;
+        result.key_ctrl = false;
+        result.key_shift = false;
+        result.number_key_pressed = -1;
         result.mouse_left_down = false;
         result.mouse_right_down = false;
         result.mouse_left_clicked = false;
@@ -205,6 +234,12 @@ bool macos_window_poll_events(MacOSWindow *window) {
         // Reset click flags at the start of each frame
         window->mouse_left_clicked = false;
         window->mouse_right_clicked = false;
+        window->number_key_pressed = -1;
+
+        // Update modifier key state from current flags
+        NSUInteger modFlags = [NSEvent modifierFlags];
+        window->key_ctrl = (modFlags & NSEventModifierFlagControl) != 0;
+        window->key_shift = (modFlags & NSEventModifierFlagShift) != 0;
 
         while (true) {
             NSEvent *event = [app nextEventMatchingMask:NSEventMaskAny
@@ -236,6 +271,18 @@ bool macos_window_poll_events(MacOSWindow *window) {
                 if (keyCode == 0) window->key_a = true;         // A
                 if (keyCode == 1) window->key_s = true;         // S
                 if (keyCode == 2) window->key_d = true;         // D
+
+                // Number keys (top row: 18=1, 19=2, 20=3, 21=4, 23=5, 22=6, 26=7, 28=8, 25=9, 29=0)
+                if (keyCode == 18) { window->key_1 = true; window->number_key_pressed = 1; }
+                if (keyCode == 19) { window->key_2 = true; window->number_key_pressed = 2; }
+                if (keyCode == 20) { window->key_3 = true; window->number_key_pressed = 3; }
+                if (keyCode == 21) { window->key_4 = true; window->number_key_pressed = 4; }
+                if (keyCode == 23) { window->key_5 = true; window->number_key_pressed = 5; }
+                if (keyCode == 22) { window->key_6 = true; window->number_key_pressed = 6; }
+                if (keyCode == 26) { window->key_7 = true; window->number_key_pressed = 7; }
+                if (keyCode == 28) { window->key_8 = true; window->number_key_pressed = 8; }
+                if (keyCode == 25) { window->key_9 = true; window->number_key_pressed = 9; }
+                if (keyCode == 29) { window->key_0 = true; window->number_key_pressed = 0; }
             } else if (event.type == NSEventTypeKeyUp) {
                 // Release keys
                 unsigned short keyCode = [event keyCode];
@@ -247,6 +294,18 @@ bool macos_window_poll_events(MacOSWindow *window) {
                 if (keyCode == 0) window->key_a = false;
                 if (keyCode == 1) window->key_s = false;
                 if (keyCode == 2) window->key_d = false;
+
+                // Number keys release
+                if (keyCode == 18) window->key_1 = false;
+                if (keyCode == 19) window->key_2 = false;
+                if (keyCode == 20) window->key_3 = false;
+                if (keyCode == 21) window->key_4 = false;
+                if (keyCode == 23) window->key_5 = false;
+                if (keyCode == 22) window->key_6 = false;
+                if (keyCode == 26) window->key_7 = false;
+                if (keyCode == 28) window->key_8 = false;
+                if (keyCode == 25) window->key_9 = false;
+                if (keyCode == 29) window->key_0 = false;
             } else if (event.type == NSEventTypeLeftMouseDown) {
                 window->mouse_left_down = true;
                 window->mouse_left_clicked = true;
@@ -324,6 +383,15 @@ void macos_window_get_mouse_button_state(MacOSWindow *window,
     *right_down = window->mouse_right_down;
     *left_clicked = window->mouse_left_clicked;
     *right_clicked = window->mouse_right_clicked;
+}
+
+// Get modifier keys and number key pressed this frame
+void macos_window_get_modifier_state(MacOSWindow *window,
+                                      bool *ctrl, bool *shift,
+                                      int8_t *number_pressed) {
+    *ctrl = window->key_ctrl;
+    *shift = window->key_shift;
+    *number_pressed = window->number_key_pressed;
 }
 
 // Destroy window
