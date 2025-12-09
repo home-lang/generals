@@ -101,6 +101,12 @@ const Unit = struct {
     unit_type: UnitType,
     health: f32,
     max_health: f32,
+    damage: f32,
+    attack_range: f32,
+    attack_cooldown: f32,
+    attack_timer: f32,
+    target_unit: ?usize,
+    is_alive: bool,
 };
 
 const Faction = enum {
@@ -142,17 +148,52 @@ const BuildingType = enum {
     PowerPlant,
 };
 
+const Explosion = struct {
+    x: f32,
+    y: f32,
+    radius: f32,
+    max_radius: f32,
+    lifetime: f32,
+    max_lifetime: f32,
+    is_active: bool,
+};
+
+const Projectile = struct {
+    x: f32,
+    y: f32,
+    target_x: f32,
+    target_y: f32,
+    speed: f32,
+    damage: f32,
+    faction: Faction,
+    is_active: bool,
+};
+
+const MuzzleFlash = struct {
+    x: f32,
+    y: f32,
+    lifetime: f32,
+    is_active: bool,
+};
+
 const GameState = struct {
     mode: GameMode,
     units: [64]Unit,
     unit_count: usize,
     buildings: [32]Building,
     building_count: usize,
+    explosions: [32]Explosion,
+    explosion_count: usize,
+    projectiles: [64]Projectile,
+    projectile_count: usize,
+    muzzle_flashes: [32]MuzzleFlash,
+    muzzle_flash_count: usize,
     camera_x: f32,
     camera_y: f32,
     camera_zoom: f32,
     selected_unit_index: ?usize,
     resources: i32,
+    power: i32,
     is_running: bool,
     frame_count: u64,
 };
@@ -497,192 +538,65 @@ fn initGameState() GameState {
         .unit_count = 0,
         .buildings = undefined,
         .building_count = 0,
+        .explosions = undefined,
+        .explosion_count = 0,
+        .projectiles = undefined,
+        .projectile_count = 0,
+        .muzzle_flashes = undefined,
+        .muzzle_flash_count = 0,
         .camera_x = 0,
         .camera_y = 0,
         .camera_zoom = 1.0,
         .selected_unit_index = null,
         .resources = 5000,
+        .power = 100,
         .is_running = true,
         .frame_count = 0,
     };
 
-    // Create USA units
-    state.units[0] = Unit{
-        .x = 200,
-        .y = 200,
-        .target_x = 200,
-        .target_y = 200,
-        .speed = 100,
-        .size = 36,
-        .selected = false,
-        .faction = .USA,
-        .unit_type = .Crusader,
-        .health = 100,
-        .max_health = 100,
-    };
-    state.units[1] = Unit{
-        .x = 260,
-        .y = 220,
-        .target_x = 260,
-        .target_y = 220,
-        .speed = 80,
-        .size = 42,
-        .selected = false,
-        .faction = .USA,
-        .unit_type = .Paladin,
-        .health = 150,
-        .max_health = 150,
-    };
-    // USA Infantry squad
-    state.units[2] = Unit{
-        .x = 180,
-        .y = 280,
-        .target_x = 180,
-        .target_y = 280,
-        .speed = 60,
-        .size = 24,
-        .selected = false,
-        .faction = .USA,
-        .unit_type = .Infantry,
-        .health = 50,
-        .max_health = 50,
-    };
-    state.units[3] = Unit{
-        .x = 210,
-        .y = 285,
-        .target_x = 210,
-        .target_y = 285,
-        .speed = 60,
-        .size = 24,
-        .selected = false,
-        .faction = .USA,
-        .unit_type = .Infantry,
-        .health = 50,
-        .max_health = 50,
-    };
-    state.units[4] = Unit{
-        .x = 240,
-        .y = 280,
-        .target_x = 240,
-        .target_y = 280,
-        .speed = 60,
-        .size = 24,
-        .selected = false,
-        .faction = .USA,
-        .unit_type = .Infantry,
-        .health = 50,
-        .max_health = 50,
-    };
+    // Helper to create unit with combat stats
+    const createUnit = struct {
+        fn create(x: f32, y: f32, speed: f32, size: f32, faction: Faction, unit_type: UnitType, health: f32, damage: f32, range: f32) Unit {
+            return Unit{
+                .x = x,
+                .y = y,
+                .target_x = x,
+                .target_y = y,
+                .speed = speed,
+                .size = size,
+                .selected = false,
+                .faction = faction,
+                .unit_type = unit_type,
+                .health = health,
+                .max_health = health,
+                .damage = damage,
+                .attack_range = range,
+                .attack_cooldown = 1.0,
+                .attack_timer = 0,
+                .target_unit = null,
+                .is_alive = true,
+            };
+        }
+    }.create;
 
-    // Create China units
-    state.units[5] = Unit{
-        .x = 900,
-        .y = 400,
-        .target_x = 900,
-        .target_y = 400,
-        .speed = 90,
-        .size = 38,
-        .selected = false,
-        .faction = .China,
-        .unit_type = .Battlemaster,
-        .health = 120,
-        .max_health = 120,
-    };
-    state.units[6] = Unit{
-        .x = 960,
-        .y = 420,
-        .target_x = 960,
-        .target_y = 420,
-        .speed = 70,
-        .size = 48,
-        .selected = false,
-        .faction = .China,
-        .unit_type = .Overlord,
-        .health = 200,
-        .max_health = 200,
-    };
-    // China Infantry
-    state.units[7] = Unit{
-        .x = 880,
-        .y = 480,
-        .target_x = 880,
-        .target_y = 480,
-        .speed = 55,
-        .size = 24,
-        .selected = false,
-        .faction = .China,
-        .unit_type = .Infantry,
-        .health = 40,
-        .max_health = 40,
-    };
-    state.units[8] = Unit{
-        .x = 910,
-        .y = 485,
-        .target_x = 910,
-        .target_y = 485,
-        .speed = 55,
-        .size = 24,
-        .selected = false,
-        .faction = .China,
-        .unit_type = .Infantry,
-        .health = 40,
-        .max_health = 40,
-    };
+    // USA units - Tanks have high damage, infantry lower
+    state.units[0] = createUnit(200, 200, 100, 36, .USA, .Crusader, 100, 25, 150);
+    state.units[1] = createUnit(260, 220, 80, 42, .USA, .Paladin, 150, 35, 160);
+    state.units[2] = createUnit(180, 280, 60, 24, .USA, .Infantry, 50, 8, 100);
+    state.units[3] = createUnit(210, 285, 60, 24, .USA, .Infantry, 50, 8, 100);
+    state.units[4] = createUnit(240, 280, 60, 24, .USA, .Infantry, 50, 8, 100);
 
-    // Create GLA units
-    state.units[9] = Unit{
-        .x = 700,
-        .y = 150,
-        .target_x = 700,
-        .target_y = 150,
-        .speed = 120,
-        .size = 30,
-        .selected = false,
-        .faction = .GLA,
-        .unit_type = .Technical,
-        .health = 60,
-        .max_health = 60,
-    };
-    state.units[10] = Unit{
-        .x = 760,
-        .y = 170,
-        .target_x = 760,
-        .target_y = 170,
-        .speed = 85,
-        .size = 34,
-        .selected = false,
-        .faction = .GLA,
-        .unit_type = .Scorpion,
-        .health = 80,
-        .max_health = 80,
-    };
-    // GLA Infantry (rebels)
-    state.units[11] = Unit{
-        .x = 680,
-        .y = 220,
-        .target_x = 680,
-        .target_y = 220,
-        .speed = 65,
-        .size = 22,
-        .selected = false,
-        .faction = .GLA,
-        .unit_type = .Infantry,
-        .health = 35,
-        .max_health = 35,
-    };
-    state.units[12] = Unit{
-        .x = 710,
-        .y = 225,
-        .target_x = 710,
-        .target_y = 225,
-        .speed = 65,
-        .size = 22,
-        .selected = false,
-        .faction = .GLA,
-        .unit_type = .Infantry,
-        .health = 35,
-        .max_health = 35,
-    };
+    // China units - Overlord is powerful but slow
+    state.units[5] = createUnit(900, 400, 90, 38, .China, .Battlemaster, 120, 30, 140);
+    state.units[6] = createUnit(960, 420, 70, 48, .China, .Overlord, 200, 50, 170);
+    state.units[7] = createUnit(880, 480, 55, 24, .China, .Infantry, 40, 6, 90);
+    state.units[8] = createUnit(910, 485, 55, 24, .China, .Infantry, 40, 6, 90);
+
+    // GLA units - Fast but fragile
+    state.units[9] = createUnit(700, 150, 120, 30, .GLA, .Technical, 60, 15, 120);
+    state.units[10] = createUnit(760, 170, 85, 34, .GLA, .Scorpion, 80, 20, 130);
+    state.units[11] = createUnit(680, 220, 65, 22, .GLA, .Infantry, 35, 5, 85);
+    state.units[12] = createUnit(710, 225, 65, 22, .GLA, .Infantry, 35, 5, 85);
 
     state.unit_count = 13;
 
@@ -821,8 +735,11 @@ fn updateGameState(state: *GameState, window: *MacOSWindow, dt: f32) void {
         }
     }
 
-    // Update unit positions
-    for (state.units[0..state.unit_count]) |*unit| {
+    // Update unit positions and combat
+    for (state.units[0..state.unit_count], 0..) |*unit, i| {
+        if (!unit.is_alive) continue;
+
+        // Movement
         const dx = unit.target_x - unit.x;
         const dy = unit.target_y - unit.y;
         const dist = @sqrt(dx * dx + dy * dy);
@@ -837,9 +754,186 @@ fn updateGameState(state: *GameState, window: *MacOSWindow, dt: f32) void {
                 unit.y += (dy / dist) * move_dist;
             }
         }
+
+        // Update attack timer
+        if (unit.attack_timer > 0) {
+            unit.attack_timer -= dt;
+        }
+
+        // Auto-attack: Find nearby enemy and attack
+        if (unit.attack_timer <= 0) {
+            var closest_enemy: ?usize = null;
+            var closest_dist: f32 = unit.attack_range;
+
+            for (state.units[0..state.unit_count], 0..) |*other, j| {
+                if (i == j or !other.is_alive) continue;
+                if (other.faction == unit.faction) continue; // Don't attack allies
+
+                const ex = other.x - unit.x;
+                const ey = other.y - unit.y;
+                const enemy_dist = @sqrt(ex * ex + ey * ey);
+
+                if (enemy_dist < closest_dist) {
+                    closest_dist = enemy_dist;
+                    closest_enemy = j;
+                }
+            }
+
+            // Attack if enemy in range
+            if (closest_enemy) |enemy_idx| {
+                state.units[enemy_idx].health -= unit.damage;
+                unit.attack_timer = unit.attack_cooldown;
+                unit.target_unit = enemy_idx;
+
+                // Create muzzle flash at attacker position
+                if (state.muzzle_flash_count < 32) {
+                    state.muzzle_flashes[state.muzzle_flash_count] = MuzzleFlash{
+                        .x = unit.x,
+                        .y = unit.y,
+                        .lifetime = 0.1,
+                        .is_active = true,
+                    };
+                    state.muzzle_flash_count += 1;
+                }
+
+                // Sound placeholder (print to console occasionally)
+                if (state.frame_count % 30 == 0) {
+                    const sound_name = if (unit.unit_type == .Infantry) "rifle_shot.wav" else "cannon_fire.wav";
+                    std.debug.print("[SOUND] Playing: {s}\n", .{sound_name});
+                }
+
+                // Check if enemy dies
+                if (state.units[enemy_idx].health <= 0) {
+                    state.units[enemy_idx].is_alive = false;
+                    state.units[enemy_idx].health = 0;
+
+                    // Sound placeholder for explosion
+                    std.debug.print("[SOUND] Playing: explosion.wav\n", .{});
+
+                    // Create explosion at death location
+                    if (state.explosion_count < 32) {
+                        state.explosions[state.explosion_count] = Explosion{
+                            .x = state.units[enemy_idx].x,
+                            .y = state.units[enemy_idx].y,
+                            .radius = 5,
+                            .max_radius = state.units[enemy_idx].size,
+                            .lifetime = 0.5,
+                            .max_lifetime = 0.5,
+                            .is_active = true,
+                        };
+                        state.explosion_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Update explosions
+    var exp_idx: usize = 0;
+    while (exp_idx < state.explosion_count) {
+        var exp = &state.explosions[exp_idx];
+        if (exp.is_active) {
+            exp.lifetime -= dt;
+            // Expand radius as explosion grows
+            const progress = 1.0 - (exp.lifetime / exp.max_lifetime);
+            exp.radius = exp.max_radius * progress;
+
+            if (exp.lifetime <= 0) {
+                exp.is_active = false;
+                // Remove by swapping with last
+                if (exp_idx < state.explosion_count - 1) {
+                    state.explosions[exp_idx] = state.explosions[state.explosion_count - 1];
+                }
+                state.explosion_count -= 1;
+                continue; // Don't increment, check swapped element
+            }
+        }
+        exp_idx += 1;
+    }
+
+    // Update muzzle flashes
+    var flash_idx: usize = 0;
+    while (flash_idx < state.muzzle_flash_count) {
+        var flash = &state.muzzle_flashes[flash_idx];
+        if (flash.is_active) {
+            flash.lifetime -= dt;
+            if (flash.lifetime <= 0) {
+                flash.is_active = false;
+                // Remove by swapping with last
+                if (flash_idx < state.muzzle_flash_count - 1) {
+                    state.muzzle_flashes[flash_idx] = state.muzzle_flashes[state.muzzle_flash_count - 1];
+                }
+                state.muzzle_flash_count -= 1;
+                continue;
+            }
+        }
+        flash_idx += 1;
     }
 
     state.frame_count += 1;
+}
+
+// Draw a 7-segment style digit
+fn drawDigit(renderer: *SpriteRenderer, ctx: *RenderContext, x: f32, y: f32, digit: u8, r: f32, g: f32, b: f32) void {
+    const w: f32 = 8; // digit width
+    const h: f32 = 14; // digit height
+    const t: f32 = 2; // segment thickness
+
+    // 7-segment patterns: [top, top-right, bottom-right, bottom, bottom-left, top-left, middle]
+    const patterns = [10][7]bool{
+        .{ true, true, true, true, true, true, false }, // 0
+        .{ false, true, true, false, false, false, false }, // 1
+        .{ true, true, false, true, true, false, true }, // 2
+        .{ true, true, true, true, false, false, true }, // 3
+        .{ false, true, true, false, false, true, true }, // 4
+        .{ true, false, true, true, false, true, true }, // 5
+        .{ true, false, true, true, true, true, true }, // 6
+        .{ true, true, true, false, false, false, false }, // 7
+        .{ true, true, true, true, true, true, true }, // 8
+        .{ true, true, true, true, false, true, true }, // 9
+    };
+
+    const d = if (digit < 10) digit else 0;
+    const p = patterns[d];
+
+    // Top segment
+    if (p[0]) sprite_renderer_draw_rect(renderer, ctx, x, y, w, t, r, g, b, 1.0);
+    // Top-right segment
+    if (p[1]) sprite_renderer_draw_rect(renderer, ctx, x + w - t, y, t, h / 2, r, g, b, 1.0);
+    // Bottom-right segment
+    if (p[2]) sprite_renderer_draw_rect(renderer, ctx, x + w - t, y + h / 2, t, h / 2, r, g, b, 1.0);
+    // Bottom segment
+    if (p[3]) sprite_renderer_draw_rect(renderer, ctx, x, y + h - t, w, t, r, g, b, 1.0);
+    // Bottom-left segment
+    if (p[4]) sprite_renderer_draw_rect(renderer, ctx, x, y + h / 2, t, h / 2, r, g, b, 1.0);
+    // Top-left segment
+    if (p[5]) sprite_renderer_draw_rect(renderer, ctx, x, y, t, h / 2, r, g, b, 1.0);
+    // Middle segment
+    if (p[6]) sprite_renderer_draw_rect(renderer, ctx, x, y + h / 2 - t / 2, w, t, r, g, b, 1.0);
+}
+
+// Draw a number (integer) using 7-segment digits
+fn drawNumber(renderer: *SpriteRenderer, ctx: *RenderContext, x: f32, y: f32, value: i32, r: f32, g: f32, b: f32) void {
+    const digit_spacing: f32 = 10;
+    const num: u32 = if (value >= 0) @intCast(value) else @intCast(-value);
+
+    // Count digits
+    var digit_count: u32 = 0;
+    var temp = num;
+    while (temp > 0) : (temp /= 10) {
+        digit_count += 1;
+    }
+    if (digit_count == 0) digit_count = 1;
+
+    // Draw digits from right to left
+    var pos_x = x + @as(f32, @floatFromInt(digit_count - 1)) * digit_spacing;
+    var n = num;
+    for (0..digit_count) |_| {
+        const digit: u8 = @intCast(n % 10);
+        drawDigit(renderer, ctx, pos_x, y, digit, r, g, b);
+        n /= 10;
+        pos_x -= digit_spacing;
+    }
 }
 
 fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *const GameTextures) void {
@@ -901,6 +995,9 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
 
     // Render units using sprites
     for (state.units[0..state.unit_count]) |unit| {
+        // Skip dead units
+        if (!unit.is_alive) continue;
+
         // Get texture based on unit type and faction
         const texture = if (unit.unit_type == .Infantry)
             switch (unit.faction) {
@@ -927,18 +1024,80 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
             sprite_renderer_draw_selection_circle(renderer, &ctx, unit.x, unit.y, unit.size * 0.6, 0.0, 1.0, 0.0, 1.0);
         }
 
-        // Health bar
+        // Health bar - color based on health percentage
         const health_pct = unit.health / unit.max_health;
+        const bar_r: f32 = if (health_pct < 0.3) 0.9 else if (health_pct < 0.6) 0.9 else 0.0;
+        const bar_g: f32 = if (health_pct < 0.3) 0.0 else if (health_pct < 0.6) 0.7 else 0.9;
         sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size - 10, unit.size, 6, 0.1, 0.1, 0.1, 0.9);
-        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size + 1, unit.y - half_size - 9, (unit.size - 2) * health_pct, 4, 0.0, 0.9, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size + 1, unit.y - half_size - 9, (unit.size - 2) * health_pct, 4, bar_r, bar_g, 0.0, 1.0);
+    }
+
+    // Render explosions
+    for (state.explosions[0..state.explosion_count]) |exp| {
+        if (exp.is_active) {
+            // Draw explosion as expanding orange/red circle
+            const alpha = exp.lifetime / exp.max_lifetime;
+            // Outer ring
+            sprite_renderer_draw_selection_circle(renderer, &ctx, exp.x, exp.y, exp.radius, 1.0, 0.5, 0.0, alpha);
+            // Inner glow
+            sprite_renderer_draw_rect(renderer, &ctx, exp.x - exp.radius * 0.5, exp.y - exp.radius * 0.5, exp.radius, exp.radius, 1.0, 0.8, 0.2, alpha * 0.8);
+        }
+    }
+
+    // Render muzzle flashes
+    for (state.muzzle_flashes[0..state.muzzle_flash_count]) |flash| {
+        if (flash.is_active) {
+            // Draw muzzle flash as bright yellow/white burst
+            const alpha = flash.lifetime / 0.1;
+            sprite_renderer_draw_rect(renderer, &ctx, flash.x - 8, flash.y - 8, 16, 16, 1.0, 1.0, 0.5, alpha);
+            sprite_renderer_draw_rect(renderer, &ctx, flash.x - 4, flash.y - 4, 8, 8, 1.0, 1.0, 1.0, alpha);
+        }
+    }
+
+    // Render attack lines (from attacker to target)
+    for (state.units[0..state.unit_count]) |unit| {
+        if (!unit.is_alive) continue;
+        if (unit.attack_timer > 0.8) { // Show line briefly after attack
+            if (unit.target_unit) |target_idx| {
+                if (target_idx < state.unit_count and state.units[target_idx].is_alive) {
+                    const target = state.units[target_idx];
+                    // Draw attack line segments (since we don't have line primitive)
+                    const dx = target.x - unit.x;
+                    const dy = target.y - unit.y;
+                    const dist = @sqrt(dx * dx + dy * dy);
+                    const steps: usize = @intFromFloat(dist / 8.0);
+                    if (steps > 0) {
+                        const step_x = dx / @as(f32, @floatFromInt(steps));
+                        const step_y = dy / @as(f32, @floatFromInt(steps));
+                        var px = unit.x;
+                        var py = unit.y;
+                        for (0..@min(steps, 20)) |_| {
+                            sprite_renderer_draw_rect(renderer, &ctx, px - 1, py - 1, 2, 2, 1.0, 0.3, 0.0, 0.7);
+                            px += step_x;
+                            py += step_y;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Render UI - Top bar with resources
     sprite_renderer_draw_rect(renderer, &ctx, 0, 0, 1280, 40, 0.1, 0.1, 0.15, 0.95);
-    // Money icon area
+    // Money icon (gold coin style)
     sprite_renderer_draw_rect(renderer, &ctx, 10, 8, 24, 24, 0.9, 0.8, 0.0, 1.0);
-    // Power icon area
+    sprite_renderer_draw_rect(renderer, &ctx, 14, 12, 16, 16, 0.7, 0.6, 0.0, 1.0);
+    sprite_renderer_draw_rect(renderer, &ctx, 18, 16, 8, 8, 0.9, 0.8, 0.0, 1.0);
+    // Draw money value using simple rectangles for digits
+    drawNumber(renderer, &ctx, 40, 12, state.resources, 0.9, 0.8, 0.0);
+
+    // Power icon (lightning bolt style)
     sprite_renderer_draw_rect(renderer, &ctx, 150, 8, 24, 24, 0.0, 0.8, 0.9, 1.0);
+    sprite_renderer_draw_rect(renderer, &ctx, 158, 10, 8, 12, 1.0, 1.0, 0.3, 1.0);
+    sprite_renderer_draw_rect(renderer, &ctx, 154, 18, 12, 4, 1.0, 1.0, 0.3, 1.0);
+    sprite_renderer_draw_rect(renderer, &ctx, 158, 18, 8, 12, 1.0, 1.0, 0.3, 1.0);
+    // Draw power value
+    drawNumber(renderer, &ctx, 180, 12, state.power, 0.0, 0.9, 0.9);
 
     // Render minimap background
     const minimap_x: f32 = 1280 - 180;
@@ -964,8 +1123,10 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
         }
     }
 
-    // Draw units on minimap
+    // Draw units on minimap (skip dead units)
     for (state.units[0..state.unit_count]) |unit| {
+        if (!unit.is_alive) continue; // Skip dead units
+
         const ux = minimap_x + 5 + unit.x * scale_x;
         const uy = minimap_y + 5 + unit.y * scale_y;
         // Color based on faction, brighter if selected
