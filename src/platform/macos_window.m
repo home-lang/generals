@@ -345,19 +345,20 @@ void macos_window_get_mouse_position(MacOSWindow *window, float *x, float *y) {
             return;
         }
         NSPoint mouseLocation = [NSEvent mouseLocation];
-        NSRect windowFrame = [ns_window frame];
 
-        // Convert from screen coordinates to window coordinates
-        NSPoint windowPoint;
-        windowPoint.x = mouseLocation.x - windowFrame.origin.x;
-        windowPoint.y = mouseLocation.y - windowFrame.origin.y;
+        // Convert screen coordinates to window's content view coordinates
+        NSPoint windowPoint = [ns_window convertPointFromScreen:mouseLocation];
+
+        // Convert from window coordinates to content view coordinates
+        NSView *contentView = [ns_window contentView];
+        NSPoint contentPoint = [contentView convertPoint:windowPoint fromView:nil];
 
         // Flip Y coordinate (macOS uses bottom-left origin, we want top-left)
-        NSRect contentRect = [[ns_window contentView] frame];
-        windowPoint.y = contentRect.size.height - windowPoint.y;
+        NSRect contentRect = [contentView frame];
+        contentPoint.y = contentRect.size.height - contentPoint.y;
 
-        *x = (float)windowPoint.x;
-        *y = (float)windowPoint.y;
+        *x = (float)contentPoint.x;
+        *y = (float)contentPoint.y;
     }
 }
 
