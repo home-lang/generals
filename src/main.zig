@@ -176,6 +176,27 @@ const MuzzleFlash = struct {
     is_active: bool,
 };
 
+const ProductionItem = struct {
+    unit_type: UnitType,
+    progress: f32, // 0.0 to 1.0
+    build_time: f32, // total time in seconds
+    cost: i32,
+};
+
+const ProductionQueue = struct {
+    items: [5]ProductionItem,
+    count: usize,
+    building_idx: usize, // which building is producing
+
+    fn init() ProductionQueue {
+        return ProductionQueue{
+            .items = undefined,
+            .count = 0,
+            .building_idx = 0,
+        };
+    }
+};
+
 const GameState = struct {
     mode: GameMode,
     units: [64]Unit,
@@ -192,10 +213,18 @@ const GameState = struct {
     camera_y: f32,
     camera_zoom: f32,
     selected_unit_index: ?usize,
+    selected_building_index: ?usize,
     resources: i32,
     power: i32,
     is_running: bool,
     frame_count: u64,
+    // Production
+    production_queue: ProductionQueue,
+    player_faction: Faction,
+    // Selection box
+    selection_start_x: f32,
+    selection_start_y: f32,
+    is_selecting: bool,
 };
 
 // =============================================================================
@@ -548,10 +577,16 @@ fn initGameState() GameState {
         .camera_y = 0,
         .camera_zoom = 1.0,
         .selected_unit_index = null,
+        .selected_building_index = null,
         .resources = 5000,
         .power = 100,
         .is_running = true,
         .frame_count = 0,
+        .production_queue = ProductionQueue.init(),
+        .player_faction = .USA,
+        .selection_start_x = 0,
+        .selection_start_y = 0,
+        .is_selecting = false,
     };
 
     // Helper to create unit with combat stats
@@ -710,19 +745,99 @@ fn updateGameState(state: *GameState, window: *MacOSWindow, dt: f32) void {
     if (left or a) state.camera_x -= camera_speed * dt;
     if (right or d) state.camera_x += camera_speed * dt;
 
-    // Unit selection (left click)
+    // Selection (left click) - check units then buildings
     if (left_clicked) {
         state.selected_unit_index = null;
+        state.selected_building_index = null;
+
+        // First check if clicking on a unit
+        var found_unit = false;
         for (state.units[0..state.unit_count], 0..) |*unit, i| {
             const dx = mouse_x - unit.x;
             const dy = mouse_y - unit.y;
             const dist_sq = dx * dx + dy * dy;
             const radius = unit.size / 2;
-            if (dist_sq < radius * radius) {
+            if (dist_sq < radius * radius and unit.is_alive) {
                 state.selected_unit_index = i;
                 unit.selected = true;
+                found_unit = true;
             } else {
                 unit.selected = false;
+            }
+        }
+
+        // If no unit found, check buildings (only player faction)
+        if (!found_unit) {
+            for (state.buildings[0..state.building_count], 0..) |building, i| {
+                if (building.faction != state.player_faction) continue;
+
+                if (mouse_x >= building.x and mouse_x < building.x + building.width and
+                    mouse_y >= building.y and mouse_y < building.y + building.height) {
+                    state.selected_building_index = i;
+                    break;
+                }
+            }
+        }
+
+        // Check if clicking on build buttons when a building is selected
+        if (state.selected_building_index) |bld_idx| {
+            const building = state.buildings[bld_idx];
+            // Check if clicking in command panel area
+            if (mouse_y >= 720 - 100) {
+                const btn_width: f32 = 60;
+                const btn_spacing: f32 = 70;
+                const btn_y: f32 = 720 - 90;
+
+                // Check each build button
+                for (0..6) |btn_i| {
+                    const btn_x: f32 = 20 + @as(f32, @floatFromInt(btn_i)) * btn_spacing;
+                    if (mouse_x >= btn_x and mouse_x < btn_x + btn_width and
+                        mouse_y >= btn_y and mouse_y < btn_y + 60) {
+                        // Queue a unit based on building type
+                        if (building.building_type == .Barracks and state.production_queue.count < 5) {
+                            if (btn_i == 0 and state.resources >= 200) {
+                                // Build infantry
+                                state.production_queue.items[state.production_queue.count] = ProductionItem{
+                                    .unit_type = .Infantry,
+                                    .progress = 0.0,
+                                    .build_time = 5.0,
+                                    .cost = 200,
+                                };
+                                state.production_queue.count += 1;
+                                state.production_queue.building_idx = bld_idx;
+                                state.resources -= 200;
+                                std.debug.print("[PRODUCTION] Queued Infantry (cost: 200)\n", .{});
+                            }
+                        } else if (building.building_type == .WarFactory and state.production_queue.count < 5) {
+                            if (btn_i == 0 and state.resources >= 800) {
+                                // Build tank
+                                state.production_queue.items[state.production_queue.count] = ProductionItem{
+                                    .unit_type = .Crusader,
+                                    .progress = 0.0,
+                                    .build_time = 10.0,
+                                    .cost = 800,
+                                };
+                                state.production_queue.count += 1;
+                                state.production_queue.building_idx = bld_idx;
+                                state.resources -= 800;
+                                std.debug.print("[PRODUCTION] Queued Crusader Tank (cost: 800)\n", .{});
+                            } else if (btn_i == 1 and state.resources >= 1100) {
+                                // Build Paladin
+                                state.production_queue.items[state.production_queue.count] = ProductionItem{
+                                    .unit_type = .Paladin,
+                                    .progress = 0.0,
+                                    .build_time = 15.0,
+                                    .cost = 1100,
+                                };
+                                state.production_queue.count += 1;
+                                state.production_queue.building_idx = bld_idx;
+                                state.resources -= 1100;
+                                std.debug.print("[PRODUCTION] Queued Paladin Tank (cost: 1100)\n", .{});
+                            }
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -868,6 +983,85 @@ fn updateGameState(state: *GameState, window: *MacOSWindow, dt: f32) void {
             }
         }
         flash_idx += 1;
+    }
+
+    // Update production queue
+    if (state.production_queue.count > 0) {
+        // Update first item in queue
+        var item = &state.production_queue.items[0];
+        item.progress += dt / item.build_time;
+
+        if (item.progress >= 1.0) {
+            // Production complete! Spawn the unit
+            if (state.unit_count < 64) {
+                const building = state.buildings[state.production_queue.building_idx];
+                const spawn_x = building.x + building.width + 20;
+                const spawn_y = building.y + building.height / 2;
+
+                // Create unit based on type
+                var unit_size: f32 = 24;
+                var unit_speed: f32 = 60;
+                var unit_health: f32 = 50;
+                var unit_damage: f32 = 8;
+                var unit_range: f32 = 100;
+
+                switch (item.unit_type) {
+                    .Infantry => {
+                        unit_size = 24;
+                        unit_speed = 60;
+                        unit_health = 50;
+                        unit_damage = 8;
+                        unit_range = 100;
+                    },
+                    .Crusader => {
+                        unit_size = 36;
+                        unit_speed = 100;
+                        unit_health = 100;
+                        unit_damage = 25;
+                        unit_range = 150;
+                    },
+                    .Paladin => {
+                        unit_size = 42;
+                        unit_speed = 80;
+                        unit_health = 150;
+                        unit_damage = 35;
+                        unit_range = 160;
+                    },
+                    else => {},
+                }
+
+                state.units[state.unit_count] = Unit{
+                    .x = spawn_x,
+                    .y = spawn_y,
+                    .target_x = spawn_x,
+                    .target_y = spawn_y,
+                    .speed = unit_speed,
+                    .size = unit_size,
+                    .selected = false,
+                    .faction = state.player_faction,
+                    .unit_type = item.unit_type,
+                    .health = unit_health,
+                    .max_health = unit_health,
+                    .damage = unit_damage,
+                    .attack_range = unit_range,
+                    .attack_cooldown = 1.0,
+                    .attack_timer = 0,
+                    .target_unit = null,
+                    .is_alive = true,
+                };
+                state.unit_count += 1;
+                std.debug.print("[PRODUCTION] Unit ready! Total units: {d}\n", .{state.unit_count});
+            }
+
+            // Remove completed item from queue (shift remaining)
+            if (state.production_queue.count > 1) {
+                var q_idx: usize = 0;
+                while (q_idx < state.production_queue.count - 1) : (q_idx += 1) {
+                    state.production_queue.items[q_idx] = state.production_queue.items[q_idx + 1];
+                }
+            }
+            state.production_queue.count -= 1;
+        }
     }
 
     state.frame_count += 1;
@@ -1212,15 +1406,105 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, _: *const Game
 
     // Render control bar at bottom
     sprite_renderer_draw_rect(renderer, &ctx, 0, 720 - 100, 1280, 100, 0.12, 0.12, 0.15, 0.95);
-    // Command buttons placeholder
-    for (0..6) |i| {
-        const btn_x: f32 = 20 + @as(f32, @floatFromInt(i)) * 70;
-        sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.25, 0.25, 0.3, 1.0);
-        sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.15, 0.2, 1.0);
+
+    // Show building selection highlight
+    if (state.selected_building_index) |bld_idx| {
+        const building = state.buildings[bld_idx];
+        // Draw selection box around building
+        sprite_renderer_draw_rect(renderer, &ctx, building.x - 2, building.y - 2, building.width + 4, 2, 0.0, 1.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x - 2, building.y + building.height, building.width + 4, 2, 0.0, 1.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x - 2, building.y, 2, building.height, 0.0, 1.0, 0.0, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x + building.width, building.y, 2, building.height, 0.0, 1.0, 0.0, 1.0);
+
+        // Show build buttons based on building type
+        if (building.building_type == .Barracks) {
+            // Infantry button
+            const btn_x: f32 = 20;
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.3, 0.4, 0.3, 1.0);
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.25, 0.15, 1.0);
+            // Infantry icon (simple person shape)
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x + 25, 720 - 80, 10, 10, 0.8, 0.7, 0.5, 1.0); // head
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x + 22, 720 - 68, 16, 20, 0.2, 0.4, 0.8, 1.0); // body
+            // Cost label
+            drawNumber(renderer, &ctx, btn_x + 5, 720 - 42, 200, 0.9, 0.8, 0.0);
+        } else if (building.building_type == .WarFactory) {
+            // Tank buttons
+            for (0..2) |btn_i| {
+                const btn_x: f32 = 20 + @as(f32, @floatFromInt(btn_i)) * 70;
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.3, 0.35, 0.4, 1.0);
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.2, 0.25, 1.0);
+                // Tank icon
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x + 10, 720 - 70, 40, 20, 0.2, 0.4, 0.8, 1.0); // body
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x + 20, 720 - 80, 20, 15, 0.15, 0.35, 0.7, 1.0); // turret
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x + 26, 720 - 90, 8, 12, 0.1, 0.1, 0.15, 1.0); // barrel
+                // Cost label
+                const cost: i32 = if (btn_i == 0) 800 else 1100;
+                drawNumber(renderer, &ctx, btn_x + 5, 720 - 42, cost, 0.9, 0.8, 0.0);
+            }
+        } else {
+            // Other buildings - empty buttons
+            for (0..6) |i| {
+                const btn_x: f32 = 20 + @as(f32, @floatFromInt(i)) * 70;
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.25, 0.25, 0.3, 1.0);
+                sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.15, 0.2, 1.0);
+            }
+        }
+    } else {
+        // No building selected - show empty buttons
+        for (0..6) |i| {
+            const btn_x: f32 = 20 + @as(f32, @floatFromInt(i)) * 70;
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x, 720 - 90, 60, 60, 0.25, 0.25, 0.3, 1.0);
+            sprite_renderer_draw_rect(renderer, &ctx, btn_x + 2, 720 - 88, 56, 56, 0.15, 0.15, 0.2, 1.0);
+        }
     }
 
-    // Unit portrait area (when unit selected)
-    sprite_renderer_draw_rect(renderer, &ctx, 500, 720 - 95, 90, 85, 0.2, 0.2, 0.25, 1.0);
+    // Production progress bar
+    if (state.production_queue.count > 0) {
+        const progress = state.production_queue.items[0].progress;
+        const bar_x: f32 = 450;
+        const bar_y: f32 = 720 - 85;
+        const bar_w: f32 = 100;
+        const bar_h: f32 = 12;
+
+        // Background
+        sprite_renderer_draw_rect(renderer, &ctx, bar_x, bar_y, bar_w, bar_h, 0.2, 0.2, 0.2, 1.0);
+        // Progress fill
+        sprite_renderer_draw_rect(renderer, &ctx, bar_x + 1, bar_y + 1, (bar_w - 2) * progress, bar_h - 2, 0.0, 0.8, 0.3, 1.0);
+
+        // Queue count
+        if (state.production_queue.count > 1) {
+            const queue_txt_x: f32 = bar_x + bar_w + 10;
+            drawNumber(renderer, &ctx, queue_txt_x, bar_y, @intCast(state.production_queue.count), 0.9, 0.9, 0.9);
+        }
+    }
+
+    // Unit/Building portrait area
+    sprite_renderer_draw_rect(renderer, &ctx, 600, 720 - 95, 90, 85, 0.2, 0.2, 0.25, 1.0);
+
+    // Show unit info if selected
+    if (state.selected_unit_index) |unit_idx| {
+        const unit = state.units[unit_idx];
+        if (unit.is_alive) {
+            // Draw unit portrait based on type
+            const portrait_x: f32 = 610;
+            const portrait_y: f32 = 720 - 85;
+
+            // Unit type icon
+            if (unit.unit_type == .Infantry) {
+                sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 30, portrait_y + 10, 15, 15, 0.8, 0.7, 0.5, 1.0);
+                sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 25, portrait_y + 30, 25, 35, 0.2, 0.4, 0.8, 1.0);
+            } else {
+                sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 10, portrait_y + 35, 55, 25, 0.2, 0.4, 0.8, 1.0);
+                sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 25, portrait_y + 15, 25, 22, 0.15, 0.35, 0.7, 1.0);
+                sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 33, portrait_y + 5, 10, 15, 0.1, 0.1, 0.15, 1.0);
+            }
+
+            // Health bar in portrait
+            const hp_ratio = unit.health / unit.max_health;
+            sprite_renderer_draw_rect(renderer, &ctx, portrait_x, portrait_y + 65, 70, 8, 0.3, 0.1, 0.1, 1.0);
+            sprite_renderer_draw_rect(renderer, &ctx, portrait_x + 1, portrait_y + 66, 68 * hp_ratio, 6, 0.1, 0.8, 0.1, 1.0);
+        }
+    }
 
     sprite_renderer_end_frame(renderer, &ctx);
 }
