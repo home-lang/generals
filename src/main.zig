@@ -936,29 +936,30 @@ fn drawNumber(renderer: *SpriteRenderer, ctx: *RenderContext, x: f32, y: f32, va
     }
 }
 
-fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *const GameTextures) void {
+fn renderGame(renderer: *SpriteRenderer, state: *const GameState, _: *const GameTextures) void {
     var ctx = sprite_renderer_begin_frame(renderer);
     if (ctx.render_encoder == null) return;
 
-    // Render terrain with textured tiles
+    // Render terrain background first (solid color)
+    sprite_renderer_draw_rect(renderer, &ctx, 0, 0, 1280, 720, 0.6, 0.5, 0.3, 1.0);
+
+    // Render terrain with textured tiles (checkerboard pattern)
     const tile_size: f32 = 64;
-    var ty: f32 = 0;
     var tile_row: u32 = 0;
-    while (ty < 720) : ({
-        ty += tile_size;
-        tile_row += 1;
-    }) {
-        var tx: f32 = 0;
+    while (tile_row < 12) : (tile_row += 1) {
         var tile_col: u32 = 0;
-        while (tx < 1280) : ({
-            tx += tile_size;
-            tile_col += 1;
-        }) {
-            // Checkerboard pattern of grass and sand
+        while (tile_col < 20) : (tile_col += 1) {
+            const tx: f32 = @as(f32, @floatFromInt(tile_col)) * tile_size;
+            const ty: f32 = @as(f32, @floatFromInt(tile_row)) * tile_size;
+
+            // Checkerboard pattern - alternate colors
             const is_grass = ((tile_row + tile_col) % 2 == 0);
-            const terrain_tex = if (is_grass) textures.terrain_grass else textures.terrain_sand;
-            if (terrain_tex) |tex| {
-                sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, tx, ty, tile_size, tile_size);
+
+            // Draw colored rectangles for terrain tiles (textures may not be loading)
+            if (is_grass) {
+                sprite_renderer_draw_rect(renderer, &ctx, tx, ty, tile_size, tile_size, 0.4, 0.55, 0.3, 1.0);
+            } else {
+                sprite_renderer_draw_rect(renderer, &ctx, tx, ty, tile_size, tile_size, 0.65, 0.55, 0.35, 1.0);
             }
         }
     }
@@ -973,19 +974,43 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
         sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.2, 0.2, 0.15, 0.3);
     }
 
-    // Render buildings using sprites
+    // Render buildings using colored rectangles
     for (state.buildings[0..state.building_count]) |building| {
-        // Get building texture based on faction
-        const texture = switch (building.faction) {
-            .USA => textures.building_usa,
-            .China => textures.building_china,
-            .GLA => textures.building_gla,
-        };
-
-        // Draw building sprite
-        if (texture) |tex| {
-            sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, building.x, building.y, building.width, building.height);
+        // Get faction colors
+        var bld_r: f32 = 0.5;
+        var bld_g: f32 = 0.5;
+        var bld_b: f32 = 0.5;
+        switch (building.faction) {
+            .USA => {
+                bld_r = 0.3;
+                bld_g = 0.5;
+                bld_b = 0.7;
+            },
+            .China => {
+                bld_r = 0.7;
+                bld_g = 0.3;
+                bld_b = 0.3;
+            },
+            .GLA => {
+                bld_r = 0.6;
+                bld_g = 0.45;
+                bld_b = 0.25;
+            },
         }
+
+        // Draw building base
+        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y, building.width, building.height, bld_r, bld_g, bld_b, 1.0);
+
+        // Draw building border
+        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y, building.width, 3, bld_r * 0.6, bld_g * 0.6, bld_b * 0.6, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y + building.height - 3, building.width, 3, bld_r * 0.6, bld_g * 0.6, bld_b * 0.6, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x, building.y, 3, building.height, bld_r * 0.6, bld_g * 0.6, bld_b * 0.6, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, building.x + building.width - 3, building.y, 3, building.height, bld_r * 0.6, bld_g * 0.6, bld_b * 0.6, 1.0);
+
+        // Draw building detail (window/door pattern)
+        const detail_w = building.width * 0.3;
+        const detail_h = building.height * 0.3;
+        sprite_renderer_draw_rect(renderer, &ctx, building.x + building.width * 0.35, building.y + building.height * 0.35, detail_w, detail_h, bld_r * 1.3, bld_g * 1.3, bld_b * 1.3, 1.0);
 
         // Building health bar
         const health_pct = building.health / building.max_health;
@@ -993,35 +1018,60 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
         sprite_renderer_draw_rect(renderer, &ctx, building.x + 1, building.y - 9, (building.width - 2) * health_pct, 4, 0.0, 0.9, 0.0, 1.0);
     }
 
-    // Render units using sprites
+    // Render units using colored rectangles (with faction colors)
     for (state.units[0..state.unit_count]) |unit| {
         // Skip dead units
         if (!unit.is_alive) continue;
 
-        // Get texture based on unit type and faction
-        const texture = if (unit.unit_type == .Infantry)
-            switch (unit.faction) {
-                .USA => textures.infantry_usa,
-                .China => textures.infantry_china,
-                .GLA => textures.infantry_gla,
-            }
-        else
-            switch (unit.faction) {
-                .USA => textures.tank_usa,
-                .China => textures.tank_china,
-                .GLA => textures.tank_gla,
-            };
-
         const half_size = unit.size / 2;
 
-        // Draw unit sprite
-        if (texture) |tex| {
-            sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, unit.x - half_size, unit.y - half_size, unit.size, unit.size);
+        // Get faction colors
+        var unit_r: f32 = 0.5;
+        var unit_g: f32 = 0.5;
+        var unit_b: f32 = 0.5;
+        switch (unit.faction) {
+            .USA => {
+                unit_r = 0.2;
+                unit_g = 0.4;
+                unit_b = 0.8;
+            },
+            .China => {
+                unit_r = 0.8;
+                unit_g = 0.2;
+                unit_b = 0.2;
+            },
+            .GLA => {
+                unit_r = 0.7;
+                unit_g = 0.5;
+                unit_b = 0.2;
+            },
         }
 
-        // Selection circle (draw UNDER the unit for better visibility)
+        // Selection circle (draw UNDER the unit)
         if (unit.selected) {
-            sprite_renderer_draw_selection_circle(renderer, &ctx, unit.x, unit.y, unit.size * 0.6, 0.0, 1.0, 0.0, 1.0);
+            sprite_renderer_draw_selection_circle(renderer, &ctx, unit.x, unit.y, unit.size * 0.7, 0.0, 1.0, 0.0, 1.0);
+        }
+
+        // Draw unit body as colored rectangle
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size, unit.size, unit.size, unit_r, unit_g, unit_b, 1.0);
+
+        // Draw darker border
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size, unit.size, 2, unit_r * 0.5, unit_g * 0.5, unit_b * 0.5, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y + half_size - 2, unit.size, 2, unit_r * 0.5, unit_g * 0.5, unit_b * 0.5, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size, unit.y - half_size, 2, unit.size, unit_r * 0.5, unit_g * 0.5, unit_b * 0.5, 1.0);
+        sprite_renderer_draw_rect(renderer, &ctx, unit.x + half_size - 2, unit.y - half_size, 2, unit.size, unit_r * 0.5, unit_g * 0.5, unit_b * 0.5, 1.0);
+
+        // Draw inner detail based on unit type
+        if (unit.unit_type == .Infantry) {
+            // Infantry: smaller inner circle (head)
+            sprite_renderer_draw_rect(renderer, &ctx, unit.x - 4, unit.y - 6, 8, 8, 0.9, 0.75, 0.6, 1.0);
+            // Body
+            sprite_renderer_draw_rect(renderer, &ctx, unit.x - 5, unit.y + 2, 10, 8, unit_r * 0.8, unit_g * 0.8, unit_b * 0.8, 1.0);
+        } else {
+            // Tank/Vehicle: turret
+            sprite_renderer_draw_rect(renderer, &ctx, unit.x - half_size * 0.4, unit.y - half_size * 0.4, unit.size * 0.4, unit.size * 0.4, unit_r * 0.7, unit_g * 0.7, unit_b * 0.7, 1.0);
+            // Cannon
+            sprite_renderer_draw_rect(renderer, &ctx, unit.x, unit.y - half_size * 0.2, half_size * 0.8, 4, 0.3, 0.3, 0.3, 1.0);
         }
 
         // Health bar - color based on health percentage
