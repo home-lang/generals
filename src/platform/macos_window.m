@@ -25,6 +25,57 @@ typedef struct {
     bool mouse_right_clicked;  // True for one frame when clicked
 } MacOSWindow;
 
+// Custom view that accepts keyboard input and works with Metal layer
+@interface GameView : NSView
+@end
+
+@implementation GameView
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+- (BOOL)canBecomeKeyView {
+    return YES;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)keyDown:(NSEvent *)event {
+    // Don't call super - this prevents the beep sound
+    // The event is handled in poll_events
+}
+
+- (void)keyUp:(NSEvent *)event {
+    // Don't call super
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    // Make this view the first responder when clicked
+    [[self window] makeFirstResponder:self];
+    [super mouseDown:event];
+}
+
+@end
+
+// Custom window that accepts key events
+@interface GameWindow : NSWindow
+@end
+
+@implementation GameWindow
+
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+
+- (BOOL)canBecomeMainWindow {
+    return YES;
+}
+
+@end
+
 // Create a window
 MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t height, bool resizable) {
     @autoreleasepool {
@@ -51,12 +102,12 @@ MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t heig
             styleMask |= NSWindowStyleMaskResizable;
         }
 
-        // Create window
+        // Create window using custom GameWindow class
         NSRect frame = NSMakeRect(100, 100, width, height);
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
-                                                      styleMask:styleMask
-                                                        backing:NSBackingStoreBuffered
-                                                          defer:NO];
+        GameWindow *window = [[GameWindow alloc] initWithContentRect:frame
+                                                           styleMask:styleMask
+                                                             backing:NSBackingStoreBuffered
+                                                               defer:NO];
 
         // Prevent the window from being released when closed
         [window setReleasedWhenClosed:NO];
@@ -71,6 +122,10 @@ MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t heig
         [window setOpaque:YES];
         [window setHasShadow:YES];
         [window setBackgroundColor:[NSColor blackColor]];
+
+        // Create and set custom content view that accepts keyboard input
+        GameView *gameView = [[GameView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+        [window setContentView:gameView];
 
         // Center window
         [window center];
@@ -111,6 +166,10 @@ void macos_window_show(MacOSWindow *window) {
 
         // Make the window key and bring to front
         [ns_window makeKeyAndOrderFront:nil];
+
+        // Make the content view first responder for keyboard input
+        [[ns_window contentView] becomeFirstResponder];
+        [ns_window makeFirstResponder:[ns_window contentView]];
 
         // Activate the application to bring it to foreground
         [app activateIgnoringOtherApps:YES];
