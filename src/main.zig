@@ -506,14 +506,14 @@ fn initGameState() GameState {
         .frame_count = 0,
     };
 
-    // Create some initial units for demo
+    // Create USA units
     state.units[0] = Unit{
         .x = 200,
         .y = 200,
         .target_x = 200,
         .target_y = 200,
         .speed = 100,
-        .size = 32,
+        .size = 36,
         .selected = false,
         .faction = .USA,
         .unit_type = .Crusader,
@@ -521,55 +521,248 @@ fn initGameState() GameState {
         .max_health = 100,
     };
     state.units[1] = Unit{
-        .x = 300,
-        .y = 250,
-        .target_x = 300,
-        .target_y = 250,
+        .x = 260,
+        .y = 220,
+        .target_x = 260,
+        .target_y = 220,
         .speed = 80,
-        .size = 40,
+        .size = 42,
         .selected = false,
         .faction = .USA,
         .unit_type = .Paladin,
         .health = 150,
         .max_health = 150,
     };
+    // USA Infantry squad
     state.units[2] = Unit{
-        .x = 600,
+        .x = 180,
+        .y = 280,
+        .target_x = 180,
+        .target_y = 280,
+        .speed = 60,
+        .size = 24,
+        .selected = false,
+        .faction = .USA,
+        .unit_type = .Infantry,
+        .health = 50,
+        .max_health = 50,
+    };
+    state.units[3] = Unit{
+        .x = 210,
+        .y = 285,
+        .target_x = 210,
+        .target_y = 285,
+        .speed = 60,
+        .size = 24,
+        .selected = false,
+        .faction = .USA,
+        .unit_type = .Infantry,
+        .health = 50,
+        .max_health = 50,
+    };
+    state.units[4] = Unit{
+        .x = 240,
+        .y = 280,
+        .target_x = 240,
+        .target_y = 280,
+        .speed = 60,
+        .size = 24,
+        .selected = false,
+        .faction = .USA,
+        .unit_type = .Infantry,
+        .health = 50,
+        .max_health = 50,
+    };
+
+    // Create China units
+    state.units[5] = Unit{
+        .x = 900,
         .y = 400,
-        .target_x = 600,
+        .target_x = 900,
         .target_y = 400,
         .speed = 90,
-        .size = 36,
+        .size = 38,
         .selected = false,
         .faction = .China,
         .unit_type = .Battlemaster,
         .health = 120,
         .max_health = 120,
     };
-    state.unit_count = 3;
+    state.units[6] = Unit{
+        .x = 960,
+        .y = 420,
+        .target_x = 960,
+        .target_y = 420,
+        .speed = 70,
+        .size = 48,
+        .selected = false,
+        .faction = .China,
+        .unit_type = .Overlord,
+        .health = 200,
+        .max_health = 200,
+    };
+    // China Infantry
+    state.units[7] = Unit{
+        .x = 880,
+        .y = 480,
+        .target_x = 880,
+        .target_y = 480,
+        .speed = 55,
+        .size = 24,
+        .selected = false,
+        .faction = .China,
+        .unit_type = .Infantry,
+        .health = 40,
+        .max_health = 40,
+    };
+    state.units[8] = Unit{
+        .x = 910,
+        .y = 485,
+        .target_x = 910,
+        .target_y = 485,
+        .speed = 55,
+        .size = 24,
+        .selected = false,
+        .faction = .China,
+        .unit_type = .Infantry,
+        .health = 40,
+        .max_health = 40,
+    };
 
-    // Create some buildings
+    // Create GLA units
+    state.units[9] = Unit{
+        .x = 700,
+        .y = 150,
+        .target_x = 700,
+        .target_y = 150,
+        .speed = 120,
+        .size = 30,
+        .selected = false,
+        .faction = .GLA,
+        .unit_type = .Technical,
+        .health = 60,
+        .max_health = 60,
+    };
+    state.units[10] = Unit{
+        .x = 760,
+        .y = 170,
+        .target_x = 760,
+        .target_y = 170,
+        .speed = 85,
+        .size = 34,
+        .selected = false,
+        .faction = .GLA,
+        .unit_type = .Scorpion,
+        .health = 80,
+        .max_health = 80,
+    };
+    // GLA Infantry (rebels)
+    state.units[11] = Unit{
+        .x = 680,
+        .y = 220,
+        .target_x = 680,
+        .target_y = 220,
+        .speed = 65,
+        .size = 22,
+        .selected = false,
+        .faction = .GLA,
+        .unit_type = .Infantry,
+        .health = 35,
+        .max_health = 35,
+    };
+    state.units[12] = Unit{
+        .x = 710,
+        .y = 225,
+        .target_x = 710,
+        .target_y = 225,
+        .speed = 65,
+        .size = 22,
+        .selected = false,
+        .faction = .GLA,
+        .unit_type = .Infantry,
+        .health = 35,
+        .max_health = 35,
+    };
+
+    state.unit_count = 13;
+
+    // Create USA buildings
     state.buildings[0] = Building{
-        .x = 100,
-        .y = 100,
-        .width = 80,
-        .height = 80,
+        .x = 80,
+        .y = 80,
+        .width = 90,
+        .height = 90,
         .building_type = .CommandCenter,
+        .faction = .USA,
+        .health = 2000,
+        .max_health = 2000,
+    };
+    state.buildings[1] = Building{
+        .x = 180,
+        .y = 100,
+        .width = 60,
+        .height = 60,
+        .building_type = .Barracks,
         .faction = .USA,
         .health = 500,
         .max_health = 500,
     };
-    state.buildings[1] = Building{
-        .x = 500,
-        .y = 350,
-        .width = 80,
-        .height = 80,
+    state.buildings[2] = Building{
+        .x = 80,
+        .y = 180,
+        .width = 70,
+        .height = 70,
+        .building_type = .WarFactory,
+        .faction = .USA,
+        .health = 800,
+        .max_health = 800,
+    };
+
+    // Create China buildings
+    state.buildings[3] = Building{
+        .x = 950,
+        .y = 300,
+        .width = 90,
+        .height = 90,
         .building_type = .CommandCenter,
+        .faction = .China,
+        .health = 2000,
+        .max_health = 2000,
+    };
+    state.buildings[4] = Building{
+        .x = 1050,
+        .y = 320,
+        .width = 60,
+        .height = 60,
+        .building_type = .Barracks,
         .faction = .China,
         .health = 500,
         .max_health = 500,
     };
-    state.building_count = 2;
+
+    // Create GLA buildings
+    state.buildings[5] = Building{
+        .x = 650,
+        .y = 50,
+        .width = 80,
+        .height = 80,
+        .building_type = .CommandCenter,
+        .faction = .GLA,
+        .health = 1500,
+        .max_health = 1500,
+    };
+    state.buildings[6] = Building{
+        .x = 750,
+        .y = 60,
+        .width = 55,
+        .height = 55,
+        .building_type = .Barracks,
+        .faction = .GLA,
+        .health = 400,
+        .max_health = 400,
+    };
+
+    state.building_count = 7;
 
     return state;
 }
@@ -708,12 +901,19 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
 
     // Render units using sprites
     for (state.units[0..state.unit_count]) |unit| {
-        // Get tank texture based on faction
-        const texture = switch (unit.faction) {
-            .USA => textures.tank_usa,
-            .China => textures.tank_china,
-            .GLA => textures.tank_gla,
-        };
+        // Get texture based on unit type and faction
+        const texture = if (unit.unit_type == .Infantry)
+            switch (unit.faction) {
+                .USA => textures.infantry_usa,
+                .China => textures.infantry_china,
+                .GLA => textures.infantry_gla,
+            }
+        else
+            switch (unit.faction) {
+                .USA => textures.tank_usa,
+                .China => textures.tank_china,
+                .GLA => textures.tank_gla,
+            };
 
         const half_size = unit.size / 2;
 
