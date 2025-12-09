@@ -171,6 +171,11 @@ const GameTextures = struct {
     building_usa: ?*anyopaque,
     building_china: ?*anyopaque,
     building_gla: ?*anyopaque,
+    infantry_usa: ?*anyopaque,
+    infantry_china: ?*anyopaque,
+    infantry_gla: ?*anyopaque,
+    terrain_grass: ?*anyopaque,
+    terrain_sand: ?*anyopaque,
 };
 
 fn createTankTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base_b: u8) ?*anyopaque {
@@ -319,19 +324,151 @@ fn createBuildingTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base
     return sprite_renderer_create_texture(renderer, TEXTURE_SIZE, TEXTURE_SIZE, &data);
 }
 
+fn createInfantryTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base_b: u8) ?*anyopaque {
+    var data: [TEXTURE_SIZE * TEXTURE_SIZE * 4]u8 = undefined;
+
+    const size = TEXTURE_SIZE;
+    const center = size / 2;
+
+    for (0..size) |y_idx| {
+        for (0..size) |x_idx| {
+            const x = @as(i32, @intCast(x_idx));
+            const y = @as(i32, @intCast(y_idx));
+            const idx = (y_idx * size + x_idx) * 4;
+
+            // Default: transparent
+            data[idx] = 0;
+            data[idx + 1] = 0;
+            data[idx + 2] = 0;
+            data[idx + 3] = 0;
+
+            const cx = @as(i32, @intCast(center));
+            const cy = @as(i32, @intCast(center));
+
+            // Head (circle at top)
+            const head_dx = x - cx;
+            const head_dy = y - (cy - 16);
+            const head_dist_sq = head_dx * head_dx + head_dy * head_dy;
+            const in_head = head_dist_sq < 8 * 8;
+
+            // Body (oval/rectangle)
+            const in_body = (x >= cx - 8 and x < cx + 8 and y >= cy - 8 and y < cy + 10);
+
+            // Arms (two rectangles)
+            const in_left_arm = (x >= cx - 16 and x < cx - 6 and y >= cy - 6 and y < cy + 2);
+            const in_right_arm = (x >= cx + 6 and x < cx + 16 and y >= cy - 6 and y < cy + 2);
+
+            // Gun (small rectangle from right arm)
+            const in_gun = (x >= cx + 12 and x < cx + 22 and y >= cy - 8 and y < cy - 2);
+
+            // Legs (two rectangles)
+            const in_left_leg = (x >= cx - 6 and x < cx - 1 and y >= cy + 8 and y < cy + 22);
+            const in_right_leg = (x >= cx + 1 and x < cx + 6 and y >= cy + 8 and y < cy + 22);
+
+            // Helmet (arc on head)
+            const helmet_dy = y - (cy - 18);
+            const in_helmet = head_dist_sq < 9 * 9 and helmet_dy < 4;
+
+            if (in_helmet) {
+                // Dark helmet
+                data[idx] = 40;
+                data[idx + 1] = 50;
+                data[idx + 2] = 50;
+                data[idx + 3] = 255;
+            } else if (in_head) {
+                // Skin tone
+                data[idx] = 140;
+                data[idx + 1] = 180;
+                data[idx + 2] = 220;
+                data[idx + 3] = 255;
+            } else if (in_gun) {
+                // Dark gun
+                data[idx] = 30;
+                data[idx + 1] = 30;
+                data[idx + 2] = 35;
+                data[idx + 3] = 255;
+            } else if (in_body or in_left_arm or in_right_arm) {
+                // Uniform color
+                data[idx] = base_b;
+                data[idx + 1] = base_g;
+                data[idx + 2] = base_r;
+                data[idx + 3] = 255;
+            } else if (in_left_leg or in_right_leg) {
+                // Darker pants
+                data[idx] = @as(u8, @intCast(@max(0, @as(i32, base_b) - 40)));
+                data[idx + 1] = @as(u8, @intCast(@max(0, @as(i32, base_g) - 40)));
+                data[idx + 2] = @as(u8, @intCast(@max(0, @as(i32, base_r) - 40)));
+                data[idx + 3] = 255;
+            }
+        }
+    }
+
+    return sprite_renderer_create_texture(renderer, TEXTURE_SIZE, TEXTURE_SIZE, &data);
+}
+
+fn createTerrainTexture(renderer: *SpriteRenderer, base_r: u8, base_g: u8, base_b: u8, is_grass: bool) ?*anyopaque {
+    var data: [TEXTURE_SIZE * TEXTURE_SIZE * 4]u8 = undefined;
+
+    const size = TEXTURE_SIZE;
+
+    // Simple random seed based on base color
+    var seed: u32 = @as(u32, base_r) * 256 + @as(u32, base_g);
+
+    for (0..size) |y_idx| {
+        for (0..size) |x_idx| {
+            const idx = (y_idx * size + x_idx) * 4;
+
+            // Simple noise variation
+            seed = seed *% 1103515245 +% 12345;
+            const noise = @as(i32, @intCast((seed >> 16) & 31)) - 16;
+
+            var r = @as(i32, base_r) + noise;
+            var g = @as(i32, base_g) + noise;
+            var b = @as(i32, base_b) + noise;
+
+            // Add grass blades pattern for grass terrain
+            if (is_grass) {
+                const blade_pattern = ((x_idx + y_idx * 3) % 7 == 0);
+                if (blade_pattern) {
+                    g = @min(255, g + 30);
+                }
+            }
+
+            // Clamp values
+            r = @max(0, @min(255, r));
+            g = @max(0, @min(255, g));
+            b = @max(0, @min(255, b));
+
+            data[idx] = @as(u8, @intCast(b));
+            data[idx + 1] = @as(u8, @intCast(g));
+            data[idx + 2] = @as(u8, @intCast(r));
+            data[idx + 3] = 255;
+        }
+    }
+
+    return sprite_renderer_create_texture(renderer, TEXTURE_SIZE, TEXTURE_SIZE, &data);
+}
+
 fn createGameTextures(renderer: *SpriteRenderer) GameTextures {
     return GameTextures{
         // USA: Blue theme (RGB: 60, 120, 200)
         .tank_usa = createTankTexture(renderer, 60, 120, 200),
         .building_usa = createBuildingTexture(renderer, 80, 130, 180),
+        .infantry_usa = createInfantryTexture(renderer, 60, 100, 160),
 
         // China: Red theme (RGB: 200, 50, 50)
         .tank_china = createTankTexture(renderer, 200, 50, 50),
         .building_china = createBuildingTexture(renderer, 180, 60, 60),
+        .infantry_china = createInfantryTexture(renderer, 180, 40, 40),
 
         // GLA: Tan/brown theme (RGB: 160, 130, 80)
         .tank_gla = createTankTexture(renderer, 160, 130, 80),
         .building_gla = createBuildingTexture(renderer, 140, 110, 70),
+        .infantry_gla = createInfantryTexture(renderer, 140, 120, 70),
+
+        // Terrain textures
+        .terrain_grass = createTerrainTexture(renderer, 60, 120, 50, true),
+        .terrain_sand = createTerrainTexture(renderer, 180, 160, 120, false),
     };
 }
 
@@ -342,6 +479,11 @@ fn destroyGameTextures(textures: *GameTextures) void {
     if (textures.building_usa) |t| sprite_renderer_destroy_texture(t);
     if (textures.building_china) |t| sprite_renderer_destroy_texture(t);
     if (textures.building_gla) |t| sprite_renderer_destroy_texture(t);
+    if (textures.infantry_usa) |t| sprite_renderer_destroy_texture(t);
+    if (textures.infantry_china) |t| sprite_renderer_destroy_texture(t);
+    if (textures.infantry_gla) |t| sprite_renderer_destroy_texture(t);
+    if (textures.terrain_grass) |t| sprite_renderer_destroy_texture(t);
+    if (textures.terrain_sand) |t| sprite_renderer_destroy_texture(t);
 }
 
 // =============================================================================
@@ -511,15 +653,37 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
     var ctx = sprite_renderer_begin_frame(renderer);
     if (ctx.render_encoder == null) return;
 
-    // Render terrain grid (subtle dark lines)
-    const grid_size: f32 = 64;
+    // Render terrain with textured tiles
+    const tile_size: f32 = 64;
+    var ty: f32 = 0;
+    var tile_row: u32 = 0;
+    while (ty < 720) : ({
+        ty += tile_size;
+        tile_row += 1;
+    }) {
+        var tx: f32 = 0;
+        var tile_col: u32 = 0;
+        while (tx < 1280) : ({
+            tx += tile_size;
+            tile_col += 1;
+        }) {
+            // Checkerboard pattern of grass and sand
+            const is_grass = ((tile_row + tile_col) % 2 == 0);
+            const terrain_tex = if (is_grass) textures.terrain_grass else textures.terrain_sand;
+            if (terrain_tex) |tex| {
+                sprite_renderer_draw_sprite_batched(renderer, &ctx, tex, tx, ty, tile_size, tile_size);
+            }
+        }
+    }
+
+    // Grid lines overlay (subtle)
     var y: f32 = 0;
-    while (y < 720) : (y += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.5, 0.4, 0.3, 0.4);
+    while (y < 720) : (y += tile_size) {
+        sprite_renderer_draw_rect(renderer, &ctx, 0, y, 1280, 1, 0.2, 0.2, 0.15, 0.3);
     }
     var x: f32 = 0;
-    while (x < 1280) : (x += grid_size) {
-        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.5, 0.4, 0.3, 0.4);
+    while (x < 1280) : (x += tile_size) {
+        sprite_renderer_draw_rect(renderer, &ctx, x, 0, 1, 720, 0.2, 0.2, 0.15, 0.3);
     }
 
     // Render buildings using sprites
@@ -577,9 +741,63 @@ fn renderGame(renderer: *SpriteRenderer, state: *const GameState, textures: *con
     sprite_renderer_draw_rect(renderer, &ctx, 150, 8, 24, 24, 0.0, 0.8, 0.9, 1.0);
 
     // Render minimap background
-    sprite_renderer_draw_rect(renderer, &ctx, 1280 - 180, 720 - 150, 170, 140, 0.05, 0.1, 0.05, 0.95);
+    const minimap_x: f32 = 1280 - 180;
+    const minimap_y: f32 = 720 - 150;
+    const minimap_w: f32 = 170;
+    const minimap_h: f32 = 140;
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x, minimap_y, minimap_w, minimap_h, 0.05, 0.1, 0.05, 0.95);
     // Minimap terrain
-    sprite_renderer_draw_rect(renderer, &ctx, 1280 - 175, 720 - 145, 160, 130, 0.3, 0.4, 0.2, 1.0);
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x + 5, minimap_y + 5, minimap_w - 10, minimap_h - 10, 0.3, 0.4, 0.2, 1.0);
+
+    // Draw buildings on minimap
+    const scale_x: f32 = (minimap_w - 10) / 1280.0;
+    const scale_y: f32 = (minimap_h - 10) / 720.0;
+
+    for (state.buildings[0..state.building_count]) |building| {
+        const bx = minimap_x + 5 + building.x * scale_x;
+        const by = minimap_y + 5 + building.y * scale_y;
+        // Color based on faction
+        switch (building.faction) {
+            .USA => sprite_renderer_draw_rect(renderer, &ctx, bx - 3, by - 3, 6, 6, 0.2, 0.5, 0.9, 1.0),
+            .China => sprite_renderer_draw_rect(renderer, &ctx, bx - 3, by - 3, 6, 6, 0.9, 0.2, 0.2, 1.0),
+            .GLA => sprite_renderer_draw_rect(renderer, &ctx, bx - 3, by - 3, 6, 6, 0.7, 0.5, 0.2, 1.0),
+        }
+    }
+
+    // Draw units on minimap
+    for (state.units[0..state.unit_count]) |unit| {
+        const ux = minimap_x + 5 + unit.x * scale_x;
+        const uy = minimap_y + 5 + unit.y * scale_y;
+        // Color based on faction, brighter if selected
+        var r: f32 = 0;
+        var g: f32 = 0;
+        var b: f32 = 0;
+        switch (unit.faction) {
+            .USA => {
+                r = 0.3;
+                g = 0.6;
+                b = 1.0;
+            },
+            .China => {
+                r = 1.0;
+                g = 0.3;
+                b = 0.3;
+            },
+            .GLA => {
+                r = 0.9;
+                g = 0.7;
+                b = 0.3;
+            },
+        }
+        const dot_size: f32 = if (unit.selected) 5 else 3;
+        sprite_renderer_draw_rect(renderer, &ctx, ux - dot_size / 2, uy - dot_size / 2, dot_size, dot_size, r, g, b, 1.0);
+    }
+
+    // Minimap viewport frame (shows current view area)
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x + 5, minimap_y + 5, (minimap_w - 10), 1, 1.0, 1.0, 1.0, 0.5);
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x + 5, minimap_y + minimap_h - 6, (minimap_w - 10), 1, 1.0, 1.0, 1.0, 0.5);
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x + 5, minimap_y + 5, 1, (minimap_h - 10), 1.0, 1.0, 1.0, 0.5);
+    sprite_renderer_draw_rect(renderer, &ctx, minimap_x + minimap_w - 6, minimap_y + 5, 1, (minimap_h - 10), 1.0, 1.0, 1.0, 0.5);
 
     // Render control bar at bottom
     sprite_renderer_draw_rect(renderer, &ctx, 0, 720 - 100, 1280, 100, 0.12, 0.12, 0.15, 0.95);
