@@ -28,7 +28,7 @@ pub const AIController = struct {
             .think_timer = 0,
             .think_interval = 2.0, // Think every 2 seconds
             .attack_timer = 0,
-            .attack_interval = 15.0, // Attack wave every 15 seconds
+            .attack_interval = 60.0, // Attack wave every 60 seconds (gives player time to build up)
             .last_attack_target_x = 0,
             .last_attack_target_y = 0,
         };

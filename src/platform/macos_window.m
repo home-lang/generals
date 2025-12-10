@@ -92,6 +92,150 @@ typedef struct {
 
 @end
 
+// Application delegate for menu actions
+@interface GameAppDelegate : NSObject <NSApplicationDelegate>
+@property (nonatomic, assign) BOOL shouldRestartGame;
+@property (nonatomic, assign) BOOL shouldNewGame;
+@end
+
+@implementation GameAppDelegate
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    // Already handled in macos_window_create
+}
+
+- (void)terminate:(id)sender {
+    [[NSApplication sharedApplication] terminate:nil];
+}
+
+- (void)newGame:(id)sender {
+    self.shouldNewGame = YES;
+    NSLog(@"[Menu] New Game requested");
+}
+
+- (void)restartGame:(id)sender {
+    self.shouldRestartGame = YES;
+    NSLog(@"[Menu] Restart Game requested");
+}
+
+- (void)showAbout:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Generals"];
+    [alert setInformativeText:@"A C&C Generals Zero Hour inspired RTS game\n\nBuilt with Zig and Metal\n\nVersion 0.1.0"];
+    [alert setAlertStyle:NSAlertStyleInformational];
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
+@end
+
+// Create the application menu bar
+static void setupMenuBar(NSApplication *app, GameAppDelegate *delegate) {
+    // Create main menu bar
+    NSMenu *menuBar = [[NSMenu alloc] init];
+    [app setMainMenu:menuBar];
+
+    // === App Menu (Generals) ===
+    NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:appMenuItem];
+
+    NSMenu *appMenu = [[NSMenu alloc] init];
+    [appMenuItem setSubmenu:appMenu];
+
+    // About
+    NSMenuItem *aboutItem = [[NSMenuItem alloc] initWithTitle:@"About Generals"
+                                                       action:@selector(showAbout:)
+                                                keyEquivalent:@""];
+    [aboutItem setTarget:delegate];
+    [appMenu addItem:aboutItem];
+
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    // Hide
+    NSMenuItem *hideItem = [[NSMenuItem alloc] initWithTitle:@"Hide Generals"
+                                                      action:@selector(hide:)
+                                               keyEquivalent:@"h"];
+    [appMenu addItem:hideItem];
+
+    // Hide Others
+    NSMenuItem *hideOthersItem = [[NSMenuItem alloc] initWithTitle:@"Hide Others"
+                                                            action:@selector(hideOtherApplications:)
+                                                     keyEquivalent:@"h"];
+    [hideOthersItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+    [appMenu addItem:hideOthersItem];
+
+    // Show All
+    NSMenuItem *showAllItem = [[NSMenuItem alloc] initWithTitle:@"Show All"
+                                                         action:@selector(unhideAllApplications:)
+                                                  keyEquivalent:@""];
+    [appMenu addItem:showAllItem];
+
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    // Quit
+    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit Generals"
+                                                      action:@selector(terminate:)
+                                               keyEquivalent:@"q"];
+    [quitItem setTarget:delegate];
+    [appMenu addItem:quitItem];
+
+    // === Game Menu ===
+    NSMenuItem *gameMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:gameMenuItem];
+
+    NSMenu *gameMenu = [[NSMenu alloc] initWithTitle:@"Game"];
+    [gameMenuItem setSubmenu:gameMenu];
+
+    // New Game
+    NSMenuItem *newGameItem = [[NSMenuItem alloc] initWithTitle:@"New Game"
+                                                         action:@selector(newGame:)
+                                                  keyEquivalent:@"n"];
+    [newGameItem setTarget:delegate];
+    [gameMenu addItem:newGameItem];
+
+    // Restart
+    NSMenuItem *restartItem = [[NSMenuItem alloc] initWithTitle:@"Restart"
+                                                         action:@selector(restartGame:)
+                                                  keyEquivalent:@"r"];
+    [restartItem setTarget:delegate];
+    [gameMenu addItem:restartItem];
+
+    // === Window Menu ===
+    NSMenuItem *windowMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:windowMenuItem];
+
+    NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
+    [windowMenuItem setSubmenu:windowMenu];
+
+    // Minimize
+    NSMenuItem *minimizeItem = [[NSMenuItem alloc] initWithTitle:@"Minimize"
+                                                          action:@selector(performMiniaturize:)
+                                                   keyEquivalent:@"m"];
+    [windowMenu addItem:minimizeItem];
+
+    // Zoom
+    NSMenuItem *zoomItem = [[NSMenuItem alloc] initWithTitle:@"Zoom"
+                                                      action:@selector(performZoom:)
+                                               keyEquivalent:@""];
+    [windowMenu addItem:zoomItem];
+
+    [windowMenu addItem:[NSMenuItem separatorItem]];
+
+    // Bring All to Front
+    NSMenuItem *bringToFrontItem = [[NSMenuItem alloc] initWithTitle:@"Bring All to Front"
+                                                              action:@selector(arrangeInFront:)
+                                                       keyEquivalent:@""];
+    [windowMenu addItem:bringToFrontItem];
+
+    // Set the window menu for proper window management
+    [app setWindowsMenu:windowMenu];
+
+    NSLog(@"[Menu] Menu bar setup complete");
+}
+
+// Global app delegate for menu state access
+static GameAppDelegate *g_appDelegate = nil;
+
 // Create a window
 MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t height, bool resizable) {
     @autoreleasepool {
@@ -106,6 +250,13 @@ MacOSWindow macos_window_create(const char *title, uint32_t width, uint32_t heig
         TransformProcessType(&psn, kProcessTransformToForegroundApplication);
 
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        // Create and set app delegate
+        g_appDelegate = [[GameAppDelegate alloc] init];
+        [app setDelegate:g_appDelegate];
+
+        // Setup menu bar
+        setupMenuBar(app, g_appDelegate);
 
         // Finish launching immediately
         if (![app isRunning]) {

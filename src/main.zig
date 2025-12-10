@@ -4,6 +4,9 @@
 const std = @import("std");
 const game = @import("game/game.zig");
 
+// Craft-style platform layer with type-safe Objective-C FFI
+pub const macos = @import("platform/macos.zig");
+
 // =============================================================================
 // External C Functions (implemented in Objective-C)
 // =============================================================================
@@ -473,6 +476,9 @@ fn handleInput(state: *MainState, window: *MacOSWindow, dt: f32) void {
             var clicked_on_unit = false;
             for (state.game_state.unit_manager.getUnits(), 0..) |*unit, i| {
                 if (!unit.is_alive) continue;
+                // Only allow selecting your own units
+                if (unit.faction != state.game_state.player_faction) continue;
+
                 const ux = mouse_x - unit.x;
                 const uy = mouse_y - unit.y;
                 const dist_sq = ux * ux + uy * uy;
@@ -485,6 +491,7 @@ fn handleInput(state: *MainState, window: *MacOSWindow, dt: f32) void {
                     }
                     state.addToSelection(i);
                     clicked_on_unit = true;
+                    std.debug.print("[SELECT] Selected unit {d} at ({d:.0}, {d:.0})\n", .{ i, unit.x, unit.y });
                     break;
                 }
             }
@@ -536,10 +543,12 @@ fn handleInput(state: *MainState, window: *MacOSWindow, dt: f32) void {
     // Unit movement - right click moves all selected units
     if (right_clicked) {
         if (state.selected_unit_count > 0) {
+            std.debug.print("[MOVE] Moving {d} units to ({d:.0}, {d:.0})\n", .{ state.selected_unit_count, mouse_x, mouse_y });
             state.moveSelectedUnits(mouse_x, mouse_y);
         } else if (state.game_state.selected_unit_index) |idx| {
             // Fallback to single selection
             if (state.game_state.unit_manager.getUnit(idx)) |unit| {
+                std.debug.print("[MOVE] Moving single unit {d} to ({d:.0}, {d:.0})\n", .{ idx, mouse_x, mouse_y });
                 unit.moveTo(mouse_x, mouse_y);
             }
         }
@@ -853,7 +862,7 @@ fn processCombat(state: *MainState, dt: f32) void {
         if (!unit.is_alive) continue;
         if (unit.attack_timer > 0) continue;
 
-        // Find nearest enemy
+        // Find nearest enemy within attack range
         var closest_enemy: ?usize = null;
         var closest_dist: f32 = unit.attack_range;
 
@@ -868,7 +877,7 @@ fn processCombat(state: *MainState, dt: f32) void {
             }
         }
 
-        // Attack
+        // Attack if enemy in range
         if (closest_enemy) |enemy_idx| {
             if (state.game_state.unit_manager.getUnit(enemy_idx)) |target| {
                 unit.attack(enemy_idx);
@@ -885,7 +894,53 @@ fn processCombat(state: *MainState, dt: f32) void {
             }
         }
     }
+
+    // Auto-attack: Player units chase nearby enemies (within sight range)
+    updatePlayerAutoAttack(state);
+
     _ = dt;
+}
+
+fn updatePlayerAutoAttack(state: *MainState) void {
+    const all_units = state.game_state.unit_manager.getUnits();
+    const sight_range: f32 = 200.0; // How far units will chase enemies
+
+    for (all_units) |*unit| {
+        if (!unit.is_alive) continue;
+        if (unit.faction != state.game_state.player_faction) continue;
+        if (unit.unit_type == .Worker) continue; // Workers don't auto-attack
+
+        // Check if unit is idle (at target position)
+        const dx = unit.target_x - unit.x;
+        const dy = unit.target_y - unit.y;
+        const dist_to_target = @sqrt(dx * dx + dy * dy);
+
+        if (dist_to_target < 10.0) {
+            // Unit is idle - look for nearby enemies to attack
+            var closest_enemy_idx: ?usize = null;
+            var closest_dist: f32 = sight_range;
+
+            for (all_units, 0..) |other, j| {
+                if (!other.is_alive) continue;
+                if (other.faction == unit.faction) continue;
+
+                const enemy_dx = other.x - unit.x;
+                const enemy_dy = other.y - unit.y;
+                const enemy_dist = @sqrt(enemy_dx * enemy_dx + enemy_dy * enemy_dy);
+
+                if (enemy_dist < closest_dist) {
+                    closest_dist = enemy_dist;
+                    closest_enemy_idx = j;
+                }
+            }
+
+            // Move towards nearby enemy
+            if (closest_enemy_idx) |enemy_idx| {
+                const enemy = &all_units[enemy_idx];
+                unit.moveTo(enemy.x, enemy.y);
+            }
+        }
+    }
 }
 
 fn updateExplosions(state: *MainState, dt: f32) void {
@@ -1557,6 +1612,28 @@ fn renderMinimap(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const M
 fn renderBuildButtons(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
     if (state.game_state.selected_building_index) |bld_idx| {
         if (state.game_state.building_manager.getBuildingConst(bld_idx)) |building| {
+            // Show building name indicator (colored bar at top of control panel)
+            const name_bar_y: f32 = 720 - 100;
+            switch (building.building_type) {
+                .CommandCenter => {
+                    // Gold bar for Command Center
+                    sprite_renderer_draw_rect(renderer, ctx, 0, name_bar_y, 450, 8, 0.9, 0.7, 0.1, 1.0);
+                },
+                .Barracks => {
+                    // Green bar for Barracks
+                    sprite_renderer_draw_rect(renderer, ctx, 0, name_bar_y, 450, 8, 0.3, 0.7, 0.3, 1.0);
+                },
+                .WarFactory => {
+                    // Blue bar for War Factory
+                    sprite_renderer_draw_rect(renderer, ctx, 0, name_bar_y, 450, 8, 0.3, 0.4, 0.8, 1.0);
+                },
+                .SupplyCenter => {
+                    // Orange bar for Supply Center
+                    sprite_renderer_draw_rect(renderer, ctx, 0, name_bar_y, 450, 8, 0.8, 0.5, 0.2, 1.0);
+                },
+                else => {},
+            }
+
             if (building.building_type == .Barracks) {
                 sprite_renderer_draw_rect(renderer, ctx, 20, 720 - 90, 60, 60, 0.3, 0.4, 0.3, 1.0);
                 sprite_renderer_draw_rect(renderer, ctx, 22, 720 - 88, 56, 56, 0.15, 0.25, 0.15, 1.0);

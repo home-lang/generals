@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     generals.linkFramework("AppKit");
     generals.linkFramework("Metal");
     generals.linkFramework("QuartzCore");
+    generals.linkSystemLibrary("objc"); // For Zig-based Objective-C runtime
     generals.linkLibC();
 
     b.installArtifact(generals);
