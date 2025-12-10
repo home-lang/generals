@@ -177,6 +177,16 @@ const MainState = struct {
     ai_china_production: game.ProductionQueue,
     ai_gla_production: game.ProductionQueue,
 
+    // Resource gathering
+    supply_manager: game.SupplyManager,
+    worker_manager: game.WorkerManager,
+
+    // Construction
+    construction_manager: game.ConstructionManager,
+
+    // Victory conditions
+    victory_checker: game.VictoryChecker,
+
     // Timing
     is_running: bool,
     frame_count: u64,
@@ -204,12 +214,28 @@ const MainState = struct {
             .ai_gla_money = 2000,
             .ai_china_production = game.ProductionQueue.init(),
             .ai_gla_production = game.ProductionQueue.init(),
+            .supply_manager = game.SupplyManager.init(),
+            .worker_manager = game.WorkerManager.init(),
+            .construction_manager = game.ConstructionManager.init(),
+            .victory_checker = game.VictoryChecker.init(),
             .is_running = true,
             .frame_count = 0,
         };
 
         // Start in skirmish mode with initial units/buildings
         state.game_state.startSkirmish();
+
+        // Add supply piles around the map
+        _ = state.supply_manager.addPile(game.SupplyPile.create(300, 400, 3000)); // Near USA base
+        _ = state.supply_manager.addPile(game.SupplyPile.create(500, 300, 3000)); // Central
+        _ = state.supply_manager.addPile(game.SupplyPile.create(900, 500, 3000)); // Near China base
+        _ = state.supply_manager.addPile(game.SupplyPile.create(600, 100, 3000)); // Near GLA base
+
+        // Add USA worker unit
+        const worker_idx = state.game_state.unit_manager.addUnit(game.Unit.create(200, 550, .USA, .Worker));
+        if (worker_idx) |idx| {
+            _ = state.worker_manager.registerWorker(idx);
+        }
 
         // Add additional enemy units for more interesting combat
         _ = state.game_state.unit_manager.addUnit(game.Unit.create(800, 550, .China, .Infantry));
@@ -420,6 +446,25 @@ fn handleInput(state: *MainState, window: *MacOSWindow, dt: f32) void {
         }
     }
 
+    // Handle placement mode
+    if (state.construction_manager.isPlacing()) {
+        if (left_clicked) {
+            // Confirm placement
+            if (state.construction_manager.confirmPlacement()) |_| {
+                std.debug.print("[BUILD] Placement confirmed, construction started\n", .{});
+            }
+        } else if (right_clicked) {
+            // Cancel placement, refund money
+            if (state.construction_manager.current_placement) |placement| {
+                const stats = game.types.getBuildingStats(placement.building_type);
+                state.game_state.player_money += stats.cost;
+            }
+            state.construction_manager.cancelPlacement();
+            std.debug.print("[BUILD] Placement cancelled\n", .{});
+        }
+        return; // Don't process other input while placing
+    }
+
     // Drag selection - start
     if (left_clicked and !state.is_selecting) {
         // Skip if clicking on UI area
@@ -511,12 +556,27 @@ fn handleBuildButtonClick(state: *MainState, building: *game.Building, bld_idx: 
             if (building.building_type == .Barracks) {
                 if (btn_i == 0) {
                     _ = state.game_state.queueProduction(.Infantry, bld_idx);
+                } else if (btn_i == 1) {
+                    _ = state.game_state.queueProduction(.Worker, bld_idx);
                 }
             } else if (building.building_type == .WarFactory) {
                 if (btn_i == 0) {
                     _ = state.game_state.queueProduction(.Crusader, bld_idx);
                 } else if (btn_i == 1) {
                     _ = state.game_state.queueProduction(.Paladin, bld_idx);
+                }
+            } else if (building.building_type == .CommandCenter) {
+                // Building construction buttons
+                const building_costs = [_]i32{ 500, 600, 1000, 800 };
+                const building_types = [_]game.BuildingType{ .PowerPlant, .Barracks, .WarFactory, .SupplyCenter };
+
+                if (btn_i < 4) {
+                    const cost = building_costs[btn_i];
+                    if (state.game_state.player_money >= cost) {
+                        state.game_state.player_money -= cost;
+                        state.construction_manager.startPlacement(building_types[btn_i], state.game_state.player_faction);
+                        std.debug.print("[BUILD] Started placement for {any}\n", .{building_types[btn_i]});
+                    }
                 }
             }
             break;
@@ -567,6 +627,15 @@ fn updateGame(state: *MainState, dt: f32) void {
 
     // Update fog of war
     updateFogOfWar(state);
+
+    // Update workers (resource gathering)
+    updateWorkers(state, dt);
+
+    // Update construction
+    updateConstruction(state, dt);
+
+    // Update victory conditions
+    state.victory_checker.update(dt, &state.game_state.building_manager, &state.game_state.unit_manager, state.game_state.player_faction);
 
     // Update visual effects
     updateExplosions(state, dt);
@@ -622,6 +691,158 @@ fn updateFogOfWar(state: *MainState) void {
                 building_vision,
             );
         }
+    }
+}
+
+fn updateWorkers(state: *MainState, dt: f32) void {
+    const harvest_distance: f32 = 40.0;
+    const dropoff_distance: f32 = 60.0;
+
+    // Iterate over all units to find workers
+    for (state.game_state.unit_manager.units[0..state.game_state.unit_manager.count], 0..) |*unit, unit_idx| {
+        if (!unit.is_alive) continue;
+        if (unit.unit_type != .Worker) continue;
+
+        // Get worker data for this unit
+        if (state.worker_manager.getWorkerData(unit_idx)) |worker| {
+            switch (worker.state) {
+                .Idle => {
+                    // Find nearest supply pile and start harvesting
+                    if (state.supply_manager.findNearest(unit.x, unit.y)) |pile_idx| {
+                        worker.target_pile = pile_idx;
+                        worker.state = .MovingToSupply;
+
+                        // Find nearest supply center for this faction
+                        for (state.game_state.building_manager.buildings[0..state.game_state.building_manager.count], 0..) |building, bld_idx| {
+                            if (building.building_type == .SupplyCenter and building.faction == unit.faction) {
+                                worker.target_building = bld_idx;
+                                break;
+                            }
+                        }
+                    }
+                },
+                .MovingToSupply => {
+                    if (worker.target_pile) |pile_idx| {
+                        if (state.supply_manager.getPile(pile_idx)) |pile| {
+                            // Move toward the supply pile
+                            const dx = pile.x - unit.x;
+                            const dy = pile.y - unit.y;
+                            const dist = @sqrt(dx * dx + dy * dy);
+
+                            if (dist < harvest_distance) {
+                                // Arrived at supply, start harvesting
+                                worker.state = .Harvesting;
+                                worker.harvest_timer = worker.harvest_time;
+                            } else {
+                                // Keep moving
+                                unit.moveTo(pile.x, pile.y);
+                            }
+                        } else {
+                            // Pile doesn't exist, go idle
+                            worker.reset();
+                        }
+                    } else {
+                        worker.reset();
+                    }
+                },
+                .Harvesting => {
+                    worker.harvest_timer -= dt;
+                    if (worker.harvest_timer <= 0) {
+                        // Harvest complete, collect resources
+                        if (worker.target_pile) |pile_idx| {
+                            if (state.supply_manager.getPile(pile_idx)) |pile| {
+                                const harvested = pile.harvest(worker.max_carry);
+                                worker.carried_resources = harvested;
+
+                                if (harvested > 0 and worker.target_building != null) {
+                                    worker.state = .ReturningToBase;
+                                } else {
+                                    // Pile depleted or no base, find another pile
+                                    worker.reset();
+                                }
+                            } else {
+                                worker.reset();
+                            }
+                        } else {
+                            worker.reset();
+                        }
+                    }
+                },
+                .ReturningToBase => {
+                    if (worker.target_building) |bld_idx| {
+                        if (state.game_state.building_manager.getBuilding(bld_idx)) |building| {
+                            // Move toward the supply center
+                            const center_x = building.x + building.width / 2;
+                            const center_y = building.y + building.height / 2;
+                            const dx = center_x - unit.x;
+                            const dy = center_y - unit.y;
+                            const dist = @sqrt(dx * dx + dy * dy);
+
+                            if (dist < dropoff_distance) {
+                                // Arrived at base, deposit resources
+                                if (unit.faction == state.game_state.player_faction) {
+                                    state.game_state.player_money += worker.carried_resources;
+                                    std.debug.print("[WORKER] Deposited ${d} resources\n", .{worker.carried_resources});
+                                }
+                                worker.carried_resources = 0;
+
+                                // Go back for more
+                                if (worker.target_pile) |pile_idx| {
+                                    if (state.supply_manager.getPile(pile_idx)) |pile| {
+                                        if (!pile.is_depleted) {
+                                            worker.state = .MovingToSupply;
+                                        } else {
+                                            // Find new pile
+                                            if (state.supply_manager.findNearest(unit.x, unit.y)) |new_pile| {
+                                                worker.target_pile = new_pile;
+                                                worker.state = .MovingToSupply;
+                                            } else {
+                                                worker.reset();
+                                            }
+                                        }
+                                    } else {
+                                        worker.reset();
+                                    }
+                                } else {
+                                    worker.reset();
+                                }
+                            } else {
+                                // Keep moving
+                                unit.moveTo(center_x, center_y);
+                            }
+                        } else {
+                            worker.reset();
+                        }
+                    } else {
+                        worker.reset();
+                    }
+                },
+                .Building => {
+                    // Construction mode - handled separately
+                },
+            }
+        }
+    }
+}
+
+fn updateConstruction(state: *MainState, dt: f32) void {
+    // Update construction sites
+    if (state.construction_manager.update(dt)) |completed_idx| {
+        // Get the completed site info before removing it
+        if (state.construction_manager.getSite(completed_idx)) |site| {
+            // Create the actual building
+            _ = state.game_state.building_manager.addBuilding(
+                game.Building.create(site.x, site.y, site.building_type, site.faction),
+            );
+            std.debug.print("[CONSTRUCTION] Building complete: {any}\n", .{site.building_type});
+        }
+        // Remove the construction site
+        state.construction_manager.removeSite(completed_idx);
+    }
+
+    // Update placement position if in placement mode
+    if (state.construction_manager.isPlacing()) {
+        state.construction_manager.updatePlacementPosition(state.current_mouse_x, state.current_mouse_y);
     }
 }
 
@@ -778,6 +999,12 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     // Terrain
     renderTerrain(renderer, &ctx);
 
+    // Supply piles
+    renderSupplyPiles(renderer, &ctx, state);
+
+    // Construction sites
+    renderConstructionSites(renderer, &ctx, state);
+
     // Buildings (with fog check)
     renderBuildings(renderer, &ctx, state);
 
@@ -793,8 +1020,14 @@ fn renderGame(renderer: *SpriteRenderer, state: *const MainState) void {
     // Effects
     renderEffects(renderer, &ctx, state);
 
+    // Building placement ghost (render on top)
+    renderPlacementGhost(renderer, &ctx, state);
+
     // UI
     renderUI(renderer, &ctx, state);
+
+    // Game over overlay (render last, on top of everything)
+    renderGameOverOverlay(renderer, &ctx, state);
 
     sprite_renderer_end_frame(renderer, &ctx);
 }
@@ -885,6 +1118,92 @@ fn renderTerrain(renderer: *SpriteRenderer, ctx: *RenderContext) void {
     var x: f32 = 0;
     while (x < 1280) : (x += tile_size) {
         sprite_renderer_draw_rect(renderer, ctx, x, 0, 1, 720, 0.2, 0.2, 0.15, 0.3);
+    }
+}
+
+fn renderSupplyPiles(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    const pile_size: f32 = 50.0;
+
+    for (state.supply_manager.piles[0..state.supply_manager.count]) |pile| {
+        // Skip depleted piles (draw as empty)
+        const percent = pile.getPercentRemaining();
+
+        // Base platform (always visible)
+        sprite_renderer_draw_rect(renderer, ctx, pile.x - pile_size / 2, pile.y - pile_size / 2, pile_size, pile_size, 0.4, 0.3, 0.2, 1.0);
+
+        if (!pile.is_depleted) {
+            // Supply crates - golden/tan color, size based on remaining resources
+            const crate_size = pile_size * 0.7 * percent + pile_size * 0.2;
+            const crate_offset = (pile_size - crate_size) / 2;
+
+            // Main supply pile (looks like crates/boxes)
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - pile_size / 2 + crate_offset, pile.y - pile_size / 2 + crate_offset, crate_size, crate_size, 0.85, 0.7, 0.3, 1.0);
+
+            // Crate details
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - crate_size / 4, pile.y - crate_size / 2 + 2, crate_size / 2, 3, 0.5, 0.4, 0.2, 1.0);
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - 2, pile.y - crate_size / 4, 3, crate_size / 2, 0.5, 0.4, 0.2, 1.0);
+
+            // Resource bar above the pile
+            const bar_width: f32 = 40.0;
+            const bar_height: f32 = 6.0;
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2, pile.y - pile_size / 2 - 12, bar_width, bar_height, 0.2, 0.2, 0.2, 0.8);
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2 + 1, pile.y - pile_size / 2 - 11, (bar_width - 2) * percent, bar_height - 2, 0.9, 0.8, 0.0, 1.0);
+        } else {
+            // Depleted - show empty platform with X
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - 10, pile.y - 2, 20, 4, 0.5, 0.3, 0.2, 0.5);
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - 2, pile.y - 10, 4, 20, 0.5, 0.3, 0.2, 0.5);
+        }
+    }
+}
+
+fn renderConstructionSites(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    for (state.construction_manager.sites[0..state.construction_manager.count]) |site| {
+        if (!site.is_active) continue;
+
+        const stats = game.types.getBuildingStats(site.building_type);
+        const w = stats.width;
+        const h = stats.height;
+
+        // Draw foundation
+        sprite_renderer_draw_rect(renderer, ctx, site.x, site.y, w, h, 0.4, 0.3, 0.2, 0.7);
+
+        // Draw scaffold (growing based on progress)
+        const built_h = h * site.progress;
+        sprite_renderer_draw_rect(renderer, ctx, site.x + 2, site.y + h - built_h, w - 4, built_h, 0.5, 0.4, 0.3, 0.9);
+
+        // Scaffold lines
+        sprite_renderer_draw_rect(renderer, ctx, site.x + w / 3, site.y, 3, h, 0.6, 0.5, 0.3, 0.8);
+        sprite_renderer_draw_rect(renderer, ctx, site.x + 2 * w / 3, site.y, 3, h, 0.6, 0.5, 0.3, 0.8);
+
+        // Progress bar
+        const bar_width: f32 = w;
+        sprite_renderer_draw_rect(renderer, ctx, site.x, site.y - 12, bar_width, 8, 0.2, 0.2, 0.2, 0.9);
+        sprite_renderer_draw_rect(renderer, ctx, site.x + 1, site.y - 11, (bar_width - 2) * site.progress, 6, 0.3, 0.7, 0.3, 1.0);
+    }
+}
+
+fn renderPlacementGhost(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    if (!state.construction_manager.isPlacing()) return;
+
+    if (state.construction_manager.getPlacement()) |placement| {
+        const stats = game.types.getBuildingStats(placement.building_type);
+        const w = stats.width;
+        const h = stats.height;
+
+        // Choose color based on validity
+        const r: f32 = if (placement.is_valid) 0.0 else 0.8;
+        const g: f32 = if (placement.is_valid) 0.7 else 0.2;
+        const b: f32 = if (placement.is_valid) 0.0 else 0.2;
+        const a: f32 = 0.5;
+
+        // Draw semi-transparent ghost
+        sprite_renderer_draw_rect(renderer, ctx, placement.x - w / 2, placement.y - h / 2, w, h, r, g, b, a);
+
+        // Draw outline
+        sprite_renderer_draw_rect(renderer, ctx, placement.x - w / 2, placement.y - h / 2, w, 2, r, g, b, 0.8);
+        sprite_renderer_draw_rect(renderer, ctx, placement.x - w / 2, placement.y + h / 2 - 2, w, 2, r, g, b, 0.8);
+        sprite_renderer_draw_rect(renderer, ctx, placement.x - w / 2, placement.y - h / 2, 2, h, r, g, b, 0.8);
+        sprite_renderer_draw_rect(renderer, ctx, placement.x + w / 2 - 2, placement.y - h / 2, 2, h, r, g, b, 0.8);
     }
 }
 
@@ -1015,6 +1334,144 @@ fn renderEffects(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const M
     }
 }
 
+fn renderGameOverOverlay(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
+    if (!state.victory_checker.isGameOver()) return;
+
+    const screen_width: f32 = 1280;
+    const screen_height: f32 = 720;
+
+    // Semi-transparent dark overlay
+    sprite_renderer_draw_rect(renderer, ctx, 0, 0, screen_width, screen_height, 0.0, 0.0, 0.0, 0.7);
+
+    // Center box
+    const box_width: f32 = 400;
+    const box_height: f32 = 200;
+    const box_x = (screen_width - box_width) / 2;
+    const box_y = (screen_height - box_height) / 2;
+
+    // Box background
+    sprite_renderer_draw_rect(renderer, ctx, box_x, box_y, box_width, box_height, 0.15, 0.15, 0.2, 1.0);
+
+    // Box border
+    const border: f32 = 4;
+    if (state.victory_checker.isVictory()) {
+        // Victory - Gold border
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y - border, box_width + border * 2, border, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y + box_height, box_width + border * 2, border, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y, border, box_height, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width, box_y, border, box_height, 0.9, 0.7, 0.1, 1.0);
+
+        // Victory text as colored bars (simulated text)
+        // "VICTORY" - Large golden letters
+        const text_y = box_y + 40;
+        const letter_w: f32 = 30;
+        const letter_h: f32 = 50;
+        const gap: f32 = 10;
+        var tx: f32 = box_x + (box_width - (letter_w + gap) * 7) / 2;
+
+        // V
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w / 2 - 4, text_y + letter_h - 15, 8, 15, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // I
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w / 2 - 4, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // C
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h - 8, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // T
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w / 2 - 4, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // O
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h - 8, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // R
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y, 8, letter_h / 2, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h / 2 - 4, letter_w, 8, 0.9, 0.7, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // Y
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h / 2, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y, 8, letter_h / 2, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w / 2 - 4, text_y + letter_h / 2 - 4, 8, letter_h / 2 + 4, 0.9, 0.7, 0.1, 1.0);
+
+        // Trophy icon
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 - 20, box_y + 110, 40, 30, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 - 10, box_y + 140, 20, 20, 0.9, 0.7, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 - 15, box_y + 160, 30, 8, 0.9, 0.7, 0.1, 1.0);
+    } else {
+        // Defeat - Red border
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y - border, box_width + border * 2, border, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y + box_height, box_width + border * 2, border, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x - border, box_y, border, box_height, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width, box_y, border, box_height, 0.8, 0.1, 0.1, 1.0);
+
+        // Defeat text as colored bars
+        const text_y = box_y + 40;
+        const letter_w: f32 = 35;
+        const letter_h: f32 = 50;
+        const gap: f32 = 8;
+        var tx: f32 = box_x + (box_width - (letter_w + gap) * 6) / 2;
+
+        // D
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w - 8, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y + 8, 8, letter_h - 16, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h - 8, letter_w - 8, 8, 0.8, 0.1, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // E
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h / 2 - 4, letter_w - 8, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h - 8, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // F
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h / 2 - 4, letter_w - 8, 8, 0.8, 0.1, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // E
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, 8, letter_h, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h / 2 - 4, letter_w - 8, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h - 8, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // A
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + 8, 8, letter_h - 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w - 8, text_y + 8, 8, letter_h - 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + 8, text_y, letter_w - 16, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y + letter_h / 2 - 4, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        tx += letter_w + gap;
+
+        // T
+        sprite_renderer_draw_rect(renderer, ctx, tx, text_y, letter_w, 8, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, tx + letter_w / 2 - 4, text_y, 8, letter_h, 0.8, 0.1, 0.1, 1.0);
+
+        // Skull icon (simplified X)
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 - 20, box_y + 110, 8, 50, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 + 12, box_y + 110, 8, 50, 0.8, 0.1, 0.1, 1.0);
+        sprite_renderer_draw_rect(renderer, ctx, box_x + box_width / 2 - 5, box_y + 125, 10, 20, 0.8, 0.1, 0.1, 1.0);
+    }
+}
+
 fn renderUI(renderer: *SpriteRenderer, ctx: *RenderContext, state: *const MainState) void {
     // Top bar
     sprite_renderer_draw_rect(renderer, ctx, 0, 0, 1280, 40, 0.1, 0.1, 0.15, 0.95);
@@ -1115,6 +1572,31 @@ fn renderBuildButtons(renderer: *SpriteRenderer, ctx: *RenderContext, state: *co
                     sprite_renderer_draw_rect(renderer, ctx, btn_x + 20, 720 - 80, 20, 15, 0.15, 0.35, 0.7, 1.0);
                     const cost: i32 = if (btn_i == 0) 800 else 1100;
                     drawNumber(renderer, ctx, btn_x + 5, 720 - 42, cost, 0.9, 0.8, 0.0);
+                }
+            } else if (building.building_type == .CommandCenter) {
+                // Building construction buttons: PowerPlant, Barracks, WarFactory, SupplyCenter
+                const costs = [_]i32{ 500, 600, 1000, 800 };
+                const colors = [_][3]f32{
+                    .{ 0.8, 0.8, 0.3 }, // PowerPlant - yellow
+                    .{ 0.3, 0.5, 0.3 }, // Barracks - green
+                    .{ 0.4, 0.4, 0.5 }, // WarFactory - gray
+                    .{ 0.7, 0.5, 0.3 }, // SupplyCenter - orange
+                };
+
+                for (0..4) |btn_i| {
+                    const btn_x: f32 = 20 + @as(f32, @floatFromInt(btn_i)) * 70;
+                    const col = colors[btn_i];
+
+                    // Button background
+                    sprite_renderer_draw_rect(renderer, ctx, btn_x, 720 - 90, 60, 60, 0.3, 0.3, 0.35, 1.0);
+                    sprite_renderer_draw_rect(renderer, ctx, btn_x + 2, 720 - 88, 56, 56, 0.18, 0.18, 0.22, 1.0);
+
+                    // Building icon (simple house shape)
+                    sprite_renderer_draw_rect(renderer, ctx, btn_x + 10, 720 - 70, 40, 25, col[0], col[1], col[2], 1.0);
+                    sprite_renderer_draw_rect(renderer, ctx, btn_x + 15, 720 - 80, 30, 12, col[0] * 0.8, col[1] * 0.8, col[2] * 0.8, 1.0);
+
+                    // Cost
+                    drawNumber(renderer, ctx, btn_x + 5, 720 - 42, costs[btn_i], 0.9, 0.8, 0.0);
                 }
             }
         }

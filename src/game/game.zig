@@ -8,6 +8,9 @@ pub const combat = @import("combat.zig");
 pub const state = @import("state.zig");
 pub const fog = @import("fog.zig");
 pub const ai = @import("ai.zig");
+pub const resources = @import("resources.zig");
+pub const construction = @import("construction.zig");
+pub const victory = @import("victory.zig");
 
 // Re-export commonly used types at top level
 pub const Faction = types.Faction;
@@ -38,3 +41,20 @@ pub const FOG_MAP_HEIGHT = fog.FOG_MAP_HEIGHT;
 
 pub const AIController = ai.AIController;
 pub const AIState = ai.AIState;
+
+pub const SupplyPile = resources.SupplyPile;
+pub const SupplyManager = resources.SupplyManager;
+pub const WorkerState = resources.WorkerState;
+pub const WorkerData = resources.WorkerData;
+pub const WorkerManager = resources.WorkerManager;
+pub const MAX_SUPPLY_PILES = resources.MAX_SUPPLY_PILES;
+pub const MAX_WORKERS = resources.MAX_WORKERS;
+
+pub const ConstructionManager = construction.ConstructionManager;
+pub const ConstructionSite = construction.ConstructionSite;
+pub const BuildPlacement = construction.BuildPlacement;
+pub const MAX_CONSTRUCTION_SITES = construction.MAX_CONSTRUCTION_SITES;
+
+pub const VictoryChecker = victory.VictoryChecker;
+pub const GameResult = victory.GameResult;
+pub const VictoryCondition = victory.VictoryCondition;
