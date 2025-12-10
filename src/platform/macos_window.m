@@ -96,9 +96,27 @@ typedef struct {
 @interface GameAppDelegate : NSObject <NSApplicationDelegate>
 @property (nonatomic, assign) BOOL shouldRestartGame;
 @property (nonatomic, assign) BOOL shouldNewGame;
+@property (nonatomic, assign) BOOL shouldPauseGame;
+@property (nonatomic, assign) BOOL isPaused;
+@property (nonatomic, assign) float gameSpeed;  // 1.0 = normal, 0.5 = slow, 2.0 = fast
+@property (nonatomic, assign) BOOL showFogOfWar;
+@property (nonatomic, assign) BOOL showHealthBars;
+@property (nonatomic, assign) BOOL showMinimap;
 @end
 
 @implementation GameAppDelegate
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _gameSpeed = 1.0f;
+        _showFogOfWar = YES;
+        _showHealthBars = YES;
+        _showMinimap = YES;
+        _isPaused = NO;
+    }
+    return self;
+}
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     // Already handled in macos_window_create
@@ -118,10 +136,91 @@ typedef struct {
     NSLog(@"[Menu] Restart Game requested");
 }
 
+- (void)pauseGame:(id)sender {
+    self.isPaused = !self.isPaused;
+    self.shouldPauseGame = YES;
+    NSLog(@"[Menu] Game %@", self.isPaused ? @"Paused" : @"Resumed");
+}
+
+- (void)setSpeedSlow:(id)sender {
+    self.gameSpeed = 0.5f;
+    NSLog(@"[Menu] Game speed: Slow (0.5x)");
+}
+
+- (void)setSpeedNormal:(id)sender {
+    self.gameSpeed = 1.0f;
+    NSLog(@"[Menu] Game speed: Normal (1.0x)");
+}
+
+- (void)setSpeedFast:(id)sender {
+    self.gameSpeed = 2.0f;
+    NSLog(@"[Menu] Game speed: Fast (2.0x)");
+}
+
+- (void)setSpeedVeryFast:(id)sender {
+    self.gameSpeed = 4.0f;
+    NSLog(@"[Menu] Game speed: Very Fast (4.0x)");
+}
+
+- (void)toggleFogOfWar:(id)sender {
+    self.showFogOfWar = !self.showFogOfWar;
+    NSLog(@"[Menu] Fog of War: %@", self.showFogOfWar ? @"ON" : @"OFF");
+}
+
+- (void)toggleHealthBars:(id)sender {
+    self.showHealthBars = !self.showHealthBars;
+    NSLog(@"[Menu] Health Bars: %@", self.showHealthBars ? @"ON" : @"OFF");
+}
+
+- (void)toggleMinimap:(id)sender {
+    self.showMinimap = !self.showMinimap;
+    NSLog(@"[Menu] Minimap: %@", self.showMinimap ? @"ON" : @"OFF");
+}
+
+- (void)selectAllUnits:(id)sender {
+    NSLog(@"[Menu] Select All Units");
+    // Will be handled by game loop
+}
+
+- (void)showControls:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Controls"];
+    [alert setInformativeText:
+        @"Movement:\n"
+        @"  WASD / Arrow Keys - Pan camera\n"
+        @"\n"
+        @"Unit Control:\n"
+        @"  Left Click - Select unit\n"
+        @"  Shift+Click - Add to selection\n"
+        @"  Right Click - Move / Attack\n"
+        @"  Drag - Box select\n"
+        @"\n"
+        @"Unit Groups:\n"
+        @"  Ctrl+1-9 - Assign group\n"
+        @"  1-9 - Select group\n"
+        @"\n"
+        @"Buildings:\n"
+        @"  Click building - Select\n"
+        @"  Click unit icon - Train unit"];
+    [alert setAlertStyle:NSAlertStyleInformational];
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
 - (void)showAbout:(id)sender {
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Generals"];
-    [alert setInformativeText:@"A C&C Generals Zero Hour inspired RTS game\n\nBuilt with Zig and Metal\n\nVersion 0.1.0"];
+    [alert setInformativeText:
+        @"A C&C Generals Zero Hour inspired RTS game\n\n"
+        @"Built with Zig and Metal\n\n"
+        @"Version 0.1.0\n\n"
+        @"Features:\n"
+        @"• 3 Factions: China, USA, GLA\n"
+        @"• Unit production and combat\n"
+        @"• Resource gathering\n"
+        @"• Building construction\n"
+        @"• AI opponent\n"
+        @"• Fog of War"];
     [alert setAlertStyle:NSAlertStyleInformational];
     [alert addButtonWithTitle:@"OK"];
     [alert runModal];
@@ -200,6 +299,94 @@ static void setupMenuBar(NSApplication *app, GameAppDelegate *delegate) {
     [restartItem setTarget:delegate];
     [gameMenu addItem:restartItem];
 
+    [gameMenu addItem:[NSMenuItem separatorItem]];
+
+    // Pause/Resume
+    NSMenuItem *pauseItem = [[NSMenuItem alloc] initWithTitle:@"Pause"
+                                                       action:@selector(pauseGame:)
+                                                keyEquivalent:@"p"];
+    [pauseItem setTarget:delegate];
+    [gameMenu addItem:pauseItem];
+
+    [gameMenu addItem:[NSMenuItem separatorItem]];
+
+    // Game Speed Submenu
+    NSMenuItem *speedMenuItem = [[NSMenuItem alloc] initWithTitle:@"Game Speed"
+                                                           action:nil
+                                                    keyEquivalent:@""];
+    NSMenu *speedMenu = [[NSMenu alloc] initWithTitle:@"Game Speed"];
+    [speedMenuItem setSubmenu:speedMenu];
+    [gameMenu addItem:speedMenuItem];
+
+    NSMenuItem *slowItem = [[NSMenuItem alloc] initWithTitle:@"Slow (0.5x)"
+                                                      action:@selector(setSpeedSlow:)
+                                               keyEquivalent:@"["];
+    [slowItem setTarget:delegate];
+    [speedMenu addItem:slowItem];
+
+    NSMenuItem *normalItem = [[NSMenuItem alloc] initWithTitle:@"Normal (1.0x)"
+                                                        action:@selector(setSpeedNormal:)
+                                                 keyEquivalent:@"\\"];
+    [normalItem setTarget:delegate];
+    [speedMenu addItem:normalItem];
+
+    NSMenuItem *fastItem = [[NSMenuItem alloc] initWithTitle:@"Fast (2.0x)"
+                                                      action:@selector(setSpeedFast:)
+                                               keyEquivalent:@"]"];
+    [fastItem setTarget:delegate];
+    [speedMenu addItem:fastItem];
+
+    NSMenuItem *veryFastItem = [[NSMenuItem alloc] initWithTitle:@"Very Fast (4.0x)"
+                                                          action:@selector(setSpeedVeryFast:)
+                                                   keyEquivalent:@""];
+    [veryFastItem setTarget:delegate];
+    [speedMenu addItem:veryFastItem];
+
+    // === Edit Menu ===
+    NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:editMenuItem];
+
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenuItem setSubmenu:editMenu];
+
+    // Select All
+    NSMenuItem *selectAllItem = [[NSMenuItem alloc] initWithTitle:@"Select All Units"
+                                                           action:@selector(selectAllUnits:)
+                                                    keyEquivalent:@"a"];
+    [selectAllItem setTarget:delegate];
+    [editMenu addItem:selectAllItem];
+
+    // === View Menu ===
+    NSMenuItem *viewMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:viewMenuItem];
+
+    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenuItem setSubmenu:viewMenu];
+
+    // Toggle Fog of War
+    NSMenuItem *fogItem = [[NSMenuItem alloc] initWithTitle:@"Toggle Fog of War"
+                                                     action:@selector(toggleFogOfWar:)
+                                              keyEquivalent:@"f"];
+    [fogItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [fogItem setTarget:delegate];
+    [viewMenu addItem:fogItem];
+
+    // Toggle Health Bars
+    NSMenuItem *healthItem = [[NSMenuItem alloc] initWithTitle:@"Toggle Health Bars"
+                                                        action:@selector(toggleHealthBars:)
+                                                 keyEquivalent:@"b"];
+    [healthItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [healthItem setTarget:delegate];
+    [viewMenu addItem:healthItem];
+
+    // Toggle Minimap
+    NSMenuItem *minimapItem = [[NSMenuItem alloc] initWithTitle:@"Toggle Minimap"
+                                                         action:@selector(toggleMinimap:)
+                                                  keyEquivalent:@"m"];
+    [minimapItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [minimapItem setTarget:delegate];
+    [viewMenu addItem:minimapItem];
+
     // === Window Menu ===
     NSMenuItem *windowMenuItem = [[NSMenuItem alloc] init];
     [menuBar addItem:windowMenuItem];
@@ -221,6 +408,15 @@ static void setupMenuBar(NSApplication *app, GameAppDelegate *delegate) {
 
     [windowMenu addItem:[NSMenuItem separatorItem]];
 
+    // Enter Full Screen
+    NSMenuItem *fullscreenItem = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen"
+                                                            action:@selector(toggleFullScreen:)
+                                                     keyEquivalent:@"f"];
+    [fullscreenItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagControl];
+    [windowMenu addItem:fullscreenItem];
+
+    [windowMenu addItem:[NSMenuItem separatorItem]];
+
     // Bring All to Front
     NSMenuItem *bringToFrontItem = [[NSMenuItem alloc] initWithTitle:@"Bring All to Front"
                                                               action:@selector(arrangeInFront:)
@@ -230,7 +426,24 @@ static void setupMenuBar(NSApplication *app, GameAppDelegate *delegate) {
     // Set the window menu for proper window management
     [app setWindowsMenu:windowMenu];
 
-    NSLog(@"[Menu] Menu bar setup complete");
+    // === Help Menu ===
+    NSMenuItem *helpMenuItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:helpMenuItem];
+
+    NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
+    [helpMenuItem setSubmenu:helpMenu];
+
+    // Controls
+    NSMenuItem *controlsItem = [[NSMenuItem alloc] initWithTitle:@"Controls"
+                                                          action:@selector(showControls:)
+                                                   keyEquivalent:@"/"];
+    [controlsItem setTarget:delegate];
+    [helpMenu addItem:controlsItem];
+
+    // Set the help menu
+    [app setHelpMenu:helpMenu];
+
+    NSLog(@"[Menu] Menu bar setup complete with Game, Edit, View, Window, Help menus");
 }
 
 // Global app delegate for menu state access
@@ -560,4 +773,47 @@ void macos_window_destroy(MacOSWindow *window) {
             window->ns_app = NULL;
         }
     }
+}
+
+// Check if New Game was requested from menu
+bool macos_window_should_new_game(void) {
+    if (g_appDelegate && g_appDelegate.shouldNewGame) {
+        g_appDelegate.shouldNewGame = NO;
+        return true;
+    }
+    return false;
+}
+
+// Check if Restart was requested from menu
+bool macos_window_should_restart(void) {
+    if (g_appDelegate && g_appDelegate.shouldRestartGame) {
+        g_appDelegate.shouldRestartGame = NO;
+        return true;
+    }
+    return false;
+}
+
+// Check if Pause was toggled from menu
+bool macos_window_should_pause(void) {
+    if (g_appDelegate && g_appDelegate.shouldPauseGame) {
+        g_appDelegate.shouldPauseGame = NO;
+        return true;
+    }
+    return false;
+}
+
+// Get paused state
+bool macos_window_is_paused(void) {
+    if (g_appDelegate) {
+        return g_appDelegate.isPaused;
+    }
+    return false;
+}
+
+// Get game speed multiplier
+float macos_window_get_game_speed(void) {
+    if (g_appDelegate) {
+        return g_appDelegate.gameSpeed;
+    }
+    return 1.0f;
 }

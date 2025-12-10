@@ -55,6 +55,13 @@ extern fn macos_window_get_mouse_button_state(window: *MacOSWindow, left_down: *
 extern fn macos_window_get_modifier_state(window: *MacOSWindow, ctrl: *bool, shift: *bool, number_pressed: *i8) void;
 extern fn macos_window_destroy(window: *MacOSWindow) void;
 
+// Menu state functions
+extern fn macos_window_should_new_game() bool;
+extern fn macos_window_should_restart() bool;
+extern fn macos_window_should_pause() bool;
+extern fn macos_window_is_paused() bool;
+extern fn macos_window_get_game_speed() f32;
+
 // Sprite Renderer
 const SpriteRenderer = extern struct {
     metal_device: ?*anyopaque,
@@ -386,6 +393,81 @@ const MainState = struct {
             }
         }
         std.debug.print("[GROUP] Recalled group {d} ({d} units)\n", .{ group_num + 1, self.selected_unit_count });
+    }
+
+    // Reset game to initial state (for New Game / Restart)
+    pub fn reset(self: *MainState) void {
+        std.debug.print("[GAME] Resetting game state...\n", .{});
+
+        // Reset core game state
+        self.game_state = game.GameState.init();
+        self.game_state.startSkirmish();
+
+        // Reset visual effects
+        self.explosion_count = 0;
+        self.muzzle_flash_count = 0;
+
+        // Reset selection
+        self.selection_start_x = 0;
+        self.selection_start_y = 0;
+        self.is_selecting = false;
+        self.selected_unit_count = 0;
+
+        // Reset unit groups
+        for (0..10) |i| {
+            self.unit_groups[i].clear();
+        }
+
+        // Reset fog of war
+        self.fog_of_war = game.FogOfWar.init();
+
+        // Reset AI controllers
+        self.ai_china = game.AIController.init(.China);
+        self.ai_gla = game.AIController.init(.GLA);
+        self.ai_china_money = 2000;
+        self.ai_gla_money = 2000;
+        self.ai_china_production = game.ProductionQueue.init();
+        self.ai_gla_production = game.ProductionQueue.init();
+
+        // Reset resource gathering
+        self.supply_manager = game.SupplyManager.init();
+        self.worker_manager = game.WorkerManager.init();
+
+        // Add supply piles
+        _ = self.supply_manager.addPile(game.SupplyPile.create(300, 400, 3000));
+        _ = self.supply_manager.addPile(game.SupplyPile.create(500, 300, 3000));
+        _ = self.supply_manager.addPile(game.SupplyPile.create(900, 500, 3000));
+        _ = self.supply_manager.addPile(game.SupplyPile.create(600, 100, 3000));
+
+        // Add USA worker unit
+        const worker_idx = self.game_state.unit_manager.addUnit(game.Unit.create(200, 550, .USA, .Worker));
+        if (worker_idx) |idx| {
+            _ = self.worker_manager.registerWorker(idx);
+        }
+
+        // Add enemy units
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(800, 550, .China, .Infantry));
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(820, 550, .China, .Infantry));
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(800, 600, .China, .Battlemaster));
+
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(700, 150, .GLA, .Technical));
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(760, 170, .GLA, .Scorpion));
+        _ = self.game_state.unit_manager.addUnit(game.Unit.create(680, 220, .GLA, .Infantry));
+
+        // GLA buildings
+        _ = self.game_state.building_manager.addBuilding(game.Building.create(650, 50, .CommandCenter, .GLA));
+        _ = self.game_state.building_manager.addBuilding(game.Building.create(750, 60, .Barracks, .GLA));
+
+        // Reset construction
+        self.construction_manager = game.ConstructionManager.init();
+
+        // Reset victory checker
+        self.victory_checker = game.VictoryChecker.init();
+
+        // Reset frame count
+        self.frame_count = 0;
+
+        std.debug.print("[GAME] Game reset complete!\n", .{});
     }
 };
 
@@ -1198,15 +1280,21 @@ fn renderSupplyPiles(renderer: *SpriteRenderer, ctx: *RenderContext, state: *con
             sprite_renderer_draw_rect(renderer, ctx, pile.x - crate_size / 4, pile.y - crate_size / 2 + 2, crate_size / 2, 3, 0.5, 0.4, 0.2, 1.0);
             sprite_renderer_draw_rect(renderer, ctx, pile.x - 2, pile.y - crate_size / 4, 3, crate_size / 2, 0.5, 0.4, 0.2, 1.0);
 
-            // Resource bar above the pile
-            const bar_width: f32 = 40.0;
-            const bar_height: f32 = 6.0;
-            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2, pile.y - pile_size / 2 - 12, bar_width, bar_height, 0.2, 0.2, 0.2, 0.8);
-            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2 + 1, pile.y - pile_size / 2 - 11, (bar_width - 2) * percent, bar_height - 2, 0.9, 0.8, 0.0, 1.0);
+            // Resource bar above the pile (larger and more visible)
+            const bar_width: f32 = 50.0;
+            const bar_height: f32 = 8.0;
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2, pile.y - pile_size / 2 - 14, bar_width, bar_height, 0.1, 0.1, 0.1, 0.9);
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - bar_width / 2 + 1, pile.y - pile_size / 2 - 13, (bar_width - 2) * percent, bar_height - 2, 0.9, 0.8, 0.0, 1.0);
+
+            // Draw numeric resource count above the bar
+            drawNumber(renderer, ctx, pile.x - 20, pile.y - pile_size / 2 - 28, pile.resources, 0.9, 0.8, 0.0);
         } else {
             // Depleted - show empty platform with X
             sprite_renderer_draw_rect(renderer, ctx, pile.x - 10, pile.y - 2, 20, 4, 0.5, 0.3, 0.2, 0.5);
             sprite_renderer_draw_rect(renderer, ctx, pile.x - 2, pile.y - 10, 4, 20, 0.5, 0.3, 0.2, 0.5);
+
+            // Show "EMPTY" indicator
+            sprite_renderer_draw_rect(renderer, ctx, pile.x - 20, pile.y - pile_size / 2 - 14, 40, 10, 0.5, 0.2, 0.2, 0.9);
         }
     }
 }
@@ -1757,6 +1845,11 @@ pub fn main() !void {
         if (!macos_window_poll_events(&window)) {
             state.is_running = false;
             break;
+        }
+
+        // Check for menu actions (New Game / Restart)
+        if (macos_window_should_new_game() or macos_window_should_restart()) {
+            state.reset();
         }
 
         handleInput(&state, &window, dt);
